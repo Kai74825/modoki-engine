@@ -25,7 +25,7 @@
  *   2. an **imported identifier** naming an engine asset-GUID constant — `DEFAULT_FONT_GUID`.
  *
  * Form 2 was initially written off as needing type information. It does not: the set of engine
- * constants is small and ENUMERABLE from source (`ENGINE_GUID_CONST_RE`), and the same
+ * constants is small and ENUMERABLE from source (`exportedGuidConsts`), and the same
  * asset-index membership test discriminates their values, so the names are derived rather than
  * hard-coded and a new engine builtin is covered automatically. It earns its keep immediately —
  * Court's font ref is a form-2 instance, and a dropped font takes its baked MTSDF atlas with it,
@@ -50,23 +50,19 @@ import { deriveGuid } from '../../packages/modoki/src/runtime/core/assetRefRules
 import { discoverProjects } from '../../scripts/projectRoots.mjs';
 import { hasInternalGames } from '../helpers/repoLayout';
 import { repoFiles } from '../../scripts/repoCorpus.mjs';
+import { assertExemptionLedger } from '@modoki/engine/testing/exemptionLedger';
+import { readScannedSource, stripComments } from '@modoki/engine/testing';
+import { findNodes, lineOf, parseSource, readsOf, referencesToPath, stringValueOf, ts } from '@modoki/engine/testing/sourceAst';
 
 // engine/tests/assets/ → repo root (games/ + demos/ live there).
 const PROJECT_ROOT = path.resolve(__dirname, '../../..');
 // The public engine snapshot ships neither games/ nor demos/ — nothing to audit there.
 const hasGames = hasInternalGames();
 
-/** A GUID literal inside a single- or double-quoted string, anywhere in a source line. */
-const GUID_LITERAL_RE = /['"]([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})['"]/gi;
-
-/**
- * Sites that reference an asset by GUID literal in code and are ACCEPTED, each with the
- * reason it cannot use a resource trait. Shrink-only: adding an entry is a deliberate,
- * reviewed decision, and the reason has to say why the resource-trait pattern does not fit.
- * A stale entry is its own bug (it silences a site that has since been fixed), so the test
- * below also fails on an entry that no longer fires.
- */
-const ALLOWED: { file: string; why: string }[] = [];
+/* ⚠️ **No ALLOWED list (#1140).** It was an EMPTY file-keyed list — its first row would have
+ *  pardoned every GUID literal a file would ever hold, which is the per-file pardon over a
+ *  per-occurrence ban the rest of this guard is careful not to be. A site that genuinely cannot use
+ *  a resource trait goes on PENDING_MIGRATION below, per GUID and counted, with its reason. */
 
 /**
  * Sites that already existed when this guard landed and are NOT yet migrated to a resource
@@ -80,10 +76,15 @@ const ALLOWED: { file: string; why: string }[] = [];
  * an already-listed file still fails, and fixing one and forgetting to delete its entry also
  * fails. `asset-keep.json` has neither property, which is why forgetting it is silent.
  *
+ * ⚠️ **Each GUID is SPENT per MATCH (#1140).** The keys were a `Set<file:guid>`, so a GUID already
+ * listed for a file could be written any number of further times in that file for free — a
+ * repeated reference collapsed into one row. A GUID matched N times (on N lines, or twice on one)
+ * now carries `{ guid, count: N }`; a plain string is one match.
+ *
  * Regenerate with: MODOKI_DUMP_CODE_ASSET_REFS=1 npx vitest run --config engine/vite.config.ts \
  *   engine/tests/assets/codeAssetRefs.test.ts
  */
-const PENDING_MIGRATION: { file: string; note: string; guids: string[] }[] = [
+const PENDING_MIGRATION: { file: string; note: string; guids: Array<string | { guid: string; count: number }> }[] = [
   {
     file: 'games/court/runtime/systems.ts',
     note: 'The engine builtin font, via the imported DEFAULT_FONT_GUID identifier — an ENGINE '
@@ -213,9 +214,6 @@ function walkFiles0(dir: string): Array<{ rel: string; abs: string }> {
   });
 }
 
-/** `export const SOME_GUID = '<guid>'` in engine source — the ENGINE's own asset-GUID constants. */
-const ENGINE_GUID_CONST_RE = /export const ([A-Za-z_][A-Za-z0-9_]*) *(?::[^=]*)?= *['"]([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})['"]/g;
-
 /**
  * Engine-exported constants that hold an ASSET guid, as `identifier → guid`. A game importing one
  * of these (`Text2D({ font: DEFAULT_FONT_GUID })`) has an asset ref that no literal scan can see —
@@ -234,15 +232,85 @@ function engineAssetGuidConstants(index: Map<string, string>): Map<string, { gui
   const out = new Map<string, { guid: string; asset: string }>();
   const engineSrc = path.join(PROJECT_ROOT, 'engine', 'packages', 'modoki', 'src');
   for (const file of walkFiles(engineSrc)) {
-    for (const m of fs.readFileSync(file, 'utf-8').matchAll(ENGINE_GUID_CONST_RE)) {
-      const [, name, guid] = m;
-      const asset = index.get(guid.toLowerCase());
+    for (const { name, guid } of exportedGuidConsts(readScannedSource(file).code, file)) {
+      const asset = index.get(guid);
       // Same discriminator as the literal path: only a guid a real asset OWNS is a ref the build
       // must be able to see. A sentinel/entity guid declared this way is correctly ignored.
-      if (asset) out.set(name, { guid: guid.toLowerCase(), asset });
+      if (asset) out.set(name, { guid, asset });
     }
   }
   return out;
+}
+
+const GUID_TEXT = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const QUOTED_GUID = /['"]([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})['"]/gi;
+
+/** Every `export const NAME = '<guid>'` declaration in one file's comment-stripped code, from the
+ *  parse (#1179). The regex it replaced matched RAW text, so a docblock quoting such a
+ *  declaration registered a constant, and `export const NAME =\n  '<guid>'` wrapped was never one. */
+function exportedGuidConsts(code: string, label: string): Array<{ name: string; guid: string }> {
+  const sf = parseSource(code, label);
+  return sf.statements.filter(ts.isVariableStatement)
+    .filter((s) => s.modifiers?.some((m) => m.kind === ts.SyntaxKind.ExportKeyword) && (s.declarationList.flags & ts.NodeFlags.Const) !== 0)
+    .flatMap((s) => s.declarationList.declarations.flatMap((d) => {
+      const guid = stringValueOf(d.initializer);
+      return ts.isIdentifier(d.name) && guid !== undefined && GUID_TEXT.test(guid) ? [{ name: d.name.text, guid: guid.toLowerCase() }] : [];
+    }));
+}
+
+/**
+ * Every asset-GUID reference in one file's comment-stripped code, from the parse (#1179): a string
+ * literal whose WHOLE value is a GUID, and every READ of an engine GUID constant (`referencesToPath` —
+ * so an import specifier, a declaration name or an object key spelled alike is not one). `lines`
+ * only supplies the quoted line text (comment-blanked lines are enough for a message). Two things the line scan got wrong: its comment filter was
+ * "the line starts with `//` or `*`", and its import filter skipped any line shaped `NAME,` — which
+ * is also a formatter-wrapped call ARGUMENT, so `useFont(\n  DEFAULT_FONT_GUID,\n  …)` was invisible.
+ */
+function assetRefsIn(
+  code: string, lines: string[], rel: string,
+  index: Map<string, string>, engineConsts: Map<string, { guid: string; asset: string }>,
+): Finding[] {
+  const sf = parseSource(code, rel);
+  const quote = (line: number) => (lines[line - 1] ?? '').trim().slice(0, 100);
+  // A string whose WHOLE value is a GUID, or a GUID QUOTED inside a longer string or template text
+  // (JSON in a string, `{"font":"<guid>"}`) — the shape the old line regex caught (#1179 P2 review).
+  const literals = findNodes(sf, (n): n is ts.StringLiteralLike | ts.TemplateLiteralLikeNode =>
+    ts.isStringLiteralLike(n) || ts.isTemplateHead(n) || ts.isTemplateMiddle(n) || ts.isTemplateTail(n))
+    .flatMap((n) => {
+      const guids = GUID_TEXT.test(n.text) ? [n.text] : [...n.text.matchAll(QUOTED_GUID)].map((m) => m[1]!);
+      return guids.flatMap((g) => {
+        const guid = g.toLowerCase();
+        const asset = index.get(guid);
+        // Not a known asset guid ⇒ an entity ref or unrelated data. Ignored by design.
+        return asset ? [{ file: rel, line: lineOf(n), guid, asset, text: quote(lineOf(n)) }] : [];
+      });
+    });
+  // A RENAMED import (`import { DEFAULT_FONT_GUID as F }`) is followed to `F`'s reads by symbol.
+  const aliases = findNodes(sf, (n): n is ts.ImportSpecifier => ts.isImportSpecifier(n)
+    && n.propertyName !== undefined && engineConsts.has(n.propertyName.text) && n.name.text !== n.propertyName.text);
+  // `readsOf` also returns a TYPE position (`typeof F`) and a re-export (`export { F }`), which
+  // `referencesToPath` excludes for the plain name — excluded here too, so both spellings count alike.
+  const isRuntimeRead = (r: ts.Identifier): boolean => {
+    if (ts.isExportSpecifier(r.parent)) return false;
+    for (let cur = r.parent; cur && !ts.isBlock(cur) && !ts.isSourceFile(cur); cur = cur.parent) if (ts.isTypeNode(cur) && !ts.isExpressionWithTypeArguments(cur)) return false;
+    return true;
+  };
+  const viaAlias = aliases.flatMap((spec) => readsOf(spec.name).filter(isRuntimeRead).map((r) => {
+    const hit = engineConsts.get(spec.propertyName!.text)!;
+    return { file: rel, line: lineOf(r), guid: hit.guid, asset: hit.asset, text: quote(lineOf(r)), via: spec.propertyName!.text };
+  }));
+  const nameOf = (r: ts.Expression | ts.BindingElement): string | undefined => {
+    if (ts.isBindingElement(r)) return ((r.propertyName ?? r.name) as ts.Identifier).text;
+    if (ts.isIdentifier(r)) return r.text;
+    if (ts.isPropertyAccessExpression(r)) return r.name.text;
+    return ts.isElementAccessExpression(r) ? stringValueOf(r.argumentExpression) : undefined;
+  };
+  const viaConst = engineConsts.size === 0 ? [] : referencesToPath(sf, ...engineConsts.keys()).flatMap((r) => {
+    const name = nameOf(r);
+    const hit = name === undefined ? undefined : engineConsts.get(name);
+    return hit ? [{ file: rel, line: lineOf(r), guid: hit.guid, asset: hit.asset, text: quote(lineOf(r)), via: name }] : [];
+  });
+  return [...literals, ...viaConst, ...viaAlias].sort((a, b) => a.line - b.line);
 }
 
 interface Finding { file: string; line: number; guid: string; asset: string; text: string; via?: string }
@@ -262,38 +330,18 @@ const EXTRA_SCAN_DIRS = [
 function findAssetGuidLiterals(): Finding[] {
   const index = buildGuidIndex();
   const engineConsts = engineAssetGuidConstants(index);
-  const constRe = engineConsts.size
-    ? new RegExp(`\\b(${[...engineConsts.keys()].join('|')})\\b`, 'g')
-    : null;
   const found: Finding[] = [];
   const scanDirs = [...(discoverProjects(PROJECT_ROOT) as { dir: string }[]).map((p) => p.dir), ...EXTRA_SCAN_DIRS];
   for (const dir of scanDirs) {
     for (const file of walkFiles(dir)) {
       const rel = path.relative(PROJECT_ROOT, file).replace(/\\/g, '/');
-      const lines = fs.readFileSync(file, 'utf-8').split('\n');
-      lines.forEach((text, i) => {
-        // A comment is never a reference — it cannot make the build keep anything. This applies to
-        // BOTH forms: a doc comment that quotes a guid (this repo's comments cite guids and
-        // constant names freely, e.g. Court's own note about DEFAULT_FONT_GUID) would otherwise be
-        // reported as a live ref, which is a false positive that costs the guard its credibility.
-        if (/^\s*(\/\/|\*|\/\*)/.test(text)) return;
-        for (const m of text.matchAll(GUID_LITERAL_RE)) {
-          const guid = m[1].toLowerCase();
-          const asset = index.get(guid);
-          // Not a known asset guid ⇒ an entity ref or unrelated data. Ignored by design.
-          if (!asset) continue;
-          found.push({ file: rel, line: i + 1, guid, asset, text: text.trim().slice(0, 100) });
-        }
-        // The identifier form, additionally skipped on import lines: an import is how the name
-        // arrives, not a use of it, so reporting both just doubles the noise.
-        if (!constRe) return;
-        if (/^\s*(import|export)\s*\{|^\s*[A-Za-z_][A-Za-z0-9_]*,\s*$|\bfrom\s+['"]/.test(text)) return;
-        for (const m of text.matchAll(constRe)) {
-          const hit = engineConsts.get(m[1]);
-          if (!hit) continue;
-          found.push({ file: rel, line: i + 1, guid: hit.guid, asset: hit.asset, text: text.trim().slice(0, 100), via: m[1] });
-        }
-      });
+      // A comment is never a reference — it cannot make the build keep anything. This applies to
+      // BOTH forms: a doc comment that quotes a guid (this repo's comments cite guids and constant
+      // names freely, e.g. Court's own note about DEFAULT_FONT_GUID) would otherwise be reported as
+      // a live ref, which is a false positive that costs the guard its credibility. An import is how
+      // a constant's name ARRIVES, not a use of it, so it is not reported either.
+      const { code } = readScannedSource(file);
+      found.push(...assetRefsIn(code, code.split('\n'), rel, index, engineConsts));
     }
   }
   return found;
@@ -305,11 +353,17 @@ const findings = hasGames ? findAssetGuidLiterals() : [];
 // machine-producible: `MODOKI_DUMP_CODE_ASSET_REFS=1 npx vitest run --config engine/vite.config.ts \
 //   engine/tests/assets/codeAssetRefs.test.ts` prints the exact literal to paste.
 if (process.env.MODOKI_DUMP_CODE_ASSET_REFS) {
-  // Deduped per file+guid: the list is keyed that way, so a guid referenced from three lines in
-  // one file is ONE entry — emitting it three times would produce a list that cannot round-trip.
-  const byFile = new Map<string, Set<string>>();
-  for (const f of findings) byFile.set(f.file, (byFile.get(f.file) ?? new Set()).add(f.guid));
-  console.log(JSON.stringify([...byFile].map(([file, guids]) => ({ file, guids: [...guids] })), null, 2));
+  // Counted per file+guid: the list is keyed that way and spends one row unit per MATCH, so the
+  // dump emits `{ guid, count }` where a guid is on more than one line — the exact literal to paste.
+  const byFile = new Map<string, Map<string, number>>();
+  for (const f of findings) {
+    const guids = byFile.get(f.file) ?? new Map<string, number>();
+    guids.set(f.guid, (guids.get(f.guid) ?? 0) + 1);
+    byFile.set(f.file, guids);
+  }
+  console.log(JSON.stringify([...byFile].map(([file, guids]) => ({
+    file, guids: [...guids].map(([guid, count]) => (count === 1 ? guid : { guid, count })),
+  })), null, 2));
 }
 
 describe('game code must not reference assets by GUID literal (#53)', () => {
@@ -319,6 +373,30 @@ describe('game code must not reference assets by GUID literal (#53)', () => {
   // a vacuously-passing corpus guard is supposed to go red. `walkFiles` discards git's `rel`,
   // so if its enumeration or its `under` prefix ever stops matching, every guard in this file
   // passes having read no files at all.
+  it('the ref detector sees a WRAPPED constant argument and a quoted GUID, and not an import or a comment (#1179)', () => {
+    const FONT = 'beef0000-0000-4000-8000-000000000002';
+    const index = new Map([[FONT, 'fonts/default.json']]);
+    const consts = new Map([['DEFAULT_FONT_GUID', { guid: FONT, asset: 'fonts/default.json' }]]);
+    const raw = [
+      "import { DEFAULT_FONT_GUID, other } from '@modoki/engine';",
+      'useFont(',
+      '  DEFAULT_FONT_GUID,',
+      '  12,',
+      ');',
+      `const icon = { K: '${FONT}' }; // was '${FONT}'`,
+      "const entity = 'aaaaaaaa-0000-4000-8000-000000000000';",
+      // #1179 P2 review: JSON in a string, a renamed import, and bracket access.
+      `const json = '{"font":"${FONT}"}';`,
+      "import { DEFAULT_FONT_GUID as F } from '@modoki/engine';",
+      'use(F); type T = typeof F; export { F };',
+      "use(engine['DEFAULT_FONT_GUID']);",
+    ].join('\n');
+    const refs = assetRefsIn(stripComments(raw), raw.split('\n'), 'games/x/a.ts', index, consts);
+    expect(refs.map((r) => `${r.line}:${r.via ?? 'literal'}`)).toEqual(['3:DEFAULT_FONT_GUID', '6:literal', '8:literal', '10:DEFAULT_FONT_GUID', '11:DEFAULT_FONT_GUID']);
+    const decl = "/** export const OLD_GUID = 'beef0000-0000-4000-8000-000000000002'; */\nexport const NEW_GUID =\n  'beef0000-0000-4000-8000-000000000002';\nconst LOCAL_GUID = 'beef0000-0000-4000-8000-000000000002';";
+    expect(exportedGuidConsts(stripComments(decl), 'e.ts')).toEqual([{ name: 'NEW_GUID', guid: FONT }]);
+  });
+
   it('the engine source scan is not vacuous', () => {
     const engineSrc = path.join(PROJECT_ROOT, 'engine', 'packages', 'modoki', 'src');
     expect(
@@ -330,19 +408,21 @@ describe('game code must not reference assets by GUID literal (#53)', () => {
     expect(discoverProjects(PROJECT_ROOT).length).toBeGreaterThan(0);
   });
 
-  /** `file:guid` — the key both lists are pinned on, so a NEW literal in an already-listed
-   *  file is still a failure. Pinning per FILE would have let sling grow a 12th ref for free. */
-  const key = (file: string, guid: string) => `${file}:${guid}`;
-  const allowedFiles = new Set(ALLOWED.map((a) => a.file));
-  const pendingKeys = new Set(PENDING_MIGRATION.flatMap((p) => p.guids.map((g) => key(p.file, g))));
-
-  it.skipIf(!hasGames)('no NEW asset-GUID literal in game/demo code', () => {
-    const offenders = findings
-      .filter((f) => !allowedFiles.has(f.file) && !pendingKeys.has(key(f.file, f.guid)))
-      .map((f) => `${f.file}:${f.line} → ${f.asset}${f.via ? ` (via the imported ${f.via})` : ''}\n      ${f.text}`);
-    expect(
-      offenders,
-      'A GUID literal in game code is a reference THE BUILD CANNOT SEE: the tree-shaker walks the '
+  it.skipIf(!hasGames)('no NEW asset-GUID literal in game/demo code, and the backlog only shrinks', () => {
+    assertExemptionLedger({
+      label: 'PENDING_MIGRATION in codeAssetRefs',
+      population: findings.map((f) => ({
+        item: `${f.file}::${f.guid}`,
+        site: `${f.file}:${f.line} → ${f.asset}${f.via ? ` (via the imported ${f.via})` : ''}\n      ${f.text}`,
+      })),
+      // One row per (file, guid), spending `count` lines. Over-blessed is the old "still fires"
+      // test: a migrated ref must be deducted here, and its asset-keep.json line dropped, in the
+      // same commit — a backlog that outlives its entries silently re-permits the ref.
+      exempt: PENDING_MIGRATION.flatMap((p) => p.guids.map((g) => (typeof g === 'string'
+        ? { item: `${p.file}::${g}`, reason: p.note }
+        : { item: `${p.file}::${g.guid}`, count: g.count, reason: p.note }))),
+      floor: 1,
+      fix: 'A GUID literal in game code is a reference THE BUILD CANNOT SEE: the tree-shaker walks the '
         + 'scene→prefab→mesh→material graph, so the asset is dropped from the production build AND '
         + 'the manifest, and it fails only in a real build — dev serves everything off disk, so the '
         + 'game looks perfect right up until you ship it. '
@@ -351,29 +431,6 @@ describe('game code must not reference assets by GUID literal (#53)', () => {
         + "RESOURCE TRAIT authored in the scene instead — the tree-shaker's generic trait sweep "
         + 'keeps any GUID that resolves in the asset index, game-defined traits included, with no '
         + 'registration at all. See #53 and CLAUDE.md\'s single-source-of-truth rule.',
-    ).toEqual([]);
-  });
-
-  it.skipIf(!hasGames)('every ALLOWED entry still fires (no stale exemptions)', () => {
-    const firing = new Set(findings.map((f) => f.file));
-    const stale = ALLOWED.filter((a) => !firing.has(a.file)).map((a) => a.file);
-    expect(
-      stale,
-      'These files are exempted but no longer contain an asset-GUID literal — the exemption is '
-        + 'silencing nothing and would silence a real regression later. Remove them from ALLOWED.',
-    ).toEqual([]);
-  });
-
-  it.skipIf(!hasGames)('every PENDING_MIGRATION guid still fires (the backlog only shrinks)', () => {
-    const firing = new Set(findings.map((f) => key(f.file, f.guid)));
-    const stale = [...pendingKeys].filter((k) => !firing.has(k));
-    expect(
-      stale,
-      'These refs are listed as pending migration but no longer appear in code — either they were '
-        + 'migrated to a resource trait (good: delete the entry, and drop the matching '
-        + 'asset-keep.json line in the same commit) or the file/guid moved. A backlog that outlives '
-        + 'its entries stops being able to tell you what is left, and silently re-permits the ref '
-        + 'if it comes back.',
-    ).toEqual([]);
+    });
   });
 });

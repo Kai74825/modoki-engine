@@ -16,8 +16,12 @@ import { readMetaPreferringPark, metaWrittenToDisk } from '../scene/pendingMeta'
 import { BufferedNumberInput } from './fields';
 import { registerSprite, isGuid, deriveGuid, type SpriteAssetRef } from '../../runtime/loaders/assetManifest';
 import { captureSpriteSnapshot, revertSpritePreview } from './nineSliceRevert';
+import { SaveRefusedNotice } from './AssetLoadRefusedBanner';
+import { saveRefusalMessage, saveRefusalConsoleMessage, type SaveRefusal } from './saveRefusal';
 import { markUIDirty } from '../../runtime/ui/uiTreeStore';
 import { registerHandleProvider, clampHandleToOwner, type InteractionHandle } from '../../runtime/rendering/interactionHandles';
+import { dragNineSliceGuide } from './sliceDrag';
+import { useDragPointerCapture, pressIsOnScrollbar } from './dragPointerCapture';
 
 export interface NineSliceBorder { l: number; r: number; t: number; b: number; }
 
@@ -36,11 +40,23 @@ export function NineSliceEditor({ path, name, onClose }: { path: string; name: s
   const scrollRef = useRef<HTMLDivElement>(null);
   const [imgDims, setImgDims] = useState<{ w: number; h: number } | null>(null);
   const [meta, setMeta] = useState<Record<string, unknown> | null>(null);
+  // #901: the reason the last Save did not write, shown IN the dialog. Cleared on every
+  // Save attempt so a stale reason can never sit under a later, different outcome.
+  const [saveRefusal, setSaveRefusal] = useState<SaveRefusal | null>(null);
+  // ⚠️ Clear it when the PATH changes, not only on the next Save. `Inspector.tsx` renders the
+  // asset views with no `key`, and an agent can re-open this modal on another texture
+  // (`TextureAssetView` does exactly that) — so the component survives the swap while
+  // `metaLoadedRef` resets and re-reads. Without this the dialog shows asset B under asset A's
+  // refusal, which is a notice describing work the human is no longer looking at.
+  useEffect(() => { setSaveRefusal(null); }, [path]);
   const [border, setBorder] = useState<NineSliceBorder>({ l: 0, r: 0, t: 0, b: 0 });
   const [edgeScale, setEdgeScale] = useState(1);   // edge render scale (CSS px per source px)
   const [zoom, setZoom] = useState(1);
   const [viewport, setViewport] = useState({ w: DEFAULT_VIEWPORT_W, h: DEFAULT_VIEWPORT_H });
-  const dragRef = useRef<Edge | null>(null);
+  /** The guide being dragged, with its inset and the pointer's image-space coordinate on that
+   *  guide's axis AT THE PRESS: the guide moves by the pointer's travel from there (#1176). Only the
+   *  dragged inset is snapshotted; the other three are read live on every move, as before. */
+  const dragRef = useRef<{ edge: Edge; startInset: number; press: number } | null>(null);
   const panRef = useRef<{ active: boolean; cx: number; cy: number; sl: number; st: number }>({ active: false, cx: 0, cy: 0, sl: 0, st: 0 });
   const pendingAnchorRef = useRef<{ ix: number; iy: number; vx: number; vy: number } | null>(null);
   // The whole-image sprite EXACTLY as it was when this modal opened (or `null` when the manifest
@@ -282,6 +298,8 @@ export function NineSliceEditor({ path, name, onClose }: { path: string; name: s
   const onMouseDown = (e: React.MouseEvent) => {
     const canvas = canvasRef.current, scroll = scrollRef.current;
     if (!canvas || !imgDims) return;
+    // A press on the viewport's own scrollbar is scrolling, not an edit, and must not be captured.
+    if (scroll && pressIsOnScrollbar(scroll, e.clientX, e.clientY)) return;
     if ((e.button === 2 || e.altKey) && scroll) {
       e.preventDefault();
       panRef.current = { active: true, cx: e.clientX, cy: e.clientY, sl: scroll.scrollLeft, st: scroll.scrollTop };
@@ -297,7 +315,10 @@ export function NineSliceEditor({ path, name, onClose }: { path: string; name: s
       const d = (edge === 'l' || edge === 'r') ? Math.abs(gc - px) : Math.abs(gc - py);
       if (d < bestDist) { bestDist = d; best = edge; }
     }
-    if (best) dragRef.current = best;
+    if (best) {
+      const ip = screenToImg(px, py);
+      dragRef.current = { edge: best, startInset: border[best], press: best === 'l' || best === 'r' ? ip.x : ip.y };
+    }
   };
 
   const onMouseMove = (e: React.MouseEvent) => {
@@ -306,23 +327,18 @@ export function NineSliceEditor({ path, name, onClose }: { path: string; name: s
       if (scroll) { scroll.scrollLeft = p.sl - (e.clientX - p.cx); scroll.scrollTop = p.st - (e.clientY - p.cy); }
       return;
     }
-    const edge = dragRef.current;
-    if (!edge || !imgDims) return;
+    const drag = dragRef.current;
+    if (!drag || !imgDims) return;
     const canvas = canvasRef.current!;
     const rect = canvas.getBoundingClientRect();
     const ip = screenToImg(e.clientX - rect.left, e.clientY - rect.top);
-    setBorder((prev) => {
-      const ix = Math.round(clamp(ip.x, 0, imgDims.w)), iy = Math.round(clamp(ip.y, 0, imgDims.h));
-      switch (edge) {
-        case 'l': return { ...prev, l: clamp(ix, 0, imgDims.w - prev.r - 1) };
-        case 'r': return { ...prev, r: clamp(imgDims.w - ix, 0, imgDims.w - prev.l - 1) };
-        case 't': return { ...prev, t: clamp(iy, 0, imgDims.h - prev.b - 1) };
-        case 'b': return { ...prev, b: clamp(imgDims.h - iy, 0, imgDims.h - prev.t - 1) };
-      }
-    });
+    const pointer = drag.edge === 'l' || drag.edge === 'r' ? ip.x : ip.y;
+    setBorder((prev) => dragNineSliceGuide({ ...prev, [drag.edge]: drag.startInset }, drag.edge, drag.press, pointer, imgDims));
   };
 
   const onMouseUp = () => { panRef.current.active = false; dragRef.current = null; };
+  // #1176: the drag lives until its own release, wherever that lands; see SpriteEditor's twin.
+  const captureDrag = useDragPointerCapture(scrollRef, () => panRef.current.active || !!dragRef.current, onMouseUp);
 
   const setEdge = (edge: Edge, v: number) => setBorder((prev) => {
     if (!imgDims) return { ...prev, [edge]: Math.max(0, v) };
@@ -337,6 +353,16 @@ export function NineSliceEditor({ path, name, onClose }: { path: string; name: s
 
   // ── Persist ──
   const save = async () => {
+    // ⚠️ Capture the path this attempt is FOR. `writeMetaOrWarn`'s POST now carries a renderer
+    // probe (up to 1500ms, two with discardUnsaved), and the Inspector renders these views with no
+    // `key` — so an agent re-opening this modal on another asset mid-flight would land THIS
+    // asset's refusal on THAT asset's dialog. The `[path]` effect above only clears a refusal left
+    // over from before the swap; this closes the other direction (close-out review 2).
+    const attemptPath = path;
+    // ⚠️ Clear FIRST, on every attempt. A refusal left standing under a later outcome is worse than
+    // no refusal: press Save again after the dev server recovers and a stale "not saved" would sit
+    // there while the write actually landed, which is the same lie in the opposite direction.
+    setSaveRefusal(null);
     const hasBorder = border.l || border.r || border.t || border.b;
     const borderOut = { ...border, ...(edgeScale !== 1 ? { scale: edgeScale } : {}) };
     const nextMeta = { ...(meta ?? {}), ...(hasBorder ? { border: borderOut } : {}) };
@@ -354,7 +380,15 @@ export function NineSliceEditor({ path, name, onClose }: { path: string; name: s
     // a transient 500 on a GET. Keeping the dialog open matches the failed-write branch below:
     // the edit is not thrown away for a reason that has nothing to do with the edit.
     if (!metaLoadedRef.current) {
-      console.error(`[NineSliceEditor] refusing to save ${path} — its .meta.json was never read successfully, so writing now would replace it with a document missing its GUID. Close and reopen once the dev server responds.`);
+      // BOTH channels (#901). The console line keeps the path + mechanism for whoever is debugging;
+      // the notice carries the consequence + remedy to whoever is editing, in the dialog they are
+      // looking at. Reporting to one of them is what made this refusal read as a dead button.
+      const refusal: SaveRefusal = { kind: 'meta-never-read' };
+      console.error(saveRefusalConsoleMessage(refusal, 'NineSliceEditor', attemptPath));
+      // The console line is unconditional — it is the record, and it names its own path. Only the
+      // ON-SCREEN notice is dropped when the dialog has moved on, because that one would be read
+      // as describing whatever is showing now.
+      if (attemptPath === path) setSaveRefusal(refusal);
       return;
     }
     const persisted = await writeMetaOrWarn(path, nextMeta);
@@ -365,7 +399,12 @@ export function NineSliceEditor({ path, name, onClose }: { path: string; name: s
       // false, so a later Cancel still reverts the live preview. `writeMetaOrWarn` has already
       // logged the status + body; this line names the dialog, since that one is tagged
       // `[Inspector]` for every caller.
-      console.error(`[NineSliceEditor] save failed for ${path} — the dialog is staying open so the edit is not lost. See the /api/write-meta error above.`);
+      const refusal: SaveRefusal = { kind: 'write-failed' };
+      console.error(saveRefusalConsoleMessage(refusal, 'NineSliceEditor', attemptPath));
+      // The console line is unconditional — it is the record, and it names its own path. Only the
+      // ON-SCREEN notice is dropped when the dialog has moved on, because that one would be read
+      // as describing whatever is showing now.
+      if (attemptPath === path) setSaveRefusal(refusal);
       return;
     }
     savedRef.current = persisted;
@@ -416,7 +455,8 @@ export function NineSliceEditor({ path, name, onClose }: { path: string; name: s
             </div>
             <div
               ref={scrollRef}
-              onMouseDown={onMouseDown} onMouseMove={onMouseMove} onMouseUp={onMouseUp} onMouseLeave={onMouseUp}
+              onPointerDown={(e) => { if (!e.isPrimary) return; onMouseDown(e); captureDrag(e.nativeEvent); }}
+              onPointerMove={(e) => { if (e.isPrimary) onMouseMove(e); }} onPointerUp={(e) => { if (e.isPrimary) onMouseUp(); }}
               onContextMenu={(e) => e.preventDefault()}
               style={{ flex: 1, minHeight: 0, overflow: 'auto', background: '#15151f', border: '1px solid #444' }}
             >
@@ -442,7 +482,12 @@ export function NineSliceEditor({ path, name, onClose }: { path: string; name: s
           </div>
         </div>
 
-        <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 8, marginTop: 10 }}>
+        <div style={{ display: 'flex', justifyContent: 'flex-end', alignItems: 'center', gap: 8, marginTop: 10 }}>
+          {/* #901: beside the Save button that did nothing — not a toast over the dialog, which
+              someone mid-drag in the border handles can miss entirely. */}
+          {saveRefusal && (
+            <SaveRefusedNotice uiId="nineSlice.saveRefused" message={saveRefusalMessage(saveRefusal)} />
+          )}
           <button data-ui-id="nineSlice.cancel" style={btn} onClick={onClose}>Cancel</button>
           <button data-ui-id="nineSlice.save" style={{ ...btn, background: '#2ecc71', border: '1px solid #27ae60', color: '#fff' }} onClick={save}>Save</button>
         </div>

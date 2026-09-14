@@ -5,11 +5,13 @@
  *  transform), so undo reverses the whole gesture in one step. */
 
 import type { UndoAction } from '../undo/undoManager';
+import { fireDirtyListeners } from '../../runtime/core/renderDirty';
 
-/** Minimal entity surface the undo closures touch. */
+/** Minimal entity surface the undo closures touch. `get` is `| undefined` because a koota handle's
+ *  is — declaring it never-undefined only compiled while `findEntity` returned `any` (#1151). */
 export interface UndoEntity {
   has(trait: unknown): boolean;
-  get(trait: unknown): Record<string, number>;
+  get(trait: unknown): Record<string, number> | undefined;
   set(trait: unknown, value: Record<string, number>): void;
 }
 
@@ -20,7 +22,7 @@ export interface TransformUndoOptions {
   /** Re-resolve the entity id from a guid-stable ref INSIDE the closures — a captured
    *  koota handle/raw id goes stale on delete/restore or a Play→Stop world rebuild. */
   resolve: () => number | null;
-  findEntity: (id: number) => UndoEntity | undefined;
+  findEntity: (id: number) => UndoEntity | null | undefined;
   /** Only the Transform fields the drag changed, at drag start. */
   before: Record<string, number>;
   /** The same fields at drag end. */
@@ -41,7 +43,11 @@ export function buildTransformUndoAction(opts: TransformUndoOptions): UndoAction
     const id = resolve();
     if (id == null) return;
     const en = findEntity(id);
-    if (en?.has(trait)) en.set(trait, { ...en.get(trait), ...fields });
+    if (!en?.has(trait)) return;
+    en.set(trait, { ...en.get(trait), ...fields });
+    // A direct ECS write fires no dirty broadcast, and undo/redo has none of its own — so without
+    // this the Game view (and anything else listening) kept the pre-undo position (#1141 sibling).
+    fireDirtyListeners();
   };
   const action: UndoAction = { label, undo: () => apply(before), redo: () => apply(after) };
   if (entityGuid) {

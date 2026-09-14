@@ -13,10 +13,11 @@ import { makeDeviceEvalApi } from './deviceEvalApi';
 import { describeElement } from './domResolve';
 import { Capacitor } from '@capacitor/core';
 import { App as CapacitorApp } from '@capacitor/app';
-import { setJournalEnabled, getFrameLoopHealth } from '@modoki/engine/runtime';
+import { setJournalEnabled, getFrameLoopHealth, hasDocKey } from '@modoki/engine/runtime';
 import { createSupersessionToken, createTeardownToken } from '@modoki/engine/runtime/core/liveness';
 import { consoleRing, installDeviceConsoleCapture, unpatchedLog } from './deviceConsoleCapture';
 import { getConsoleRingDropped } from '@modoki/engine/runtime/core/consoleRing';
+import { domCodeForKey, normalizeKeyName, refuseDeviceInputVocabulary } from '../../tools/shared/inputVocabulary';
 import {
   safeStringify,
   describeShape,
@@ -28,6 +29,7 @@ import {
   type LastScreenInfo,
   type ScreenInfoParam,
 } from './bridgeHelpers';
+import type { AimGesture } from './domPointContract';
 
 interface Request {
   id: string;
@@ -258,19 +260,24 @@ type Aim = { x: number; y: number; label: string; hitTarget?: string | null } | 
 
 /** Resolve a CSS selector to a viewport point (+ occlusion) via the shared runtime op — reused so a
  *  device tap/drag can aim by selector, occlusion-checked server-side, with no screenshot round-trip. */
-async function resolveSelectorPoint(selector: string): Promise<DomResolution> {
+async function resolveSelectorPoint(selector: string, gesture: AimGesture | undefined): Promise<DomResolution> {
   const runAgentOp = await getRunAgentOp();
-  return (await runAgentOp('resolve-dom-point', { selector })) as DomResolution;
+  return (await runAgentOp('resolve-dom-point', { selector, gesture })) as DomResolution;
 }
 
 /** Resolve an aim point from EITHER a CSS `selector` (resolved + occlusion-checked on-device) or
  *  screenshot pixel coords (converted via the last capture). `selKey`/`xKey`/`yKey` name the params
  *  (tap uses selector/x/y; drag uses fromSelector/fromX/fromY and toSelector/toX/toY). A selector
  *  that misses or is occluded returns an `Error:` string (surfaced as isError by the MCP client). */
-async function resolveAim(params: Record<string, unknown>, selKey: string, xKey: string, yKey: string): Promise<Aim> {
+async function resolveAim(
+  // `| undefined` is the honest type: `handleResolveAim` legitimately produces it for an unknown
+  // gesture, and the renderer reads absent as the STRICT reading. A cast here claimed otherwise.
+  params: Record<string, unknown>, selKey: string, xKey: string, yKey: string,
+  gesture: AimGesture | undefined,
+): Promise<Aim> {
   const selector = params[selKey];
   if (typeof selector === 'string' && selector) {
-    const r = await resolveSelectorPoint(selector);
+    const r = await resolveSelectorPoint(selector, gesture);
     if (!r.ok || typeof r.x !== 'number' || typeof r.y !== 'number') {
       return { error: `Error: ${r.error ?? `selector ${JSON.stringify(selector)} did not resolve`}` };
     }
@@ -327,6 +334,12 @@ function aimDriftSuffix(aim: { hitTarget?: string | null }, nowEl: Element | nul
  *  the same default `handleScroll` already applies, generalized to whichever key names the caller
  *  is resolving. */
 export async function handleResolveAim(params: Record<string, unknown>): Promise<Aim> {
+  // ⚠️ **The trusted CDP/WDA route resolves through HERE, so the gesture has to survive the proxy
+  // hop** (#1016 close-out). `deviceCdp.ts`'s `resolveAimViaDevice` calls this op with the caller's
+  // key names; without the gesture riding along, every `device_*` aim fell back to the strict
+  // no-redirect answer — leaving #1016 fixed in the editor and unfixed on the surface that runs
+  // against the SHIPPED game, which is the only place a `minTapSize` zone actually exists.
+  const gesture = isAimGesture(params.gesture) ? params.gesture : undefined;
   const selKey = (params.selKey as string) || 'selector';
   const xKey = (params.xKey as string) || 'x';
   const yKey = (params.yKey as string) || 'y';
@@ -336,7 +349,36 @@ export async function handleResolveAim(params: Record<string, unknown>): Promise
       || (typeof params[xKey] === 'number' && typeof params[yKey] === 'number');
     if (!hasAim) p = { ...params, [xKey]: window.innerWidth / 2, [yKey]: window.innerHeight / 2 };
   }
-  return resolveAim(p, selKey, xKey, yKey);
+  return resolveAim(p, selKey, xKey, yKey, gesture);
+}
+
+/** Is this a gesture name the aim surface knows? Anything else falls to the STRICT reading — see
+ *  `isClickShaped`'s banner: an unknown intent must not be handed the redirect, because the
+ *  redirect only ever removes refusals. */
+function isAimGesture(v: unknown): v is AimGesture {
+  return v === 'tap' || v === 'drag' || v === 'press' || v === 'hover' || v === 'scroll';
+}
+
+/** Is this device tap click-shaped? **Always, on this surface** — and the reasoning is worth
+ *  keeping because the first version of it was wrong twice over.
+ *
+ *  Chromium fires `click` for the primary button alone (a right press produces `contextmenu`, a
+ *  middle one `auxclick`), and `pressOrigin.ts` listens on `'click'` only — so the runtime does not
+ *  redirect a non-primary press, and modelling one would be a false success. That is all true, and
+ *  it is why `/api/input/tap` narrows its gesture by `button` (see `inputRoutes.ts`).
+ *
+ *  ⚠️ **It does not apply HERE, and a carve-out reading `params.button` sat in this file doing
+ *  nothing** (#1016 close-out F5'). `device_tap`'s schema is `{selector, x, y}` — no button reaches
+ *  this function — and `dispatchTapAt`'s `mouseInit` hardcodes `button: 0`, so a device tap is
+ *  ALWAYS a primary click and `'tap'` is always the honest model. The carve-out was unreachable on
+ *  the surface it was written for and absent from the one that needed it.
+ *
+ *  Kept as a named function rather than a literal so the next person to add `button` to
+ *  `device_tap` finds the rule here instead of re-deriving it. */
+function tapGestureFor(params: Record<string, unknown>): AimGesture {
+  // Defensive, not reachable today: no caller can set this, and the dispatch is hardcoded primary.
+  const button = params.button;
+  return button === undefined || button === 'left' || button === 0 ? 'tap' : 'press';
 }
 
 /** The DOM element a synthetic aim should be dispatched ON, or null to fall through to the game
@@ -495,7 +537,8 @@ function handleReleaseHeldPointer(): { released: string | null } {
 export async function handleTap(params: Record<string, unknown>): Promise<string> {
   const refusal = frameLoopRefusal('tap');
   if (refusal) { _log(`[debug-bridge] TAP → ${refusal}`); return refusal; }
-  const aim = await resolveAim(params, 'selector', 'x', 'y');
+  // #1016: `device_tap` is the click-shaped one. `button` narrows it further — see below.
+  const aim = await resolveAim(params, 'selector', 'x', 'y', tapGestureFor(params));
   if ('error' in aim) { _log(`[debug-bridge] TAP → ${aim.error}`); return aim.error; }
   _log(`[debug-bridge] TAP @ ${aim.label}`);
   const superseded = supersedeHeldPress('TAP');
@@ -505,9 +548,10 @@ export async function handleTap(params: Record<string, unknown>): Promise<string
 export async function handleDrag(params: Record<string, unknown>): Promise<string> {
   const refusal = frameLoopRefusal('drag');
   if (refusal) { _log(`[debug-bridge] DRAG → ${refusal}`); return refusal; }
-  const fromAim = await resolveAim(params, 'fromSelector', 'fromX', 'fromY');
+  // Both ends of a drag: the release is never in the from-zone, so no redirect (#1016).
+  const fromAim = await resolveAim(params, 'fromSelector', 'fromX', 'fromY', 'drag');
   if ('error' in fromAim) { _log(`[debug-bridge] DRAG → ${fromAim.error}`); return fromAim.error; }
-  const toAim = await resolveAim(params, 'toSelector', 'toX', 'toY');
+  const toAim = await resolveAim(params, 'toSelector', 'toX', 'toY', 'drag');
   if ('error' in toAim) { _log(`[debug-bridge] DRAG → ${toAim.error}`); return toAim.error; }
   const from = { x: fromAim.x, y: fromAim.y };
   const to = { x: toAim.x, y: toAim.y };
@@ -875,6 +919,10 @@ export async function handlePointer(params: Record<string, unknown>): Promise<st
   if (action !== 'down' && action !== 'move' && action !== 'up') {
     return `Error: pointer action must be 'down', 'move', or 'up' (got ${JSON.stringify(action)})`;
   }
+  // An unknown `button` is refused, not pressed as left (#1076) — the same check the backend's
+  // `/api/device/request` dispatch runs first, so a caller reaching this handler another way agrees.
+  const unknownVocab = refuseDeviceInputVocabulary('pointer', params);
+  if (unknownVocab) return `Error: ${unknownVocab.error}`;
   if (action === 'down' && heldPointer) {
     return `Error: a pointer is already held (button ${POINTER_BUTTON_NAME[heldPointer.button]} down at ${heldPointer.x.toFixed(1)},${heldPointer.y.toFixed(1)}). Release it with action:'up' before pressing again.`;
   }
@@ -891,7 +939,9 @@ export async function handlePointer(params: Record<string, unknown>): Promise<st
     || params.selector !== undefined || params.entity !== undefined;
   let aim: { x: number; y: number; label: string };
   if (hasAim || action === 'down') {
-    const resolved = await resolveAim(params, 'selector', 'x', 'y');
+    // A lone pointer action — `down` may or may not become a click, and the route cannot know
+    // yet, so it takes the strict side (#1016).
+    const resolved = await resolveAim(params, 'selector', 'x', 'y', 'press');
     if ('error' in resolved) { _log(`[debug-bridge] POINTER ${action} → ${resolved.error}`); return resolved.error; }
     aim = resolved;
   } else {
@@ -901,7 +951,11 @@ export async function handlePointer(params: Record<string, unknown>): Promise<st
   // 'down' picks the button (default left); 'move'/'up' MUST reuse the one already held — the
   // event has to say which button is down, and there is no way to change it mid-gesture.
   const buttonName = action === 'down' ? ((params.button as string) ?? 'left') : POINTER_BUTTON_NAME[heldPointer!.button];
-  const button = POINTER_BUTTON_CODE[buttonName] ?? 0;
+  // ⚠️ `hasDocKey`, NOT `?? 0` (#993). `buttonName` can be `params.button` straight off an
+  // MCP/agent payload and `POINTER_BUTTON_CODE` is a code-declared literal, so `button:"toString"`
+  // returns the inherited FUNCTION — not nullish, so `?? 0` never fires — and a function reaches
+  // the synthesized PointerEvent.
+  const button = hasDocKey(POINTER_BUTTON_CODE, buttonName) ? POINTER_BUTTON_CODE[buttonName] : 0;
 
   // The canvas is picked ONCE, at `down`, and reused for every move/up of that gesture (#93).
   // Re-picking per call would let a drag that crosses onto another canvas switch mid-gesture and
@@ -955,11 +1009,6 @@ export async function handlePointer(params: Record<string, unknown>): Promise<st
 }
 
 // --- Type text into the focused element (#31) ---
-
-/** e.code for a submitKey (Enter/Tab/Escape already match; reuse the tap-key helper otherwise). */
-function typeCode(key: string): string {
-  return keyToCode(key);
-}
 
 /** Set a form element's value through its NATIVE property setter and fire a real `input` event.
  *
@@ -1024,6 +1073,11 @@ export async function handleType(params: Record<string, unknown>): Promise<{ ok:
   if (refusal) return { ok: false, typed: 0, activeElement: null, error: refusal };
   const text = params.text;
   if (typeof text !== 'string') return { ok: false, typed: 0, activeElement: null, error: 'type-text needs a `text` string' };
+  // BEFORE anything is typed (#1094): an unrecognised `submitKey` is not an error downstream — the
+  // keyup/keydown below carry the typo and fire nothing — so without this the call types the text,
+  // submits nothing and reports ok. Refusing first leaves the field untouched rather than half-done.
+  const unknownSubmit = refuseDeviceInputVocabulary('type-text', params);
+  if (unknownSubmit) return { ok: false, typed: 0, activeElement: null, error: unknownSubmit.error };
 
   const { typable, descriptor, el } = typableFocus();
   if (!typable || !el) {
@@ -1047,9 +1101,11 @@ export async function handleType(params: Record<string, unknown>): Promise<{ ok:
   }
   const after = readFocusedValue(el) ?? '';
 
-  const submitKey = params.submitKey;
-  if (typeof submitKey === 'string' && submitKey) {
-    const init: KeyboardEventInit = { key: submitKey, code: typeCode(submitKey), bubbles: true, cancelable: true };
+  const submitKey = typeof params.submitKey === 'string' && params.submitKey
+    ? normalizeKeyName(params.submitKey) // non-null: refused above
+    : null;
+  if (submitKey) {
+    const init: KeyboardEventInit = { key: submitKey, code: domCodeForKey(submitKey), bubbles: true, cancelable: true };
     el.dispatchEvent(new KeyboardEvent('keydown', init));
     el.dispatchEvent(new KeyboardEvent('keyup', init));
   }
@@ -1099,10 +1155,6 @@ async function domDrag(el: HTMLElement, from: { x: number; y: number }, to: { x:
   return `ok (dom drag ${el.tagName.toLowerCase()}) css(${Math.round(from.x)},${Math.round(from.y)})→(${Math.round(to.x)},${Math.round(to.y)})`;
 }
 
-/** e.code for a bare key: single letters → `KeyX`, else the key itself (Fn keys, arrows already match). */
-function keyToCode(key: string): string {
-  return key.length === 1 && /[a-z]/i.test(key) ? `Key${key.toUpperCase()}` : key;
-}
 
 /** Press a key chord (keydown, hold ~1–2 frames, keyup) — open the debug menu (F12), Escape a modal,
  *  drive gameplay keys. Dispatched on the focused element (bubbles to `window`, where the menu +
@@ -1110,12 +1162,28 @@ function keyToCode(key: string): string {
 export async function handlePressKey(params: Record<string, unknown>): Promise<string> {
   const refusal = frameLoopRefusal('press-key');
   if (refusal) return refusal;
-  const key = params.key as string;
-  if (!key) return 'Error: press-key needs a key';
+  const requested = params.key as string;
+  if (!requested) return 'Error: press-key needs a key';
+  // An unknown modifier used to be dropped from the chord while the reply echoed it (#1076); an
+  // unknown KEY NAME used to be dispatched verbatim, and here — unlike the Electron side, where
+  // Chromium at least blanks it — `new KeyboardEvent({key:'Excape'})` is a perfectly well-formed
+  // event carrying the typo, so it matches no listener and the reply still said ok (#1094).
+  const unknownVocab = refuseDeviceInputVocabulary('press-key', params);
+  if (unknownVocab) return `Error: ${unknownVocab.error}`;
+  // Canonical from here down, so `Up`/`Esc`/`escape` drive the device exactly as they drive the
+  // editor. Non-null — the refusal above just passed.
+  const key = normalizeKeyName(requested)!;
   const mods = (params.modifiers as string[]) ?? [];
   const init: KeyboardEventInit = {
-    key, code: (params.code as string) || keyToCode(key), bubbles: true, cancelable: true,
-    ctrlKey: mods.includes('ctrl'), shiftKey: mods.includes('shift'), altKey: mods.includes('alt'), metaKey: mods.includes('meta'),
+    key, code: (params.code as string) || domCodeForKey(key), bubbles: true, cancelable: true,
+    // ⚠️ INCLUDING ITSELF — what a real keyboard does, and the rule `rendererOps.ts`'s drag path
+    // already states for the editor side. Without it `device_press_key {key:'Shift'}` reports
+    // `shiftKey:false`, so a game latching `shift = e.shiftKey` on keydown gets the OPPOSITE of the
+    // key it was sent (found in review; the bare modifiers only became pressable this close-out).
+    ctrlKey: mods.includes('ctrl') || key === 'Control',
+    shiftKey: mods.includes('shift') || key === 'Shift',
+    altKey: mods.includes('alt') || key === 'Alt',
+    metaKey: mods.includes('meta') || key === 'Meta',
   };
   const target: EventTarget = (document.activeElement && document.activeElement !== document.body) ? document.activeElement : window;
   target.dispatchEvent(new KeyboardEvent('keydown', init));
@@ -1130,7 +1198,7 @@ export async function handlePressKey(params: Record<string, unknown>): Promise<s
 export async function handleHover(params: Record<string, unknown>): Promise<string> {
   const refusal = frameLoopRefusal('hover');
   if (refusal) return refusal;
-  const aim = await resolveAim(params, 'selector', 'x', 'y');
+  const aim = await resolveAim(params, 'selector', 'x', 'y', 'hover');
   if ('error' in aim) return aim.error;
   const el = document.elementFromPoint(aim.x, aim.y);
   if (!el) return `Error: no element at (${Math.round(aim.x)},${Math.round(aim.y)}) to hover`;
@@ -1148,7 +1216,7 @@ export async function handleScroll(params: Record<string, unknown>): Promise<str
   if (refusal) return refusal;
   const hasAim = typeof params.selector === 'string' || (typeof params.x === 'number' && typeof params.y === 'number');
   const p = hasAim ? params : { ...params, x: window.innerWidth / 2, y: window.innerHeight / 2 };
-  const aim = await resolveAim(p, 'selector', 'x', 'y');
+  const aim = await resolveAim(p, 'selector', 'x', 'y', 'scroll');
   if ('error' in aim) return aim.error;
   const hit = document.elementFromPoint(aim.x, aim.y);
   const el = hit ?? document.scrollingElement ?? document.body;

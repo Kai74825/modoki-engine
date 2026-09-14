@@ -7,7 +7,8 @@
  *
  *  DETERMINISM: the playhead advances on `getSimDelta` (raw × timeScale, 0 when not
  *  running) and every discrete event (marker / audio cue / activation edge / sequence
- *  start-end / skeletal clip trigger) is edge-detected from stored `lastTime` vs `time` —
+ *  start-end / skeletal clip trigger) is edge-detected over `(time-before-advance, time-after]` —
+ *  NOT from `lastTime`, which this line used to name and which nothing reads (#1093) —
  *  a pure `prev < t <= cur` crossing (with an explicit loop-wrap branch). No wall-clock,
  *  no `Math.random`. Verifiable headless via the `@sequence`/`@marker` journal.
  *
@@ -29,6 +30,7 @@ import { EntityAttributes } from '../core/traits/EntityAttributes';
 import { requestSkeletalSeek, clearSkeletalSeeks } from '../core/skeletalSeek';
 import { Paused } from '../traits/Paused';
 import { getTime, getSimDelta } from '../core/getTime';
+import { getRunMode, onRunModeChange } from '../core/playState';
 import { emit, entityRef } from '../core/journal';
 import { dispatchGameAction } from '../core/actionRegistry';
 import { cueClip } from '../audio/audioCues';
@@ -69,6 +71,79 @@ function advance(time: number, dt: number, duration: number, loop: boolean): num
   if (loop) { t %= duration; if (t < 0) t += duration; return t; }
   return t < 0 ? 0 : t > duration ? duration : t;
 }
+
+/** Bring an arbitrary playhead value inside a timeline — clamped to `[0, duration]`, or wrapped
+ *  when the Director loops. The ONE wrap rule: `advance` by zero, so a seek (the `engine.director`
+ *  handler, which applies it at write) and the system agree by construction (#1113).
+ *
+ *  A non-finite value maps to a finite one (`+Infinity` → the end when clamping, anything else → 0).
+ *  `advance` alone returns NaN for NaN (and for `Infinity % duration` when looping), and a NaN
+ *  playhead never compares equal to itself, so the system would read it as a fresh write — and
+ *  re-pose a paused Director — on every frame. */
+function wrapDirectorTime(time: number, duration: number, loop: boolean): number {
+  if (!Number.isFinite(time)) return !loop && time === Infinity && duration > 0 ? duration : 0;
+  return advance(time, 0, duration, loop);
+}
+
+/** The playhead a SEEK to `time` actually lands on, for a Director on `timeline`. Wrapped into the
+ *  timeline when its def is loaded; floored at 0 otherwise. The system wraps any out-of-range
+ *  playhead itself the first frame it holds the def, so an unwrapped seek is corrected — and, on a
+ *  paused Director, posed — then. */
+export function seekLandsAt(timeline: string, loop: boolean, time: number): number {
+  const def = getTimeline(timeline);
+  return def ? wrapDirectorTime(time, def.duration, loop) : Math.max(0, time);
+}
+
+/** Per-Director playhead memory, keyed `id:generation` (#1113). Two things need it and neither the
+ *  trait nor the edge window can supply them:
+ *
+ *  - **`t` — the value this system last left the playhead at**, so a write it did not make is
+ *    visible. A PAUSED Director never advances, so without it nothing re-poses a seek.
+ *  - **`endFired` — this playthrough's end has fired and the playhead has not left the end since.**
+ *    The crossing test `prev < duration` cannot fire an end for a playhead that STARTS a frame at
+ *    `duration` (a seek onto the end), so the end is instead "due" whenever a non-looping playhead
+ *    is at the end on an advancing frame and `endFired` is false. The flag is what stops that
+ *    re-firing every frame after a natural end; any frame that sees the playhead below the end
+ *    clears it.
+ *
+ *  ⚠️ With no record, `endFired` is UNKNOWN (`null`), resolved the first frame the Director is
+ *  processed: ended iff it has `started`, sits at the end, and its playhead was not written since first
+ *  sight (a started Director skipped on arrival — root inactive, def loading — and then sought onto
+ *  the end must still end). Both simpler defaults were measured wrong:
+ *   - FALSE re-fired the end of every already-ended Director whose record was lost without a seek —
+ *     a world swap carrying a `Persistent` Director (the snapshot copies `time` and `started`), a
+ *     Stop→Play, a module hot-patch — and an `onEnd` that loads a scene keeping that base looped.
+ *   - Arming the end only on a DETECTED write lost it for every seek made before the first record (a
+ *     seek on the first frame, a def still loading, a root authored inactive, a not-yet-started
+ *     Director frozen at speed 0) — the #1113 lock-up in its likeliest shape. `started` is false in
+ *     each of those, so the resolved default fires them.
+ *  The record also keeps `started`: a `started` that went false behind the system's back is `restart`
+ *  (a new playthrough), which re-arms the end even when combined with a seek onto the end — the record's
+ *  `endFired` is still set then, so only the true→false TRANSITION separates a restart from the same
+ *  playthrough. (`driveSubdirector`'s read-back keeps a slaved child's `started` consistent with this
+ *  model, #1158.)
+ *
+ *  ⚠️ `t` defaults to the playhead itself: FIRST SIGHT IS NOT A WRITE. The record is created the first
+ *  frame the query meets a Director, however that frame is skipped, and a paused Director is posed
+ *  only when its playhead later differs, or is out of range. So a dormant cutscene authored paused
+ *  in range is not posed when its scene opens; one authored OUT of range (a shortened timeline asset,
+ *  a repointed `Director.timeline`) is wrapped and posed on its first frame. An in-range write made
+ *  before the system first met a Director is indistinguishable from the authored value, and is not
+ *  posed; so is a seek away and back (4 → 1 → 4) that completes while the Director is skipped.
+ *
+ *  Not stored on `Director.lastTime`: that field is a read-back the handler rewrites on every seek,
+ *  and a second role would make every seek look like the system's own value.
+ *
+ *  Rebuilt every frame from the Directors the query meets (two maps swapped), so a destroyed entity's
+ *  record is gone the next frame — never an ever-growing set (#738). Cleared on world swap (ids are
+ *  world-local) and whenever the run mode leaves `playing`: the editor restores the scene on Stop,
+ *  and a remembered pre-Stop playhead would read the restored value as a seek. */
+interface PlayheadSeen { t: number; endFired: boolean | null; started: boolean }
+let _playheadSeen = new Map<string, PlayheadSeen>();
+let _playheadSeenSpare = new Map<string, PlayheadSeen>();
+function clearPlayheadSeen(): void { _playheadSeen.clear(); _playheadSeenSpare.clear(); }
+onWorldSwap(clearPlayheadSeen);
+onRunModeChange(() => { if (getRunMode() !== 'playing') clearPlayheadSeen(); });
 
 /** Did the playhead cross tick `t` this frame, over (prev, cur]? `advanced` is the SIGNED
  *  per-frame delta (simDelta × speed). v1 is FORWARD-ONLY: a non-positive `advanced` (paused,
@@ -362,7 +437,7 @@ export function previewTimelineAt(world: World, rootId: number, def: TimelineDef
       // 3D skeletal — the render layer seeks/blends the mixer to these exact times (Phase 5/B).
       const sa = entity.get(SkeletalAnimator) as { fadeDuration?: number } | undefined;
       const parts = activeClipsAt(track, t, sa?.fadeDuration ?? 0);
-      requestSkeletalSeek(targetId, parts.map((p) => ({ clip: p.clip, time: p.localT, weight: p.weight })));
+      requestSkeletalSeek(entity, parts.map((p) => ({ clip: p.clip, time: p.localT, weight: p.weight })));
     }
   }
 }
@@ -397,7 +472,8 @@ export function previewControlAt(world: World, rootId: number, def: TimelineDef,
         const end = clip.start + (clip.duration ?? PARTICLE_IMPULSE_SCRUB_S);
         if (!track.muted && t >= clip.start && t < end) on = true;
       }
-      if (hasParticleClip) reflectParticleScrub(resolved, on);
+      const target = idx.byId.get(resolved) as unknown as Entity | undefined;
+      if (hasParticleClip && target) reflectParticleScrub(target, on);
     }
     for (let ci = 0; ci < track.clips.length; ci++) {
       const clip = track.clips[ci];
@@ -499,15 +575,15 @@ function controlSpawn(world: World, director: Entity, key: string, prefabRef: st
 /** Journal + request a particle action on a control clip's edge (Phase E). Journals `@control`
  *  regardless (parity with spawn/despawn — a reliable headless trace even with no renderer), then
  *  writes the restart/pause request for `targetId` that `syncParticles` drains in the render layer.
- *  `targetId < 0` means the track target didn't resolve — still journals the edge, no request. */
-function controlParticle(world: World, director: Entity, targetId: number, action: ParticleControlAction): void {
+ *  An undefined `target` means the track target didn't resolve — still journals the edge, no request. */
+function controlParticle(world: World, director: Entity, target: Entity | undefined, action: ParticleControlAction): void {
   emit('@control', { director: entityRef(director), phase: action === 'restart' ? 'particle' : 'particle-pause' }, world);
-  if (targetId >= 0) {
-    requestParticleControl(targetId, action);
+  if (target) {
+    requestParticleControl(target, action);
     // Keep the scrub-reflect memory in sync with what forward preview just did to this emitter, so a
     // scrub taking over after a paused preview sees the true on/off and can pause a still-running emitter
     // (review C8). 'restart' → ON, 'pause' → OFF.
-    noteScrubParticleState(targetId, action === 'restart');
+    noteScrubParticleState(target, action === 'restart');
   }
 }
 
@@ -636,17 +712,27 @@ function activationBaseKey(targetId: number, targetGeneration: number): string {
   return `${_trackMutedEpoch}:${targetId}:${targetGeneration}`;
 }
 
-/** Memoized "does this timeline have ANY sub-director control clip?" A `.timeline.json` is immutable
- *  once loaded (a re-import replaces the def object), so a WeakMap keyed on the def is a stable,
- *  self-evicting cache. Lets the per-frame slaving scan skip the O(tracks×clips) walk for the common
- *  case (no nested timelines) — a plain O(1) lookup instead (review C9). */
+/** Memoized "does this timeline contain ANY sub-director control clip?" A `.timeline.json` is
+ *  immutable once loaded (a re-import replaces the def object), so a WeakMap keyed on the def is a
+ *  stable, self-evicting cache. Lets the per-frame slaving scan skip the O(tracks×clips) walk for
+ *  the common case (no nested timelines) — a plain O(1) lookup instead (review C9).
+ *
+ *  ⚠️ **Deliberately IGNORES `track.muted`, unlike the walk that calls it**, and the two reasons are
+ *  really one. `muted` is re-read every frame (`docs/timeline.md` § Muting a track), so it is not a
+ *  property of the DEF — caching a value derived from it under a key that only changes when the def
+ *  object does would be caching a mutable fact, whereas "does this def nest at all" genuinely cannot
+ *  change for a given def, which is what makes the memo sound. And it leaves the
+ *  muted-does-not-slave rule with ONE home (`forEachSlavingEdge`): it used to live here as well,
+ *  which made the copy in the walk UNTESTABLE — a mutation deleting it could not be detected,
+ *  because this gate short-circuited first for a timeline whose only subdirector track was muted
+ *  (found by mutation-checking #1112's accept-side case). */
 const _hasSubdir = new WeakMap<TimelineDef, boolean>();
 function timelineHasSubdirector(def: TimelineDef): boolean {
   const memo = _hasSubdir.get(def);
   if (memo !== undefined) return memo;
   let has = false;
   for (const track of def.tracks) {
-    if (track.type !== 'control' || track.muted) continue;
+    if (track.type !== 'control') continue;
     if (track.clips.some((c) => c.subdirector)) { has = true; break; }
   }
   _hasSubdir.set(def, has);
@@ -654,6 +740,33 @@ function timelineHasSubdirector(def: TimelineDef): boolean {
 }
 
 const _EMPTY_SLAVED: ReadonlySet<number> = new Set();
+
+/** Walk every slaving EDGE: `visit(parentId, childId, trackId)` once per non-muted `subdirector`
+ *  control clip whose track resolves to a Director other than the parent itself.
+ *
+ *  This is the ONE authority on slaving, and it is a walk rather than a set so that both questions
+ *  the engine asks of it share these rules: *which children must not self-advance* (per frame,
+ *  `collectSlavedDirectors` below) and *who owns this child* (once per user/agent action,
+ *  `findSlavingParent`, #1112). Two implementations would drift, and the two rules most easily
+ *  re-derived wrongly are both load-bearing — see the docblocks below for muted tracks and for
+ *  scanning ALL directors rather than only the playing ones. */
+function forEachSlavingEdge(
+  world: World, index: EntityIndex,
+  visit: (parentId: number, childId: number, trackId: string) => void,
+): void {
+  world.query(Director).updateEach(([dir], entity) => {
+    const def = getTimeline((dir as { timeline: string }).timeline);
+    if (!def || !timelineHasSubdirector(def)) return; // O(1) skip for non-nesting timelines
+    for (const track of def.tracks) {
+      if (track.type !== 'control' || track.muted) continue; // muted → don't slave (child stays free)
+      for (const clip of track.clips) {
+        if (!clip.subdirector) continue;
+        const childId = resolveTrackTarget(index, entity.id(), track.target);
+        if (childId !== null && childId !== entity.id()) visit(entity.id(), childId, track.id);
+      }
+    }
+  });
+}
 
 /** The set of child Director entity ids that are SLAVED — i.e. a non-muted `subdirector` control clip
  *  in some parent Director's timeline targets them. A slaved child must NOT self-advance in the normal
@@ -673,19 +786,38 @@ const _EMPTY_SLAVED: ReadonlySet<number> = new Set();
  *  when no timeline nests, the common case. */
 function collectSlavedDirectors(world: World, index: EntityIndex): ReadonlySet<number> {
   let slaved: Set<number> | undefined;
-  world.query(Director).updateEach(([dir], entity) => {
-    const def = getTimeline((dir as { timeline: string }).timeline);
-    if (!def || !timelineHasSubdirector(def)) return; // O(1) skip for non-nesting timelines
-    for (const track of def.tracks) {
-      if (track.type !== 'control' || track.muted) continue; // muted → don't slave (child stays free)
-      for (const clip of track.clips) {
-        if (!clip.subdirector) continue;
-        const childId = resolveTrackTarget(index, entity.id(), track.target);
-        if (childId !== null && childId !== entity.id()) (slaved ??= new Set()).add(childId);
-      }
-    }
-  });
+  forEachSlavingEdge(world, index, (_parentId, childId) => { (slaved ??= new Set()).add(childId); });
   return slaved ?? _EMPTY_SLAVED;
+}
+
+/** Who DRIVES this Director — the parent whose non-muted `subdirector` clip targets it, or `null`
+ *  when it runs on its own clock. Public because the answer changes what a TRANSPORT REQUEST means,
+ *  and the surfaces that receive those requests sit outside this module (#1112).
+ *
+ *  ⚠️ **A slaved child's playhead is a pure FUNCTION of its parent's** — `driveSubdirector` writes
+ *  `time = parentTime − clip.start` back onto the child every in-span frame — so there is no state
+ *  in which "child paused, parent playing" can be REPRESENTED. Holding the child would require it
+ *  to carry an offset from its parent's clip position, which is exactly the single-authority
+ *  invariant the whole nesting model rests on. That is why callers REFUSE a transport write on a
+ *  slaved child rather than queueing or honouring it: `playing`/`speed` would never be read, and
+ *  `time`/`lastTime`/`started` are overwritten on the next in-span frame.
+ *
+ *  Derived on demand, deliberately: slaving lives in the PARENT's authored clip, so caching it on
+ *  the child (a tag, or a `Director.slavedTo` field written per frame) would be a second copy of an
+ *  authored fact — the shape #1042 catalogues. Cost is one `buildEntityIndex` + one Director scan
+ *  per call, which is a user action, not a frame. It builds its OWN index rather than taking one:
+ *  the only caller that HAS an index is the per-frame pass, and that goes through
+ *  `forEachSlavingEdge` directly — so an `index` parameter here was an affordance nothing reached.
+ *  Add it back if a caller ever appears that both holds an index and asks this question. */
+export function findSlavingParent(
+  world: World, childId: number,
+): { parentId: number; trackId: string } | null {
+  let found: { parentId: number; trackId: string } | null = null;
+  forEachSlavingEdge(world, buildEntityIndex(world), (parentId, cId, trackId) => {
+    if (found || cId !== childId) return; // first edge wins; two parents slaving one child is authoring error
+    found = { parentId, trackId };
+  });
+  return found;
 }
 
 /** Drive the track target's nested `Director` synced to a `subdirector` clip (Phase F). The child's
@@ -753,7 +885,20 @@ function driveSubdirector(
   applyDirectorFrame(world, cp, index, opts, nested, driven);
 
   // Read-back the child's synced playhead so Percept/inspection shows the nested time.
-  child.set(Director, { ...(child.get(Director) as object), time: childCur, lastTime: childPrev, started: !cp.justEnded });
+  //
+  // ⚠️ `started` is written as the state a STANDALONE Director would hold here, because nothing reads it
+  // while the child is slaved (its start edge is the parent's `atStart` crossing) — it matters only once
+  // the child is un-slaved and runs on its own clock (#1158). At its own duration an ended child is
+  // `started` with its end fired, like any ended Director. The old `!cp.justEnded` left it at the end
+  // but NOT started, which no standalone Director can be: a playing one then re-fired its start with no
+  // end, a `restart` changed nothing the record could see, and a lost record (Stop→Play) ended it again.
+  // A clip that TRUNCATES the child ends it below its duration, which cannot be represented as ended, so
+  // that one stays not-started: running the tail on its own clock is then a balanced start + end.
+  const started = !cp.justEnded || childCur >= cDur;
+  child.set(Director, { ...(child.get(Director) as object), time: childCur, lastTime: childPrev, started });
+  // The parent's write, not an outside seek — record it, or un-slaving this child would read it as one
+  // (and, at the child's end, fire the end the drive above already fired).
+  _playheadSeen.set(`${childId}:${child.generation()}`, { t: childCur, endFired: childCur >= cDur, started });
 }
 
 /** Fire the declarative `OnSequence` action for a start/end phase. Pipeline-safe. */
@@ -878,6 +1023,7 @@ function applyDirectorFrame(world: World, p: Pending, index: EntityIndex, opts: 
         //   particle    → RESTART the track target's ParticleEmitter at start, pause it at end.
         //   subdirector → drive the track target's nested Director synced across the clip span.
         const resolvedTarget = resolveTrackTarget(index, p.rootId, track.target);
+        const particleTarget = resolvedTarget === null ? undefined : index.byId.get(resolvedTarget) as unknown as Entity | undefined;
         const parentId = resolvedTarget ?? p.rootId;
         // Registry key uses the runtime rootId (world-local, cleared on swap); the guid seed uses the
         // Director's STABLE ref (guid) so a control-spawned instance's guid is replay-deterministic.
@@ -885,8 +1031,11 @@ function applyDirectorFrame(world: World, p: Pending, index: EntityIndex, opts: 
         for (let ci = 0; ci < track.clips.length; ci++) {
           const clip = track.clips[ci];
           if (clip.subdirector) {
-            // Muting a subdirector clip means the PARENT stops driving the child (docs/timeline.md
-            // :152) — the child then runs on its own clock instead of freezing. This is existing,
+            // Muting a subdirector clip means the PARENT stops driving the child
+            // (docs/timeline.md § "Sub-directors (Phase F)") — the child then runs on its own clock
+            // instead of freezing. Cited by HEADING, not by line: this said `:152` and the statement
+            // was at `:253`, then at `:266` after an edit moved it — and docCitations.test.ts scans
+            // docs/** only, so a line citation in SOURCE is checked by nothing. This is existing,
             // documented behaviour, unrelated to the new muted handling below: preserve it as-is.
             if (track.muted) continue;
             if (opts.driveSubdirectors) driveSubdirector(world, p, index, opts, track, clip, visited, driven);
@@ -907,15 +1056,15 @@ function applyDirectorFrame(world: World, p: Pending, index: EntityIndex, opts: 
             // fires `atEnd` either, muted or not, so there is nothing for a mute to turn off.
             if (track.muted) {
               if (justMuted && clip.duration !== undefined && insideClipSpan(p.cur, clip)) {
-                controlParticle(world, p.entity, resolvedTarget ?? -1, 'pause');
+                controlParticle(world, p.entity, particleTarget, 'pause');
               }
               continue; // skip this clip's normal edges while muted
             }
             if (justUnmuted && !atStart && clip.duration !== undefined && insideClipSpan(p.cur, clip)) {
-              controlParticle(world, p.entity, resolvedTarget ?? -1, 'restart');
+              controlParticle(world, p.entity, particleTarget, 'restart');
             }
-            if (atStart) controlParticle(world, p.entity, resolvedTarget ?? -1, 'restart');
-            if (atEnd) controlParticle(world, p.entity, resolvedTarget ?? -1, 'pause');
+            if (atStart) controlParticle(world, p.entity, particleTarget, 'restart');
+            if (atEnd) controlParticle(world, p.entity, particleTarget, 'pause');
           } else {
             // Prefab clip — PRESENCE is the truth (controlSpawnRegistry already holds it), so the
             // span test is only needed to keep the JOURNAL balanced: `controlDespawn` emits
@@ -1040,7 +1189,19 @@ export function timelineSystem(world: World): void {
   // PASS 1 — collect. Integrate each NON-slaved playhead + stage a record; never emit/dispatch/
   // set-on-other-entities inside the query.
   const pending: Pending[] = [];
+  const seekPoses: { rootId: number; def: TimelineDef; t: number }[] = [];
+  const seen = _playheadSeen;
+  _playheadSeen = _playheadSeenSpare;
+  _playheadSeenSpare = seen;
+  _playheadSeen.clear();
   world.query(Director).updateEach(([dir], entity) => {
+    const key = `${entity.id()}:${entity.generation()}`;
+    // Every early return below keeps this record: created on first sight, CARRIED otherwise. A write
+    // that lands while the Director is skipped (inactive, `Paused`, def still loading, a frozen first
+    // frame) is then still seen the frame it is next processed — a missed window must not become a
+    // permanent miss. See `_playheadSeen` for both defaults.
+    const last: PlayheadSeen = seen.get(key) ?? { t: dir.time, endFired: null, started: dir.started };
+    _playheadSeen.set(key, last);
     if (entity.has(Paused)) return;
     // Deactivating an entity turns it OFF — that must FREEZE its Director, the same way
     // deactivating a mesh hides it. Without this the playhead kept advancing and its signal/
@@ -1049,14 +1210,39 @@ export function timelineSystem(world: World): void {
     // FREEZE, not stop: `dir.time`/`started` are left untouched, so reactivating resumes where
     // it left off. `Director.playing = false` remains the separate PAUSE concept.
     if (!isEntityActiveInHierarchy(index, entity.id())) return;
-    if (slaved.has(entity.id())) return; // parent-driven sub-director — skip self-advance (Phase F)
-    if (!dir.playing) return;
+    // Parent-driven sub-director — skip self-advance (Phase F). Its record is written by
+    // `driveSubdirector` after the parent's read-back, so un-slaving it does not look like a seek.
+    if (slaved.has(entity.id())) return;
     const def = getTimeline(dir.timeline);
     if (!def) return; // lazy — retry next frame
 
     const duration = def.duration;
     const loop = dir.loop;
-    const prev = dir.time;
+    // The playhead this frame starts from, brought inside the timeline. Differs from `dir.time` only
+    // when something other than this system wrote it: a seek through `engine.director` whose def was
+    // not loaded yet, or any code setting the trait (#1113).
+    const wrapped = wrapDirectorTime(dir.time, duration, loop);
+    const written = dir.time !== last.t || wrapped !== dir.time;
+    // `started` cleared since this system last saw it set is a NEW playthrough (`restart`), whose end
+    // has not fired. With no record yet resolved (`null`), a started Director sitting UNWRITTEN at the
+    // end is taken to have ended already; one written since first sight (a seek made while it was
+    // skipped) has not — see `_playheadSeen`.
+    const restarted = last.started && !dir.started;
+    const endFired = wrapped >= duration && !restarted && (last.endFired ?? (dir.started && !written));
+
+    if (!dir.playing) {
+      if (written) {
+        // A PAUSED seek re-poses once (#1113, owner-settled option A): the same idempotent state
+        // Play applies every frame, and NO edges — a seek moves the playhead, it does not play
+        // through.
+        dir.time = wrapped;
+        seekPoses.push({ rootId: entity.id(), def, t: wrapped });
+      }
+      _playheadSeen.set(key, { t: wrapped, endFired, started: dir.started });
+      return;
+    }
+
+    const prev = wrapped;
     const advanced = simDelta * dir.speed;
     // A director frozen at its start (global timeScale=0 time-stop, or speed=0) has NOT started: don't
     // consume `justStarted`/set `started` on a non-advancing first frame, else the sequence-start +
@@ -1068,17 +1254,24 @@ export function timelineSystem(world: World): void {
     if (advanced <= 0 && !dir.started) return;
     const justStarted = !dir.started;
     const cur = advance(prev, advanced, duration, loop);
-    // Non-looping end: prev was below duration and we've now clamped to it. Clamp keeps cur at
-    // duration on subsequent frames, so prev < duration is false then → fires exactly once.
-    const justEnded = !loop && prev < duration && cur >= duration;
+    // Non-looping end: DUE whenever an advancing frame leaves the playhead at the end and this
+    // playthrough's end has not fired. For ordinary playback that is exactly the old crossing
+    // (`prev < duration` ⇒ `endFired` was cleared). The difference is a playhead that STARTS the frame
+    // at the end — a seek onto it — whose end the crossing test swallowed, so a cutscene whose
+    // `OnSequence.onEnd` hands control back never handed it (#1113). `advanced > 0` holds it through
+    // a time-stop or speed 0 rather than firing while frozen; `duration > 0` keeps a zero-length
+    // timeline silent, as it always was.
+    const justEnded = !loop && duration > 0 && advanced > 0 && cur >= duration && !endFired;
 
     dir.lastTime = prev;
     dir.time = cur;
     dir.started = true;
+    _playheadSeen.set(key, { t: cur, endFired: endFired || justEnded, started: true });
 
     pending.push({ entity, rootId: entity.id(), def, prev, cur, loop, duration, justStarted, justEnded, advanced });
   });
 
+  for (const s of seekPoses) applyTimelineState(world, s.rootId, s.def, s.t, index);
   if (pending.length === 0) return;
 
   // PASS 2 — apply. Real Play poses via applyTimelineState (animationSystem/mixer sample the rest),

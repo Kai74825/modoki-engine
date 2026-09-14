@@ -13,17 +13,20 @@
  *  `toastForSave` is pure over `SaveOutcome` — it reads no globals, so the run-mode context it
  *  needs is captured INTO the outcome by `runSaveAll` rather than sampled later. */
 
-import { saveAll, unsavedChangeCauses, type SaveResult } from './serialize';
-import { flushDirtyAssets, type FlushResult } from './dirtyAssets';
-import { flushPendingBaseScenes } from './pendingBaseScene';
-import { flushPendingMeta, type MetaFlushResult } from './pendingMeta';
+import {
+  saveAll, unsavedChangeCauses, causeSpecs, flushParked,
+  type SaveResult, type UnsavedCauses,
+} from './serialize';
+import { type FlushResult } from './dirtyAssets';
+import { type MetaFlushResult } from './pendingMeta';
 import { isEditingPrefab, savePrefabEdit } from './prefabEdit';
 import { getRunMode, canEdit, type RunMode } from '../../runtime/core/playState';
 import {
-  hasTimelinePreviewSession, getPreviewSaveHandler, previewHasAuthoredEdits,
+  hasTimelinePreviewSession, getPreviewSaveHandler, previewHasAuthoredEdits, whenPreviewRestoresLanded,
   resumeHandlerFor,
 } from './timelinePreview';
 import { getModeOwner } from './playMode';
+import { beginWorldReplacement } from './authoringSettle';
 
 export interface SaveOutcome {
   /** Parked asset docs written by this save. ALWAYS attempted, whatever the scene half does. */
@@ -73,10 +76,18 @@ export interface SaveOutcome {
  *
  *  `dirtyScenes` counts too: `saveAll` writes dirty BASE scenes after the primary, and skipping the
  *  scene half would strand them exactly the way the pre-#259 flush was stranded. */
-export function sceneNeedsWriting(
-  causes: { sceneDirty: boolean; dirtyScenes: string[] } = unsavedChangeCauses(),
-): boolean {
-  return causes.sceneDirty || causes.dirtyScenes.length > 0;
+export function sceneNeedsWriting(causes: UnsavedCauses = unsavedChangeCauses()): boolean {
+  // Derived from the table's `writtenBy`, not a hand-picked pair (#972 P3). The parameter used to
+  // be typed `{ sceneDirty: boolean; dirtyScenes: string[] }` — a structural subtype of the real
+  // causes object, so it accepted the full value while checking two of its five fields and a sixth
+  // cause would have compiled green here forever. It is now the whole type, so a cause can only be
+  // left out of this answer by declaring itself not scene-written.
+  for (const [key, spec] of Object.entries(causeSpecs())) {
+    if (spec.writtenBy !== 'scene-write') continue;
+    const v = causes[key as keyof UnsavedCauses];
+    if (Array.isArray(v) ? v.length > 0 : v) return true;
+  }
+  return false;
 }
 
 /**
@@ -102,6 +113,10 @@ export function runSaveAll(): Promise<SaveOutcome> {
 }
 
 async function runSaveAllOnce(): Promise<SaveOutcome> {
+  // A preview restore still landing: ⏹ Exit has already cleared the session and set 'stopped', so
+  // every check below would pass while the world is still POSED, and the scene write would bake the
+  // pose (#1167 review). Wait for the swap rather than refuse — the save is then of the authored world.
+  await whenPreviewRestoresLanded();
   // ── Inside a preview envelope: put it down, save, pick it back up ──
   // A scene/prefab write must contain AUTHORED data, and the envelope's whole point is that the
   // live world is posed. Refusing was the old answer and it cost two keystrokes every time; simply
@@ -116,12 +131,24 @@ async function runSaveAllOnce(): Promise<SaveOutcome> {
   const preview = hasTimelinePreviewSession() ? getPreviewSaveHandler() : null;
   const needsAuthoredWorld = isEditingPrefab() || sceneNeedsWriting();
   if (preview && !needsAuthoredWorld) {
-    // Alongside `flushDirtyAssets` — not before or after it in any load-bearing sense (#845). See
-    // `pendingMeta.ts`'s header: `/api/write-meta` carries no unsaved-work refusal, so there is no
-    // ordering constraint here the way there is for the base-scene flush below.
-    const assets = await flushDirtyAssets();
-    const importSettings = await flushPendingMeta();
-    return { assets, ...(importSettings.saved.length || importSettings.failed.length ? { importSettings } : {}), target: 'assets' };
+    // ⚠️ EVERY parked flush, derived from the cause table — not a hand-picked pair (#972 P12).
+    // This branch used to name `flushDirtyAssets` and `flushPendingMeta` and stop there, so a
+    // session with a preview live and ONLY a parked base-scene ref took this path, got
+    // `{target:'assets'}` reporting success, and the ref was never written. Its gate could not
+    // see the cause either — `sceneNeedsWriting()` read two of the five.
+    // Both phases run here even though no scene is written: this branch IS the whole save, so
+    // `after-scene` work has nothing else to run behind. The phase names describe an ORDER, and
+    // that order still holds — there is simply no scene write between them. The base-scene route
+    // does not refuse here: the branch condition guarantees `sceneDirty` false and `dirtyScenes`
+    // empty, so the unsaved-work report it gates on is already clear of live-world edits.
+    const { dirtyAssetPaths: assets, pendingImportSettings: importSettings } = await flushParked('before-scene');
+    const { pendingBaseScenes: baseScenes } = await flushParked('after-scene');
+    return {
+      assets,
+      ...(importSettings.saved.length || importSettings.failed.length ? { importSettings } : {}),
+      ...(baseScenes.saved.length || baseScenes.failed.length ? { baseScenes } : {}),
+      target: 'assets',
+    };
   }
   if (preview && previewHasAuthoredEdits()) {
     // ⚠️ DO NOT cycle here. Exiting restores the snapshot taken when the preview began, which would
@@ -135,6 +162,13 @@ async function runSaveAllOnce(): Promise<SaveOutcome> {
   }
   if (preview) {
     const owner = preview.owner;
+    // #1164 review: the suspend returns the run mode to 'stopped', which would settle authoring and
+    // start a deferred hot-reload replay in the middle of this save — the replay loads the external
+    // bytes into the world while the save writes the pre-change world over the file, and the resume's
+    // new snapshot races the replay's load. Held across suspend → save → resume, the token keeps a
+    // change deferred until the envelope that resumes finally exits (or, if nothing resumes, until
+    // this releases with the mode stopped). Both resume handlers re-enter scrub synchronously.
+    const releaseReplacement = beginWorldReplacement();
     try {
       // MUST be awaited: the restore rebuilds the world, and the save serializes it a line later.
       // Inside the try, because a restore that REJECTS (a failed scene load, a throwing rebind)
@@ -161,6 +195,8 @@ async function runSaveAllOnce(): Promise<SaveOutcome> {
     } catch (e) {
       resumeHandlerFor(owner, preview)?.resume();
       throw e;
+    } finally {
+      releaseReplacement();
     }
   }
   return runSaveTargets();
@@ -172,11 +208,9 @@ async function runSaveTargets(): Promise<SaveOutcome> {
   // ('prefab-edit') and the panel's own save is the right one. Flush the parked docs here, since
   // this branch never reaches `saveAll`'s own flush.
   if (isEditingPrefab()) {
-    const assets = await flushDirtyAssets();
-    // Alongside `flushDirtyAssets`, for the same #845 reason as the branch above — this one never
-    // reaches `saveAll`'s own flush either, and `/api/write-meta` has no ordering constraint to
-    // respect relative to the prefab write below.
-    const importSettings = await flushPendingMeta();
+    // Derived from the cause table, like every other save site (#972 P12). This branch never
+    // reaches `saveAll`'s own flush, so it must run the phases itself.
+    const { dirtyAssetPaths: assets, pendingImportSettings: importSettings } = await flushParked('before-scene');
     // `savePrefabEdit` owns the run-mode refusal itself (so the agent path inherits it too); this
     // reads the same condition ONLY to phrase the message — a bare `false` cannot tell "refused
     // because you are scrubbing" from "the prefab root was not found", and those need different
@@ -191,7 +225,7 @@ async function runSaveTargets(): Promise<SaveOutcome> {
     // while the editor reports unsaved work, and the prefab world's own edits are exactly that —
     // running it first would refuse every ref against the save that is trying to persist it. Same
     // ordering rule as `saveAll`'s, for the same reason.
-    const baseScenes = await flushPendingBaseScenes();
+    const { pendingBaseScenes: baseScenes } = await flushParked('after-scene');
     return {
       assets, target: 'prefab', prefabSaved,
       ...(baseScenes.saved.length || baseScenes.failed.length ? { baseScenes } : {}),
@@ -217,7 +251,25 @@ async function runSaveTargets(): Promise<SaveOutcome> {
  *  bare failure over asset docs that DID land — both halves have to be in the sentence. */
 export function toastForSave(o: SaveOutcome): { text: string; kind: 'success' | 'warn' | 'info' } {
   const n = o.assets.saved.length;
-  const assetPhrase = n === 1 ? '1 asset saved' : `${n} assets saved`;
+  // ⚠️ Every KIND of successful write, not just asset docs (#972 close-out review). `n` counts
+  // `assets.saved` alone, and the failure suffix below already names base-scene and
+  // import-settings FAILURES — so their SUCCESSES were the one outcome nothing reported. After
+  // #972 P12 that became a lie the human acts on: a Cmd+S under a timeline preview that writes
+  // only a parked base-scene ref took the `target:'assets'` branch, wrote the ref correctly, and
+  // toasted "Nothing to save". The `runSaveAll` test covering that path is even titled "so the
+  // toast can name them" while asserting only the outcome field.
+  //
+  // Separate nouns, for the same reason the failure clauses use separate nouns: "asset" names an
+  // ASSET_SCHEMA_TYPES document, and a human told "1 asset saved" for a `.meta.json` sidecar or a
+  // one-field scene mutation looks in the wrong panel.
+  const savedParts: string[] = [];
+  if (n) savedParts.push(n === 1 ? '1 asset saved' : `${n} assets saved`);
+  const baseSaved = o.baseScenes?.saved.length ?? 0;
+  if (baseSaved) savedParts.push(baseSaved === 1 ? '1 base-scene ref saved' : `${baseSaved} base-scene refs saved`);
+  const metaSaved = o.importSettings?.saved.length ?? 0;
+  if (metaSaved) savedParts.push(metaSaved === 1 ? '1 import-setting edit saved' : `${metaSaved} import-setting edits saved`);
+  const assetPhrase = savedParts.join(', ');
+  const savedAny = savedParts.length > 0;
   const assetFails = o.assets.failed;
 
   // A failed asset write is reported first and always: it is pending work that stayed pending,
@@ -264,7 +316,7 @@ export function toastForSave(o: SaveOutcome): { text: string; kind: 'success' | 
   if (o.target === 'assets') {
     // No scene half to report. Silence about it is the point: while authoring a clip the scene is
     // untouched, so "the SCENE was not saved" would be a warning about a non-event.
-    return n
+    return savedAny
       ? { text: `${assetPhrase}${failSuffix}`, kind: worst('success') }
       : { text: `Nothing to save${failSuffix}`, kind: worst('info') };
   }
@@ -276,13 +328,13 @@ export function toastForSave(o: SaveOutcome): { text: string; kind: 'success' | 
       const why = o.previewHoldsEdits
         ? 'the scene was CHANGED while previewing, and exiting preview reverts those changes — undo them, or exit and re-apply them, then save.'
         : whyBlocked(o.mode);
-      return { text: `${n ? `${assetPhrase} — but the PREFAB was not saved: ` : 'The prefab was not saved: '}${why}${failSuffix}`, kind: 'warn' };
+      return { text: `${savedAny ? `${assetPhrase} — but the PREFAB was not saved: ` : 'The prefab was not saved: '}${why}${failSuffix}`, kind: 'warn' };
     }
     if (!o.prefabSaved) {
-      return { text: `Prefab save FAILED — nothing written to disk (see console)${n ? `. ${assetPhrase}.` : ''}${failSuffix}`, kind: 'warn' };
+      return { text: `Prefab save FAILED — nothing written to disk (see console)${savedAny ? `. ${assetPhrase}.` : ''}${failSuffix}`, kind: 'warn' };
     }
     return {
-      text: `Prefab saved${n ? ` · ${assetPhrase}` : ''}${failSuffix}`,
+      text: `Prefab saved${savedAny ? ` · ${assetPhrase}` : ''}${failSuffix}`,
       kind: worst('success'),
     };
   }
@@ -293,17 +345,17 @@ export function toastForSave(o: SaveOutcome): { text: string; kind: 'success' | 
     // would leave them wondering where their frame went.
     const lostPreview = o.previewCycled && !o.previewResumed ? ' · preview ended' : '';
     return {
-      text: `Scene saved${n ? ` · ${assetPhrase}` : ''}${lostPreview}${failSuffix}`,
+      text: `Scene saved${savedAny ? ` · ${assetPhrase}` : ''}${lostPreview}${failSuffix}`,
       kind: worst('success'),
     };
   }
 
   // The scene did not save. Say what DID, then why it did not — in that order, because the first
   // half is the part the human cannot otherwise find out.
-  const savedPart = n ? `${assetPhrase} — but the SCENE was not saved: ` : '';
+  const savedPart = savedAny ? `${assetPhrase} — but the SCENE was not saved: ` : '';
 
   if (r.reason === 'cancelled') {
-    return n
+    return savedAny
       ? { text: `${assetPhrase} — the scene save was cancelled, nothing written for it${failSuffix}`, kind: worst('info') }
       : { text: `Save cancelled — nothing written${failSuffix}`, kind: worst('info') };
   }

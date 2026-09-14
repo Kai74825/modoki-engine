@@ -23,6 +23,8 @@
 
 import { rawNow } from './clock';
 import { createTeardownToken } from './liveness';
+import { notifyListeners } from './notifyListeners';
+import { PENDING_PROMISE_MARKER, isThenable, jsonSafeReplacer, renderError } from './jsonSafe';
 
 export type ConsoleRingLevel = 'log' | 'info' | 'warn' | 'error';
 
@@ -75,10 +77,10 @@ export const unpatchedLog: (...args: unknown[]) => void = console.log.bind(conso
 // console.error". It was not pristine: `engine/app/main.tsx` imports `./installErrorCapture` (which
 // calls `installGlobalErrorHandlers()`, synchronously, at module eval) ABOVE `./installConsoleRing`
 // (which is what first imports and evaluates THIS module) — so by the time a module-scope
-// `console.error.bind(console)` here would run, `globalErrors.ts:490` has ALREADY replaced
+// `console.error.bind(console)` here would run, `globalErrors.ts`'s `installGlobalErrorHandlers` has ALREADY replaced
 // `console.error` with its Crashlytics-reporting wrapper. Binding "console.error" at that point
 // captures that wrapper, not the real thing — there is no way to reach past it from this module,
-// and reordering the imports is not the fix (`main.tsx:12-15` documents why `installErrorCapture`
+// and reordering the imports is not the fix (`main.tsx`'s comment on `./installErrorCapture` documents why `installErrorCapture`
 // must stay the inner wrap).
 //
 // That would have been SAFE for re-entrancy — globalErrors' wrapper sits INNER to this ring's own
@@ -131,40 +133,15 @@ let notifyScheduled = false;
  *  restores `console[level]` from them. */
 let originals: Record<ConsoleRingLevel, (...args: unknown[]) => void> | null = null;
 
-/** Duplicates `engine/app/debug/bridgeHelpers.ts`'s `safeStringify` semantics on purpose — that
- *  helper lives in the app layer (L-above L0) and this file cannot import it. Strings pass
- *  through; an `Error` becomes `"Name: message"`; anything else goes through `JSON.stringify`,
- *  falling back to `String(v)` on failure (a circular reference, a BigInt, a symbol, …); a plain
- *  `undefined` argument stringifies to the literal `'undefined'`, matching `String(undefined)`. */
-/** Kept BYTE-IDENTICAL to `engine/app/debug/bridgeHelpers.ts`'s `PENDING_PROMISE_MARKER`. Duplicated
- *  rather than imported because that helper is in the app layer and this file is L0. */
-const PENDING_PROMISE_MARKER = '[unresolved Promise — did you forget `await`?]';
-
-function isThenable(v: unknown): boolean {
-  return !!v && (typeof v === 'object' || typeof v === 'function')
-    && typeof (v as { then?: unknown }).then === 'function';
-}
-
-/** Depth cap for `formatCauseChain` below — copied from the editor's now-deleted `formatError`
- *  (F3, #626/#633 adversarial review). Guards against a pathological (or cyclic) `cause` chain
- *  growing an entry without bound; four links is already far more than any real error chain in
- *  this codebase has ever carried. */
-const CAUSE_CHAIN_DEPTH_CAP = 4;
-
-/** `\n  caused by: Name: message`, repeated for each `Error` in `err.cause`'s chain, depth-capped.
- *  Returns `''` when there is no `cause` (or it isn't an `Error`) — the overwhelmingly common case,
- *  so a caller can always just append the result.
+/** One console arg as text, with `engine/app/debug/bridgeHelpers.ts`'s `safeStringify` semantics.
+ *  Strings pass through; an `Error` becomes its `renderError` text; anything else goes through
+ *  `JSON.stringify` with the shared replacer, falling back to `String(v)` on failure (a circular
+ *  reference, a BigInt, a symbol, …); a plain `undefined` argument stringifies to the literal
+ *  `'undefined'`, matching `String(undefined)`.
  *
- *  Each link is rendered as `Name: message`, not its own `.stack` — the HEAD (whatever the caller
- *  prefixes this with) already carries a full stack saying WHERE the outer error was thrown; a
- *  cause is there to say WHAT led to it, one line each. */
-function formatCauseChain(err: Error, depth = 0): string {
-  const cause = (err as { cause?: unknown }).cause;
-  if (depth >= CAUSE_CHAIN_DEPTH_CAP || !(cause instanceof Error)) return '';
-  const head = `${cause.name || 'Error'}: ${cause.message}`;
-  return `\n  caused by: ${head}${formatCauseChain(cause, depth + 1)}`;
-}
-
+ *  The marker, the thenable check, the cause chain and the replacer all come from `./jsonSafe`
+ *  (#1068). They used to be copies kept "byte-identical" with `bridgeHelpers.ts` by hand, because
+ *  that helper is in the app layer and this file is L0; the shared module is L0 as well. */
 function stringifyArg(v: unknown): string {
   if (typeof v === 'string') return v;
   if (v === undefined) return 'undefined';
@@ -178,7 +155,8 @@ function stringifyArg(v: unknown): string {
   // error once reached `diagnose` as a literal `{}` (measured on a Samsung, #157). An earlier draft
   // of THIS file returned `${v.name}: ${v.message}`, which is the same defect wearing a nicer
   // label: visible but useless, because the stack is what says WHERE. All three captures this file
-  // replaced returned `stack || message`; so does this.
+  // replaced returned `stack || message`. That kept the stack but, on iOS, LOST the message: a
+  // JavaScriptCore stack has no `Name: message` line (#1055). `errorText` keeps both.
   //
   // F3 (#626/#633 adversarial review): PLUS the `cause` chain, which `.stack` alone never carries.
   // `formatError` used to do this in the editor's own projection — reachable by nothing once #626
@@ -186,7 +164,10 @@ function stringifyArg(v: unknown): string {
   // `createEditor.tsx`'s `sceneReady.catch((e) => console.error('[Editor] scene load failed:', e))`
   // logs) reached every consumer with its cause silently erased. Fixed HERE, at the ring, so every
   // projection (editor, in-game debug menu, agent bridge, device bridge) gains it at once.
-  if (v instanceof Error) return (v.stack || v.message) + formatCauseChain(v);
+  //
+  // Both the rendering and the cause chain now live in `jsonSafe.ts`'s `renderError` (#1068), shared
+  // with every other exit rather than kept here in a copy.
+  if (v instanceof Error) return renderError(v);
   try {
     // Handled at BOTH depths, matching `safeStringify`: the branch above catches a top-level Error,
     // the replacer below catches one NESTED in an object or array. `{cause: err}` and `[err]` are
@@ -194,16 +175,11 @@ function stringifyArg(v: unknown): string {
     // the same defect one level down — a distinction `bridgeHelpers.ts` records learning the hard
     // way, in its own close-out review.
     //
-    // The `cause` chain is appended here too (F3/F8, #626/#633 adversarial review) — the module doc
-    // comment above already claimed a nested Error is "handled at BOTH depths", but until now that
-    // meant `stack || message` only, dropping `cause` for exactly the shapes this branch exists for
-    // (`console.error('ctx', { err })`, `console.error([err])`). A non-Error `cause` still stays
-    // dropped here, same as the top-level branch above — that is pre-existing and fine, only an
-    // `Error` cause carries anything worth chaining.
-    const json = JSON.stringify(v, (_k, val) => (
-      isThenable(val) ? PENDING_PROMISE_MARKER
-        : val instanceof Error ? (val.stack || val.message) + formatCauseChain(val)
-          : val));
+    // The `cause` chain is appended here too (F3/F8, #626/#633 adversarial review): `renderError`
+    // carries it at both depths, for exactly the shapes this branch exists for
+    // (`console.error('ctx', { err })`, `console.error([err])`). A non-Error `cause` stays dropped,
+    // same as the top-level branch above — only an `Error` cause carries anything worth chaining.
+    const json = JSON.stringify(v, jsonSafeReplacer);
     // `JSON.stringify` returns `undefined` — not a string — for a function, a symbol, or any value
     // whose `toJSON` yields undefined. Returning that would put a non-string into
     // `ConsoleRingEntry.args` despite its `string[]` type, and the first consumer to call
@@ -219,19 +195,14 @@ function notify(): void {
   notifyScheduled = true;
   queueMicrotask(() => {
     notifyScheduled = false;
-    for (const fn of listeners) {
-      // Per-listener, and never allowed to escape or block the rest — see the module doc comment
-      // above `unpatchedLog` (where `unpatchedError` used to be) for why the report below goes
-      // through `unpatchedLog` and not the live `console.error`.
-      try {
-        fn();
-      } catch (err) {
-        // `unpatchedLog`, not a `console.error` path: this is an internal bookkeeping failure, and
-        // routing it through anything that reaches `globalErrors.ts` would spend a real
-        // Crashlytics issue on it.
-        unpatchedLog('[consoleRing] a subscriber threw during flush', err);
-      }
-    }
+    // Per-listener isolation comes from the shared helper (#888); the REPORTER does not, and
+    // must not. `unpatchedLog`, not a `console.error` path: this is an internal bookkeeping
+    // failure, and routing it through anything that reaches `globalErrors.ts` would spend a real
+    // Crashlytics issue on it — and `console.error` here would re-enter the flush we are inside.
+    // See the module doc comment above `unpatchedLog` (where `unpatchedError` used to be).
+    notifyListeners(listeners, 'consoleRing', [], (label, err) => {
+      unpatchedLog(`[${label}] a subscriber threw during flush`, err);
+    });
   });
 }
 
@@ -424,11 +395,11 @@ export function installConsoleRing(opts?: ConsoleRingOptions): void {
  *
  *  ⚠️ DO NOT "SIMPLIFY" THIS INTO A `console[level](...)` CALL. That looks tidier (one recording
  *  path instead of two) and it silently reintroduces a defect this repo already measured and fixed:
- *  `runtime/core/globalErrors.ts:490` wraps `console.error` and reports to Crashlytics, and its
- *  de-duplication (`:385-389`) only recognises a call whose SOLE argument is an `Error` OBJECT,
+ *  `runtime/core/globalErrors.ts`'s `installGlobalErrorHandlers` wraps `console.error` and reports to Crashlytics, and its
+ *  de-duplication (`captureConsoleError`) only recognises a call whose SOLE argument is an `Error` OBJECT,
  *  keyed in a WeakSet. A synthetic STRING cannot match it, so routing an already-reported uncaught
  *  error back through `console.error` files a SECOND Crashlytics issue for the same fault — the
- *  "two issues per fault" symptom documented at `globalErrors.ts:366-377` (measured on a Galaxy
+ *  "two issues per fault" symptom documented in `globalErrors.ts`'s `alreadyReported` doc (measured on a Galaxy
  *  S22, 2026-08-20). Writing straight into the ring keeps the diagnostic line and reports nothing. */
 export function recordConsoleRingEntry(level: ConsoleRingLevel, args: unknown[]): void {
   record(level, args);
@@ -494,7 +465,7 @@ export function getConsoleRingBootPrefixCount(): number {
  *  synchronous notify from a warn/error raised during render would be a setState-during-render
  *  from the caller's perspective (see `runtime/debug/consoleCapture.ts`'s `bump()` doc comment for
  *  the measured incident this mirrors), and is pinned by
- *  `engine/tests/ui/debugErrorToaster.test.tsx:84`'s sibling ring. `version` still bumps
+ *  the sibling ring in `engine/tests/ui/debugErrorToaster.test.tsx`'s "does NOT notify … synchronously" test. `version` still bumps
  *  immediately, so a snapshot taken right after a log call is already correct even before the
  *  microtask runs. */
 export function subscribeConsoleRing(fn: () => void): () => void {

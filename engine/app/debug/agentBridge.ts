@@ -19,7 +19,7 @@
  *  ⚠️ NOT gated on `import.meta.hot` — this docblock said so for a long time and it was WRONG in a
  *  way that matters. The registrations below are top-level, and a **device** build is a production
  *  build that runs them. What actually keeps all of this out of a shipped app is
- *  `project.config.json` `build.debugBuild` (`engine/app/main.tsx:14`), which decides whether the
+ *  `project.config.json` `build.debugBuild` (`engine/app/main.tsx`'s `initDebugBridge` gate), which decides whether the
  *  bridge is mounted at all. Do not re-derive the safety answer from this file's scope.
  *
  *  HMR note (load-bearing, and INCIDENTAL — which is why it is written down): this module has no
@@ -31,7 +31,9 @@
  *  ops to the runtime ones. Nobody designed it as a safety mechanism: removing or `@vite-ignore`-ing
  *  the `main.tsx` import, or adding an accept boundary here, would quietly break it. */
 
+import { opReplyFor } from './opRefusal';
 import {
+  hasDocKey,
   sceneManager,
   getAllEntities,
   getAllTraits,
@@ -41,14 +43,19 @@ import {
   validateSceneData,
   loadManifestJson,
   renderSceneOffscreen,
+  hasSceneRenderer,
   journalEvents,
   clearJournal,
   setJournalEnabled,
+  JOURNAL_LEVELS,
+  isJournalLevel,
+  type JournalLevel,
   resolveRefName,
   setVerboseCapture,
   verboseCaptureState,
   isVerboseType,
   dispatchUIAction,
+  isActionRefusal,
   getUIActionNames,
   getUIActionParams,
   getReadSourceNames,
@@ -60,6 +67,8 @@ import {
   registerFrameCallback,
   unregisterFrameCallback,
   getCurrentWorld,
+  pendingPhysics,
+  ensurePhysicsReady,
   getContactState,
   registerHandleProvider,
   invalidateModel,
@@ -78,6 +87,7 @@ import {
   invalidateAnimSet,
   invalidateMaterial,
   invalidateShader,
+  invalidatePrefab,
   fireDirtyListeners,
   findEntityByGuid,
   getCachedPrefab,
@@ -102,10 +112,10 @@ import {
   stopInputWatch,
   clearInputPresses,
   readInputPresses,
-  type InputPressRecord,
+  isUnresolvedPress,
 } from '@modoki/engine/runtime';
 import { applyLiveMutate } from './liveMutate';
-import { createEntityLive, duplicateEntityLive, deleteEntitiesLive } from './liveLifecycle';
+import { createEntityLive, duplicateEntityLive, deleteEntitiesLive, liveGuidOf } from './liveLifecycle';
 import { computeLayoutBounds, type LayoutBoundsParams, type LayoutEntry } from './layoutDump';
 import { tailWithCounts, tailHint, CONSOLE_TAIL_DEFAULT, JOURNAL_TAIL_DEFAULT } from './streamSummary';
 import { roundFloats, resolvePrecision } from './roundFloats';
@@ -375,6 +385,13 @@ function frameStalenessWarning(what: string): string | null {
  *  enough that a generated one can't flood a context window before the agent narrows. */
 export const DEFAULT_INDEX_LIMIT = 200;
 
+/** Why `where` cannot be evaluated (the same parse `dumpSceneState` applies), or null. Lets a caller
+ *  refuse a typo'd predicate up front instead of reading it as "nothing matches" (#1154). */
+export function whereError(where: string): string | null {
+  const r = parseWhere(where, new Map(getAllTraits().map((m) => [m.name, m] as const)));
+  return 'error' in r ? r.error : null;
+}
+
 export function dumpSceneState(params: SceneStateParams = {}) {
   const metaByName = new Map(getAllTraits().map((m) => [m.name, m] as const));
   const readTrait = params.full ? readTraitDataFull : readTraitData;
@@ -467,17 +484,19 @@ export function dumpSceneState(params: SceneStateParams = {}) {
 
   // Contact roll-up (Percept): resolve a contacted body's runtime id → its stable GUID
   // (memoized; the index stores ids since it's per-world and read within that world).
-  const eaMeta = metaByName.get('EntityAttributes');
-  const guidCache = new Map<number, string>();
-  const guidOf = (id: number): string => {
+  // `null` for an entity with no guid, NEVER `String(id)` (#1199): the id-as-guid looked addressable
+  // and every guid-addressed op refused it. See `liveGuidOf` in liveLifecycle.ts.
+  const guidCache = new Map<number, string | null>();
+  const guidOf = (id: number): string | null => {
     let g = guidCache.get(id);
-    if (g === undefined) {
-      const d = eaMeta ? readTraitData(id, eaMeta) : null;
-      g = ((d?.guid as string) || '') || String(id);
-      guidCache.set(id, g);
-    }
+    if (g === undefined) { g = liveGuidOf(id); guidCache.set(id, g); }
     return g;
   };
+  // A contact partner with no guid is `id:<n>`, not null (#1199 review). A row's `guid: null` has
+  // its `id` beside it; a bare array element has nothing else, so null would lose WHICH body it is
+  // (and two such partners would read `[null, null]`). `id:<n>` is this file's existing
+  // non-address form (see the `exclude` refusal's options) and cannot be mistaken for a guid.
+  const contactRefOf = (id: number): string => guidOf(id) ?? `id:${id}`;
   const contactWorld = params.contacts ? getCurrentWorld() : null;
   // An unknown or WRONG-CASE `trait=` was applied silently: every entity came back with
   // `traits:{}` and no warning, which reads as "nothing in this scene has that trait" rather than
@@ -547,8 +566,8 @@ export function dumpSceneState(params: SceneStateParams = {}) {
       // Current physics contacts as GUIDs, rolled up to bodies. Present only on a body
       // that's currently touching something (solid `contacts` / sensor `overlaps`).
       const cs = getContactState(contactWorld, info.id);
-      if (cs?.contacts.length) out.contacts = cs.contacts.map(guidOf);
-      if (cs?.overlaps.length) out.overlaps = cs.overlaps.map(guidOf);
+      if (cs?.contacts.length) out.contacts = cs.contacts.map(contactRefOf);
+      if (cs?.overlaps.length) out.overlaps = cs.overlaps.map(contactRefOf);
     }
     return out;
   });
@@ -584,16 +603,28 @@ const agentOps = new Map<string, AgentOpHandler>();
 /** Optional gate that suppresses scene hot-reload while it would be discarded.
  *  Installed by the EDITOR (lazy path) — in editor Play mode a scene edit would
  *  hot-reload the live world but then be clobbered by the Play-press snapshot on
- *  Stop (see editor/scene/playMode.ts), so we skip the reload and tell the caller
- *  to Stop first. Unset in the shipped game runtime (which has no Stop that could
- *  clobber), so hot-reload there always proceeds. Returns a reason string when
- *  reload should be suppressed, else null. */
+ *  Stop (see editor/scene/playMode.ts), so we hold the reload back and tell the caller
+ *  to Stop first. A held reload is DEFERRED, not dropped (#1164): it replays once
+ *  authoring settles — `replaySuppressedSceneReloads`, docs/editor-hmr.md. Unset in the
+ *  shipped game runtime (which has no Stop that could clobber), so hot-reload there
+ *  always proceeds. Returns a reason string when reload should be suppressed, else null. */
 let _reloadSuppressor: (() => string | null) | null = null;
 
 /** Editor-only: install the hot-reload suppression gate. Called from
  *  `agentEditorOps.ts` at editor startup so game builds never suppress. */
 export function setSceneReloadSuppressor(fn: (() => string | null) | null): void {
   _reloadSuppressor = fn;
+}
+
+/** Editor-only: re-reads the EDITOR's copy of a prefab whose file changed on disk (#1169). The
+ *  runtime cache is evicted here directly; the editor's diff-base copy lives in the editor package,
+ *  which this module must not import, so the editor installs the refresh the way it installs the
+ *  suppressor. */
+let _prefabSourceRefresher: ((urlPath: string) => Promise<void>) | null = null;
+
+/** Editor-only: install the editor-side prefab refresh. Called from `agentEditorOps.ts`. */
+export function setPrefabSourceRefresher(fn: ((urlPath: string) => Promise<void>) | null): void {
+  _prefabSourceRefresher = fn;
 }
 
 /** Why scene hot-reload is currently suppressed (editor Play mode), or null when
@@ -613,6 +644,46 @@ export function listAgentOps(): string[] {
   return [...agentOps.keys()];
 }
 
+/** Is `name` registered in THIS client right now?
+ *
+ *  The relay's decline test (#1030) — see the `modoki:request` handler. Deliberately a membership
+ *  question rather than "did `runAgentOp` throw something that reads like `unknown agent op`":
+ *  the string test would miscount an op that legitimately throws those words, and would have RUN
+ *  the op before deciding. Exported (like `listAgentOps`) so the transport asks the registry
+ *  through the same seam a test can. */
+export function hasAgentOp(name: string): boolean {
+  return agentOps.has(name);
+}
+
+/** The `modoki:response` payload this client owes for one relayed request (#1030).
+ *
+ *  Extracted from the `modoki:request` handler because that handler lives inside
+ *  `initAgentBridge`, behind a live Vite `hot` — so the DECISION it makes had no test, which is
+ *  the shape this repo's convention exists to stop ("a panel's decisions belong in a plain `.ts`
+ *  module beside it"). It is also the half that makes #1030 work in production: the server's
+ *  decline counting is inert if no client ever sends `declined`.
+ *
+ *  Three outcomes, and the distinction between the last two is the entire fix:
+ *  - **declined** — this client has no handler for the op. NOT an answer; the server counts it and
+ *    settles only once every client has said the same.
+ *  - **error** — the op ran and threw. An ANSWER, from the one client that owns the op, and it
+ *    must settle immediately rather than wait for anyone else.
+ *  - **result** — the op ran and returned.
+ *
+ *  ⚠️ Membership is asked BEFORE dispatch, deliberately. Deciding by catching `/unknown agent op/`
+ *  out of `run` would both miscount an op that legitimately throws those words and have already
+ *  RUN the op before deciding whether it existed. */
+export async function relayResponseFor(
+  msg: { id: number; op: string; params?: unknown },
+  has: (op: string) => boolean = hasAgentOp,
+  run: (op: string, params: unknown) => Promise<unknown> = (op, params) => runAgentOp(op, params),
+): Promise<{ id: number; result?: unknown; error?: string; declined?: boolean }> {
+  if (!has(msg.op)) return { id: msg.id, declined: true };
+  // An `OpRefusal` comes back as a coded RESULT, not an `error` — through `opReplyFor`, which the
+  // Electron IPC handler shares so the two transports cannot disagree about it (#1012).
+  return { id: msg.id, ...(await opReplyFor(() => run(msg.op, msg.params))) };
+}
+
 // Built-in runtime ops (no editor deps — safe in every build the bridge runs in).
 // Round agent-facing floats at the OP, never in `dumpSceneState` — an in-process caller must
 // keep exact float64. `precision` defaults to 9 significant digits (~17% of the real tokens on a
@@ -622,9 +693,64 @@ registerAgentOp('scene-state', (params) => {
   const p = (params ?? {}) as SceneStateParams & { precision?: number };
   return roundFloats(dumpSceneState(p), resolvePrecision(p.precision));
 });
+/** The §5 refusal `render-scene` answers when no scene renderer is registered (#994).
+ *
+ *  Shape, not prose: `code` is what the MCP client reads back (`codeFromBody` in
+ *  `tools/modoki-mcp/src/context.ts` lets a body-supplied code beat the one derived from the HTTP
+ *  status) and what `test-live-tools.ts` classifies on — `NO_RENDERER` is already in its `ENV_CODES`,
+ *  so this needs no harness change. `error` carries the WHY in the caller's terms; `options` is the
+ *  field that turns a dead end into the next move.
+ *
+ *  ⚠️ WHAT THIS DELIBERATELY DOES NOT SAY. A first draft blamed an unselected Game TAB and told the
+ *  reader to check `gameView.panelMounted`. Both were wrong, and measuring beat repeating: on this
+ *  clone's editor (games/3d-test, 2026-09-09) `gameView.panelMounted` was **false** while
+ *  `surfaces` listed `game-3d` and `/api/render-scene` returned a frame. `panelMounted` is
+ *  `GameView.tsx`'s own mount flag — a different fact — so a refusal citing it would have sent the
+ *  reader to a field that does not answer this question. That is the exact defect this issue is
+ *  about, one layer up. (`modoki_render_scene`'s own tool description still carries the same claim;
+ *  recorded on #994, not fixed here — the true mount story was not established.)
+ *
+ *  What IS established, by exhaustive grep: `Scene3D.tsx` is the repo's ONLY caller of
+ *  `registerSceneRenderer`, and it registers the renderer and the `game-3d` bounds provider in one
+ *  effect, dropping both through the same teardown scope. So `surfaces` containing `game-3d` is the
+ *  observable for "a renderer is registered", and it is what the options point at. */
+export const NO_RENDERER_REFUSAL = Object.freeze({
+  ok: false as const,
+  code: 'NO_RENDERER' as const,
+  error:
+    'no scene renderer is registered, so there is nothing to render offscreen and nothing was '
+    + 'rendered. The runtime Scene3D layer is the only thing that registers one, and it is absent '
+    + 'when the project is built without the 3D renderer module (build.modules.render3d:false) or '
+    + 'sets disable3D, and before the app shell has mounted it. This is the editor\'s STATE — NOT a '
+    + 'missing route, NOT a wedged editor, and NOT a reason to relaunch.',
+  options: Object.freeze([
+    'modoki_get_editor_state — `surfaces` lists `game-3d` exactly when a scene renderer is registered; if it is missing, this refusal is why',
+    'if the 3D surface should be up but is not, modoki_diagnose and modoki_get_console_logs report a renderer that failed to come up',
+    'read the scene as DATA instead — modoki_get_scene_state / modoki_diagnose need no renderer at all',
+  ]),
+  // FROZEN, and `options` frozen WITH it: one object is returned BY REFERENCE to every caller of
+  // this op, so an accidental mutation anywhere would rewrite the refusal for every future call.
+  // Nothing mutates it today (the router spreads rather than assigns) — freezing is what keeps that
+  // true. ⚠️ `Object.freeze` is SHALLOW, so freezing the outer object alone left `options.push(…)`
+  // and `options[0] = …` working and the claim above only half-kept.
+});
+
 // Deterministic offscreen frame → JPEG data URL. The backend decodes it to a temp
 // file so the agent gets a path, not an inline image.
-registerAgentOp('render-scene', (params) => renderSceneOffscreen((params ?? {}) as OffscreenRenderOpts));
+//
+// The no-renderer case is a §5 REFUSAL, not a throw (#994). `renderSceneOffscreen` rejects with a
+// plain Error, and every route that relays this op turns a throw into a hard-coded 504 → the MCP
+// client's `NOT_AVAILABLE_HERE`, i.e. "could not look: the route is absent". That is the exact
+// inversion §5 exists to prevent: the route is present, the renderer answered, and it said no —
+// an ordinary editor state — a project built without the 3D renderer module, or a Game tab that has
+// never been opened this session — was reported to the agent as a dead tool, and to
+// `test:mcp:live` as a DEFECT.
+// This generalises the lesson already applied to the game-tool op below (`game-tool-call`'s throwing-handler catch): a
+// state refusal names its own code, because the op is the only layer that knows it.
+registerAgentOp('render-scene', (params) => {
+  if (!hasSceneRenderer()) return NO_RENDERER_REFUSAL;
+  return renderSceneOffscreen((params ?? {}) as OffscreenRenderOpts);
+});
 // Summary-first at the OP, never in `dumpConsoleLogs` — `diagnose` (below) reads that
 // producer directly for its error list, and a default tail there would silently drop errors
 // from `modoki_diagnose` with no failing test. The shared ring holds 1000 entries in the editor
@@ -663,22 +789,55 @@ registerAgentOp('console-logs', (params) => {
 // Read the tick-stamped game-event trace — the screenshot-free way to verify game
 // LOGIC (assert on match/score/win). Journaling is on by default, but force-enable
 // in case a shipped game turned it off, so the agent always sees events.
+/** The capture-control verbs `journal-events` accepts — a table so an unknown one is refused with the
+ *  real options (#1072) rather than falling through to a plain read. */
+const JOURNAL_CAPTURE_ACTIONS = ['start', 'stop'] as const;
+const isJournalCaptureAction = (a: unknown): a is typeof JOURNAL_CAPTURE_ACTIONS[number] =>
+  (JOURNAL_CAPTURE_ACTIONS as readonly unknown[]).includes(a);
+
 registerAgentOp('journal-events', (params) => {
-  const p = (params ?? {}) as { type?: string; level?: 'info' | 'warn' | 'error'; clear?: boolean; limit?: number; action?: 'start' | 'stop' };
+  const p = (params ?? {}) as { type?: string; level?: unknown; clear?: boolean; limit?: number; action?: unknown };
   setJournalEnabled(true);
+  // ⚠️ These two vocabulary refusals carry a §5 CODE and `options`, and that is load-bearing, not
+  // decoration (#1072). This op answers a GET relay: `relayJson` sends a coded envelope as a 400, and
+  // the MCP client fails any status ≥400 — but a plain read's 200 body is NOT checked for `ok:false`
+  // (`getJson`'s `checkFailure` is off for reads, because diagnose/validate return `ok:false` as their
+  // ANSWER). So an uncoded `{ok:false, reason}` here reached the agent as a SUCCESSFUL read. The route
+  // forwards the raw value precisely so these can fire; it used to drop an unknown one first.
+  if (p.action !== undefined && !isJournalCaptureAction(p.action)) {
+    return {
+      ok: false, code: 'REFUSED_BY_OP',
+      error: `unknown action ${JSON.stringify(p.action)} — nothing was started, stopped, read or cleared. Omit action to just read.`,
+      options: [...JOURNAL_CAPTURE_ACTIONS], captures: verboseCaptureState(),
+    };
+  }
   // Tier-2 capture control: `action:start|stop` with `type` names the watch-gated diagnostic
   // (e.g. @contact) to begin/end capturing. Off by default so the journal stays lean; a Tier-2
   // type emits NOTHING until started, and only from the start point forward (no back-history).
-  if (p.action === 'start' || p.action === 'stop') {
+  if (p.action !== undefined) {
     const t = p.type;
     if (!t) return { ok: false, reason: 'action needs type= naming the diagnostic to capture (e.g. @contact)', captures: verboseCaptureState() };
     if (!isVerboseType(t)) return { ok: false, reason: `"${t}" is always-on, not watch-gated — nothing to start/stop. Watch-gated types: ${verboseCaptureState().types.join(', ') || '(none)'}.`, captures: verboseCaptureState() };
     setVerboseCapture(t, p.action === 'start');
     return { ok: true, action: p.action, type: t, captures: verboseCaptureState() };
   }
-  const filtered = !!(p.type || p.level);
+  // ⚠️ REFUSE an unknown level rather than silently returning the whole ring (#993 close-out
+  // § 2d). `filtered` below would still report the reply as filtered — so `level:"wran"` answered
+  // with every event of every level, which an agent reads as "there really were N warn+ events".
+  // Both MCP tools enum-validate `level`, so what reaches this is the dev-server curl API and an
+  // in-process call; it was unreachable from curl too until #1072 stopped the route dropping it.
+  if (p.level !== undefined && (typeof p.level !== 'string' || !isJournalLevel(p.level))) {
+    return {
+      ok: false, code: 'REFUSED_BY_OP',
+      error: `unknown level ${JSON.stringify(p.level)} — nothing was read and nothing was cleared. `
+        + 'A level filter means that severity AND ABOVE.',
+      options: [...JOURNAL_LEVELS],
+    };
+  }
+  const level = p.level as JournalLevel | undefined;
+  const filtered = !!(p.type || level);
   const all = journalEvents();
-  const events = filtered ? journalEvents({ type: p.type, level: p.level }) : all;
+  const events = filtered ? journalEvents({ type: p.type, level }) : all;
   // `clear` used to wipe the ENTIRE 10,000-event ring even when the read was FILTERED — so
   // `journal {type:'match', clear:true}` returned 100 match events and silently destroyed every
   // @contact / score / win event alongside them, including the human's. There is no selective
@@ -855,32 +1014,18 @@ registerAgentOp('dispatch-action', (params) => {
   if (p.targetGuid && !findEntityByGuid(p.targetGuid)) {
     return { ok: false, dispatched: false, reason: `targetGuid '${p.targetGuid}' matched no entity in the live world — it may be stale (ids/entities are rebuilt on scene reload and play→stop). Re-read it with get_scene_state.`, simRunning: true };
   }
-  // engine.playClip: validate the clip NAME against the target's switchable clips. C7 fixed the
-  // phantom-GUID case but not the phantom-CLIP case — a typo'd/wrong-case clip name only
-  // console.warned while the op reported dispatched:true, so the agent trusted a switch that
-  // never happened. Only reject a wrong clip when the clip list is KNOWN (non-empty): an empty list is
-  // ambiguous (the animator's clipSet/GLB may not have loaded yet), so rejecting on it would
-  // false-negative a valid clip — mirrors list_traits' empty-registry nuance. (C7 re-audit.)
-  if (p.name === 'engine.playClip') {
-    const clip = (p.params as { clip?: unknown } | undefined)?.clip;
-    const entityId = p.targetGuid ? findEntityByGuid(p.targetGuid)?.id() : undefined;
-    if (entityId != null) {
-      // No animator trait at all → engine.playClip only console.warns and no-ops, but the op used to
-      // answer dispatched:true. Reject: nothing to drive. This is DISTINCT from an empty clip list
-      // (clips-not-loaded, ambiguous) — a missing trait is unambiguous, so it's safe to fail here. (F5)
-      const ent = getAllEntities().find((e) => e.id === entityId);
-      if (!ent || !ent.traits.some((t) => ANIMATOR_CLIP_TRAITS.has(t))) {
-        return { ok: false, dispatched: false, reason: `target '${p.targetGuid}' has no animator trait (Animator / SpriteAnimator / SkeletalAnimator) — engine.playClip has nothing to drive.`, simRunning: true };
-      }
-      if (typeof clip === 'string' && clip) {
-        const known = [...ANIMATOR_CLIP_TRAITS].flatMap((t) => switchableClipNames(entityId, t));
-        if (known.length > 0 && !known.includes(clip)) {
-          return { ok: false, dispatched: false, reason: `no clip named "${clip}" on the target's animator (names are case-sensitive). Known clips: ${known.join(', ')}.`, known, simRunning: true };
-        }
-      }
-    }
+  // The HANDLER decides whether it acted, and says so by returning a refusal (#1129). This op used to
+  // re-derive that answer for two actions with hand-written pre-flights (engine.playClip's animator and
+  // clip-name checks, engine.director's trait and slaved-child checks) and answered `dispatched:true`
+  // for every other refusal — nine conditions across four actions, plus every silent audio/video/
+  // haptics/quality refusal. The copies also drifted: the playClip one refused a typo'd SKELETAL clip
+  // that the handler, and so every authored button, wrote anyway. Reading the return value leaves the
+  // preconditions in exactly one place. `detail` (e.g. `known` clips, `slavedTo`) is spread FIRST so it
+  // can never overwrite the verdict fields.
+  const result = dispatchUIAction(p.name, { payload: p.payload, params: p.params, targetGuid: p.targetGuid });
+  if (isActionRefusal(result)) {
+    return { ...result.detail, ok: false, dispatched: false, reason: result.reason, simRunning: true };
   }
-  dispatchUIAction(p.name, { payload: p.payload, params: p.params, targetGuid: p.targetGuid });
   return { dispatched: true, simRunning: true, ...(p.targetGuid ? { targetResolved: true } : {}) };
 });
 // Clear the journal (start of a clean playtest scenario).
@@ -1033,9 +1178,10 @@ registerAgentOp('diagnose', (params) => {
   // §6 is summary-first: a per-clip index would grow every caller's payload to answer a question
   // almost none of them asked.
   //
-  // It needs a surface at all because the accessor alone is not reachable. `modoki_eval` runs in
+  // It needed a surface at all because the accessor alone was not reachable. `modoki_eval` runs in
   // the renderer and could import `pipeline.ts` through `/@fs` — but that yields a SECOND module
-  // instance whose slot is null, so it would report "no cache" for a perfectly live one. Before
+  // instance whose slot is null, so it would report "no cache" for a perfectly live one.
+  // (`modoki.import` has reached the app's instance since #1155; this filter stays the typed read.) Before
   // this, QA-VIDEO-0002 patched `window.fetch` to infer a refetch, which measures the network
   // rather than the cache and cannot tell a MISS from a cache that was never wired.
   //
@@ -1246,9 +1392,6 @@ registerAgentOp('watch-clear', (params) => clearWatch((params as { id?: string }
 registerAgentOp('input-watch-start', (params) => startInputWatch((params ?? {}) as { max?: number }));
 
 const DEFAULT_INPUT_WATCH_LIMIT = 20;
-function isUnresolvedPress(p: InputPressRecord): boolean {
-  return p.resolved.by === 'none' || p.resolved.by === 'unknown';
-}
 /** Shared by `read` and `stop` (stop reports what was captured, same shape as a read). */
 function shapeInputWatchRead(params: unknown): unknown {
   const p = (params ?? {}) as { limit?: number; unresolvedOnly?: boolean; precision?: number };
@@ -1305,12 +1448,23 @@ registerAgentOp('input-watch-clear', () => ({ ok: true, cleared: clearInputPress
 // by how much. `show`/`hide` drive the on-screen overlay (which also plots the last few recorded
 // presses); `read` returns the geometry as data, which is what an agent actually reasons over. ──
 const DEFAULT_HIT_REGION_LIMIT = 60;
+const HIT_REGION_ACTIONS = ['read', 'show', 'hide'] as const;
 registerAgentOp('hit-regions', (raw: unknown) => {
   const p = (raw ?? {}) as {
     action?: string; provider?: string; kind?: string; ids?: string[];
     limit?: number; precision?: number; at?: { x: number; y: number };
   };
   const action = String(p.action ?? 'read');
+  // An unknown action is REFUSED with the verbs, not run as a read (#1072's mechanism, found by its
+  // close-out sweep): `action:'shwo'` answered geometry, so a caller that meant to put the overlay
+  // up read "it worked" while nothing appeared. Coded, because this op answers a GET relay too.
+  if (!(HIT_REGION_ACTIONS as readonly string[]).includes(action)) {
+    return {
+      ok: false, code: 'REFUSED_BY_OP',
+      error: `hit-regions: unknown action ${JSON.stringify(p.action)} — nothing was shown, hidden or read.`,
+      options: [...HIT_REGION_ACTIONS],
+    };
+  }
   if (action === 'show' || action === 'hide') {
     setHitRegionOverlayVisible(action === 'show');
     return { ok: true, visible: action === 'show', providers: hitRegionProviders() };
@@ -2011,7 +2165,7 @@ registerAgentOp('load-scene', async (params) => {
   const before = sceneManager.getCurrent()?.path ?? null;
   const loading = sceneManager.loadScene(p.path);
   // SceneManager allocates THIS attempt's id into `nextLoad` synchronously, before loadScene's
-  // first await (SceneManager.ts:286-288) — so reading it here, between the call and the await,
+  // first await (SceneManager.loadScene's step-2 `nextSceneId`/`nextLoad` allocation) — so reading it here, between the call and the await,
   // names OUR load specifically, not whichever load happens to win a later swap (#486 finding A).
   const myId = sceneManager.getNext()?.id ?? null;
   try {
@@ -2037,16 +2191,16 @@ registerAgentOp('load-scene', async (params) => {
       return { ok: true, current: after, previous: before, entityCount: getAllEntities().length };
     }
     // ⚠️ `> myId`, NOT `!== myId`. Scene ids come from a monotonic `this.nextSceneId++`
-    // (sceneManager.ts:286), so only an id GREATER than ours is evidence that a LATER load won
+    // (loadScene's `nextSceneId` bump), so only an id GREATER than ours is evidence that a LATER load won
     // the swap. A different-but-SMALLER id means nothing newer ever installed and our own load
     // simply never became primary — and reporting THAT as "a later scene load won" would assert
     // from evidence that only says "the current id is not mine", which is the same shape of
     // over-claim this fix exists to remove. That case falls through to the original path check
-    // below and keeps its original message. (A genuinely bad path throws at sceneManager.ts:325
+    // below and keeps its original message. (A genuinely bad path throws at loadScene's `Failed to fetch scene` check
     // and is answered by the catch above; this is belt-and-braces for any resolve-without-
     // installing path, which is what the original `after !== p.path` check was written for.)
     if (cur.id > myId) {
-      // Superseded. `loadScene` still resolved successfully for us (sceneManager.ts:896, "a
+      // Superseded. `loadScene` still resolved successfully for us (loadScene's step-11 `primaryId === id` guard, "a
       // superseded load skips straight to resolving"), so this is not our load failing and it
       // says nothing about whether `p.path` exists.
       if (cur.path === p.path) {
@@ -2106,9 +2260,51 @@ registerAgentOp('sim-step', (params) => {
   }
   const frames = Math.max(1, Math.min(600, Math.floor(Number(p.frames ?? 1))));
   const scale = typeof p.scale === 'number' && Number.isFinite(p.scale) && p.scale > 0 ? p.scale : 1;
-  const timeoutMs = Math.max(100, Math.min(SIM_STEP_MAX_TIMEOUT_MS, Number(p.timeoutMs ?? simStepDefaultTimeout(frames))));
+  const budgetMs = Math.max(100, Math.min(SIM_STEP_MAX_TIMEOUT_MS, Number(p.timeoutMs ?? simStepDefaultTimeout(frames))));
 
-  return new Promise((resolve) => {
+  // Physics readiness (#1175): a body whose Rapier WASM has not instantiated is SKIPPED by the
+  // physics system, so these frames would come back physics-free and read as real. Wait for it like
+  // the editor's `step` does — but inside this op's OWN budget, so the host's transport deadline
+  // (derived from the same timeoutMs) still holds: whatever the wait spends, the frames lose.
+  return (async () => {
+    let timeoutMs = budgetMs;
+    const pending = pendingPhysics(world);
+    if (pending.length > 0) {
+      // REAL wall time, not rawNow(): this budget races the host's transport deadline, and a manual
+      // (test/headless) clock would read the wait as 0ms and hand the frames the whole budget again.
+      const started = Date.now();
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const outOfTime = new Promise<'loading'>((res) => { timer = setTimeout(() => res('loading'), budgetMs); });
+      const r = await Promise.race([ensurePhysicsReady(world), outOfTime]);
+      clearTimeout(timer);
+      const names = pending.map((m) => m.name);
+      if (r === 'loading') {
+        return {
+          ok: false, physicsLoading: names,
+          error: `sim-step refused — ${names.join(' + ')} was still loading its WASM after ${budgetMs}ms, so a step `
+            + `would run with NO physics. The load continues; retry the step.`,
+        };
+      }
+      if (!r.ok) {
+        // Permanent (the loader gave up and memoised the rejection) — retrying cannot help, so say so.
+        return { ok: false, error: `sim-step refused — physics failed to initialize, so the world would advance with NO physics: ${r.error}` };
+      }
+      timeoutMs = Math.max(100, budgetMs - (Date.now() - started));
+      if (getCurrentWorld() !== world) {
+        // A scene load replaced the world while physics loaded — nothing was unfrozen, so there is nothing to undo.
+        return { ok: false, worldReplaced: true, stepped: 0, requested: frames, error: 'the world was REPLACED while physics was loading — a scene load swapped it out, so no frames were stepped.' };
+      }
+      // Re-read the precondition: a resume (or a concurrent sim-step, whose continuation ran first and
+      // unfroze the world) landed during the wait. Stepping on would re-freeze a world someone else
+      // just set running — the side effect the entry check refuses.
+      if (getTimeScale(world) !== 0) {
+        return { ok: false, timeScale: getTimeScale(world), error: `sim-step requires a PAUSED world — timeScale became ${getTimeScale(world)} while physics was loading.` };
+      }
+    }
+    return stepFrames(timeoutMs);
+  })();
+
+  function stepFrames(timeoutMs: number) { return new Promise((resolve) => {
     const key = `__agent-sim-step-${Date.now()}`;
     let seen = 0;
     let done = false;
@@ -2159,7 +2355,7 @@ registerAgentOp('sim-step', (params) => {
       if (++seen >= frames) finish(false);
     }, 100);
     setTimeScale(world, scale);
-  });
+  }); }
 });
 
 // ── Entity lifecycle (#166 P2) — runtime twins, so the DEVICE can spawn/duplicate/delete. The
@@ -2172,11 +2368,7 @@ registerAgentOp('delete-entities', deleteEntitiesLive);
 registerAgentOp('set-traits', (params) =>
   applyLiveMutate(params, {
     parseWhere,
-    guidOf: (id) => {
-      const eaMeta = getAllTraits().find((m) => m.name === 'EntityAttributes');
-      const d = eaMeta ? readTraitData(id, eaMeta) : null;
-      return ((d?.guid as string) || '') || String(id);
-    },
+    guidOf: liveGuidOf,
   }));
 
 /** Dispatch a server request op to a result via the registry.
@@ -2259,15 +2451,67 @@ async function dropParkedWriteFor(urlPath: string): Promise<void> {
   } catch { /* not an editor context — no registry to clear */ }
 }
 
+type SceneChangedMsg = { urlPath: string; kind: SceneChangedKind; viaSibling?: boolean };
+
+/** Scene/prefab changes that arrived while the reload was suppressed, keyed by `urlPath`, in the
+ *  order of their latest write (#1164). Drained by {@link replaySuppressedSceneReloads}. */
+const _suppressedReloads = new Map<string, SceneChangedMsg>();
+
+/** Replay every scene/prefab change that arrived while the hot reload was suppressed, through the
+ *  same `handleSceneChanged` a live change takes, so a deferred change gets exactly the treatment
+ *  it would have had one frame after Stop. That includes **disk winning over unsaved edits** the
+ *  restored snapshot carried (owner's choice, 2026-09-13, on #1164): a stopped-mode external write
+ *  already behaves that way.
+ *
+ *  Editor-only in practice: the editor calls it on its "authoring settled" signal
+ *  (`agentEditorOps.ts`), which fires only once no restore or scene open is still loading. Calling
+ *  it on a bare run-mode edge is the defect that signal exists to avoid (see `authoringSettle.ts`).
+ *  A no-op while still suppressed, so an early call keeps the entries rather than losing them.
+ *
+ *  ⚠️ SEQUENTIAL, not fired together. Reloads started together supersede each other, and the
+ *  winner does not carry the loser's options: a changed BASE scene reloads with `forceReloadBases`,
+ *  a prefab change without it, so a prefab reload winning over a base reload leaves the base stale
+ *  (measured live: fired together, the scene reload logged "superseded" and the prefab one won).
+ *  A live watcher batch has the same race, but a run collects every write made during it, so
+ *  deferral makes the mix far more likely. Prefab changes need only ONE reload, so they collapse to
+ *  their last entry, replayed last and carrying the others to evict at the same moment. That entry
+ *  runs even after a scene reload, because a scene entry outside the loaded chain reloads nothing.
+ *  Nothing is evicted up front: a replay that finds itself suppressed again part-way (Play pressed
+ *  mid-replay) re-defers what is left, and an eviction already made would then run during Play.
+ *  Resolves with the number of changes replayed. */
+export async function replaySuppressedSceneReloads(): Promise<number> {
+  if (_suppressedReloads.size === 0 || sceneReloadSuppressedReason()) return 0;
+  const pending = [..._suppressedReloads.values()];
+  _suppressedReloads.clear();
+  console.log(`[agentBridge] replaying ${pending.length} scene hot-reload(s) deferred during the run`);
+  for (const m of pending) if (m.kind !== 'prefab') await handleSceneChanged(m);
+  const prefabs = pending.filter((m) => m.kind === 'prefab');
+  const last = prefabs.at(-1);
+  if (last) await handleSceneChanged(last, prefabs.slice(0, -1).map((m) => m.urlPath));
+  return pending.length;
+}
+
+/** Test seam: the deferred changes currently held, as `urlPath`s in replay order. */
+export function peekSuppressedSceneReloads(): string[] {
+  return [..._suppressedReloads.keys()];
+}
+
 /** Hot-reload the active scene when its file (or any prefab) changes on disk.
  *  Shared by the Vite HMR path and the Electron IPC path. */
-async function handleSceneChanged(msg: { urlPath: string; kind: SceneChangedKind; viaSibling?: boolean }): Promise<void> {
+async function handleSceneChanged(msg: SceneChangedMsg, evictAlso: readonly string[] = []): Promise<void> {
   // An asset-def change (.anim/.timeline/.particle/.spriteanim/.rig2d) invalidates just that
   // cache entry and returns — see ASSET_CACHE_INVALIDATORS above for why this is a table and what
   // it prevents. The parked write goes with the cache entry: once the cached def is dropped the
   // pending doc has no live counterpart, and disk becomes the truth for that asset (otherwise the
   // next save_all flushes the stale parked doc over the file that was just written).
-  const invalidateCachedAsset = ASSET_CACHE_INVALIDATORS[msg.kind];
+  // ⚠️ `hasDocKey`, NOT a raw index (#993). `msg.kind` arrives on the device-debug/HMR
+  // protocol and `ASSET_CACHE_INVALIDATORS` is a code-declared literal, so `kind:"constructor"`
+  // returns the inherited FUNCTION — truthy, so the `if` below passes — and the next line CALLS
+  // it: `Object(urlPath)`. The looked-up value being invoked is what makes this one the sharpest
+  // read in the family after scroll-demo's URL param.
+  const invalidateCachedAsset = hasDocKey(ASSET_CACHE_INVALIDATORS, msg.kind)
+    ? ASSET_CACHE_INVALIDATORS[msg.kind]
+    : undefined;
   if (invalidateCachedAsset) {
     invalidateCachedAsset(msg.urlPath);
     // ⚠️ Only when THIS asset's own file changed. `viaSibling` says the broadcast was raised by a
@@ -2287,19 +2531,44 @@ async function handleSceneChanged(msg: { urlPath: string; kind: SceneChangedKind
     fireDirtyListeners();
     return;
   }
-  const current = sceneManager.getCurrent()?.path;
-  if (!current) return;
-  // Suppressed in editor Play mode: reloading now would be discarded by the
-  // Play-press snapshot on Stop, so the edit would silently vanish. Skip and log
-  // — the caller (agent mutate) is told separately to Stop first.
+  // Suppressed during Play/Pause and inside a scrub/preview envelope: a reload now would rebuild the
+  // world the run's snapshot belongs to, and Stop/Exit would restore the pre-write snapshot over it.
+  // DEFERRED, not dropped (#1164) — dropping left the world behind disk after Stop/Exit, and the next
+  // save wrote that stale world over the external change. `replaySuppressedSceneReloads` runs it
+  // once authoring settles. Checked BEFORE `current`, so a change arriving with no scene loaded is
+  // still recorded rather than lost the same way.
+  const defer = (reason: string): void => {
+    const held = [msg, ...evictAlso.map((urlPath): SceneChangedMsg => ({ urlPath, kind: 'prefab' }))];
+    for (const m of held) {
+      _suppressedReloads.delete(m.urlPath); // re-insert, so replay order follows the latest write
+      _suppressedReloads.set(m.urlPath, m);
+    }
+    console.warn(`[agentBridge] scene hot-reload deferred (${msg.kind} change: ${msg.urlPath}) — ${reason}`);
+  };
   const suppressed = sceneReloadSuppressedReason();
-  if (suppressed) {
-    console.warn(`[agentBridge] scene hot-reload skipped (${msg.kind} change: ${msg.urlPath}) — ${suppressed}`);
-    return;
-  }
+  if (suppressed) { defer(suppressed); return; }
+  // #1169: a prefab change must evict the cached prefab BEFORE the scene reload below, or the reload
+  // re-instantiates the OLD prefab: a load acquires before it releases, so the new scene id finds the
+  // entry still owned and `fetchPrefab` returns on the cache hit. BOTH copies: the runtime cache
+  // (evicted), and the editor's own (`_prefabSourceRefresher`, RE-READ — never left empty, see
+  // `refreshPrefabSourceForPath`), which the serializer diffs instances against. Refresh only the
+  // runtime one and the instance is rebuilt from the new prefab while the next save diffs it against
+  // the old, keeping an added trait or entity as a false override. Not in ASSET_CACHE_INVALIDATORS:
+  // that branch runs during Play too, where evicting a prefab breaks the runtime's synchronous
+  // `getCachedPrefab` spawns — so the runtime eviction runs only on this path, once suppression is
+  // over, and as late as possible (see the re-check below). Keyed by the path form the watcher sends.
+  const prefabPaths = msg.kind === 'prefab' ? [msg.urlPath, ...evictAlso] : [...evictAlso];
+  const evictRuntimePrefabs = (): void => { for (const urlPath of prefabPaths) invalidatePrefab(urlPath); };
+  const refreshEditorPrefabs = async (): Promise<void> => {
+    const refresh = _prefabSourceRefresher;
+    if (refresh) await Promise.all(prefabPaths.map((urlPath) => refresh(urlPath).catch(() => {})));
+  };
+  const current = sceneManager.getCurrent()?.path;
+  if (!current) { evictRuntimePrefabs(); await refreshEditorPrefabs(); return; }
   // In prefab-edit mode the active "scene" is a synthetic in-memory scene
-  // (`/__prefab-edit__/<guid>`) with no file on disk — leave it alone.
-  if (current.startsWith('/__prefab-edit__/')) return;
+  // (`/__prefab-edit__/<guid>`) with no file on disk — leave it alone. The editor's prefab copy is
+  // still re-read: the prefab-edit save reads it synchronously for the edited and nested prefabs.
+  if (current.startsWith('/__prefab-edit__/')) { evictRuntimePrefabs(); await refreshEditorPrefabs(); return; }
   // A7 (scene-loading.md): the changed file may be a BASE in the
   // loaded chain, not the primary — match against EVERY loaded scene, not just the
   // primary's path. Without this, editing Base.json on disk (an agent's
@@ -2316,7 +2585,7 @@ async function handleSceneChanged(msg: { urlPath: string; kind: SceneChangedKind
       if (entry.role === 'base') changedBaseGuid = entry.guid;
       break;
     }
-    if (!matchedAny) return; // touches no scene in the currently-loaded chain
+    if (!matchedAny) return; // touches no scene in the currently-loaded chain (a scene change carries no prefabs)
   }
   try {
     // Fetch the fresh file once: validate it AND hand it to loadScene via
@@ -2351,6 +2620,16 @@ async function handleSceneChanged(msg: { urlPath: string; kind: SceneChangedKind
         }
       } catch { /* fall back to loadScene's own fetch */ }
     }
+    // Before the re-check, since it awaits too: the editor copy is re-read in place, so refreshing it
+    // and then deferring leaves nothing stale-and-missing behind.
+    await refreshEditorPrefabs();
+    // ⚠️ Re-check after the awaits (#1164 review). The check above ran before the fetch, and a Play
+    // press, an envelope, or a scene open/restore taking a world-replacement token can all begin
+    // inside it. Loading now would supersede that scene open or land inside the new run, and the
+    // change would be gone from the pending list — so defer it again instead.
+    const lateReason = sceneReloadSuppressedReason();
+    if (lateReason) { defer(lateReason); return; }
+    evictRuntimePrefabs();
     await sceneManager.loadScene(current, {
       ...(preloaded ? { preloaded } : undefined),
       ...(changedBaseGuid ? { forceReloadBases: [changedBaseGuid] } : undefined),
@@ -2368,6 +2647,65 @@ async function handleSceneChanged(msg: { urlPath: string; kind: SceneChangedKind
     }
     console.warn('[agentBridge] scene hot-reload failed:', e);
   }
+}
+
+/** The minimal HMR surface `registerRelayResponder` needs, so a test can play the dev server. */
+export interface RelayHot {
+  send(event: string, data: unknown): void;
+  // `any` matches Vite's own `ViteHotContext.on`, whose callback payload is inferred per event —
+  // a narrower parameter type here makes the real `import.meta.hot` unassignable.
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  on(event: string, cb: (data: any) => void): void;
+}
+
+/** Make this client a relay responder: ANNOUNCE first, then accept `modoki:request`.
+ *
+ *  ⚠️ **The two halves are one function because they are one invariant** (#1030): *nothing may be
+ *  able to answer `modoki:request` before it has announced.* The server sizes its decline
+ *  denominator from clients that have announced, so a client that can decline while uncounted
+ *  completes a count that was one short — and that is #1030 itself, a live editor's asset-path
+ *  repair skipped silently. Split across two statements they can drift; here they cannot.
+ *
+ *  The announce exists because `modoki:schema` was the only signal and it is NOT prompt:
+ *  `makeSchemaPusher` refuses to send an empty registry and polls at 200ms, while
+ *  `initAgentBridge` is reached through a top-level dynamic import from `main.tsx` — so every tab
+ *  could answer for a while before it was counted, and a tab parked on the Vite error overlay
+ *  never announced at all.
+ *
+ *  ⚠️ **Exported and taking `hot` as a parameter so the PRODUCER is testable.** `initAgentBridge`
+ *  reads `import.meta.hot` inline, which no test can fake — and with this logic inline there, the
+ *  announce could be deleted with 3,621 tests green (found by review, one round after the same
+ *  shape was found on the server side). The consumer had a seam test; the producer had nothing.
+ *
+ *  ⚠️ **`vite:ws:connect` cannot currently fire for this listener, and it is kept knowingly.**
+ *  Vite 8 emits it once per page from inside `/@vite/client`'s own `transport.connect`, long
+ *  before `main.tsx`'s dynamic import registers anything, and it has no in-page reconnect (on
+ *  disconnect the client polls and calls `location.reload()`). So a dev-server restart re-announces
+ *  via the fresh page's `announce()`, NOT via this listener. An earlier comment claimed this was
+ *  the reconnect path; it was wrong. Kept because it is free and correct if Vite ever reconnects
+ *  in place — but do not cite it as the mechanism for anything. (The neighbouring
+ *  `vite:ws:connect` schema listener is dead for exactly the same reason.) */
+export function registerRelayResponder(hot: RelayHot): void {
+  const announce = (): void => { hot.send('modoki:bridge-hello', {}); };
+  announce();
+  hot.on('vite:ws:connect', announce);
+
+  // ⚠️ **DECLINE an op we do not have — do not reject it** (#1030). The dev server BROADCASTS
+  // `modoki:request` to every HMR client, so this runs in every open tab, not only the editor's.
+  // A tab on the runtime route has no editor ops and answers in about a millisecond, which used
+  // to BEAT the editor tab and settle the request on its behalf.
+  //
+  // `declined` is a separate channel from `error` because the two mean opposite things to the
+  // server: "I do not have this op" is countable, while "this op threw" is a real answer from the
+  // one client that owns the op and must settle immediately. Collapsing them is the whole defect.
+  //
+  // The decision is `relayResponseFor`, called with NO overrides on purpose: its defaults already
+  // are `hasAgentOp` and `runAgentOp`, so passing them again adds a line that can be mis-wired —
+  // swapping `hasAgentOp` for `() => true` there left 228 tests green while making every client
+  // claim every op. Nothing to pass is nothing to get wrong.
+  hot.on('modoki:request', async (msg: { id: number; op: string; params?: unknown }) => {
+    hot.send('modoki:response', await relayResponseFor(msg));
+  });
 }
 
 export function initAgentBridge(): void {
@@ -2395,8 +2733,9 @@ export function initAgentBridge(): void {
     pusher.start();
     bridge.on('request', async (data) => {
       const msg = data as { id: number; op: string; params?: unknown };
-      try { bridge.send('response', { id: msg.id, result: await handleOp(msg.op, msg.params) }); }
-      catch (e) { bridge.send('response', { id: msg.id, error: String(e instanceof Error ? e.message : e) }); }
+      // The same reply function as the HMR relay's `relayResponseFor`, so an `OpRefusal` reaches the
+      // packaged editor's backend as a coded envelope too — not only the dev server's (#1012).
+      bridge.send('response', { id: msg.id, ...(await opReplyFor(() => handleOp(msg.op, msg.params))) });
     });
     // Drive scene reloads off main's watcher (which owns the guard) when chosen —
     // for an Electron bridge this is ALWAYS the case, dev or packaged. See
@@ -2440,16 +2779,23 @@ export function initAgentBridge(): void {
   const pusher = makeSchemaPusher((schema) => { hot.send('modoki:schema', schema); schemaPushed = true; });
   pusher.start();
   hot.on('vite:afterUpdate', () => { schemaPushed = false; pusher.start(); });
-  // Reconnect (server restart drops the dev server's cache): force a resend even if the
-  // trait set is unchanged — a plain start() would find the same signature already sent
-  // and send nothing, leaving the freshly-restarted server with no schema at all.
+  // Intended as the reconnect path: a server restart drops the dev server's cache, and a plain
+  // start() would find the same signature already sent and send nothing, leaving the freshly-
+  // restarted server with no schema at all. The `force` is what makes the resend happen.
+  //
+  // ⚠️ **This listener CANNOT FIRE in Vite 8, so the reconnect it describes is handled elsewhere.**
+  // Vite emits `vite:ws:connect` once per page from inside `/@vite/client`'s own
+  // `transport.connect`, which runs while `/@vite/client` is evaluating — long before
+  // `main.tsx`'s dynamic `import('./debug/agentBridge')` registers anything here. And there is no
+  // in-page reconnect to catch: on `vite:ws:disconnect` the client polls and calls
+  // `location.reload()`, so a restarted server is served by a FRESH page whose own `pusher.start()`
+  // above does the push. Kept because it costs nothing and would be correct if Vite ever
+  // reconnected in place — but do not cite it as the mechanism for anything. (Found while fixing
+  // #1030's announce, whose sibling listener has the same property and says so.)
   hot.on('vite:ws:connect', () => { if (!schemaPushed) pusher.start({ force: true }); });
 
-  // 2. Answer request ops from the dev server.
-  hot.on('modoki:request', async (msg: { id: number; op: string; params?: unknown }) => {
-    try { hot.send('modoki:response', { id: msg.id, result: await handleOp(msg.op, msg.params) }); }
-    catch (e) { hot.send('modoki:response', { id: msg.id, error: String(e instanceof Error ? e.message : e) }); }
-  });
+  // 2 + 3. Announce, then take the ops. ONE call, deliberately — see `registerRelayResponder`.
+  registerRelayResponder(hot);
 
   // 3. Hot-reload the active scene on a .scene.json / .prefab.json edit — ONLY when
   //    Vite owns the self-write guard (browser dev, same-origin writes). With an

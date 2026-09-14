@@ -140,7 +140,7 @@ const norm = (d: Decl): ToolContract => ({
 const TARGET_ENTITY_OCCLUSION_NOTE =
   'A RESOLVABLE aim covered by something else is REFUSED (400, `OCCLUDED`), naming the cover: the '
   + 'input would land on that instead, and reporting ok for it is the false success §0 ranks worst. '
-  + 'This binds BOTH resolvable aims — `entity` and `selector` — and matches the device surface, '
+  + 'This binds EVERY resolvable aim — `entity`, `selector` and `label` — and matches the device surface, '
   + 'which has always refused a covered selector. Raw `{x,y}` is never refused: a coordinate is '
   + 'exactly what was asked for. `allowOccluded:true` dispatches anyway (per-endpoint on `drag`); '
   + "on `pointer` it applies to `action:'down'` only, since a move/up is delivered to whatever "
@@ -168,7 +168,7 @@ const DECLS: Record<string, Decl> = {
     kind: 'mutate', method: 'POST', route: '/api/scene-mutate',
     mutating: true, undoable: true, persists: 'live', requires: ['editor', 'scene'], aim: 'entity',
     minimalArgs: { ops: [{ op: 'addEntity', name: 'ContractProbe', parentId: 0 }] },
-    notes: 'Path defaults to the ACTIVE scene via activeScenePath (reads /api/editor-state first).',
+    notes: "Path defaults to the ACTIVE scene via activeScenePath (reads /api/editor-state first). ⚠️ The FILE-DIRECT path (a scene that is not the live one, or a setBaseScene op) refuses REQUIRES_SAVE while the editor holds ANY unsaved work, because the write hot-reloads the scene and that DISCARDS it — `holds` names each path and registry. There is no force/discardUnsaved hatch here on purpose: modoki_save_all is the only remedy. It also refuses NO_RENDERER (503) when a renderer may be attached and did not answer the probe — retry, it is usually mid-parse (#889 §8). With NO renderer at all it writes as before and says so in `warnings`.",
   },
   modoki_set_transform: {
     kind: 'mutate', method: 'POST', route: '/api/scene-mutate',
@@ -179,7 +179,7 @@ const DECLS: Record<string, Decl> = {
   modoki_validate_scene: {
     kind: 'read', method: 'GET', route: '/api/validate-scene', requires: ['project'], aim: 'asset',
     minimalArgs: { path: '/assets/scenes/main.scene.json' },
-    notes: 'C7: reports findings in `warnings`; `ok:false` is an ANSWER (unhealthy scene), not a failed call.',
+    notes: "C7: reports findings in `warnings`; `ok:false` is an ANSWER (unhealthy scene), not a failed call. ⚠️ It validates the scene FILE ON DISK. When the editor holds unsaved work that could change the verdict it DISCLOSES rather than refusing (#889): `staleInputs` names what it could not see, `staleInputsUnknown` says the renderer could not be asked, `staleInputsNote` carries both in one sentence — all ABSENT when clean, never an empty array, so their presence is the signal. Deliberately narrow, and narrow in a way you can predict: it fires for an unsaved PREFAB (its resolver reads prefab documents) and for parked IMPORT SETTINGS (the manifest it tests refs against is DERIVED from the sidecar — retyping a texture 2d->3d deletes a sprite guid the scene references). It does NOT fire for a parked material/particle document or a pending baseScene ref: neither can move a warning. modoki_save_all first for an answer about what you are looking at.",
   },
   modoki_list_traits: {
     kind: 'read', method: 'GET', route: '/api/trait-schema', filters: ['name'],
@@ -210,6 +210,7 @@ const DECLS: Record<string, Decl> = {
     // unconditionally: an unknown target is a refusal here, because answering
     // `unreferenced: true` for a file that does not exist reads as "safe to delete".
     minimalArgs: { target: '/assets/scenes/main.scene.json' },
+    notes: "⚠️ It walks FILES ON DISK, so a '0 references' verdict is computed from the PRE-EDIT graph whenever the editor holds unsaved work — the same blindness as modoki_unused_assets, and the reason its unresolvable-TARGET branch refuses rather than answering zero. It discloses rather than refusing (#889): `staleInputs` names what it could not see, `staleInputsUnknown` says the renderer could not be asked, `staleInputsNote` carries both. ABSENT when the editor is clean, never an empty array. modoki_save_all first if you just changed something.",
   },
   modoki_reimport_asset: {
     kind: 'asset', method: 'POST', route: '/api/reimport',
@@ -221,13 +222,37 @@ const DECLS: Record<string, Decl> = {
   // ── visual capture ──
   modoki_capture_viewport: {
     kind: 'read', method: 'POST', route: '/api/capture-viewport', requires: ['editor', 'electron'],
-    notes: 'FORCES a render, so it MASKS render-on-demand + stale-frame bugs. Use CDP for a true framebuffer.',
+    // ⚠️ This note said "FORCES a render, so it MASKS render-on-demand + stale-frame bugs" — the
+    // exact OPPOSITE of what this tool does, and the note that belongs on render_scene/-sequence
+    // below (found by #994's close-out sweep). `capturePage()` is a screenshot of the WINDOW, i.e.
+    // whatever each surface last drew, so it is the one capture tool that CAN show a stale frame —
+    // which is the entire reason the render-on-demand SceneView caveat exists. The tool's own
+    // description and CLAUDE.md § Debug Tools have both said so since the 2026-08-18 measurement;
+    // this line contradicted them from inside the contract table that is supposed to be the SSOT.
+    notes: 'Does NOT force a render — capturePage() returns whatever the window last drew, so an '
+      + 'unchanged capture is NOT evidence a change failed to render (the SceneView is '
+      + 'render-on-demand). Use modoki_render_scene to force one, or CDP for a true framebuffer. '
+      + 'A capture failure is a §5 refusal, not a bare throw (#994), and the CODE says which kind: '
+      + 'NO_RENDERER (503) for an ordinary state the caller can undo — window minimised, not '
+      + 'visible, collapsed pane, no viewport mounted — and NOT_AVAILABLE_HERE for a broken editor '
+      + 'that does not self-recover: renderer crashed, window/webContents destroyed, GPU device '
+      + 'lost, frame loop stalled, renderer gate failed. The split is deliberate: NO_RENDERER is in '
+      + 'test-live-tools.ts\'s ENV_CODES, so using it for a dead editor would turn the live gate '
+      + 'green through one. Options differ per branch — relaunch leads for the second.',
   },
   modoki_render_scene: {
     kind: 'read', method: 'POST', route: '/api/render-scene', requires: ['editor', 'renderer', 'scene'],
+    notes: 'FORCES a fresh render, so unlike capture_viewport it MASKS render-on-demand + '
+      + 'stale-frame bugs — the broken frame heals in the capture. Use CDP for a true framebuffer. '
+      + 'Refuses NO_RENDERER (503) when no scene renderer is registered; `surfaces` in '
+      + 'modoki_get_editor_state lists `game-3d` exactly when one is (#994).',
   },
   modoki_render_sequence: {
     kind: 'read', method: 'POST', route: '/api/render-sequence', requires: ['editor', 'renderer', 'scene'],
+    notes: 'FORCES a fresh render per frame, same masking caveat as render_scene. Refuses 409 '
+      + 'while the editor is STOPPED (every frame would be identical) and NO_RENDERER (503) with no '
+      + 'scene renderer registered — mid-sequence it reports `framesWritten`/`paths` for what did '
+      + 'land, rather than reading as either "rendered nothing" or "finished" (#994).',
   },
 
   // ── Enact: trusted input ──
@@ -283,12 +308,12 @@ const DECLS: Record<string, Decl> = {
   },
   modoki_handles: {
     kind: 'read', method: 'GET', route: '/api/enact-handles', requires: ['editor'],
-    // All THREE filters, not just `kind` — the over-cap hint is built from this list, so a missing
+    // EVERY filter, not just `kind` — the over-cap hint is built from this list, so a missing
     // one is a filter the agent is never told about (S3.10). (This comment used to claim the docs
     // catalog reads `filters` too. It does not — `renderCatalog` emits Tool/Endpoint/Effect/Needs/
     // Aim/Smallest-call and no filters column. Naming a consumer that does not exist is how a
     // declaration gets trusted for a job nothing is doing.)
-    filters: ['editor', 'kind', 'ids'],
+    filters: ['editor', 'kind', 'ids', 'prefix', 'label'],
   },
   modoki_tap_handle: {
     kind: 'input', method: 'POST', route: '/api/input/tap-handle',
@@ -330,6 +355,14 @@ const DECLS: Record<string, Decl> = {
     filters: ['type', 'source', 'since', 'limit'],
     notes: 'IMPURE READ, and a mutating GET: clear:true empties the editor-activity buffer via GET.',
   },
+  modoki_wait_for: {
+    kind: 'read', method: 'POST', route: '/api/wait-for', requires: ['editor', 'renderer'],
+    minimalArgs: { editor: { runMode: 'stopped' }, timeoutMs: 50 },
+    notes: 'BLOCKS for up to timeoutMs (default 5s, max 120s); minimalArgs pins 50ms and a condition '
+      + 'that holds on a stopped editor so the live sweep returns at once. A POST read: the condition '
+      + 'is a nested object, and nothing is written. A timeout is a normal {satisfied:false, timedOut:true} '
+      + 'answer, not a failure (#1154).',
+  },
   modoki_wait_for_edit: {
     kind: 'read', method: 'GET', route: '/api/wait-for-edit',
     filters: ['type', 'source', 'since'],
@@ -368,7 +401,7 @@ const DECLS: Record<string, Decl> = {
   modoki_new_scene: {
     kind: 'control', method: 'POST', route: '/api/editor-action', op: 'new-scene',
     mutating: true, persists: 'live', requires: ['editor', 'project'],
-    notes: 'Same unsaved-work refusal as load-scene. ALSO refuses while a prefab is being edited (#853) — exit prefab-edit first; that refusal is not bypassable with discardUnsaved, because it is not about unsaved work. Replaces the world through a real SceneManager swap, so onWorldSwap fires and every id-keyed cache clears; the outgoing scene\'s resources are released immediately.',
+    notes: 'Same unsaved-work refusal as load-scene. ALSO refuses while a prefab is being edited (#853) — exit prefab-edit first; that refusal is not bypassable with discardUnsaved, because it is not about unsaved work. AND refuses while another new_scene is still in flight (#887): two overlapping calls used to interleave, discarding one populated world and leaving the editor path decided by whichever write landed last. ⚠️ You are unlikely to reach that refusal from here, and that is measured, not assumed: modoki_batch runs its steps IN ORDER so it cannot overlap them by construction, and two parallel modoki_new_scene tool calls did not overlap either when driven (both fulfilled, 2026-09-08). The refusal is reachable in-process — a human double-click racing this op, or two callers of the editor API — and was verified live through the renderer seam, not through this route. If you do see it, re-issue after the first returns. Replaces the world through a real SceneManager swap, so onWorldSwap fires and every id-keyed cache clears; the outgoing scene\'s resources are released immediately.',
   },
   modoki_save_all: {
     kind: 'mutate', method: 'POST', route: '/api/editor-action', op: 'save-all',
@@ -603,7 +636,7 @@ const DECLS: Record<string, Decl> = {
   },
   modoki_diagnose: {
     kind: 'read', method: 'GET', route: '/api/diagnose', requires: ['editor', 'scene'],
-    notes: 'C7: `ok:false` is an ANSWER (your scene is unhealthy), not a failed call. The `video` param is deliberately NOT declared in `filters`: §6 filters are params that NARROW a response, and this one EXPANDS it (an opt-in video-cache index) — which is what the boolean heuristic already expects, so listing it would be the exact misuse `narrowingFlags` warns against, "a way to bless an expanding flag". Opt-in matters anyway, because diagnose is a swept read: a per-clip index would grow every caller\'s payload to answer a question almost none of them asked. It is the only surface that can read the downloaded-video cache (#288 Phase 6) — the singleton sits behind the __MODOKI_MODULE_VIDEO__ flag, and an /@fs import in modoki_eval yields a second module instance whose slot is null.',
+    notes: 'C7: `ok:false` is an ANSWER (your scene is unhealthy), not a failed call. The `video` param is deliberately NOT declared in `filters`: §6 filters are params that NARROW a response, and this one EXPANDS it (an opt-in video-cache index) — which is what the boolean heuristic already expects, so listing it would be the exact misuse `narrowingFlags` warns against, "a way to bless an expanding flag". Opt-in matters anyway, because diagnose is a swept read: a per-clip index would grow every caller\'s payload to answer a question almost none of them asked. It is the typed read of the downloaded-video cache (#288 Phase 6) — the singleton sits behind the __MODOKI_MODULE_VIDEO__ flag, and a hand-written /@fs import in modoki_eval yields a second module instance whose slot is null (`modoki.import` reaches the app\'s, #1155).',
   },
   modoki_profiler: {
     // `varies:'method'`, not 'both': every action uses the SAME route (`/api/profiler`) and only
@@ -679,7 +712,7 @@ const DECLS: Record<string, Decl> = {
     kind: 'asset', method: 'POST', route: '/api/asset-write',
     mutating: true, persists: 'file', requires: ['project'], aim: 'asset',
     minimalArgs: { path: '/assets/particles/probe.particle.json', type: 'particle', data: {} },
-    notes: 'F1: `path` and `type` — its two primary args — are undocumented. Can RE-MINT the asset id.',
+    notes: 'F1: `path` and `type` — its two primary args — are undocumented. Can RE-MINT the asset id. ⚠️ REFUSES with REQUIRES_SAVE while the human has a PARKED edit to this same document, because this is a wholesale replace and the file-change event it raises makes the editor drop their copy (#889). The hatch is `discardUnsaved`, and the reply then names what was dropped in `discardedParked` — or carries `discardWarning` if the discard could not be confirmed, which means their older copy may still flush back over this write. The editor own save is exempt via selfWrite; an agent must not send that.',
   },
   modoki_delete_asset: {
     kind: 'mutate', method: 'POST', route: '/api/delete-asset',
@@ -766,11 +799,11 @@ const DECLS: Record<string, Decl> = {
   modoki_validate_prefab: {
     kind: 'read', method: 'GET', route: '/api/validate-prefab', requires: ['project'], aim: 'asset',
     minimalArgs: { path: '/assets/prefabs/probe.prefab.json' },
-    notes: "The prefab twin of modoki_validate_scene. C7: `ok:false` is an ANSWER (this prefab has problems), not a failed call. Consults NO trait schema — hence no schemaAvailable, unlike its scene sibling, and no renderer requirement.",
+    notes: "The prefab twin of modoki_validate_scene. C7: `ok:false` is an ANSWER (this prefab has problems), not a failed call. Consults NO trait schema — hence no schemaAvailable, unlike its scene sibling, and no renderer requirement. ⚠️ Reads the prefab FILE ON DISK and DISCLOSES when the editor holds it unsaved (#889): same `staleInputs`/`staleInputsUnknown`/`staleInputsNote` fields, absent when clean. PATH-SCOPED, unlike its scene sibling — this pass consults no resolver, so only THIS document being unsaved can change the answer, which in practice means the prefab is open in prefab-edit.",
   },
   modoki_unused_assets: {
     kind: 'read', method: 'GET', route: '/api/unused-assets', requires: ['project'],
-    notes: "The single owner of 'what would the build DROP?' — it runs the real tree-shaker from the scene seeds, so it answers about what SHIPS. A `?unreferenced=1` mode on find_references was measured against it and DELETED (docs/build.md): its answer was a strict subset on every committed project, and weaker where they differed. Scoped to the project's own assets; the engine's shared /modoki/assets root is excluded as engine-owned.",
+    notes: "The single owner of 'what would the build DROP?' — it runs the real tree-shaker from the scene seeds, so it answers about what SHIPS. A `?unreferenced=1` mode on find_references was measured against it and DELETED (docs/build.md): its answer was a strict subset on every committed project, and weaker where they differed. Scoped to the project's own assets; the engine's shared /modoki/assets root is excluded as engine-owned. ⚠️ It reads every scene/prefab/material off DISK, so when the editor holds unsaved work the answer is computed from the PRE-EDIT graph — and this answer feeds a DELETE (the Clean Up dialog trashes what it lists). It discloses rather than refusing (#889): `staleInputs` names what it could not see, `staleInputsUnknown` says the renderer could not be asked, and `staleInputsNote` carries both in one sentence. All three are ABSENT when the editor is clean — never an empty array — so their presence is the signal. modoki_save_all first for an accurate list.",
   },
   modoki_write_asset_meta: {
     kind: 'asset', method: 'POST', route: '/api/write-meta',

@@ -12,10 +12,8 @@
   "games/alien-animal/CLAUDE.md": 3500,
   "games/anim-bug/CLAUDE.md": 3000,
   "games/audio-demo/CLAUDE.md": 3500,
-  "games/chess/CLAUDE.md": 4000,
-  "games/court/CLAUDE.md": 51500,
+  "games/court/CLAUDE.md": 52500,
   "games/iap-test/CLAUDE.md": 10000,
-  "games/llm-test/CLAUDE.md": 4500,
   "games/ota-subgame-test/CLAUDE.md": 3500,
   "games/ota-test/CLAUDE.md": 6000,
   "games/scroll-demo/CLAUDE.md": 6500,
@@ -26,5 +24,5 @@
   "games/text_demo/CLAUDE.md": 3500,
   "games/timeline-demo/CLAUDE.md": 5500,
   "games/video-test/CLAUDE.md": 4500,
-  "games/wordweave/CLAUDE.md": 20007
+  "games/wordweave/CLAUDE.md": 23000
 }

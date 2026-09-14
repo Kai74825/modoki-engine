@@ -34,8 +34,11 @@ import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { stripSwiftComments } from '@modoki/engine/testing';
+import { assertExemptionLedger } from '@modoki/engine/testing/exemptionLedger';
 import { hasNativeProjects } from '../helpers/repoLayout';
 import { discoverProjects } from '../../scripts/projectRoots.mjs';
+// @ts-expect-error — .mjs script module, no type declarations by design (it is a build script).
+import { PLUGIN_CLASS_LEGS } from '../../scripts/nativePluginLegs.mjs';
 
 const repoRoot = path.resolve(__dirname, '../../..');
 const PKG_DIR = 'engine/packages';
@@ -149,12 +152,12 @@ describe('capacitor plugin platform declarations', () => {
 
   /** #368's third plugin, which the pbxproj rule above cannot reach.
    *
-   *  `capacitor-litert-lm` is compiled into no App target, so `compiledIntoAppTarget` is false
-   *  and the doubling rule has nothing to say about it — yet adding `ios` there is just as
-   *  wrong, for an unrelated reason: its `LitertLmPlugin.swift` really does `import
-   *  MediaPipeTasksGenAI` (it is a full implementation, NOT the stub a stale Package.swift
-   *  comment still calls it), the podspec declares that dependency, and `Package.swift` does
-   *  not. So an SPM build of the target cannot compile, while `npm run verify` stays green.
+   *  `capacitor-litert-lm` (deleted in #1191) was compiled into no App target, so `compiledIntoAppTarget` is false
+   *  and the doubling rule had nothing to say about it — yet adding `ios` there was just as
+   *  wrong, for an unrelated reason: its `LitertLmPlugin.swift` really did `import
+   *  MediaPipeTasksGenAI` (a full implementation, NOT the stub a stale Package.swift comment
+   *  called it), the podspec declared that dependency, and `Package.swift` did not. So an SPM
+   *  build of the target could not compile, while `npm run verify` stayed green.
    *
    *  The rule, stated generally: if the podspec needs a dependency the SPM manifest lacks, the
    *  package must not claim SPM support. */
@@ -267,6 +270,53 @@ describe('capacitor plugin platform declarations', () => {
     }
     expect(missing, `files[] promises a file the package does not ship: ${missing.join(', ')}`).toEqual([]);
   });
+
+  /** The MIRROR of the check above, and the direction that actually ships a broken tarball (#971).
+   *
+   *  A plugin manifest may declare a nested local package — `.package(path: "iap-core")` — to hold
+   *  logic that host tooling can test (`import Capacitor` has no macOS xcframework, so the plugin
+   *  target itself cannot be host-built). That nested directory is a BUILD INPUT for every consumer:
+   *  drop it from `files[]` and the published tarball carries a `Package.swift` pointing at nothing.
+   *
+   *  ⚠️ Nothing else catches that. `npm run verify`, `npm run test:native` and both CI legs all run
+   *  against the REPO, where the directory is present; the first thing to fail is a game's iOS build,
+   *  long after the tarball is vendored. Until this test the invariant was held by a comment in
+   *  Package.swift asking the next author to remember. */
+  it('every nested .package(path:) a plugin declares is shipped in files[]', () => {
+    const offenders: string[] = [];
+    for (const p of pkgs) {
+      const manifest = path.join(p.dir, 'Package.swift');
+      if (!fs.existsSync(manifest)) continue;
+      // ⚠️ Strip comments FIRST — this file's own four `a name only in a comment` tests exist
+      // because a commented-out declaration must not count as declared, and the reverse is just
+      // as wrong: `// .package(path: "legacy-core")` would otherwise be reported as unshipped.
+      const src = stripSwiftComments(fs.readFileSync(manifest, 'utf8'));
+      // ⚠️ `path:` is NOT always the first argument. `.package(name: "X", path: "Y")` is legal and
+      // is the spelling Capacitor's own generated CapApp-SPM manifests use — the very form this
+      // file pins further down. An earlier version of this guard anchored on `.package(\s*path:`
+      // and was mutation-proven BLIND to that spelling: renaming the call and deleting both
+      // files[] entries left the suite fully green. Match the call, then find `path:` inside it.
+      for (const call of src.matchAll(/\.package\(([^)]*)\)/g)) {
+        const pathArg = call[1].match(/(?:^|,)\s*path:\s*"([^"]+)"/);
+        if (!pathArg) continue;                       // a url: dependency — not our business
+        const dep = pathArg[1].replace(/^\.\//, '').replace(/\/$/, '');
+        // A path dep is a DIRECTORY containing a Package.swift; both it and the sources under it
+        // must ship. `files[]` may name the directory (with or without a trailing slash — npm
+        // accepts both and ships the whole tree either way) or the concrete entries.
+        const needed = [`${dep}/Package.swift`, `${dep}/Sources/`];
+        for (const n of needed) {
+          const covered = p.files.some((f: string) => {
+            const e = f.replace(/^\.\//, '');
+            if (e === n) return true;
+            if (e === dep || e === `${dep}/`) return true;   // the whole directory is shipped
+            return e.endsWith('/') && n.startsWith(e);        // a covering prefix
+          });
+          if (!covered) offenders.push(`${p.name}: .package(path: "${dep}") but files[] omits ${n}`);
+        }
+      }
+    }
+    expect(offenders, `a nested SPM path-dependency is not shipped:\n  ${offenders.join('\n  ')}`).toEqual([]);
+  });
 });
 
 /** ----------------------------------------------------------------------------------------------
@@ -340,7 +390,7 @@ function resolveDepPackageJson(projDir: string, depName: string): { capacitor?: 
  *
  *  Deriving scope from `capacitor.ios` (rather than an allowlist naming every real plugin) is
  *  what makes the android-only plugins fall out AUTOMATICALLY instead of needing to be listed
- *  here by hand: `capacitor-game-debug`, `capacitor-modoki-ota` and `capacitor-litert-lm` declare
+ *  here by hand: `capacitor-game-debug` and `capacitor-modoki-ota` declare
  *  android-only ON PURPOSE (see this file's header — SPM's static linker strips a plugin class
  *  with no external framework dependency, so they're compiled into the App target via a pbxproj
  *  reference instead), and a project depending on one of them is correctly never expected to
@@ -375,9 +425,14 @@ function spmProjects(): { id: string; dir: string; manifest: string }[] {
  *  second test below asserts the entry is STILL absent, so that when #342 unblocks and
  *  `CapacitorApplovinMax` legitimately returns to the manifest, THIS repo's own test fails loudly
  *  (the exception no longer matches reality) and forces someone to delete the entry — rather than
- *  quietly tolerating either state forever. */
-const KNOWN_MISSING: ReadonlyArray<{ project: string; dep: string }> = [
-  { project: 'games/court', dep: 'capacitor-applovin-max' },
+ *  quietly tolerating either state forever.
+ *
+ *  Spent through `assertExemptionLedger` since #1140. The hand-rolled "still absent" test did not
+ *  check that the dep was still in package.json, so removing the plugin outright left the row
+ *  standing; the over-blessed arm covers both. */
+const KNOWN_MISSING: ReadonlyArray<{ item: string; reason: string }> = [
+  { item: 'games/court::capacitor-applovin-max',
+    reason: '#342 — AppLovin MAX is parked; its SPM product is deliberately absent from the committed Package.swift' },
 ];
 
 describe('committed Package.swift vs package.json — every SPM-iOS capacitor dep is declared (#371)', () => {
@@ -394,40 +449,29 @@ describe('committed Package.swift vs package.json — every SPM-iOS capacitor de
   it.skipIf(!hasNativeProjects())(
     'every SPM-iOS capacitor dep in package.json is declared in Package.swift',
     () => {
-      const offenders: string[] = [];
+      const undeclared: Array<{ item: string; site: string }> = [];
       for (const proj of spmProjects()) {
         const manifestText = fs.readFileSync(proj.manifest, 'utf8');
         for (const dep of iosSpmDeps(proj.dir)) {
-          if (KNOWN_MISSING.some((k) => k.project === proj.id && k.dep === dep)) continue;
           if (!isSpmDepDeclared(dep, manifestText)) {
-            offenders.push(
-              `${proj.id}: ${dep} (expected "${expectedSpmName(dep)}") is not declared in ` +
-                `${path.relative(repoRoot, proj.manifest)} — package.json depends on it and its ` +
-                `own package.json declares capacitor.ios, so \`cap sync ios\` will re-add it on ` +
-                `every build (#371).`,
-            );
+            undeclared.push({
+              item: `${proj.id}::${dep}`,
+              site: `${proj.id}: ${dep} (expected "${expectedSpmName(dep)}") is not declared in `
+                + `${path.relative(repoRoot, proj.manifest)}`,
+            });
           }
         }
       }
-      expect(offenders, offenders.join('; ')).toEqual([]);
-    },
-  );
-
-  it.skipIf(!hasNativeProjects())(
-    'the #342 AppLovin exception is still real — asserted, not just assumed',
-    () => {
-      for (const { project, dep } of KNOWN_MISSING) {
-        const proj = spmProjects().find((p) => p.id === project);
-        expect(proj, `${project}: expected to still have a committed Package.swift`).toBeTruthy();
-        if (!proj) continue;
-        const manifestText = fs.readFileSync(proj.manifest, 'utf8');
-        expect(
-          isSpmDepDeclared(dep, manifestText),
-          `${project}: ${dep} (${expectedSpmName(dep)}) is now declared in Package.swift — #342 ` +
-            `must have unblocked AppLovin's native build. Delete this KNOWN_MISSING entry (see ` +
-            `commit e34e8d8fe) rather than loosening this assertion.`,
-        ).toBe(false);
-      }
+      assertExemptionLedger({
+        label: 'KNOWN_MISSING in capacitorPlatformDeclarations',
+        population: undeclared,
+        exempt: KNOWN_MISSING,
+        floor: 1,
+        fix: 'package.json depends on these and their own package.json declares capacitor.ios, so '
+          + '`cap sync ios` will re-add them on every build (#371). A KNOWN_MISSING row that blesses '
+          + 'more than exists means #342 unblocked (or the plugin was removed): delete the row '
+          + '(see commit e34e8d8fe) rather than loosening this assertion.',
+      });
     },
   );
 
@@ -466,6 +510,97 @@ describe('committed Package.swift vs package.json — every SPM-iOS capacitor de
       const spm =
         '.package(name: "CapacitorModokiIap", path: "../../../node_modules/capacitor-modoki-iap")';
       expect(isSpmDepDeclared('capacitor-modoki-iap', spm)).toBe(true);
+    });
+  });
+});
+
+/** #991: a `'no-spm'` leg in `nativePluginLegs.mjs` asserts a PREMISE, and this is where it expires.
+ *
+ *  The row it replaced carried `knownFail: '#991'`, whose one virtue was self-expiry — a knownFail
+ *  leg that PASSES is reported as a failure telling you to delete the marker. That virtue is why
+ *  the replacement has to be checked somewhere, or `'no-spm'` becomes the standing exemption
+ *  nobody revisits that #991 explicitly warned about.
+ *
+ *  ⚠️ It is checked HERE rather than in the native gate, and that is an improvement rather than a
+ *  relocation. `knownFail` could only expire on a machine with macOS **and** Xcode running
+ *  `npm run test:native`, which is rare and manual. This file runs under `npm run verify` — every
+ *  push, every clone, no toolchain — so the row now goes stale in front of the person who made it
+ *  stale, not months later in front of somebody else.
+ *
+ *  ⚠️ Deliberately NO vacuity floor on the row count. Zero `'no-spm'` rows is the SUCCESS state
+ *  (it means #991 got genuinely fixed and the row was removed), so `expect(rows.length)
+ *  .toBeGreaterThan(0)` would fail the repo for doing the right thing. The rule is protected from
+ *  passing vacuously by the fixtures below instead — the same answer this file already reaches for
+ *  in `missingSpmDeps`' own describe block, and for the same reason. */
+export function noSpmPremiseProblems(pkgJsonText: string, podspecText: string, spmText: string): string[] {
+  const problems: string[] = [];
+  const platforms = Object.keys((JSON.parse(pkgJsonText).capacitor ?? {}) as Record<string, unknown>);
+  if (platforms.includes('ios')) {
+    problems.push('package.json now declares capacitor.ios — cap sync WILL add the SPM package, so this is an SPM consumer and the row should be \'spm\'');
+  }
+  if (!missingSpmDeps(podspecText, spmText).length) {
+    problems.push('Package.swift now declares every dependency the podspec does — an SPM build can resolve, so the row should be \'spm\' and the leg should actually run');
+  }
+  return problems;
+}
+
+describe("#991 a 'no-spm' leg's premise, asserted where it will actually be read", () => {
+  const rows = (PLUGIN_CLASS_LEGS as { dir: string; shape: string }[])
+    .filter((l) => l.shape === 'no-spm')
+    .filter((l) => fs.existsSync(path.join(repoRoot, l.dir)));
+
+  it('every no-spm package still cannot be an SPM consumer', () => {
+    for (const row of rows) {
+      const dir = path.join(repoRoot, row.dir);
+      const podspecName = fs.readdirSync(dir).find((f) => f.endsWith('.podspec'));
+      const manifest = path.join(dir, 'Package.swift');
+      // ⚠️ These two files ARE the row's stated evidence, so their disappearance invalidates it as
+      // surely as their contents changing. Skipping quietly when one is missing is how the check
+      // would go green on a package that had been restructured out from under it.
+      expect(podspecName, `${row.dir} is 'no-spm' but ships no podspec — the row's reasoning cites one`).toBeTruthy();
+      expect(fs.existsSync(manifest), `${row.dir} is 'no-spm' but has no Package.swift — the row's reasoning cites one`).toBe(true);
+      const problems = noSpmPremiseProblems(
+        fs.readFileSync(path.join(dir, 'package.json'), 'utf8'),
+        fs.readFileSync(path.join(dir, podspecName!), 'utf8'),
+        fs.readFileSync(manifest, 'utf8'),
+      );
+      expect(
+        problems,
+        `${row.dir}'s 'no-spm' row is STALE: ${problems.join('; ')}. Update the row in engine/scripts/nativePluginLegs.mjs.`,
+      ).toEqual([]);
+    }
+  });
+
+  describe('noSpmPremiseProblems — the rule itself, on fixtures', () => {
+    const POD = "s.dependency 'Capacitor'\ns.dependency 'MediaPipeTasksGenAI'\n";
+    const SPM_WITHOUT = 'let package = Package(name: "X", dependencies: [.package(url: "https://github.com/ionic-team/capacitor-swift-pm.git", from: "8.0.0")])';
+    const SPM_WITH = `${SPM_WITHOUT}\n.package(name: "MediaPipeTasksGenAI", path: "./vendor")`;
+    const ANDROID_ONLY = JSON.stringify({ capacitor: { android: { src: 'android' } } });
+    const BOTH = JSON.stringify({ capacitor: { android: { src: 'android' }, ios: { src: 'ios' } } });
+
+    it('is satisfied by the state the row actually describes', () => {
+      expect(noSpmPremiseProblems(ANDROID_ONLY, POD, SPM_WITHOUT)).toEqual([]);
+    });
+
+    it('flags the row once the manifest gains the podspec dependency', () => {
+      expect(noSpmPremiseProblems(ANDROID_ONLY, POD, SPM_WITH)).toHaveLength(1);
+    });
+
+    it('flags the row once package.json declares ios', () => {
+      expect(noSpmPremiseProblems(BOTH, POD, SPM_WITHOUT)).toHaveLength(1);
+    });
+
+    it('flags BOTH when the package has fully become an SPM consumer', () => {
+      // The case that matters most and is easiest to get wrong: an early `return` on the first
+      // problem would report one, and the operator would fix one thing and re-run into the other.
+      expect(noSpmPremiseProblems(BOTH, POD, SPM_WITH)).toHaveLength(2);
+    });
+
+    it('a dependency named only in a COMMENT does not satisfy the manifest', () => {
+      // The exact disarming that already happened once to `missingSpmDeps` (see its docblock): the
+      // commit that added that rule also wrote MediaPipeTasksGenAI into this manifest's prose.
+      const commented = `${SPM_WITHOUT}\n// TODO: add MediaPipeTasksGenAI once Google ships an SPM distribution`;
+      expect(noSpmPremiseProblems(ANDROID_ONLY, POD, commented)).toEqual([]);
     });
   });
 });

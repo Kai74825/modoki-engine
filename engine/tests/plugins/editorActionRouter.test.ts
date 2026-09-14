@@ -3,7 +3,8 @@
  *  /api/import-file (request validation). These prove the routing/guard logic
  *  without a live renderer — requestBrowser is mocked. */
 
-import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach, afterAll } from 'vitest';
+import { relay } from './backendRelay';
 import os from 'os';
 import fs from 'fs';
 import path from 'path';
@@ -11,6 +12,7 @@ import { fileURLToPath } from 'url';
 import { handleBackendRequest, type BackendContext, type Manifest } from '../../plugins/backend/editorBackendRouter';
 import { DEFAULT_PROJECT_CONFIG, PRIVATE_BUILD_FIELDS } from '../../project-config';
 import { readScannedSource } from '@modoki/engine/testing';
+import { makeScratchDir } from '@modoki/engine/testing/scratchDir';
 
 function makeCtx(over: Partial<BackendContext> = {}): BackendContext {
   const base = {
@@ -23,7 +25,12 @@ function makeCtx(over: Partial<BackendContext> = {}): BackendContext {
     // Required by BackendContext: every write route fingerprints its own write so the
     // watcher skips it. Absent here, /api/create-asset threw once its guard was added.
     markEditorWrite: () => {},
-    requestBrowser: async () => ({}),
+    // ⚠️ Default = a renderer that ANSWERS and holds nothing, which is what `async () => ({})`
+    // used to mean for the one op that existed. It is no longer expressible as a single object:
+    // `resolve-unsaved` needs a `covers` list, and a reply without one is correctly read as "the
+    // renderer could not answer" — so the old default silently turned every scene-mutate case into
+    // a 503. Cases that want a busy or absent renderer override this with a throwing stub.
+    requestBrowser: relay(),
     getSchema: () => undefined,
     invalidateProjectConfig: () => {},
   };
@@ -118,6 +125,29 @@ describe('/api/editor-action', () => {
     const ctx = makeCtx({ requestBrowser: async () => { throw new Error('something went sideways'); } });
     const r = (await post('/api/editor-action', { action: 'undo' }, ctx)) as { status?: number };
     expect(r.status).toBe(400);
+  });
+
+  /** #1012 — this route relayed with a bare `json(raw)`, so a coded refusal an op RETURNED (or threw
+   *  as `OpRefusal`) left as a 200. It carries most of the ops that name a code. */
+  it('relays a CODED refusal on its code\'s status, body intact — not as a 200', async () => {
+    const envelope = { ok: false, code: 'NOT_FOUND', error: 'stale guid', options: ['g1'] };
+    const ctx = makeCtx({ requestBrowser: async () => envelope });
+    const r = (await post('/api/editor-action', { action: 'reparent-entity', guid: 'x' }, ctx)) as { status?: number; body?: unknown };
+    expect(r.status).toBe(400);
+    expect(r.body).toEqual(envelope);
+  });
+
+  it('NO_RENDERER travels on 503 here too — one code, one status', async () => {
+    const ctx = makeCtx({ requestBrowser: async () => ({ ok: false, code: 'NO_RENDERER', error: 'nothing is rendering' }) });
+    const r = (await post('/api/editor-action', { action: 'undo' }, ctx)) as { status?: number };
+    expect(r.status).toBe(503);
+  });
+
+  it('an UNCODED {ok:false, reason} still answers 200 — only a named code earns a status (accept side)', async () => {
+    const ctx = makeCtx({ requestBrowser: async () => ({ ok: false, reason: 'nothing to undo' }) });
+    const r = (await post('/api/editor-action', { action: 'undo' }, ctx)) as { status?: number; body?: unknown };
+    expect(r.status ?? 200).toBe(200);
+    expect(r.body).toEqual({ ok: false, reason: 'nothing to undo' });
   });
 });
 
@@ -218,6 +248,59 @@ describe('/api/eval', () => {
   });
 });
 
+describe('/api/wait-for (#1154)', () => {
+  it('forwards the body whole, and sizes the relay deadline past the op\'s own clamped park', async () => {
+    const requestBrowser = vi.fn(async () => ({ satisfied: true, elapsedMs: 3 }));
+    const body = { chrome: { label: 'OK' }, timeoutMs: 20_000 };
+    const r = (await post('/api/wait-for', body, makeCtx({ requestBrowser }))) as { body: unknown };
+    expect(requestBrowser).toHaveBeenCalledWith('wait-for', body, 30_000);
+    expect(r.body).toEqual({ satisfied: true, elapsedMs: 3 });
+    await post('/api/wait-for', { editor: { runMode: 'x' }, timeoutMs: 999_999 }, makeCtx({ requestBrowser }));
+    expect(requestBrowser).toHaveBeenLastCalledWith('wait-for', expect.anything(), 130_000);
+    await post('/api/wait-for', { editor: { runMode: 'x' } }, makeCtx({ requestBrowser }));
+    expect(requestBrowser).toHaveBeenLastCalledWith('wait-for', expect.anything(), 15_000);
+  });
+});
+
+describe('/api/module-url (#1155)', () => {
+  const answer = { url: '/packages/a.ts', file: '/repo/engine/packages/a.ts', inGraph: true };
+
+  it('400 without a path — before the host is ever asked', async () => {
+    const resolveModuleUrl = vi.fn();
+    const r = (await get('/api/module-url', makeCtx({ resolveModuleUrl }))) as { status?: number };
+    expect(r.status).toBe(400);
+    expect(resolveModuleUrl).not.toHaveBeenCalled();
+  });
+
+  it('503 on a host with no module graph, rather than a derived URL it cannot vouch for', async () => {
+    const r = (await get('/api/module-url?path=/packages/a.ts', makeCtx())) as { status?: number; body: { error: string } };
+    expect(r.status).toBe(503);
+    expect(r.body.error).toMatch(/module graph/);
+  });
+
+  it('passes the spec through and returns the resolution', async () => {
+    const resolveModuleUrl = vi.fn(async () => answer);
+    const r = (await get(`/api/module-url?path=${encodeURIComponent('/@fs/repo/engine/packages/a.ts')}`, makeCtx({ resolveModuleUrl }))) as { status?: number; body: unknown };
+    expect(resolveModuleUrl).toHaveBeenCalledWith('/@fs/repo/engine/packages/a.ts');
+    expect(r.status).toBeUndefined();
+    expect(r.body).toEqual(answer);
+  });
+
+  it('a forwarded failure keeps the status its host gave it', async () => {
+    const r = (await get('/api/module-url?path=/a.ts', makeCtx({ resolveModuleUrl: async () => ({ error: 'module graph unreachable: boom', status: 502 }) }))) as { status?: number; body: unknown };
+    expect(r.status).toBe(502);
+    expect(r.body).toEqual({ error: 'module graph unreachable: boom' });
+  });
+
+  it('a spec that names no file is the caller\'s 400; an unreachable graph is a 502', async () => {
+    const bad = (await get('/api/module-url?path=/nope.ts', makeCtx({ resolveModuleUrl: async () => ({ error: 'no such file: /nope.ts' }) }))) as { status?: number };
+    expect(bad.status).toBe(400);
+    const down = (await get('/api/module-url?path=/a.ts', makeCtx({ resolveModuleUrl: async () => { throw new Error('ECONNREFUSED'); } }))) as { status?: number; body: { error: string } };
+    expect(down.status).toBe(502);
+    expect(down.body.error).toMatch(/ECONNREFUSED/);
+  });
+});
+
 describe('/api/editor-state', () => {
   it('relays the editor-state op', async () => {
     const requestBrowser = vi.fn(async () => ({ playState: 'stopped', selection: { entityId: 3 } }));
@@ -270,7 +353,7 @@ describe('/api/asset-schema + /api/asset-write (Phase C, host-side)', () => {
     const ctx = () => makeCtx({ resolveAssetPath: (p: string) => path.join(dir, path.basename(p)) });
     const readBack = (name: string) => JSON.parse(fs.readFileSync(path.join(dir, name), 'utf-8'));
 
-    beforeEach(() => { dir = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-assetwrite-')); });
+    beforeEach(() => { dir = makeScratchDir('modoki-assetwrite-'); });
     afterEach(() => { fs.rmSync(dir, { recursive: true, force: true }); });
 
     it('ANIMATION: keeps the existing id when data omits it (the empty-string trap)', async () => {
@@ -315,7 +398,7 @@ describe('/api/asset-schema + /api/asset-write (Phase C, host-side)', () => {
     let dir: string;
     const ctx = () => makeCtx({ resolveAssetPath: (p: string) => path.join(dir, p.replace(/^\/games\/x\//, '')) });
 
-    beforeEach(() => { dir = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-createasset-')); });
+    beforeEach(() => { dir = makeScratchDir('modoki-createasset-'); });
     afterEach(() => { fs.rmSync(dir, { recursive: true, force: true }); });
 
     it('creates the parent directories rather than throwing ENOENT', async () => {
@@ -365,7 +448,7 @@ describe('/api/read-meta (F10: outside-root & missing-asset are not a silent {})
   });
 
   it('200 raw when the asset EXISTS but has no sidecar — now unambiguously "no sidecar"', async () => {
-    const asset = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-meta-')), 'x.glb');
+    const asset = path.join(makeScratchDir('modoki-meta-'), 'x.glb');
     fs.writeFileSync(asset, 'glb-bytes');
     const ctx = makeCtx({ resolveAssetPath: (p: string) => p });
     const r = (await get('/api/read-meta?path=' + encodeURIComponent(asset), ctx)) as { kind?: string; status?: number; body: string };
@@ -377,9 +460,9 @@ describe('/api/read-meta (F10: outside-root & missing-asset are not a silent {})
 
 describe('/api/import-file (F11: an unrecognized type is not a phantom success)', () => {
   it('copies the file but returns ok:false 422 when nothing registers as an asset', async () => {
-    const src = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-imp-')), 'thing.xyz');
+    const src = path.join(makeScratchDir('modoki-imp-'), 'thing.xyz');
     fs.writeFileSync(src, 'not an asset');
-    const destFolder = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-dest-'));
+    const destFolder = makeScratchDir('modoki-dest-');
     const ctx = makeCtx({
       resolveAssetPath: (p: string) => p,   // destFolder resolves to itself (a real dir)
       absToAssetUrl: (p: string) => p,      // dest abs → a "url"
@@ -398,13 +481,210 @@ describe('/api/import-file (F11: an unrecognized type is not a phantom success)'
   });
 });
 
+/** #889 phase 2 — the two validators DISCLOSE the unsaved work they could not see.
+ *
+ *  ⚠️ **What `unsavedGateCoverage.test.ts` proves and what it cannot.** That guard is structural:
+ *  it reads the router source and asserts these routes CALL `unsavedGate` and declare registries a
+ *  superset of what their helpers can read. It cannot see whether the disclosure reaches the
+ *  response BODY — a route could gate correctly and drop the fields on the floor, which is exactly
+ *  the defect phase 1's own close-out found one route over (the wiring reached the MCP surface and
+ *  the human path threw it away). So the body is asserted here.
+ *
+ *  Owner ruling 2026-09-09: DISCLOSE, do not refuse. These answer 200 either way; a read that
+ *  refuses is worse than one that admits what it could not see.
+ */
+describe('/api/validate-scene and /api/validate-prefab — stale-input disclosure', () => {
+  let seq = 0;
+  /** ⚠️ **Returns an ASSET-URL path, not a native one, and that is load-bearing on Windows.**
+   *
+   *  This used to return `path.join(os.tmpdir(), …)`, which is `/var/folders/…` on macOS and
+   *  `E:\dev-temp\…` on Windows. The route keys its staleness gate on
+   *  `normalizeAssetUrl(requestedPath)`, whose first act is `startsWith('/') ? p : '/' + p` — so the
+   *  macOS spelling passed through unchanged and matched the held path, while the Windows one
+   *  became `/E:\dev-temp\…` and matched nothing. `staleInputs` came back `undefined` and the case
+   *  failed on Windows only.
+   *
+   *  ⚠️ It is the FIXTURE that was wrong, not the route. Production `resolveAssetPath` resolves
+   *  only paths under an asset root's `urlPrefix`, so a native absolute path never gets past the
+   *  404 and never reaches the gate — the shape only exists here, because `makeCtx`'s stub is
+   *  identity and lets through what production rejects. Fixing `normalizeAssetUrl` for it would
+   *  widen production code to serve a path production cannot produce.
+   *
+   *  So the fixture now speaks the vocabulary the route actually takes, and `resolveDir` maps it
+   *  onto the real temp file — the same shape the `/games/x/…` cases above already use. */
+  const dir = makeScratchDir('modoki-validate-', { canonical: true });
+  const resolveDir = (p: string) => path.join(dir, path.basename(p));
+  // Created once at collection, so it needs one teardown — otherwise every run leaves a
+  // `modoki-validate-*` directory behind. (The old fixture wrote loose files straight into
+  // os.tmpdir(), so this is not a regression in kind, but it is a whole directory per run.)
+  afterAll(() => { fs.rmSync(dir, { recursive: true, force: true }); });
+  const tempFile = (name: string, doc: unknown): string => {
+    const url = `/assets/modoki-validate-${process.pid}-${seq++}-${name}`;
+    fs.writeFileSync(resolveDir(url), JSON.stringify(doc));
+    return url;
+  };
+  const scene = () => tempFile('s.scene.json', { entities: [] });
+  const prefab = () => tempFile('p.prefab.json', { id: 'pf', version: 2, name: 'P', rootLocalId: 1, entities: [{ localId: 1, name: 'P', traits: {} }] });
+  const held = (path: string, registry: string, detail: string) => [{ path, registry, detail }];
+  /** `makeCtx` with the asset resolver these fixtures need. The base stub is identity, which is
+   *  what let a native path reach the route at all — see `tempFile` above. */
+  const ctxFor = (over: Partial<BackendContext> = {}): BackendContext =>
+    makeCtx({ resolveAssetPath: resolveDir, ...over });
+
+  it('validate-scene discloses, and still answers 200 with its warnings', async () => {
+    const scenePath = scene();
+    const ctx = ctxFor({ requestBrowser: relay({
+      holds: held('/assets/prefabs/Badge.prefab.json', 'liveScene', 'unsaved live-world edits in the PREFAB open for editing'),
+    }) });
+
+    const r = (await get(`/api/validate-scene?path=${encodeURIComponent(scenePath)}`, ctx)) as
+      { status?: number; body: { warnings?: unknown[]; staleInputs?: Array<{ path: string }>; staleInputsNote?: string } };
+
+    expect(r.status ?? 200).toBe(200);
+    expect(Array.isArray(r.body.warnings), 'it still validates').toBe(true);
+    expect(r.body.staleInputs?.map((h) => h.path)).toEqual(['/assets/prefabs/Badge.prefab.json']);
+    expect(r.body.staleInputsNote).toMatch(/computed from the files on DISK/);
+  });
+
+  it('validate-scene DOES disclose parked import settings — the manifest is derived from them', async () => {
+    // ⚠️ The regression case. A first pass narrowed this route's ask by asking "which pass reads
+    // a .meta.json?" — neither does — and dropped `pendingMeta`. Wrong question: `assetExists`
+    // tests membership in the MANIFEST, and `vite-asset-scanner` emits a texture's auto
+    // whole-image `sprite` sub-entry only when the SIDECAR types it `2d`/`ui`. So parking a Type
+    // change from `2d` to `3d` deletes a guid the scene references, and the dangling-ref warning
+    // appears at the human's next Cmd+S and not before. Under-disclosure, the dangerous direction.
+    const ctx = ctxFor({ requestBrowser: relay({
+      holds: held('/assets/textures/logo.png', 'pendingMeta', 'unsaved import settings'),
+    }) });
+
+    const r = (await get(`/api/validate-scene?path=${encodeURIComponent(scene())}`, ctx)) as
+      { body: { staleInputs?: Array<{ path: string }> } };
+
+    expect(r.body.staleInputs?.map((h) => h.path)).toEqual(['/assets/textures/logo.png']);
+  });
+
+  it('validate-scene does NOT disclose a pending baseScene ref — it cannot change the verdict', async () => {
+    // The other half of the correction. `sceneValidation.ts` contains the string "baseScene" zero
+    // times: this route parses one file and validates it alone, and `baseScene` is a top-level
+    // scene field rather than a trait, so the ref walk never reaches it. Declaring it would
+    // caveat EVERY validate call on EVERY scene for a park that moves nothing.
+    const ctx = ctxFor({ requestBrowser: relay({
+      holds: held('/assets/scenes/Level-02.scene.json', 'pendingBaseScene', 'an unsaved baseScene ref'),
+    }) });
+
+    const r = (await get(`/api/validate-scene?path=${encodeURIComponent(scene())}`, ctx)) as
+      { body: Record<string, unknown> };
+
+    expect('staleInputs' in r.body).toBe(false);
+  });
+
+  it('validate-scene is GLOBAL — an unsaved PREFAB elsewhere changes its answer, so it is disclosed', async () => {
+    // ⚠️ **This case used to be fixtured on a `dirtyAsset` MATERIAL while its title said PREFAB**,
+    // and it passed — because the route asked for all four registries. It was pinning a
+    // false-positive disclosure as intended behaviour, and arguing the prefab-resolver case in a
+    // comment while asserting the asset one. `makeAssetResolver` is a membership test over
+    // manifest GUIDs; no parked asset document can move a warning.
+    //
+    // What the route really depends on is `makePrefabResolver`, and the only registry that can
+    // hold an unsaved prefab is `liveScene` (prefab-edit). GLOBAL still matters: the prefab is
+    // NOT this scene's path, so a path-scoped probe would report nothing and look precise.
+    // ⚠️ The fixture is a prefab that is NOT this scene's path, which is the whole point of the
+    // case — a path-scoped probe would report nothing here and look precise doing it. (It was
+    // briefly byte-identical to the case above, which made it assert nothing the other did not.)
+    const scenePath = scene();
+    const ctx = ctxFor({ requestBrowser: relay({
+      holds: [
+        { path: '/assets/prefabs/Elsewhere.prefab.json', registry: 'liveScene', detail: 'unsaved live-world edits in the PREFAB open for editing' },
+      ],
+    }) });
+
+    const r = (await get(`/api/validate-scene?path=${encodeURIComponent(scenePath)}`, ctx)) as
+      { body: { staleInputs?: Array<{ path: string }> } };
+
+    expect(r.body.staleInputs?.map((h) => h.path)).toEqual(['/assets/prefabs/Elsewhere.prefab.json']);
+    expect(r.body.staleInputs?.map((h) => h.path)).not.toContain(scenePath);
+  });
+
+  it('validate-scene does NOT disclose a parked ASSET document — it cannot change the verdict', async () => {
+    // The accept side of the narrowed scope, and the case that would have caught the original
+    // error. A human dragging a Material slider must not make an unrelated, perfectly clean scene
+    // report as stale — the agent then burns a turn on save_all, which writes their parked edits
+    // to disk unasked, for a byte-identical answer.
+    const ctx = ctxFor({ requestBrowser: relay({
+      holds: held('/assets/materials/rock.mat.json', 'dirtyAsset', 'an unsaved asset document'),
+    }) });
+
+    const r = (await get(`/api/validate-scene?path=${encodeURIComponent(scene())}`, ctx)) as
+      { body: Record<string, unknown> };
+
+    expect('staleInputs' in r.body).toBe(false);
+  });
+
+  it('validate-prefab is PATH-SCOPED — its own document is disclosed', async () => {
+    // Reachable only because `dirtyWorldTarget` gives the prefab-edit world the prefab's own path
+    // (see prefabEditUnsavedProbe.test.ts). A prefab is not an AssetSchemaType, so `dirtyAsset`
+    // can never hold one — before that fix this disclosure could not fire at all.
+    const prefabPath = prefab();
+    const ctx = ctxFor({ requestBrowser: relay({
+      holds: held(prefabPath, 'liveScene', 'unsaved live-world edits in the PREFAB open for editing'),
+    }) });
+
+    const r = (await get(`/api/validate-prefab?path=${encodeURIComponent(prefabPath)}`, ctx)) as
+      { status?: number; body: { warnings?: unknown[]; staleInputs?: Array<{ path: string }> } };
+
+    expect(r.status ?? 200).toBe(200);
+    expect(r.body.staleInputs?.map((h) => h.path)).toEqual([prefabPath]);
+  });
+
+  it('validate-prefab does NOT disclose an unrelated document', async () => {
+    // The scope, and the reason it differs from validate-scene: `validatePrefabData` consults no
+    // resolver, so nothing but this document can change its answer. Caveating a correct answer
+    // because some particle is dirty trains readers to skip the field.
+    const prefabPath = prefab();
+    const ctx = ctxFor({ requestBrowser: relay({
+      holds: held('/assets/particles/spark.particle.json', 'dirtyAsset', 'an unsaved asset document'),
+    }) });
+
+    const r = (await get(`/api/validate-prefab?path=${encodeURIComponent(prefabPath)}`, ctx)) as
+      { body: Record<string, unknown> };
+
+    expect('staleInputs' in r.body).toBe(false);
+  });
+
+  it('ACCEPT — a clean editor gets NO disclosure fields at all', async () => {
+    // Absent, never `staleInputs: []`. A field present on every call is one readers learn to skip,
+    // and then the call that matters is skipped too.
+    const sceneBody = ((await get(`/api/validate-scene?path=${encodeURIComponent(scene())}`, ctxFor())) as { body: Record<string, unknown> }).body;
+    const prefabBody = ((await get(`/api/validate-prefab?path=${encodeURIComponent(prefab())}`, ctxFor())) as { body: Record<string, unknown> }).body;
+
+    for (const body of [sceneBody, prefabBody]) {
+      expect('staleInputs' in body).toBe(false);
+      expect('staleInputsNote' in body).toBe(false);
+      expect('staleInputsUnknown' in body).toBe(false);
+    }
+  });
+
+  it('a renderer that did not answer is disclosed as UNKNOWN, not as clean', async () => {
+    // The distinction the whole probe exists for. "Could not look" reported as "nothing is there"
+    // is worse here than no disclosure, because the answer then reads as verified.
+    const ctx = ctxFor({ requestBrowser: async () => { throw new Error('timed out waiting for the renderer'); } });
+
+    const r = (await get(`/api/validate-scene?path=${encodeURIComponent(scene())}`, ctx)) as
+      { body: { staleInputsUnknown?: { reason: string }; staleInputsNote?: string } };
+
+    expect(r.body.staleInputsUnknown?.reason).toMatch(/timed out/);
+    expect(r.body.staleInputsNote).toMatch(/could NOT be checked/);
+  });
+});
+
 describe('/api/scene-mutate (play-mode guard)', () => {
   // The mutate handler reads/writes a real scene file, so each case gets a temp
   // scene on disk. resolveAssetPath is identity (makeCtx default), so the abs
   // temp path passed as `body.path` resolves straight through.
   let seq = 0;
   function tempScene(): string {
-    const p = path.join(os.tmpdir(), `modoki-mutate-guard-${process.pid}-${seq++}.json`);
+    // Inside a scratch dir: a bare `os.tmpdir()` file here was never removed (32 per run, #1117).
+    const p = path.join(makeScratchDir('modoki-mutate-guard-'), `scene-${seq++}.json`);
     fs.writeFileSync(p, JSON.stringify({
       entities: [{ id: 1, name: 'Box', traits: { Transform: { x: 0, y: 0 }, EntityAttributes: { name: 'Box', guid: 'g-box' } } }],
     }));
@@ -419,7 +699,7 @@ describe('/api/scene-mutate (play-mode guard)', () => {
     it(`refuses with 409 while ${playState}, leaving the file untouched`, async () => {
       const scenePath = tempScene();
       const before = fs.readFileSync(scenePath, 'utf-8');
-      const ctx = makeCtx({ requestBrowser: vi.fn(async () => ({ playState })) });
+      const ctx = makeCtx({ requestBrowser: relay({ editorState: { playState } }) });
       const r = (await post('/api/scene-mutate', setX(scenePath), ctx)) as { status?: number; body: { playState?: string } };
       expect(r.status).toBe(409);
       expect(r.body.playState).toBe(playState);
@@ -428,12 +708,170 @@ describe('/api/scene-mutate (play-mode guard)', () => {
     });
   }
 
+  /** #1122 — the scrub/preview ENVELOPE, which the Play guard above structurally cannot see.
+   *
+   *  `playState` is a 3-value compat shim in which `scrub` and `preview` both read back as
+   *  'stopped', so the loop above passes them straight through. `canEdit()` names *mutate* as
+   *  unsafe there and already gates save + prefab-edit; this route was the agent's authoring entry
+   *  point with no envelope guard at all, so a mutate mid-preview returned `{ok:true, changed:N}`,
+   *  read back correctly, and evaporated when the human left the preview.
+   *
+   *  The accept cases below are load-bearing, not padding: a guard that refuses `runMode` it does
+   *  not recognise would pass every refusal case here and break every ordinary headless edit. */
+  describe('the scrub/preview envelope (#1122)', () => {
+    for (const runMode of ['scrub', 'preview'] as const) {
+      it(`refuses with 409 while in a ${runMode} envelope, leaving the file untouched`, async () => {
+        const scenePath = tempScene();
+        const before = fs.readFileSync(scenePath, 'utf-8');
+        // playState is 'stopped' here BY CONSTRUCTION — that is the whole defect. A fixture that
+        // reported anything else would be testing the Play guard over again.
+        const ctx = makeCtx({ requestBrowser: relay({ editorState: { playState: 'stopped', runMode, modeOwner: 'timeline' } }) });
+
+        const r = (await post('/api/scene-mutate', setX(scenePath), ctx)) as
+          { status?: number; body: { ok: boolean; code?: string; runMode?: string; error?: string } };
+
+        expect(r.status).toBe(409);
+        expect(r.body.code).toBe('PREVIEW_ENVELOPE');
+        expect(r.body.runMode).toBe(runMode);
+        expect(r.body.error).toMatch(/reverts on Exit/);
+        expect(fs.readFileSync(scenePath, 'utf-8'), 'nothing was written').toBe(before);
+      });
+    }
+
+    it('names exit_pose_envelope for an ANIMATION-owned envelope — an exit that really works there', async () => {
+      const ctx = makeCtx({ requestBrowser: relay({ editorState: { playState: 'stopped', runMode: 'scrub', modeOwner: 'animation' } }) });
+      const r = (await post('/api/scene-mutate', setX(tempScene()), ctx)) as
+        { body: { modeOwner?: string; options?: string[] } };
+
+      expect(r.body.modeOwner).toBe('animation');
+      expect(r.body.options?.join(' ')).toMatch(/modoki_exit_pose_envelope/);
+    });
+
+    it('does NOT offer exit_pose_envelope for a TIMELINE-owned envelope — there it always refuses', async () => {
+      // §5's bar: a refusal names REAL exits. `exitPoseEnvelope` is ownership-guarded and will not
+      // end the Timeline panel's session (ending it would revert that world mid-run), so listing it
+      // here would spend the agent a turn to be told no. The human's Exit button is the real exit.
+      const ctx = makeCtx({ requestBrowser: relay({ editorState: { playState: 'stopped', runMode: 'preview', modeOwner: 'timeline' } }) });
+      const r = (await post('/api/scene-mutate', setX(tempScene()), ctx)) as
+        { body: { modeOwner?: string; options?: string[]; hint?: string } };
+
+      expect(r.body.modeOwner).toBe('timeline');
+      const options = r.body.options?.join(' ') ?? '';
+      expect(options).not.toMatch(/modoki_exit_pose_envelope/);
+      // ⚠️ The AGENT exit comes first. A draft of this refusal offered only the human's button,
+      // which stalls an unattended agent on a one-call fix: `stopPlay()` ends a timeline preview
+      // SESSION and the `stop` op is unguarded.
+      expect(options).toMatch(/modoki_play_control/);
+      // …and it must WARN, because that exit is destructive: it restores the snapshot taken when
+      // the envelope opened, discarding whatever the human authored inside it. An exit handed to
+      // an unattended agent without that caution is a trap, not a fix.
+      expect(options).toMatch(/DESTRUCTIVE/);
+      // The residual case is a session that has not finished seating (the snapshot is async), so
+      // the advice is RETRY — not the pre-Phase-3 "a plain drag-scrub holds no session".
+      expect(options).toMatch(/retry stop/);
+      expect(options, 'the stale pre-Phase-3 caveat must not come back').not.toMatch(/drag-scrub/);
+      expect(options).toMatch(/Exit Preview/);
+      // …but the agent is still TOLD why, so it does not go looking for the op itself. Warning and
+      // instruction are separate fields precisely so the option list stays purely actionable.
+      expect(r.body.hint).toMatch(/modoki_exit_pose_envelope/);
+    });
+
+    it('refuses on the LIVE path too — the branch every case above silently missed', async () => {
+      // ⚠️ REVIEW FINDING on this very change. The shared `relay()` fixture reports no
+      // `scenePath`, so `canGoLive` is false in every other case here and they ALL exercise the
+      // file-direct branch. Moving the envelope guard down into that branch would have kept the
+      // whole block green while a renderer with this scene loaded routed to `apply-scene-ops`,
+      // joined the snapshotted preview world, answered {ok:true, changed:N} — and lost the edit on
+      // Exit. That is #1122 intact, passing its own tests.
+      const scenePath = tempScene();
+      const before = fs.readFileSync(scenePath, 'utf-8');
+      const applied: string[] = [];
+      const ctx = makeCtx({
+        requestBrowser: vi.fn(async (op: string) => {
+          applied.push(op);
+          if (op === 'editor-state') return { playState: 'stopped', runMode: 'preview', modeOwner: 'timeline', scenePath };
+          if (op === 'resolve-unsaved') return { ok: true, holds: [], discarded: [], covers: ['dirtyAsset', 'pendingMeta', 'pendingBaseScene', 'liveScene'] };
+          return { ok: true, changed: 1, errors: [], warnings: [], unresolved: [] };
+        }),
+      });
+
+      const r = (await post('/api/scene-mutate', setX(scenePath), ctx)) as
+        { status?: number; body: { code?: string } };
+
+      expect(r.status).toBe(409);
+      expect(r.body.code).toBe('PREVIEW_ENVELOPE');
+      expect(applied, 'the live applier must never be reached').not.toContain('apply-scene-ops');
+      expect(fs.readFileSync(scenePath, 'utf-8'), 'and nothing was written either').toBe(before);
+    });
+
+    it('gives GENERIC advice when no modeOwner is reported — not the timeline script', async () => {
+      // ⚠️ Review finding. `modeOwner` is omit-when-null, so a renderer in an envelope with no
+      // owner seated (or a future third panel) hits this branch. A previous draft folded the
+      // generic arm into the timeline one, which then told such a caller "Stop also ends a
+      // TIMELINE preview session" and gave it the timeline-only hint — the same "nobody remembers
+      // the next one" failure the mode allowlist exists to prevent, one expression over.
+      const ctx = makeCtx({ requestBrowser: relay({ editorState: { playState: 'stopped', runMode: 'scrub' } }) });
+
+      const r = (await post('/api/scene-mutate', setX(tempScene()), ctx)) as
+        { status?: number; body: { modeOwner?: string; options?: string[]; hint?: string } };
+
+      expect(r.status).toBe(409);
+      expect('modeOwner' in r.body, 'omitted, not null').toBe(false);
+      const options = r.body.options?.join(' ') ?? '';
+      expect(options).toMatch(/Exit Preview/);
+      expect(options, 'no timeline-specific advice for an unknown owner').not.toMatch(/modoki_play_control/);
+      expect(r.body.hint, 'the timeline hint is timeline-only').toBeUndefined();
+    });
+
+    it('ACCEPT — a genuinely stopped editor still writes', async () => {
+      const scenePath = tempScene();
+      const ctx = makeCtx({ requestBrowser: relay({ editorState: { playState: 'stopped', runMode: 'stopped' } }) });
+
+      const r = (await post('/api/scene-mutate', setX(scenePath), ctx)) as { body: { ok: boolean; changed: number } };
+
+      expect(r.body.ok).toBe(true);
+      expect(r.body.changed).toBeGreaterThan(0);
+      expect(JSON.parse(fs.readFileSync(scenePath, 'utf-8')).entities[0].traits.Transform.x).toBe(5);
+    });
+
+    it('refuses an UNKNOWN future run mode — the gate is an allowlist, like canEdit()', async () => {
+      // `canEdit()` is `runMode === 'stopped'`. A gate listing the two bad modes would silently
+      // PERMIT a fifth RunMode that save already refuses, and nobody remembers to add it here.
+      const scenePath = tempScene();
+      const before = fs.readFileSync(scenePath, 'utf-8');
+      const ctx = makeCtx({ requestBrowser: relay({ editorState: { playState: 'stopped', runMode: 'some-future-mode' } }) });
+
+      const r = (await post('/api/scene-mutate', setX(scenePath), ctx)) as { status?: number; body: { code?: string } };
+
+      expect(r.status).toBe(409);
+      expect(r.body.code).toBe('PREVIEW_ENVELOPE');
+      expect(fs.readFileSync(scenePath, 'utf-8')).toBe(before);
+    });
+
+    it('ACCEPT — a renderer that reports NO runMode at all still writes', async () => {
+      // Deliberately no `?? playState` fallback in the guard: a build old enough to omit `runMode`
+      // predates the preview-mode refactor and cannot BE in scrub/preview. This pins that the
+      // missing field reads as "not in an envelope" rather than refusing every older renderer.
+      const scenePath = tempScene();
+      const ctx = makeCtx({ requestBrowser: relay({ editorState: { playState: 'stopped' } }) });
+
+      const r = (await post('/api/scene-mutate', setX(scenePath), ctx)) as { body: { ok: boolean; changed: number } };
+
+      expect(r.body.ok).toBe(true);
+      expect(JSON.parse(fs.readFileSync(scenePath, 'utf-8')).entities[0].traits.Transform.x).toBe(5);
+    });
+  });
+
   it('refuses with 409 when the editor has UNSAVED live changes, leaving the file untouched (F3)', async () => {
     // The write would hot-reload the scene FILE, rebuilding the live world and destroying live-only
     // entities (create_entity / prefab) not yet saved. Refuse, like load_scene/new_scene guardUnsaved.
     const scenePath = tempScene();
     const before = fs.readFileSync(scenePath, 'utf-8');
-    const ctx = makeCtx({ requestBrowser: vi.fn(async () => ({ playState: 'stopped', unsavedChanges: true })) });
+    // The hold rows are what `resolve-unsaved` really returns — path, registry and a human detail —
+    // rather than the bare `unsavedChanges: true` boolean this route used to read off editor-state.
+    const ctx = makeCtx({ requestBrowser: relay({
+      holds: [{ path: '/assets/scenes/main.scene.json', registry: 'liveScene', detail: 'unsaved live-world edits in the OPEN scene' }],
+    }) });
     const r = (await post('/api/scene-mutate', setX(scenePath), ctx)) as { status?: number; body: { ok: boolean; unsavedChanges?: boolean; error?: string } };
     expect(r.status).toBe(409);
     expect(r.body.ok).toBe(false);
@@ -442,19 +880,123 @@ describe('/api/scene-mutate (play-mode guard)', () => {
     expect(fs.readFileSync(scenePath, 'utf-8')).toBe(before); // no write
   });
 
+  /** #889 phase 2 — §8 convergence: "the renderer did not answer" is a refusal.
+   *
+   *  ⚠️ **The behaviour these replace had NO test at all**, which is a large part of why the
+   *  divergence survived: the route caught every probe rejection into one `probeFailed` boolean,
+   *  wrote the file anyway and appended a warning, and nothing anywhere asserted on it. The
+   *  written rationale was real — a genuinely headless edit is this route's normal case — but it
+   *  rested on the two failures being indistinguishable, which `isRelayTransportFailure` +
+   *  `isRelayTimeout` had already stopped being true.
+   *
+   *  Both sides are pinned, and the pair is the point: a fix that refused everything would pass
+   *  the first two and break every headless caller, and that is exactly the trade the old code
+   *  declined to make. */
+  describe('a probe that does not answer (§8)', () => {
+    const busy = 'timed out waiting for the renderer — is the editor window open?';
+    const gone = 'no editor renderer window';
+
+    it('REFUSES 503 when a renderer may be attached and did not answer, leaving the file untouched', async () => {
+      const scenePath = tempScene();
+      const before = fs.readFileSync(scenePath, 'utf-8');
+      const ctx = makeCtx({ requestBrowser: vi.fn(async () => { throw new Error(busy); }) });
+
+      const r = (await post('/api/scene-mutate', setX(scenePath), ctx)) as
+        { status?: number; body: { ok: boolean; code?: string; error?: string; options?: string[] } };
+
+      expect(r.status).toBe(503);
+      expect(r.body.code).toBe('NO_RENDERER');
+      expect(r.body.error).toMatch(/could NOT rule out/);
+      // ⚠️ The options must not name an escape this route does not implement — it has neither
+      // `force` nor `discardUnsaved`, and an agent that spends a turn discovering the parameter is
+      // ignored is worse off than one told plainly to save.
+      expect(r.body.options?.join(' ')).not.toMatch(/force|discardUnsaved/);
+      expect(fs.readFileSync(scenePath, 'utf-8'), 'nothing was written').toBe(before);
+    });
+
+    it('treats an UNRECOGNISED probe error as unknown, not as absent', async () => {
+      // The conservative direction. A message the classifier does not know is not evidence that no
+      // renderer exists, and reading it that way is the fail-open in miniature.
+      const scenePath = tempScene();
+      const before = fs.readFileSync(scenePath, 'utf-8');
+      const ctx = makeCtx({ requestBrowser: vi.fn(async () => { throw new Error('something went sideways'); }) });
+
+      const r = (await post('/api/scene-mutate', setX(scenePath), ctx)) as { status?: number };
+      expect(r.status).toBe(503);
+      expect(fs.readFileSync(scenePath, 'utf-8')).toBe(before);
+    });
+
+    it('PROCEEDS when no renderer exists at all — the headless path still works', async () => {
+      // The accept side, and the reason this is not simply "refuse on any probe failure". Every
+      // registry the guards consult is renderer-only module state; with no renderer there is
+      // nothing that could be in the way.
+      const scenePath = tempScene();
+      const ctx = makeCtx({ requestBrowser: vi.fn(async () => { throw new Error(gone); }) });
+
+      const r = (await post('/api/scene-mutate', setX(scenePath), ctx)) as
+        { status?: number; body: { ok: boolean; changed: number; warnings: string[] } };
+
+      expect(r.body.ok).toBe(true);
+      expect(r.body.changed).toBeGreaterThan(0);
+      // Disclosed, not silent: the guards did not run, and the caller must not read a plain
+      // success as "the editor was checked and had nothing pending".
+      expect(r.body.warnings.join(' ')).toMatch(/no editor renderer is attached/);
+      expect(JSON.parse(fs.readFileSync(scenePath, 'utf-8')).entities[0].traits.Transform.x).toBe(5);
+    });
+
+    it('a renderer that DIES between the two probes still discloses that it did not check', async () => {
+      // Close-out review finding. `editor-state` answers, the window then closes, so the unsaved
+      // probe comes back `absent`. The headless disclosure was gated on the FIRST probe's outcome
+      // only, so this path wrote the file and said nothing at all about not having checked. Benign
+      // — nothing can be held with no renderer — but it was the one silent branch.
+      const scenePath = tempScene();
+      const ctx = makeCtx({ requestBrowser: vi.fn(async (op: string) => {
+        if (op === 'resolve-unsaved') throw new Error('no editor renderer window');
+        return { playState: 'stopped' };
+      }) });
+
+      const r = (await post('/api/scene-mutate', setX(scenePath), ctx)) as
+        { body: { ok: boolean; changed: number; warnings: string[] } };
+
+      expect(r.body.ok).toBe(true);
+      expect(r.body.changed).toBeGreaterThan(0);
+      // ⚠️ Its OWN sentence, not the headless one. In this path the Play-state guard really did
+      // run, against a real answer — saying "the Play-state and unsaved-work guards did not run"
+      // would be false, which is the shape of defect this whole change keeps turning up.
+      expect(r.body.warnings.join(' ')).toMatch(/answered the state probe and was GONE/);
+      expect(r.body.warnings.join(' ')).not.toMatch(/no editor renderer is attached/);
+    });
+
+    it('REFUSES when the renderer answers the unsaved probe without covering what was asked', async () => {
+      // Version skew. A renderer that answers but does not implement a registry the caller asked
+      // about is indistinguishable from one reporting "all clear" unless `covers` is checked — and
+      // this route asks for all four, so an older tab reporting three must not read as clean.
+      const scenePath = tempScene();
+      const before = fs.readFileSync(scenePath, 'utf-8');
+      const ctx = makeCtx({ requestBrowser: vi.fn(async (op: string) => (
+        op === 'resolve-unsaved'
+          ? { ok: true, holds: [], discarded: [], covers: ['dirtyAsset', 'pendingMeta', 'pendingBaseScene'] }
+          : { playState: 'stopped' }
+      )) });
+
+      const r = (await post('/api/scene-mutate', setX(scenePath), ctx)) as
+        { status?: number; body: { code?: string; error?: string } };
+
+      expect(r.status).toBe(503);
+      expect(r.body.error).toMatch(/liveScene|older build/);
+      expect(fs.readFileSync(scenePath, 'utf-8')).toBe(before);
+    });
+  });
+
   it('names the ACTUAL cause when the unsaved work is a dirty ASSET, not a fixed create_entity string (#844)', async () => {
     // Since #831 a Material slider drag parks a dirty asset the same way create_entity parks a
     // live-world edit — the fixed refusal string used to blame create_entity/duplicate_entity/
     // prefab regardless, sending an agent hunting entities it never created.
     const scenePath = tempScene();
     const before = fs.readFileSync(scenePath, 'utf-8');
-    const ctx = makeCtx({
-      requestBrowser: vi.fn(async () => ({
-        playState: 'stopped',
-        unsavedChanges: true,
-        unsavedCauses: { sceneDirty: false, dirtyAssetPaths: ['/assets/x.mat.json'], dirtyScenes: [] },
-      })),
-    });
+    const ctx = makeCtx({ requestBrowser: relay({
+      holds: [{ path: '/assets/x.mat.json', registry: 'dirtyAsset', detail: 'an unsaved asset document' }],
+    }) });
     const r = (await post('/api/scene-mutate', setX(scenePath), ctx)) as { status?: number; body: { ok: boolean; unsavedChanges?: boolean; error?: string } };
     expect(r.status).toBe(409);
     expect(r.body.unsavedChanges).toBe(true);
@@ -467,7 +1009,7 @@ describe('/api/scene-mutate (play-mode guard)', () => {
 
   it('applies the mutate when the editor is stopped', async () => {
     const scenePath = tempScene();
-    const ctx = makeCtx({ requestBrowser: vi.fn(async () => ({ playState: 'stopped' })) });
+    const ctx = makeCtx({ requestBrowser: relay({ editorState: { playState: 'stopped' } }) });
     const r = (await post('/api/scene-mutate', setX(scenePath), ctx)) as { body: { ok: boolean; changed: number } };
     expect(r.body.ok).toBe(true);
     expect(r.body.changed).toBeGreaterThan(0);
@@ -525,7 +1067,7 @@ describe('/api/scene-mutate (play-mode guard)', () => {
   // write path, that nothing read — and the wrong data besides (the pre-expansion file,
   // not the live world). Now opt-in.
   describe('scene echo', () => {
-    const stopped = () => makeCtx({ requestBrowser: vi.fn(async () => ({ playState: 'stopped' })) });
+    const stopped = () => makeCtx({ requestBrowser: relay({ editorState: { playState: 'stopped' } }) });
 
     it('omits `scene` by default, even on a successful change', async () => {
       const scenePath = tempScene();
@@ -571,7 +1113,7 @@ describe('/api/scene-mutate (play-mode guard)', () => {
   // had already been WRITTEN to disk before the call reported ok:false. ──
   describe('schema-aware field-typo guard', () => {
     const schema = { traits: { Transform: { category: 'component' as const, fields: { x: { type: 'number' as const }, y: { type: 'number' as const } } } } };
-    const stoppedWithSchema = () => makeCtx({ requestBrowser: vi.fn(async () => ({ playState: 'stopped' })), getSchema: () => schema });
+    const stoppedWithSchema = () => makeCtx({ requestBrowser: relay({ editorState: { playState: 'stopped' } }), getSchema: () => schema });
 
     it('fails ok:false when a setTrait writes an unknown field on a known trait', async () => {
       const scenePath = tempScene();
@@ -661,7 +1203,7 @@ describe('/api/scene-mutate (play-mode guard)', () => {
     it('cold start (no schema) stays warn-but-load — an unknown field is NOT failed', async () => {
       const scenePath = tempScene();
       const body = { path: scenePath, ops: [{ op: 'setTrait', entity: { id: 1 }, trait: 'Transform', fields: { xx: 5 } }] };
-      const r = (await post('/api/scene-mutate', body, makeCtx({ requestBrowser: vi.fn(async () => ({ playState: 'stopped' })) }))) as { body: { ok: boolean } };
+      const r = (await post('/api/scene-mutate', body, makeCtx({ requestBrowser: relay({ editorState: { playState: 'stopped' } }) }))) as { body: { ok: boolean } };
       expect(r.body.ok).toBe(true); // getSchema() undefined → can't know it is a typo
     });
   });
@@ -690,7 +1232,7 @@ describe('/api/invalidate-project-config', () => {
     // Its OWN temp root, not makeCtx's default os.tmpdir(): this route now READS the
     // config before writing it, so a stale or hand-broken /tmp/project.config.json
     // left by anything else on the machine would 400 the save and fail this test.
-    const projectRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'projset-inval-'));
+    const projectRoot = makeScratchDir('projset-inval-');
     try {
       await post('/api/project-settings', { app: { appName: 'X' } }, makeCtx({ invalidateProjectConfig, projectRoot }));
       expect(invalidateProjectConfig).toHaveBeenCalledTimes(1);
@@ -708,7 +1250,7 @@ describe('/api/invalidate-project-config', () => {
  *  The body is a PATCH onto what's on disk; absence means "don't touch". */
 describe('/api/project-settings is a non-destructive PATCH', () => {
   let root: string;
-  beforeEach(() => { root = fs.mkdtempSync(path.join(os.tmpdir(), 'projset-')); });
+  beforeEach(() => { root = makeScratchDir('projset-'); });
   afterEach(() => { fs.rmSync(root, { recursive: true, force: true }); });
 
   const cfgPath = () => path.join(root, 'project.config.json');
@@ -1167,6 +1709,32 @@ describe('/api/enact-handles summarizes in the ROUTER, not the op', () => {
     expect(r.body.hint).toContain('dopesheet');              // what exists
   });
 
+  it('prefix/label are FILTERS — they forward to the op and are not summarised as a bare call (#1152)', async () => {
+    const seen: Array<{ op: string; params: unknown }> = [];
+    const spy = makeCtx({
+      requestBrowser: (async (op: string, params: unknown) => { seen.push({ op, params }); return opResult; }) as BackendContext['requestBrowser'],
+    });
+    await get('/api/enact-handles?prefix=inspector.&label=Save', spy);
+    expect(seen[0]).toMatchObject({ op: 'enact-handles', params: { prefix: 'inspector.', label: 'Save' } });
+    const r = (await get('/api/enact-handles?prefix=inspector.', ctx())) as { body: { handles?: unknown[]; byEditor?: unknown } };
+    expect(r.body.handles).toHaveLength(3);
+    expect(r.body.byEditor).toBeUndefined();
+  });
+
+  it('an EMPTY prefix result names the live chrome prefixes — a closed dialog is not a typo (#1152)', async () => {
+    const live = [...HANDLES, { id: 'inspector.header.delete', editor: 'chrome', kind: 'button', x: 1, y: 1 },
+      { id: 'layout.tab.console', editor: 'chrome', kind: 'tab', x: 1, y: 1 }];
+    const ctxMiss = makeCtx({
+      requestBrowser: (async (_op: string, params: { prefix?: string } | undefined) =>
+        params?.prefix ? { ...opResult, count: 0, editors: [], handles: [] } : { ...opResult, handles: live }
+      ) as unknown as BackendContext['requestBrowser'],
+    });
+    const r = (await get('/api/enact-handles?prefix=saveAsDialog.', ctxMiss)) as { body: { hint: string } };
+    expect(r.body.hint).toContain('prefix=saveAsDialog.');
+    expect(r.body.hint).toContain('{a., b., inspector., layout.}');
+    expect(r.body.hint).not.toMatch(/[{ ]c\./); // a dopesheet key is not a chrome prefix
+  });
+
   it('…and when NOTHING is live, the miss says that instead of listing an empty set', async () => {
     const nothing = makeCtx({ requestBrowser: (async () => ({ ...opResult, count: 0, editors: [], handles: [] })) as BackendContext['requestBrowser'] });
     const r = (await get('/api/enact-handles?kind=keyframe', nothing)) as { body: { hint: string } };
@@ -1210,14 +1778,15 @@ describe('/api/asset-def', () => {
     const requestBrowser = vi.fn(async () => ({ ok: true, def: { maxParticles: 137 } }));
     const ctx = makeCtx({ requestBrowser });
     const r = (await get('/api/asset-def?path=/assets/particles/a.particle.json&type=particle', ctx)) as { body?: unknown };
-    expect(requestBrowser).toHaveBeenCalledWith('read-asset-def', { path: '/assets/particles/a.particle.json', type: 'particle' });
+    // Third arg: the route passes no timeout of its own (relayJson's optional slot, so the relay default applies).
+    expect(requestBrowser).toHaveBeenCalledWith('read-asset-def', { path: '/assets/particles/a.particle.json', type: 'particle' }, undefined);
     expect(r.body).toEqual({ ok: true, def: { maxParticles: 137 } });
   });
 
   it('omits `type` entirely when not given, so the op can infer it from the suffix', async () => {
     const requestBrowser = vi.fn(async () => ({ ok: true }));
     await get('/api/asset-def?path=/assets/particles/a.particle.json', makeCtx({ requestBrowser }));
-    expect(requestBrowser).toHaveBeenCalledWith('read-asset-def', { path: '/assets/particles/a.particle.json' });
+    expect(requestBrowser).toHaveBeenCalledWith('read-asset-def', { path: '/assets/particles/a.particle.json' }, undefined);
   });
 
   it('400 when the asset is not in the live cache — the op answering, not a dead gateway', async () => {
@@ -1230,6 +1799,76 @@ describe('/api/asset-def', () => {
   it('504 when the RELAY is down', async () => {
     const ctx = makeCtx({ requestBrowser: async () => { throw new Error('no editor renderer window'); } });
     const r = (await get('/api/asset-def?path=/x.particle.json', ctx)) as { status?: number };
+    expect(r.status).toBe(504);
+  });
+
+  it('a CODED refusal is a 400, not a 200 — the GET tool runs no checkFailure, so a 200 reads as success (#1012)', async () => {
+    const envelope = { ok: false, code: 'NOT_FOUND', error: 'no such def' };
+    const ctx = makeCtx({ requestBrowser: async () => envelope });
+    const r = (await get('/api/asset-def?path=/x.particle.json', ctx)) as { status?: number; body?: unknown };
+    expect(r.status).toBe(400);
+    expect(r.body).toEqual(envelope);
+  });
+});
+
+/** `GET /api/asset-meta` — the agent's sidecar read, preferring a parked Inspector edit (#872).
+ *  It had no route test. Its catch differs from `relayJson`'s (a transport failure falls back to the
+ *  disk read), so the envelope check sits in its `try` — which is exactly the shape that can drift. */
+describe('/api/asset-meta', () => {
+  const dir = makeScratchDir('asset-meta-1012-');
+  const asset = path.join(dir, 'tex.png');
+  fs.writeFileSync(asset, 'png');
+  afterAll(() => fs.rmSync(dir, { recursive: true, force: true }));
+
+  it('relays the op\'s answer as-is when it has one', async () => {
+    const reply = { ok: true, path: asset, meta: { type: '2d' }, source: 'pending' };
+    const r = (await get(`/api/asset-meta?path=${asset}`, makeCtx({ requestBrowser: async () => reply }))) as { status?: number; body?: unknown };
+    expect(r.status ?? 200).toBe(200);
+    expect(r.body).toEqual(reply);
+  });
+
+  it('a CODED refusal is a 400 with its body — not a 200 the GET tool would read as success (#1012)', async () => {
+    const envelope = { ok: false, code: 'AMBIGUOUS', error: 'which one' };
+    const r = (await get(`/api/asset-meta?path=${asset}`, makeCtx({ requestBrowser: async () => envelope }))) as { status?: number; body?: unknown };
+    expect(r.status).toBe(400);
+    expect(r.body).toEqual(envelope);
+  });
+
+  it('a transport failure still falls back to the DISK read, and says so (accept side)', async () => {
+    const ctx = makeCtx({ requestBrowser: async () => { throw new Error('no editor renderer window'); } });
+    const r = (await get(`/api/asset-meta?path=${asset}`, ctx)) as { status?: number; body?: { source?: string; editorConnected?: boolean } };
+    expect(r.status ?? 200).toBe(200);
+    expect(r.body).toMatchObject({ source: 'disk', editorConnected: false });
+  });
+
+  it('an op that THROWS is still the op answering — 400, no disk fallback', async () => {
+    const ctx = makeCtx({ requestBrowser: async () => { throw new Error('read-asset-meta requires { path }'); } });
+    const r = (await get(`/api/asset-meta?path=${asset}`, ctx)) as { status?: number };
+    expect(r.status).toBe(400);
+  });
+});
+
+/** `GET /api/game-view-devices` — the fourth route the #1012 sweep found relaying a bare `json(raw)`.
+ *  Its op never refuses today, so this pins the ROUTE's shape: the GET tool runs no `checkFailure`,
+ *  and a coded envelope relayed as a 200 would reach the agent as a success. */
+describe('/api/game-view-devices', () => {
+  it('relays the catalog as-is', async () => {
+    const reply = { ok: true, current: { device: 'Free' }, presets: [] };
+    const r = (await get('/api/game-view-devices', makeCtx({ requestBrowser: async () => reply }))) as { status?: number; body?: unknown };
+    expect(r.status ?? 200).toBe(200);
+    expect(r.body).toEqual(reply);
+  });
+
+  it('a CODED refusal travels on its code\'s status, not as a 200', async () => {
+    const envelope = { ok: false, code: 'NO_RENDERER', error: 'no editor window' };
+    const r = (await get('/api/game-view-devices', makeCtx({ requestBrowser: async () => envelope }))) as { status?: number; body?: unknown };
+    expect(r.status).toBe(503);
+    expect(r.body).toEqual(envelope);
+  });
+
+  it('a dead relay is still a 504', async () => {
+    const ctx = makeCtx({ requestBrowser: async () => { throw new Error('no editor renderer window'); } });
+    const r = (await get('/api/game-view-devices', ctx)) as { status?: number };
     expect(r.status).toBe(504);
   });
 });
@@ -1258,11 +1897,70 @@ describe('/api/render-scene (S3.14 — the route had no test at all)', () => {
     expect('quality' in r.body).toBe(false);
   });
 
-  it('a renderer with no 3D surface mounted is a 504 carrying the reason, not an empty 200', async () => {
-    const ctx = makeCtx({ requestBrowser: async () => { throw new Error('no 3D view is mounted (open the Game panel)'); } });
-    const r = (await post('/api/render-scene', {}, ctx)) as { status?: number; body: { error?: string } };
+  // ⚠️ REWRITTEN, not deleted (#994). This asserted `status === 504` under the title "a renderer
+  // with no 3D surface mounted is a 504 carrying the reason, not an empty 200" — and the fix turns
+  // that state into a 503 §5 envelope, so the assertion could not survive. It was rewritten rather
+  // than relaxed because the test's SUBJECT is "carrying the reason, not an empty 200": it exists
+  // to stop a silent success. A coded envelope carries strictly more reason than the 504 did (it
+  // adds `code` and `options`), so the assertion below is stronger, not weaker. The status literal
+  // was incidental to what the test was about — and `bd33e2e32`, which introduced it, shows it was
+  // describing an until-then untested route rather than pinning a contract.
+  it('a renderer with no 3D surface mounted answers the op\'s §5 refusal, not a 504 and not an empty 200', async () => {
+    const refusal = { ok: false, code: 'NO_RENDERER', error: 'no scene renderer is registered …', options: ['select the Game tab'] };
+    const ctx = makeCtx({ requestBrowser: async () => refusal });
+    const r = (await post('/api/render-scene', {}, ctx)) as
+      { status?: number; body: { ok?: boolean; code?: string; error?: string; options?: string[]; path?: string } };
+    expect(r.status).toBe(503);
+    expect(r.body.code).toBe('NO_RENDERER');
+    expect(r.body.error).toMatch(/no scene renderer/);
+    // `options` is the field that turns a dead end into the next move, and `httpFailure` in the MCP
+    // client only forwards it if the route does — dropping it here would lose it silently.
+    expect(r.body.options).toEqual(['select the Game tab']);
+    // Not an empty 200, and no phantom frame path: nothing was rendered.
+    expect(r.body.path).toBeUndefined();
+  });
+
+  it('a genuine RELAY failure is still a 504 — a throw is transport, an envelope is the op answering', async () => {
+    const ctx = makeCtx({ requestBrowser: async () => { throw new Error('no editor renderer window'); } });
+    const r = (await post('/api/render-scene', {}, ctx)) as { status?: number; body: { error?: string; code?: string } };
     expect(r.status).toBe(504);
-    expect(r.body.error).toMatch(/no 3D view is mounted/);
+    expect(r.body.code).toBeUndefined();
+  });
+
+  /** #994 close-out F1 — the guard covers "no renderer registered"; a renderer that IS registered
+   *  and then FAILS still throws, and that throw was reaching the agent as NOT_AVAILABLE_HERE.
+   *
+   *  The real producer: `Scene3D`'s offscreen readback is wrapped in a 10s `withTimeout`, so a lost
+   *  GPU device or a stalled readback rejects with a `TimeoutError` whose message matches no
+   *  `isRelayTransportFailure` alternative. At a hard-coded 504 the agent was told "the route is
+   *  absent" and sent to relaunch a present route over a wedged GPU — the same inversion #994
+   *  fixes one case over, and the one case the new §5 rule was stated for and not kept. */
+  it('a render that FAILS with a renderer attached is the op answering (400), not a dead route (504)', async () => {
+    const ctx = makeCtx({ requestBrowser: async () => { throw new Error('offscreen readback timed out after 10000ms'); } });
+    const r = (await post('/api/render-scene', {}, ctx)) as { status?: number; body: { error?: string } };
+    expect(r.status, 'a 504 here becomes NOT_AVAILABLE_HERE — "the route is absent" — about a live route').toBe(400);
+    expect(r.body.error).toMatch(/timed out/);
+    // ⚠️ 400 maps to REFUSED_BY_OP, which is NOT in the live gate's ENV_CODES — so a genuinely
+    // wedged GPU still reddens `test:mcp:live` instead of being waved through as editor state.
+  });
+
+  it('a §5 code OTHER than NO_RENDERER travels at 400 — the op answering, not a gateway failure', async () => {
+    // `refusalStatus`'s non-NO_RENDERER branch had no producer and no test; this exercises the rule
+    // rather than leaving it stated for a case nothing drives.
+    const ctx = makeCtx({ requestBrowser: async () => ({ ok: false, code: 'NOT_FOUND', error: 'nope' }) });
+    const r = (await post('/api/render-scene', {}, ctx)) as { status?: number; body: { code?: string } };
+    expect(r.status).toBe(400);
+    expect(r.body.code).toBe('NOT_FOUND');
+  });
+
+  it('an ordinary {ok:false, reason} answer is NOT hijacked — only a CLOSED-SET code earns a status', async () => {
+    // The discriminator has to be narrow: dozens of ops report a bad parameter as `{ok:false,
+    // reason}` at HTTP 200, where the MCP client's `isFailureBody` picks them up. Treating those as
+    // §5 envelopes would change the status of a large, unrelated surface.
+    const ctx = makeCtx({ requestBrowser: async () => ({ ok: false, reason: 'nope', code: 'NOT_A_REAL_CODE', dataUrl: DATA_URL, width: 1, height: 1 }) });
+    const r = (await post('/api/render-scene', {}, ctx)) as { status?: number; body: { path?: string } };
+    expect(r.status ?? 200).toBe(200);
+    expect(r.body.path).toMatch(/modoki-render-.*\.jpg$/);
   });
 });
 
@@ -1314,6 +2012,60 @@ describe('render-sequence refuses a STOPPED editor at the ROUTE (review follow-u
       { status?: number; body: { paths?: unknown[] } };
     expect(r.status ?? 200).toBe(200);
     expect(r.body.paths).toHaveLength(2);
+  });
+
+  // #994 — the per-frame path reaches the SAME `render-scene` op, so it inverts the same way. It
+  // was LATENT rather than absent: a stopped editor is refused above before the loop is reached, so
+  // only a PLAYING editor with no 3D surface gets here. That is why the observed live run reddened
+  // on render_scene and not on this one, and why fixing the mechanism beats fixing the row that
+  // happened to print.
+  const refusing = (failAtFrame: number) => {
+    let frame = 0;
+    return makeCtx({
+      requestBrowser: vi.fn(async (op: string) => {
+        if (op === 'editor-state') return { playState: 'playing', runMode: 'playing' };
+        if (frame++ >= failAtFrame) return { ok: false, code: 'NO_RENDERER', error: 'no scene renderer is registered …', options: ['select the Game tab'] };
+        return { dataUrl: 'data:image/jpeg;base64,/9j/4AAQ' };
+      }),
+    });
+  };
+
+  it('a per-frame NO_RENDERER is relayed as the envelope, not a 504', async () => {
+    const r = (await post('/api/render-sequence', { frames: 3, fps: 30 }, refusing(0))) as
+      { status?: number; body: { code?: string; framesWritten?: number; paths?: unknown[] } };
+    expect(r.status).toBe(503);
+    expect(r.body.code).toBe('NO_RENDERER');
+    expect(r.body.framesWritten).toBe(0);
+    expect(r.body.paths).toEqual([]);
+  });
+
+  it('a panel closed MID-sequence reports what was written — neither "rendered nothing" nor "finished"', async () => {
+    const r = (await post('/api/render-sequence', { frames: 4, fps: 60 }, refusing(2))) as
+      { status?: number; body: { code?: string; framesWritten?: number; paths?: string[]; tMs?: number[] } };
+    expect(r.status).toBe(503);
+    expect(r.body.code).toBe('NO_RENDERER');
+    expect(r.body.framesWritten).toBe(2);
+    expect(r.body.paths).toHaveLength(2);
+    // #994 close-out F5 — the timings of the frames that DID land come back too. This tool's own
+    // description says to time frames by `tMs[]` and NEVER by frameIndex × 1/fps, so dropping it
+    // leaves a caller holding 2 real frames and exactly the basis it was told not to use.
+    expect(r.body.tMs, 'tMs for the frames that landed').toHaveLength(2);
+  });
+
+  it('a mid-sequence THROW reports tMs too, and is the op answering when it is not transport', async () => {
+    let frame = 0;
+    const ctx = makeCtx({
+      requestBrowser: vi.fn(async (op: string) => {
+        if (op === 'editor-state') return { playState: 'playing', runMode: 'playing' };
+        if (frame++ >= 2) throw new Error('offscreen readback timed out after 10000ms');
+        return { dataUrl: 'data:image/jpeg;base64,/9j/4AAQ' };
+      }),
+    });
+    const r = (await post('/api/render-sequence', { frames: 4, fps: 60 }, ctx)) as
+      { status?: number; body: { framesWritten?: number; tMs?: number[] } };
+    expect(r.status).toBe(400);
+    expect(r.body.framesWritten).toBe(2);
+    expect(r.body.tMs).toHaveLength(2);
   });
 });
 

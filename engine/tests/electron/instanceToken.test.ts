@@ -1,6 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import fs from 'node:fs';
-import os from 'node:os';
 import path from 'node:path';
 import {
   TOKEN_FILE,
@@ -11,7 +10,10 @@ import {
   tokenMismatchError,
   _resetTokenCache,
   rootKey,
+  legacyRootKey,
 } from '../../electron/instanceToken';
+import { makeDirLink } from '../helpers/linkFixture';
+import { makeScratchDir } from '@modoki/engine/testing/scratchDir';
 
 /**
  * C6 unit gate — the instance token (docs/connect-claude-code.md, C6).
@@ -55,7 +57,7 @@ describe('checkToken — validate if present', () => {
 describe('token store', () => {
   let dir: string;
   beforeEach(() => {
-    dir = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-token-'));
+    dir = makeScratchDir('modoki-token-');
     _resetTokenCache();
   });
   afterEach(() => {
@@ -84,7 +86,7 @@ describe('token store', () => {
   });
 
   it('different INSTALLS get different tokens for the SAME project (dev vs DMG)', () => {
-    const other = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-token2-'));
+    const other = makeScratchDir('modoki-token2-');
     try {
       const a = ensureToken(dir, '/a/project');
       _resetTokenCache();
@@ -161,6 +163,83 @@ describe('token store', () => {
       ensureToken(dir, '/a/one'); // prime the cache so a stale read is possible
       siblingWrites({ [rootKey('/a/mine')]: 'minted-by-sibling' });
       expect(ensureToken(dir, '/a/mine')).toBe('minted-by-sibling');
+    });
+  });
+});
+
+/** #899 — the 403 the token exists to PREVENT, fired by a second spelling of the same project.
+ *
+ *  Driven end to end rather than at the key level: `rootKey` returning two strings only matters
+ *  because of what `checkToken` then says about it, and the issue was filed on the key alone.
+ *  Real filesystem, and `os.tmpdir()` realpath'd first — on macOS it is itself a symlink, which
+ *  would make both sides agree for the wrong reason. */
+describe('#899 — a symlinked project spelling is the SAME project', () => {
+  let base = '';
+  let real = '';
+  let link = '';
+  let ud = '';
+  beforeEach(() => {
+    _resetTokenCache();
+    base = makeScratchDir('tok-899-', { canonical: true });
+    real = path.join(base, 'court');
+    fs.mkdirSync(real);
+    link = path.join(base, 'link');
+    makeDirLink(real, link);
+    ud = path.join(base, 'userdata');
+  });
+  afterEach(() => { _resetTokenCache(); fs.rmSync(base, { recursive: true, force: true }); });
+
+  it('Connect via the real path, launch via the symlink ⇒ ok, not a 403 against your own editor', () => {
+    const minted = ensureToken(ud, real);
+    _resetTokenCache();
+    expect(readToken(ud, link)).toBe(minted);
+    expect(checkToken(minted, readToken(ud, link))).toBe('ok');
+  });
+
+  it('and does not collapse two genuinely different projects into one token', () => {
+    const other = path.join(base, 'wordweave');
+    fs.mkdirSync(other);
+    expect(ensureToken(ud, real)).not.toBe(ensureToken(ud, other));
+  });
+
+  // The migration half. rootKey's output MOVES for a symlinked path, so an entry written by a
+  // pre-#899 editor would be stranded — readToken would return null, checkToken would say
+  // `mismatch`, and the user's existing .mcp.json would start 403ing at the migration.
+  describe('adopting a pre-#899 entry', () => {
+    const seed = (map: Record<string, string>) => {
+      fs.mkdirSync(ud, { recursive: true });
+      fs.writeFileSync(path.join(ud, TOKEN_FILE), JSON.stringify(map));
+      _resetTokenCache();
+    };
+
+    it('readToken still finds an entry stored under the OLD key', () => {
+      seed({ [legacyRootKey(link)]: 'old-token' });
+      expect(readToken(ud, link)).toBe('old-token');
+    });
+
+    // …and Connect must WRITE IT FORWARD rather than mint a competing token: the .mcp.json on
+    // disk carries 'old-token', so minting a new one here would itself be the 403.
+    it('ensureToken adopts that token under the new key instead of minting a rival', () => {
+      seed({ [legacyRootKey(link)]: 'old-token' });
+      expect(ensureToken(ud, link)).toBe('old-token');
+      const map = JSON.parse(fs.readFileSync(path.join(ud, TOKEN_FILE), 'utf8'));
+      expect(map[rootKey(link)]).toBe('old-token');
+      // The write-forward is what CONVERGES the two spellings — the point of the exercise.
+      _resetTokenCache();
+      expect(readToken(ud, real)).toBe('old-token');
+    });
+
+    // Deterministic precedence when both keys are present.
+    //
+    // ⚠️ This was written as "a POST-migration entry must win", which the code cannot actually
+    // distinguish (close-out review): for a non-symlinked spelling `rootKey === legacyRootKey`, so
+    // an entry at the new key is indistinguishable from the OLD entry for another spelling of the
+    // same directory. What this really pins is that the order is FIXED and the new key wins, so the
+    // legacy key fades out instead of quietly becoming load-bearing forever. The user who had both
+    // pre-#899 entries loses one token and is 403d once; see `rootKey`'s docblock.
+    it('prefers the new key when both are present', () => {
+      seed({ [legacyRootKey(link)]: 'old-token', [rootKey(link)]: 'new-token' });
+      expect(readToken(ud, link)).toBe('new-token');
     });
   });
 });

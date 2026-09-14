@@ -36,6 +36,7 @@ import { describe, expect, it } from 'vitest';
 // below to compute brace/bracket DEPTH safely, so a stray `(`/`{`/`[` inside a tooltip string
 // cannot desync a balanced-span scan (#723 review finding H).
 import { stripComments, stripCommentsAndStrings, findDamagedCodeTokens, readScannedSource } from '@modoki/engine/testing';
+import { assertExemptionLedger } from '@modoki/engine/testing/exemptionLedger';
 
 /** `qa/README.md` is read as PROSE — the format spec's own tables and sentences are what these
  *  assertions are about, and Markdown has no comment syntax for a scan to be blinded by. */
@@ -63,6 +64,13 @@ import {
 // The panel's OWN slug function, so a derived id and the rendered one cannot drift apart.
 import { particleFieldSlug } from '../../packages/modoki/src/editor/panels/particle/fieldIds.js';
 import { repoFiles } from '../../scripts/repoCorpus.mjs';
+import { SECTION_CITE, headingIds } from '../helpers/docSections';
+import {
+  CLONE_BACKEND_PORTS,
+  vitePortForBackend,
+  cdpPortForBackend,
+  editorCdpPortForBackend,
+} from '../../scripts/editorPorts.mjs';
 
 const toPosix = (p: string) => p.replace(/\\/g, '/');
 
@@ -316,13 +324,167 @@ function suiteDocs(): Array<{ rel: string; body: string }> {
     .map((f) => ({ rel: `qa/${f}`, body: readFileSync(join(dir, f), 'utf8') }));
 }
 
-const PROSE_ALLOWED: ReadonlyArray<{ file: string; token: string }> = [
-  { file: 'qa/cases/persistence/cloud-sync-two-device-progress-fork.md', token: 'line 123' },
+/** The three answers to "does a save EXECUTE, and at what run mode" (#1095). Mirrored in
+ *  `qa/README.md` § Format; the guard below pins every case that needs one to this list. */
+const SCENE_WRITE_VALUES = ['saves', 'refused', 'never'];
+
+/** `restores:` entries, however the author spelled the field.
+ *
+ *  ⚠️ A SCALAR (`restores: games/x/y.json`) is valid YAML and the frontmatter parser stores it as a
+ *  string. The first draft did `if (!Array.isArray(restores)) continue`, so a scalar — typo'd or
+ *  not — was checked by nothing at all on a `never`/`refused` case. Coerced rather than rejected:
+ *  the one-path spelling is the natural thing to write, and refusing it would teach the author
+ *  that the field is fussy rather than that their path is wrong. */
+function restoresEntries(v: unknown): unknown[] {
+  if (v === undefined || v === null) return [];
+  return Array.isArray(v) ? v : [v];
+}
+
+const PROSE_ALLOWED: ReadonlyArray<{ file: string; token: string; count?: number; reason: string }> = [
+  {
+    file: 'qa/cases/persistence/cloud-sync-two-device-progress-fork.md',
+    token: 'line 123',
+    reason: 'the ONE paragraph explaining the cite-the-symbol convention, which cannot make its point '
+      + 'without naming a line — an example, not a citation',
+  },
 ];
 
-const LINE_REF_ALLOWED: ReadonlyArray<{ file: string; token: string }> = [
-  { file: 'qa/cases/persistence/cloud-sync-two-device-progress-fork.md', token: 'file.ts:123' },
+/**
+ * Cases that may name a per-clone port literally, keyed `{file, port}` — never a whole file, so a
+ * case allowed its own subject's port still cannot quietly acquire a DIFFERENT clone's lane.
+ *
+ * #1098: 220 cases hardcoded `5183` — `modoki-qa`'s lane — into their launch recipe, MCP-target
+ * preconditions and prose, because `qa/knowledge.md` § 1's recipe carried the pin and every case
+ * copied it. An explicit `MODOKI_BACKEND_PORT` OVERRIDES the launcher's per-clone derivation
+ * (`launch-editor.sh`, the `:-` default around `editorPorts.mjs backend`), so a runner on any other
+ * clone followed those cases into a port their clone does not own. It was invisible from `work-qa`,
+ * where the corpus is written and where `5183` is right — which is how it survived 220 files.
+ *
+ * ⚠️ Two of the derived numbers are also GENERIC defaults: `vitePortForBackend(5179)` is 5173,
+ * Vite's own, and `cdpPortForBackend(5179)` is 9222, the `chrome-devtools` MCP's — which is
+ * precisely why the ai-panel row below exists. A future case documenting either in its ordinary
+ * sense will be flagged as naming a clone lane and will need a row here; write the REAL reason on
+ * it ("Vite's own default, not the hub's lane") rather than a lane reason that is not true.
+ */
+const CLONE_PORT_ALLOWED: ReadonlyArray<{ file: string; port: number; count?: number; reason: string }> = [
+  {
+    file: 'qa/cases/packaged/reap-is-clone-and-app-scoped.md',
+    port: 5180,
+    count: 7,
+    reason: "another clone's lane IS the subject — the case proves a reap does not cross clones, so "
+      + 'the SIBLING clone (work-ai, 5180) is named once as the precondition and then addressed '
+      + 'directly at every step that must reach it: identity curls before and after the reap, its '
+      + 'editor-state curl, and the warning that modoki_identity "against 5180" answers from this '
+      + "clone instead. Every one is the other clone's port on purpose; none is this runner's lane",
+  },
+  {
+    file: 'qa/cases/editor/ai-panel-reports-this-editors-ports.md',
+    port: 5179,
+    count: 5,
+    reason: 'quotes the committed `${MODOKI_BACKEND:-http://127.0.0.1:5179}` default verbatim — '
+      + 'three times (the context, the precondition, the pass criterion) — and names 5179 as the '
+      + "HUB twice around it, because the case's subject is the default resolving to the hub's "
+      + 'lane. It is the failure being tested for, never a port the runner uses',
+  },
+  {
+    file: 'qa/cases/packaged/clean-install-renders.md',
+    port: 5179,
+    reason:
+      "names the HUB's lane as the failure mode of an empty pin — the unpinned ladder's first " +
+      'candidate (`DEFAULT_BACKEND_PORT`), which is what the case warns its runner about',
+  },
+  {
+    file: 'qa/cases/packaged/electron-only-surfaces-respond.md',
+    port: 5179,
+    reason: "quotes the launcher's own `9222 + (backend − 5179)` CDP derivation",
+  },
+  {
+    file: 'qa/cases/packaged/electron-only-surfaces-respond.md',
+    port: 9222,
+    count: 2,
+    reason: "one line, two meanings, both not a lane: the `chrome-devtools` MCP's own default 9222 "
+      + "(which the case says NOT to aim at), and the base of the launcher's `9222 + (backend − "
+      + "5179)` CDP derivation it contrasts that with",
+  },
+  {
+    file: 'qa/cases/editor/ai-panel-reports-this-editors-ports.md',
+    port: 9222,
+    count: 2,
+    reason: "quotes the source comment about a packaged editor showing 'CDP 9222' green while 9222 "
+      + "was another process's — the one quoted sentence names the port twice",
+  },
+  // Both halves of the launcher's CDP formula are ledgered per file: the base (9222) and the hub
+  // backend it offsets from (5179). Quoting a derivation is the opposite of hardcoding a lane —
+  // but the guard reads numbers, not intent, so the exception is written down rather than
+  // pattern-matched. A regex that tried to recognise "this is a formula" is the false positive
+  // surface #680's review spent a round on.
+  {
+    file: 'qa/cases/tooling/wrong-backend-detected-by-identity.md',
+    port: 5179,
+    reason: "quotes the launcher's own `9222 + (backend − 5179)` CDP derivation",
+  },
+  {
+    file: 'qa/cases/tooling/wrong-backend-detected-by-identity.md',
+    port: 9222,
+    reason: "quotes the launcher's own `9222 + (backend − 5179)` CDP derivation",
+  },
+  {
+    file: 'qa/cases/platform/win-vite-port-collision-banner.md',
+    port: 5179,
+    reason: "quotes the launcher's own `9222 + (BACKEND_PORT − 5179)` CDP derivation",
+  },
+  {
+    file: 'qa/cases/platform/win-vite-port-collision-banner.md',
+    port: 9222,
+    reason: "quotes the launcher's own `9222 + (BACKEND_PORT − 5179)` CDP derivation",
+  },
 ];
+
+const LINE_REF_ALLOWED: ReadonlyArray<{ file: string; token: string; count?: number; reason: string }> = [
+  {
+    file: 'qa/cases/persistence/cloud-sync-two-device-progress-fork.md',
+    token: 'file.ts:123',
+    reason: 'the same convention paragraph, which spells the forbidden shape once as a placeholder '
+      + '(`file.ts`, not a real file) to show what not to write',
+  },
+];
+
+/**
+ * Spend `rows` against `population` through `assertExemptionLedger` (#1128) — the one place this
+ * file's `{file, token}` ledgers are checked, so none of them can drift back to `.some()` MATCHING.
+ *
+ * ⚠️ **Matched rows pardoned every occurrence, and that is what this replaced.** `LINE_REF_ALLOWED`,
+ * `PROSE_ALLOWED` and `TOOLBAR_PROSE_ALLOWED` were each consulted with `.some`/`.find`, so a SECOND
+ * `file.ts:123` in the one exempt case — or a second bare toolbar id beside a ledgered snippet — was
+ * green (proven by addition on `work-qa`, #1134 → #1128). A row now spends `count` (default 1).
+ *
+ * ⚠️ **Every row is spent — none is filtered by whether its case exists.** The first cut dropped rows
+ * whose file was absent, "for the checkout with no corpus"; but every caller sits inside
+ * `describeCases`, which is `describe.skip` there, so that branch was unreachable and the filter's
+ * only real effect was to HIDE a row for a deleted case — green, where the matched form it replaced
+ * went red with "matched nothing" (close-out review, confirmed). A row naming a gone case now reports
+ * over-blessed, and would otherwise pre-approve whatever is next written at that path.
+ * With no rows at all, nothing is pardoned and the population must be empty outright, since
+ * `assertExemptionLedger`'s `floor >= 1` cannot hold over a population that is legitimately 0.
+ */
+function spendLedger(
+  label: string,
+  population: ReadonlyArray<{ item: string; site: string }>,
+  rows: ReadonlyArray<{ file: string; key: string; count?: number; reason: string }>,
+  fix: string,
+): void {
+  if (rows.length === 0) {
+    expect(population.map((o) => o.site), `${label}: pardoned by nothing.\n\n${fix}`).toEqual([]);
+    return;
+  }
+  assertExemptionLedger({
+    label,
+    population,
+    exempt: rows.map((r) => ({ item: `${r.file}::${r.key}`, count: r.count, reason: r.reason })),
+    floor: 1,
+    fix,
+  });
+}
 
 /**
  * Every `data-ui-id="…"` a case or doc cites.
@@ -466,7 +628,7 @@ export function knownUiIds(sources: string[]): {
   // A template-built id (`hierarchy.folder.${name}`) can only be checked to its static prefix.
   // `\s*` BEFORE the `=` as well as after it: a JSX prop is written `uiId={`a.${b}`}` with no
   // space, but the same id is often built in a local first — `const uiId = `projectSettings.${
-  // field.key}`;` (ProjectSettingsDialog.tsx:55) — and without the leading `\s*` that whole
+  // field.key}`;` (`ProjectSettingsDialog.tsx`'s `FieldControl`) — and without the leading `\s*` that whole
   // family of ids is invisible here. The symptom is a case correctly citing a selector that
   // demonstrably resolves in the live DOM being reported as unknown, which is the false alarm
   // qa/README.md warns turns a guard into one people disable. Verified 2026-08-21: every
@@ -1476,7 +1638,7 @@ describe('qa case guard helpers', () => {
     });
 
     it('sees a template id built in a LOCAL first, not only the JSX prop form', () => {
-      // `ProjectSettingsDialog.tsx:55` writes it as a local, with spaces around the `=`:
+      // `ProjectSettingsDialog.tsx`'s `FieldControl` writes it as a local, with spaces around the `=`:
       //   const uiId = `projectSettings.${field.key}`;
       // The prefix regex required no space BEFORE the `=`, so that whole family was invisible
       // and every `projectSettings.<section>.<key>` a case cited came back unknown — a false
@@ -1494,10 +1656,9 @@ describe('qa case guard helpers', () => {
       // real panel rather than a hand-typed fixture is what gives this teeth: if the row's
       // spelling changes again, this goes red instead of the guard silently forgetting the
       // family. Same argument as the `useFieldId` test above.
-      const panel = readFileSync(
+      const panel = readScannedSource(
         join(REPO_ROOT, 'engine/packages/modoki/src/editor/panels/Hierarchy.tsx'),
-        'utf8',
-      );
+      ).code;
       const { prefixes, patterns } = knownUiIds([panel]);
       expect(prefixes).toContain('hierarchy.entity.');
       const known = (id: string) => patterns.some((p) => p.test(id));
@@ -1644,10 +1805,9 @@ describe('qa case guard helpers', () => {
     });
 
     it('animation.viewMode — from the REAL TrackList tuple', () => {
-      const src = readFileSync(
+      const src = readScannedSource(
         join(REPO_ROOT, 'engine/packages/modoki/src/editor/panels/animation/TrackList.tsx'),
-        'utf8',
-      );
+      ).code;
       const { ids, patterns } = knownUiIds([src]);
       const known = (id: string) => ids.has(id) || patterns.some((p) => p.test(id));
       expect(known('animation.viewMode.dopesheet')).toBe(true);
@@ -1656,10 +1816,9 @@ describe('qa case guard helpers', () => {
     });
 
     it('sceneView.toolbar.gizmo — from the REAL gizmoModes array', () => {
-      const src = readFileSync(
+      const src = readScannedSource(
         join(REPO_ROOT, 'engine/packages/modoki/src/editor/panels/SceneView.tsx'),
-        'utf8',
-      );
+      ).code;
       const { ids, patterns } = knownUiIds([src]);
       const known = (id: string) => ids.has(id) || patterns.some((p) => p.test(id));
       expect(known('sceneView.toolbar.gizmo.translate')).toBe(true);
@@ -1669,10 +1828,9 @@ describe('qa case guard helpers', () => {
     });
 
     it('gameView.devicePicker.device — from the REAL device catalog', () => {
-      const src = readFileSync(
+      const src = readScannedSource(
         join(REPO_ROOT, 'engine/packages/modoki/src/editor/scene/devicePresets.ts'),
-        'utf8',
-      );
+      ).code;
       const { ids, patterns } = knownUiIds([src]);
       const known = (id: string) => ids.has(id) || patterns.some((p) => p.test(id));
       expect(known('gameView.devicePicker.device.Free')).toBe(true);
@@ -1683,10 +1841,9 @@ describe('qa case guard helpers', () => {
     });
 
     it('module-toggles — from the REAL MODULES × OPTIONS arrays', () => {
-      const src = readFileSync(
+      const src = readScannedSource(
         join(REPO_ROOT, 'engine/packages/modoki/src/editor/panels/ModuleTogglesEditor.tsx'),
-        'utf8',
-      );
+      ).code;
       const { ids, patterns } = knownUiIds([src]);
       const known = (id: string) => ids.has(id) || patterns.some((p) => p.test(id));
       expect(known('module-toggles.render3d.auto')).toBe(true);
@@ -1696,14 +1853,12 @@ describe('qa case guard helpers', () => {
     });
 
     it('quality-tiers.* — from the REAL editor + model files, mutation-checked exactly as named in the brief', () => {
-      const editorSrc = readFileSync(
+      const editorSrc = readScannedSource(
         join(REPO_ROOT, 'engine/packages/modoki/src/editor/panels/QualityTiersEditor.tsx'),
-        'utf8',
-      );
-      const modelSrc = readFileSync(
+      ).code;
+      const modelSrc = readScannedSource(
         join(REPO_ROOT, 'engine/packages/modoki/src/editor/panels/qualityTiersModel.ts'),
-        'utf8',
-      );
+      ).code;
       const { ids, patterns } = knownUiIds([editorSrc, modelSrc]);
       const known = (id: string) => ids.has(id) || patterns.some((p) => p.test(id));
       expect(known('quality-tiers.field.mid.pixelRatioCap')).toBe(true);
@@ -1803,10 +1958,9 @@ describe('qa case guard helpers', () => {
 
       // I: a quote-bearing device name (`iPad Pro 11"`) — CITED_UI_ID_RE only, not `knownUiIds`
       // itself, so exercised against the REAL device catalog + the regex directly.
-      const devicePresetsSrc = readFileSync(
+      const devicePresetsSrc = readScannedSource(
         join(REPO_ROOT, 'engine/packages/modoki/src/editor/scene/devicePresets.ts'),
-        'utf8',
-      );
+      ).code;
       const { ids: deviceIds, patterns: devicePatterns } = knownUiIds([devicePresetsSrc]);
       const knownDevice = (id: string) => deviceIds.has(id) || devicePatterns.some((p) => p.test(id));
       expect(knownDevice('gameView.devicePicker.device.iPad Pro 11"')).toBe(true);
@@ -1820,10 +1974,9 @@ describe('qa case guard helpers', () => {
       // then returns [], and because `DERIVED_FAMILY_TEMPLATES` already removed the shape
       // pattern, a previously-good citation must now be UNKNOWN rather than quietly still passing
       // on the shape it used to fall back to. This is rule 1's whole point: fail closed, not open.
-      const renamed = readFileSync(
+      const renamed = readScannedSource(
         join(REPO_ROOT, 'engine/packages/modoki/src/editor/panels/SceneView.tsx'),
-        'utf8',
-      ).replace(/gizmoModes/g, 'renamedGizmoModes');
+      ).code.replace(/gizmoModes/g, 'renamedGizmoModes');
       const { ids, patterns } = knownUiIds([renamed]);
       const known = (id: string) => ids.has(id) || patterns.some((p) => p.test(id));
       expect(sceneViewGizmoIds(renamed)).toEqual([]);
@@ -2212,6 +2365,8 @@ describeCases('QA case references', () => {
    */
   it('no citation carries a line number — they rot silently, so cite the symbol (#680)', () => {
     const offenders: string[] = [];
+    // `citesALine` hits, one per occurrence, SPENT against LINE_REF_ALLOWED below (#1128).
+    const lineRefs: Array<{ item: string; site: string }> = [];
     // Anti-vacuity, same reasoning as the knowledge.md check: a detector that silently stops
     // matching would leave this passing forever over a suite full of line refs.
     let scanned = 0;
@@ -2227,8 +2382,7 @@ describeCases('QA case references', () => {
         if (REPO_TOP_LEVEL.test(stripLineRef(token))) scanned += 1;
         if (!citesALine(token)) continue;
         const t = token.replace(/[.,;)\]]+$/, '').trim();
-        if (LINE_REF_ALLOWED.some((a) => a.file === rel && a.token === t)) continue;
-        offenders.push(`${rel}: "${t}"`);
+        lineRefs.push({ item: `${rel}::${t}`, site: `${rel}: "${t}"` });
       }
       for (const span of codeSpans(body)) {
         if (isBareLineSpan(span)) offenders.push(`${rel}: "${span.trim()}"`);
@@ -2237,9 +2391,7 @@ describeCases('QA case references', () => {
       // heading, a link label or a table cell is invisible to it. Same blind spot the docs gate had.
       for (const token of nonCodeText(body).split(/\s+/)) {
         const t = token.replace(/[.,;)\]]+$/, '').trim();
-        if (citesALine(token) && !LINE_REF_ALLOWED.some((a) => a.file === rel && a.token === t)) {
-          offenders.push(`${rel}: "${t}"`);
-        }
+        if (citesALine(token)) lineRefs.push({ item: `${rel}::${t}`, site: `${rel}: "${t}"` });
       }
       // The `~L202` marker rots here exactly as it does in docs/ — it was only found there first.
       // Wiring it into one gate and not the other is how a shape comes back through the door the
@@ -2247,6 +2399,12 @@ describeCases('QA case references', () => {
       for (const m of citesALineByMarker(body)) offenders.push(`${rel}: "${m}"`);
     }
     expect(offenders).toEqual([]);
+    spendLedger(
+      'LINE_REF_ALLOWED in qaCaseReferences',
+      lineRefs,
+      LINE_REF_ALLOWED.map((a) => ({ file: a.file, key: a.token, count: a.count, reason: a.reason })),
+      'Cite the SYMBOL, not the line (#680) — name the function, export, action id or route.',
+    );
     // The suite cites thousands of code tokens; 500 is a floor no accident meets.
     if (HAS_CASES) expect(scanned).toBeGreaterThan(500);
   });
@@ -2310,6 +2468,25 @@ describeCases('QA case references', () => {
   });
 
   /**
+   * No case taps or drags an Assets row it has not revealed first (#1143). The row exists only
+   * while its group is expanded, and that state is persisted per profile, so an unrevealed tap is
+   * green on one runner and refused on the next. Mechanism, the two accepted reveals and the bounds
+   * of what this proves: `scanAssetRowOpens`.
+   */
+  it('no case opens an Assets row it has not revealed first (#1143)', () => {
+    const offenders: string[] = [];
+    let rowActions = 0;
+    for (const { rel, body } of cases) {
+      const scan = scanAssetRowOpens(body);
+      rowActions += scan.rowActions;
+      for (const o of scan.offenders) offenders.push(`${rel}: ${o}`);
+    }
+    expect(offenders).toEqual([]);
+    // Anti-vacuity: ~30 row actions exist today. If ROW stops matching, zero offenders means nothing.
+    if (HAS_CASES) expect(rowActions).toBeGreaterThan(15);
+  });
+
+  /**
    * The same rule, for line numbers written in PROSE. (#680)
    *
    * `codeTokens` only reads backticked spans, so the check above is blind to "the `onMove` handler
@@ -2329,23 +2506,26 @@ describeCases('QA case references', () => {
    * because README's own table quotes `saveSync.ts:1745` to explain the rule.
    */
   it('no citation writes a line number in prose either (#680)', () => {
-    const offenders: string[] = [];
     const docs: Array<{ rel: string; body: string }> = [
       ...cases.map((c) => ({ rel: c.rel, body: c.body })),
       ...suiteDocs(),
     ];
+    const proseRefs: Array<{ item: string; site: string }> = [];
     for (const { rel, body } of docs) {
       // Keyed file+TOKEN, exactly like LINE_REF_ALLOWED. It exempted the whole FILE first, which
       // was strictly wider for no reason: this is one of the most internals-heavy cases in the
       // suite, so "the merge branch at line 812 of saveSync.ts" appearing in it later would have
       // been invisible to both rules. The one legitimate occurrence is the paragraph explaining
       // this convention, which cannot make its point without naming a line.
-      for (const m of citesALineInProse(body)) {
-        if (PROSE_ALLOWED.some((a) => a.file === rel && a.token === m)) continue;
-        offenders.push(`${rel}: "${m}"`);
-      }
+      // Spent, not matched (#1128): a second `line 123` in the same case is an offender.
+      for (const m of citesALineInProse(body)) proseRefs.push({ item: `${rel}::${m}`, site: `${rel}: "${m}"` });
     }
-    expect(offenders).toEqual([]);
+    spendLedger(
+      'PROSE_ALLOWED in qaCaseReferences',
+      proseRefs,
+      PROSE_ALLOWED.map((a) => ({ file: a.file, key: a.token, count: a.count, reason: a.reason })),
+      'Cite the SYMBOL, not the line, in prose too (#680).',
+    );
     // Anti-vacuity: this rule had NONE, which made it unfalsifiable — see `citesALineInProse`.
     // The exempt paragraph is the one prose line reference the suite is allowed to contain, so
     // seeing exactly it proves the detector still fires.
@@ -2392,6 +2572,304 @@ describeCases('QA case references', () => {
     // guards against is the field vanishing entirely, not shrinking.
     expect(checked).toBeGreaterThan(0);
     expect(residue).toEqual([]);
+  });
+
+  /**
+   * The CLEANUP CONTRACT (#1095, #900, #1086) — three rules, none of which reads English.
+   *
+   * The defect: a case's claim about the working tree was PROSE, and nothing linked it to the rule
+   * that decides whether the claim is true. So when the rule moved, every copy went stale silently
+   * and each one became a runner filing a false finding against a healthy tree. It happened twice —
+   * `SCENE_FORMAT_VERSION` 12→13 stranded 21 cases asserting an empty tree (#900), and the
+   * cloud-sync dirty/clean read stranded two more (#1086).
+   *
+   * ⚠️ **The version is deliberately NOT part of these rules**, though #1095 proposed keying on it.
+   * `saveScene` has no dirty check: at `runMode: 'stopped'` it re-serializes and WRITES the scene
+   * whether or not anything changed. Whether that write also DIRTIES the file depends on the bytes
+   * round-tripping — on a fixture already at the current format version with no content change it
+   * may not, and 5 of the 30 `saves` fixtures are at 13 today (25 are at 12). The rule is stated on
+   * the write, not the dirt, because the write is the part that is always true: "a case that saves
+   * must restore" holds across the next format change, whatever it touches, whereas a
+   * version-keyed rule answers only "is this stale TODAY" and must be re-derived at each bump —
+   * the same half-life as the prose it replaces, which is the failure this issue exists to stop.
+   * The cost of stating it on the write is a `restores:` that is occasionally a no-op. That is the
+   * cheap direction.
+   *
+   * `scene_write` is the author's answer to the one question no text search can answer — does a
+   * save EXECUTE, and at what run mode:
+   *   `saves`   — a save runs at `runMode: 'stopped'`; the scene file IS written, even when the
+   *               case only cares about an asset (QA-ASSET-0013's three `modoki_save_all` calls,
+   *               at its steps 4, 12 and 13, touch a scene its assertions never look at).
+   *   `refused` — a save runs, but `saveScene` refuses the scene half because run mode is
+   *               `scrub`/`playing` (QA-ANIM-0012's preview envelope, QA-EDITOR-0015's Cmd+S
+   *               during Play).
+   *   `never`   — no save executes. Most cases that MENTION a save mention it to forbid one.
+   */
+  it('every case that can write its fixture scene declares it (#1095)', () => {
+    const undeclared: string[] = [];
+    let checked = 0;
+    // `Cmd+S` needs the boundary: without it the pattern also matches `Cmd+Shift+Z`, which earns a
+    // case a `scene_write` declaration that means nothing and that a later reader would trust.
+    const TOOL_SAVE = /modoki_save_all|save_all/;
+    const HUMAN_SAVE = /Cmd\+S(?![A-Za-z])|⌘S(?![A-Za-z])/;
+    let viaHumanSaveOnly = 0;
+    for (const c of cases) {
+      if (typeof c.fm?.fields.fixture_scene !== 'string') continue;
+      const tool = TOOL_SAVE.test(c.body);
+      const human = HUMAN_SAVE.test(c.body);
+      if (!tool && !human) continue;
+      checked++;
+      if (human && !tool) viaHumanSaveOnly++;
+      const v = c.fm.fields.scene_write;
+      if (typeof v !== 'string' || !SCENE_WRITE_VALUES.includes(v)) {
+        undeclared.push(
+          `${c.rel}: names a fixture_scene and mentions a save, so it must declare ` +
+            `scene_write: ${SCENE_WRITE_VALUES.join(' | ')} (got ${JSON.stringify(v)})`,
+        );
+      }
+    }
+    // The DEMAND side is detected from text, and that is deliberate: a false positive here costs
+    // one word of frontmatter, never a wrong verdict. The verdict itself is always the author's.
+    expect(checked).toBeGreaterThan(50);
+    // ⚠️ A single total floor cannot tell the two halves of the detector apart — measured, deleting
+    // the `Cmd+S` alternative drops the population from 129 to 122, clearing any floor of 50 while
+    // silently un-demanding seven cases, THREE of which are `saves` and match on nothing else
+    // (menubar/keyboard-accelerators, assets/rename-moves-parked-asset-write,
+    // assets/undo-after-save-reparks-asset-edit). The human-accelerator half is the one that
+    // catches a case pressing Cmd+S to prove a negative, so it gets its own floor.
+    expect(viaHumanSaveOnly).toBeGreaterThanOrEqual(3);
+    expect(undeclared).toEqual([]);
+  });
+
+  it('a case that writes its fixture scene restores it (#1095)', () => {
+    const offenders: string[] = [];
+    let checked = 0;
+    for (const c of cases) {
+      if (c.fm?.fields.scene_write !== 'saves') continue;
+      checked++;
+      const scene = c.fm.fields.fixture_scene;
+      const restores = c.fm.fields.restores;
+      // A whole-directory restore (`git checkout -- games/anim-bug`) covers the scene inside it —
+      // via this file's own `isUnder`, not a second copy of the same predicate.
+      const covered = restoresEntries(restores).some(
+        (p) => typeof p === 'string' && isUnder(String(scene), p),
+      );
+      if (!covered) {
+        offenders.push(
+          `${c.rel}: scene_write: saves, so restores: must cover ${scene} — a save at 'stopped' ` +
+            're-serializes and writes the scene whether or not anything changed',
+        );
+      }
+    }
+    expect(checked).toBeGreaterThan(0);
+    expect(offenders).toEqual([]);
+  });
+
+  it('every `restores:` path is repo-relative and TRACKED (#1095)', () => {
+    const bad: string[] = [];
+    let checked = 0;
+    // The mirror of `creates:`, which requires its paths to be ABSENT. A restore names something
+    // the case puts BACK, so it must exist and be tracked — an untracked path cannot be restored
+    // by git, and a typo'd one silently restores nothing.
+    // Through `repoFiles`, never a direct `git ls-files` — `corpusProducerIsShared.test.ts`
+    // Rule 1 forbids a second enumeration, and it caught this rule's first draft doing exactly
+    // that. `includeUntracked: false` is the `--cached` view, i.e. tracked-only, which is the
+    // question this rule asks.
+    const tracked = new Set(repoFiles({ includeUntracked: false, floor: 0 }).map((f) => f.rel));
+    const trackedDirs = new Set<string>();
+    for (const p of tracked) {
+      const parts = p.split('/');
+      for (let i = 1; i < parts.length; i++) trackedDirs.add(parts.slice(0, i).join('/'));
+    }
+    for (const c of cases) {
+      const restores = restoresEntries(c.fm?.fields.restores);
+      for (const entry of restores) {
+        checked++;
+        if (typeof entry !== 'string' || /[<>{}*$\s]/.test(entry)) {
+          bad.push(`${c.rel}: restores: ${JSON.stringify(entry)} is a placeholder, not a real path`);
+        } else if (!tracked.has(entry) && !trackedDirs.has(entry)) {
+          bad.push(`${c.rel}: restores: "${entry}" is not a tracked file or directory`);
+        }
+      }
+    }
+    expect(checked).toBeGreaterThan(0);
+    expect(bad).toEqual([]);
+  });
+
+  /**
+   * `cites:` — the LINK from a case to the rule it depends on (#1095).
+   *
+   * The defect this closes is not "a case says something wrong"; it is that **nothing could answer
+   * *which cases depend on § 23?*** when § 23 changed. #900 and #1086 were both found by a runner
+   * hitting the stale copy, and #900's own close-out concluded the population was "three questions
+   * no text search answers". A declaration turns that into one query.
+   *
+   * Two rules: every entry resolves to a real section, and every qualified citation in the body is
+   * declared. The second is what keeps it COMPLETE — a `cites:` that lists one of a case's three
+   * dependencies is worse than none, because it reads as exhaustive.
+   *
+   * Not redundant with `docCitations.test.ts`, which also resolves `<doc>.md § N` — that one reads
+   * PROSE across the whole repo and answers "does this pointer still resolve"; these two read
+   * FRONTMATTER and answer "is the dependency list complete". Prose citations are covered by both,
+   * which is how the README's own explanation of this rule got caught: it described an
+   * unqualified `§ 4b` in a sentence that read as a citation to a section the field manual does
+   * not define, and the doc gate went red on the phase that introduced it.
+   *
+   * ⚠️ **Only QUALIFIED citations count — the ones that name `knowledge.md` near the section mark.**
+   * A bare `§ 4b` does not say WHICH document: measured, `packaged/signed-release-artifact-installs-
+   * clean.md` cites `§ 4b`/`§ 4c` of the **release-version skill**, which really does have those
+   * sections while `knowledge.md` does not. A guard reading bare marks would have called those two
+   * dangling and sent someone to "fix" a correct citation.
+   */
+  it('every `cites:` entry names a real qa/knowledge.md section (#1095)', () => {
+    const dangling: string[] = [];
+    let checked = 0;
+    const sections = headingIds(readFileSync(join(REPO_ROOT, 'qa/knowledge.md'), 'utf8'));
+    // A parse that stopped matching headings would
+    // make every entry dangle, so floor the INPUT set as well as the checked one.
+    expect(sections.size).toBeGreaterThan(20);
+    for (const c of cases) {
+      for (const entry of restoresEntries(c.fm?.fields.cites)) {
+        checked++;
+        const m = typeof entry === 'string' && /^knowledge\.md#([0-9]+[a-zA-Z]*(?:-bis)?)$/.exec(entry);
+        if (!m) {
+          dangling.push(`${c.rel}: cites: ${JSON.stringify(entry)} — want knowledge.md#<section>`);
+        } else if (!sections.has(m[1])) {
+          dangling.push(`${c.rel}: cites: "${entry}" names no section in qa/knowledge.md`);
+        }
+      }
+    }
+    expect(checked).toBeGreaterThan(50);
+    expect(dangling).toEqual([]);
+  });
+
+  it('every qa/knowledge.md section a case cites in prose is declared in `cites:` (#1095)', () => {
+    const undeclared: string[] = [];
+    let checked = 0;
+    for (const c of cases) {
+      const declared = new Set(
+        restoresEntries(c.fm?.fields.cites)
+          .filter((e): e is string => typeof e === 'string')
+          .map((e) => e.replace(/^knowledge\.md#/, '')),
+      );
+      // One definition of "a citation", shared with `docCitations` — then keep only the ones whose
+      // DOC is the field manual, since a case legitimately cites other documents' sections too.
+      const cited = new Set(
+        [...c.body.matchAll(SECTION_CITE)]
+          .filter(([, doc]) => doc.endsWith('knowledge.md'))
+          .map(([, , section]) => section),
+      );
+      for (const m of cited) {
+        checked++;
+        if (!declared.has(m)) {
+          undeclared.push(
+            `${c.rel}: cites qa/knowledge.md § ${m} in prose but does not declare ` +
+              `knowledge.md#${m} — the declaration is how "who depends on § ${m}?" gets answered`,
+          );
+        }
+      }
+    }
+    expect(checked).toBeGreaterThan(100);
+    expect(undeclared).toEqual([]);
+  });
+
+  /**
+   * Every `git checkout` of a repo path in a case body is DECLARED in `restores:` (#1095 review).
+   *
+   * `restores:` started life covering only the fixture scene, which made `qa/knowledge.md` § 8's
+   * new instruction — "restore what the frontmatter declares" — false for 20 cases that restore
+   * something else: a rig, a `.particle.json`, a `.png.meta.json`, a `project.config.json`, even a
+   * `runtime/config.ts`. A runner following § 8 would restore the scene, run `git status`, and see
+   * a modified file the frontmatter never mentioned — which is #900's failure one grain finer.
+   *
+   * This rule is what keeps the declaration COMPLETE rather than merely present. The body is the
+   * source of truth here precisely because a `git checkout` is unambiguous: it names a path, and
+   * the only reason to name it is to put it back.
+   *
+   * ⚠️ What this canNOT see: a case that overwrites a committed file and restores it some OTHER
+   * way, or not at all. QA-INSP-0006 was exactly that — it "restored" by writing the old value
+   * back, left a stray key, and made no tree claim, so nothing mechanical was ever going to catch
+   * it. It was found by reading. This rule narrows that gap; it does not close it.
+   */
+  it('every `git checkout` a case performs is declared in `restores:` (#1095)', () => {
+    const undeclared: string[] = [];
+    let checked = 0;
+    const CHECKOUT = /git checkout(?: --)?\s+`?([^\s`'"|)]+)/g;
+    for (const c of cases) {
+      const declared = restoresEntries(c.fm?.fields.restores).filter(
+        (p): p is string => typeof p === 'string',
+      );
+      for (const m of c.body.matchAll(CHECKOUT)) {
+        const path = m[1].trim();
+        if (!REPO_TOP_LEVEL.test(path)) continue;
+        checked++;
+        if (!declared.some((d) => isUnder(path, d))) {
+          undeclared.push(
+            `${c.rel}: restores \`${path}\` in its body but does not declare it in restores: — ` +
+              'a runner following knowledge.md § 8 restores only what is declared',
+          );
+        }
+      }
+    }
+    expect(checked).toBeGreaterThan(20);
+    expect(undeclared).toEqual([]);
+  });
+
+  /**
+   * No case names a per-clone port — the launcher DERIVES it (#1098, #349).
+   *
+   * The ports come from `editorPorts.mjs`, the one authored table, for the same reason
+   * `clonePortHardcoding.test.ts` derives them: a hand-listed copy here would go stale exactly the
+   * way the corpus did, in the guard whose job is to notice. Backend, Vite and CDP all count — a
+   * case telling its runner to read `http://127.0.0.1:<vite>/#/editor` is as clone-specific as one
+   * pinning the backend, and 25 cases did that too.
+   *
+   * Deliberately scoped to `qa/cases/**`, NOT `suiteDocs()`: `qa/knowledge.md` § 1 carries the
+   * per-clone table on purpose, marked as a copy of `editorPorts.mjs`.
+   */
+  it('no case hardcodes a per-clone port — the launcher derives it (#1098)', () => {
+    const clonePorts = Object.values(CLONE_BACKEND_PORTS).flatMap((backend) => [
+      backend,
+      vitePortForBackend(backend),
+      cdpPortForBackend(backend),
+      // ⚠️ The 932x OVERRIDE, and it is the series that actually matters here. `cdpPortForBackend`
+      // derives 9222..9226, but the `editor-*` shell functions on the main Mac set
+      // `MODOKI_CDP_PORT` to 932x by hand so it cannot collide with the `chrome-devtools` MCP's
+      // 9222 — and `launch-editor.sh` honours an explicit value ahead of its own derivation, so
+      // 932x is what a runner's environment holds and what the corpus had baked in (`9326`, in
+      // four CDP probes). Deriving only the 922x series left the guard covering ports nothing on
+      // this machine binds while the real ones walked past: measured — a re-introduced `9326`
+      // passed, a `5177` failed. The offset is the same; only the base differs.
+      //
+      // ⚠️ ASKED of `editorPorts.mjs`, not re-derived here (#1102). This line used to spell the
+      // arithmetic out, which made it the third copy of a series that was authored nowhere — the
+      // same restated-fact mechanism the `qa/knowledge.md` half of #1102 is about.
+      editorCdpPortForBackend(backend),
+    ]);
+    // A guard over an empty port list would pass over any corpus at all. This is the input set,
+    // so it is floored HERE and not only at the case count (#680 review: mutate where the guard
+    // COLLECTS, not only where it reads).
+    expect(clonePorts.length).toBeGreaterThanOrEqual(20);
+    expect(cases.length).toBeGreaterThan(0);
+    // ⚠️ **One population entry per LITERAL, not per file (#1128).** The detector was
+    // `RegExp.test(body)` — presence per `{file, port}` — so a row keyed `{file, port}` could not
+    // carry a count, and a SECOND `5179` added to a case allowed one quoted default was green. The
+    // staleness half is now the ledger's over-blessed arm, on the same population as the ban.
+    const literals: Array<{ item: string; site: string }> = [];
+    for (const c of cases) {
+      for (const port of clonePorts) {
+        const n = c.body.match(new RegExp(`\\b${port}\\b`, 'g'))?.length ?? 0;
+        for (let i = 1; i <= n; i++) literals.push({ item: `${c.rel}::${port}`, site: `${c.rel} — port ${port} (#${i})` });
+      }
+    }
+    assertExemptionLedger({
+      label: 'CLONE_PORT_ALLOWED in qaCaseReferences',
+      population: literals,
+      exempt: CLONE_PORT_ALLOWED.map((a) => ({ item: `${a.file}::${a.port}`, count: a.count, reason: a.reason })),
+      floor: 1,
+      fix: 'derive the port (bare `launch-editor.sh`, or `node engine/scripts/editorPorts.mjs backend .`), '
+        + 'or ledger it in CLONE_PORT_ALLOWED — per literal, with a reason that argues for each one.',
+    });
   });
 
   /**
@@ -2710,5 +3188,787 @@ describeCases('QA case references', () => {
       }
     }
     expect(unknown).toEqual([]);
+  });
+
+  /**
+   * No case may write the SCENE while the editor is Playing — the refusal is invisible in the
+   * case's own assertions.
+   *
+   * WHY THIS GUARD EXISTS
+   * ---------------------
+   * `POST /api/scene-mutate` refuses unconditionally while `playState` is `playing` or `paused`
+   * (409, *"stop the game (press Stop) before editing the scene"*). A case whose procedure issues
+   * one there has a step that never ran — and this fails in the worst way available: the
+   * measurement that step was setting up is simply absent, while the Expected block can still pass.
+   *
+   * QA-TIMELINE-0002 paused a `Director` this way and sat `blocked` for three weeks; worse, its two
+   * idempotence reads AGREED, because a playhead that was never paused reads the same time twice —
+   * so a false PASS was exactly as likely as a fail (#1093).
+   *
+   * It is not a one-off. `qa/knowledge.md` § 4 records an audit on 2026-08-20 that found EIGHT
+   * cases of this shape (QA-ZONE-0001/0002, QA-AUDIO-0002, QA-VIDEO-0002, QA-UI-0002 among them),
+   * every one repaired by hand. This is the mechanical check that stops the ninth.
+   */
+  it('no case writes the scene while Playing (the 409 is invisible in its own assertions)', () => {
+    const offenders = cases.flatMap((c) => scanPlayOrdering(c.body).offenders.map((w) => `${c.rel}: ${w}`));
+    expect(offenders).toEqual([]);
+  });
+
+  /**
+   * The COVERAGE FLOOR for the check above, and it is not decoration.
+   *
+   * `expect(offenders).toEqual([])` is satisfied identically by a working scanner and by one that
+   * skipped every file — the exact "a guard that passes while measuring nothing" shape this repo
+   * keeps hitting (docs/falsifiable-tests.md). The procedure region is found by HEADING, and
+   * `qa/README.md` calls those headings a *convention*, not a contract: renaming `## Steps` to
+   * `## Steps — Part A` for readability would silently drop that case from the guard forever, with
+   * nothing going red. So assert the reach directly — every case that presses Play must be
+   * scannable.
+   *
+   * Measured 2026-09-12: 52 of 266 cases press Play, and all 52 are scannable. The first draft of
+   * this guard matched `/^##\s+Steps\s*$/` exactly and silently missed 4 of them, including
+   * `inspector/resource-trait-hot-reload.md` — long, interleaving Play with scene writes, and
+   * documenting this very 409 in its own prose.
+   */
+  it('every case that presses Play is actually reachable by the play-ordering scan', () => {
+    const unreachable = cases
+      .filter((c) => HAS_A_PLAY.test(c.body) && !scanPlayOrdering(c.body).scannable)
+      .map((c) => c.rel);
+    expect(unreachable).toEqual([]);
+    if (HAS_CASES) {
+      // A floor on the floor: if the play detector itself stopped matching, `unreachable` would be
+      // empty for the wrong reason.
+      expect(cases.filter((c) => HAS_A_PLAY.test(c.body)).length).toBeGreaterThan(40);
+    }
+  });
+
+  /**
+   * A case that leaves the editor PLAYING hands the next case a world in which its own first
+   * mutate 409s — `qa/knowledge.md` § 4 names a trailing `stop` as suite convention, and the
+   * failure is #1093's mechanism displaced one case later, where it is even harder to attribute.
+   *
+   * RATCHET, not a hard rule, because 11 cases predate the check (#1121). The set is frozen: a NEW
+   * offender fails, and so does a STALE entry, so draining the list cannot be undone silently.
+   */
+  it('the set of cases that leave the editor Playing is exactly the frozen baseline', () => {
+    const playing = cases.filter((c) => scanPlayOrdering(c.body).endsPlaying).map((c) => c.rel);
+    expect(playing.sort()).toEqual([...LEAVES_EDITOR_PLAYING].sort());
+  });
+
+  /**
+   * The COST of `TOOLBAR`'s call anchor, guarded rather than left as a comment.
+   *
+   * Counting transport only inside a `data-ui-id` selector makes a Play written as PROSE invisible
+   * — a false negative, the direction that hides a real defect. Exactly one case did that
+   * (`rendering/group-alpha-reaches-2d-particle-emitters.md` step 10, *"**Play** again
+   * (`gameView.toolbar.play`), wait ~3s"*) and was rewritten to the braced form in #1121.
+   *
+   * ⚠️ **This deliberately does NOT look at line shape, and the first draft did.** That draft asked
+   * whether the id sat on a line starting `N. ` — and only **3 of the corpus's 12 toolbar calls do**.
+   * The rest are continuation lines under a step, and transport also appears in bulleted (`- `) and
+   * table-row steps, so the check was very nearly vacuous for the thing it was written to stop:
+   * rewriting group-alpha's step 10 with the id one line further down left the case genuinely
+   * ending Playing with the whole suite green.
+   *
+   * So the question is not "does this line look like a step" but "is every toolbar id in the
+   * PROCEDURE a real call" — and the handful that are not are ledgered by file and NEARBY WORDING,
+   * each row SPENT per mention through `spendLedger` (#1128). ⚠️ This comment used to say they were
+   * "ledgered per file with a count, the convention this file already uses" — none of the rows it
+   * named carried a count, and these were `.find()`-matched, so a second bare mention beside a
+   * ledgered snippet was green (proven by addition, #1134). The wording key blocks a SUBSTITUTION
+   * placed more than the ±160-char window away from the snippet; only the count blocks an ADDITION.
+   * ⚠️ A substitution INSIDE the window — the ledgered mention removed, a press-written-as-prose added
+   * beside the same snippet — is still billed to the row and stays green, as it did before #1128.
+   *
+   * Both halves bite: a new prose mention fails, and so does a ledger row whose wording matches
+   * nothing — so a case that CLEANS UP its prose must drop the row in the same commit.
+   *
+   * **The allowlist was measured before this granularity was chosen, not discovered after.** On
+   * `work-qa` at the tree that added this: 18 mentions of `gameView.toolbar.(play|stop)` corpus-wide,
+   * 12 inside a `modoki_tap` call and 6 not; 16 of those sit inside a procedure region, 11 taps and
+   * 5 prose, which is the 4 rows below (one row covers two mentions on a single line). No
+   * granularity removes the allowlist — the 5 are genuine documentation, and a predicate that
+   * excluded them would also excuse a press written as prose, which is the whole defect.
+   *
+   * ⚠️ **What it cannot see**, stated so a green run is not read as more than it is:
+   * - `gameView.toolbar.pause`/`.step` are not modelled. Deliberate — only `stop` transitions out of
+   *   the hazard, and a case that pauses still reads as `endsPlaying`.
+   * - Anything before the FIRST procedure heading is outside the region, prose and taps alike.
+   *   `editor/ai-capture-contact-on-play-wiring.md` quotes the play selector in its Preconditions
+   *   and is neither counted nor ledgered.
+   * - A case with no procedure heading is skipped entirely; the coverage floor above is what stops
+   *   that hiding a case which presses Play.
+   */
+  const TOOLBAR_PROSE_ALLOWED: { file: string; near: string; count?: number; reason: string }[] = [
+    {
+      file: 'qa/cases/gameview/first-click-into-game-panel-reaches-the-game.md',
+      near: 'the game area itself carries no',
+      reason:
+        'Its subject IS the tagging: the line enumerates the ids the toolbar carries in order to ' +
+        'say the game AREA carries none. Naming them is the finding.',
+    },
+    {
+      file: 'qa/cases/editor/cmd-s-during-play-saves-assets-not-scene.md',
+      near: 'an unselected tab has never rendered',
+      reason: 'Explains that the id does not RESOLVE while its tab is unrendered — the opposite of pressing it.',
+    },
+    {
+      file: 'qa/cases/editor/cmd-s-during-play-saves-assets-not-scene.md',
+      near: 'and are used directly',
+      reason:
+        'Its closing `## Note on selectors`. This is the case #1121 falsely accused — it Stops twice.',
+    },
+    {
+      file: 'qa/cases/editor/ai-capture-contact-on-play-wiring.md',
+      near: 'are real `data-ui-id`s',
+      count: 2,
+      reason:
+        'Its closing `## Note on selectors` names `.play` and `.stop` in one sentence. Under the old ' +
+        'bare-name matcher those two cancelled each other, which is the only reason this case did ' +
+        'not read as an offender too.',
+    },
+  ];
+
+  it('every toolbar transport id in a procedure is a real PRESS, or is ledgered prose (#1121)', () => {
+    const mentions: Array<{ item: string; site: string }> = [];
+    let pressesSeen = 0;
+    const WINDOW = 160;
+    for (const c of cases) {
+      const region = procedureRegion(c.body);
+      if (region === null) continue;
+      const presses = [...region.matchAll(TOOLBAR('play')), ...region.matchAll(TOOLBAR('stop'))].map(
+        (m) => [m.index ?? 0, (m.index ?? 0) + m[0].length] as const,
+      );
+      pressesSeen += presses.length;
+      for (const m of region.matchAll(TOOLBAR_ANY())) {
+        const at = m.index ?? 0;
+        if (presses.some(([s, e]) => at >= s && at < e)) continue; // part of a real tap
+        const ctx = region.slice(Math.max(0, at - WINDOW), at + WINDOW);
+        // The KEY is the ledgered wording this mention sits beside, when there is one — so a row is
+        // spent per mention near its snippet, and a mention near no snippet is its own unpardonable
+        // key. The row list only NAMES the wording; how many mentions sit beside it is counted.
+        const near = TOOLBAR_PROSE_ALLOWED.find((a) => a.file === c.rel && ctx.includes(a.near))?.near;
+        const site = `${c.rel}: ${JSON.stringify(ctx.slice(WINDOW - 40, WINDOW + 40))}`;
+        mentions.push({ item: `${c.rel}::${near ?? `unledgered@${at}`}`, site });
+      }
+    }
+    // Staleness is the ledger's over-blessed arm now: a row whose wording no longer sits beside a
+    // bare mention — including one naming a deleted or renamed case — blesses more than it finds.
+    spendLedger(
+      'TOOLBAR_PROSE_ALLOWED in qaCaseReferences',
+      mentions,
+      TOOLBAR_PROSE_ALLOWED.map((a) => ({ file: a.file, key: a.near, count: a.count, reason: a.reason })),
+      "a toolbar id that is not a press. A press is `modoki_tap {selector: '[data-ui-id=\"gameView.toolbar.play\"]'}`; "
+        + 'the scan reads the TAP, not the id, so transport written any other way does nothing. If this is '
+        + 'genuinely prose, ledger it in TOOLBAR_PROSE_ALLOWED with a nearby snippet, a count and a reason.',
+    );
+    // ⚠️ Anti-vacuity, and the ONLY corpus-level check that can see `TOOLBAR` stop matching: the
+    // frozen baseline is drained to `[]`, so it reads `[] === []` and survives a dead detector, and
+    // `HAS_A_PLAY`'s floor survives on its `play_control` alternative alone. A RATCHET, not slack —
+    // 11 presses today, no case contributes fewer than 2, so removing one deliberately means
+    // lowering this number deliberately.
+    if (HAS_CASES) expect(pressesSeen).toBeGreaterThanOrEqual(11);
+  });
+
+});
+
+/**
+ * A toolbar transport CALL — the `data-ui-id` selector a real `modoki_tap` always carries — and
+ * NOT a prose mention of the same id (#1121).
+ *
+ * This is the brace rule below applied to the other event kind. Transport used to be matched by
+ * bare name (`/gameView\.toolbar\.play/`), which read a case's documentation as if it were a
+ * button press: cases NAME these ids in prose — two CASES do so in a trailing `## Note on selectors`
+ * section (three mentions between them), the rest in a sentence about what the toolbar carries.
+ * Measured over all 266 cases AFTER the corpus edit below: 18 mentions, of which 12 sit inside a
+ * `modoki_tap` call and 6 do not. ⚠️ Counting the SELECTOR rather than the tap is not enough — see
+ * the guard's own ledger for the prose-in-selector-form hole that cost.
+ *
+ * It went wrong in both directions at once. `editor/cmd-s-during-play-saves-assets-not-scene.md`
+ * Stops twice and was still listed as leaving the editor Playing, because its closing note names
+ * `.play` last; and `editor/ai-capture-contact-on-play-wiring.md` read CLEAN only because its own
+ * note happens to name `.play` before `.stop`, so two false events cancelled — reordering two
+ * words in that sentence would have switched its check off silently.
+ *
+ * ⚠️ The cost was paid in the CORPUS, not hidden here. `rendering/group-alpha-reaches-2d-particle-
+ * emitters.md` step 10 was a genuine Play written as prose (``**Play** again (`gameView.toolbar.
+ * play`)``) and is now a braced call like every other transport step, because a regex cannot tell
+ * "I pressed this" from "this exists" and guessing would have traded a false accusation for a
+ * false NEGATIVE — the direction that hides a real defect.
+ */
+const TOOLBAR_SELECTOR = (id: 'play' | 'stop' | '(?:play|stop)') =>
+  `data-ui-id=\\\\?["']gameView\\.toolbar\\.${id}\\\\?["']`;
+
+/** ANY mention of a transport id, pressed or merely described. Derived from the same literal as
+ *  `TOOLBAR`, so renaming the id namespace cannot update one and leave the other behind. */
+const TOOLBAR_ANY = () => new RegExp(`gameView\\.toolbar\\.(?:play|stop)`, 'g');
+
+const TOOLBAR = (id: 'play' | 'stop') =>
+  new RegExp(`modoki_tap[^}]{0,80}?${TOOLBAR_SELECTOR(id)}`, 'g');
+
+/** Case bodies that press Play. Shared by the scan and by its coverage floor, so the floor cannot
+ *  pass because the detector drifted — including the `TOOLBAR` form, which must stay the SAME
+ *  shape here or the floor would demand scannability for cases the scan no longer reads. */
+const HAS_A_PLAY = new RegExp(
+  `play_control[^}]{0,80}?["']?action["']?\\s*:\\s*["']play["']|${TOOLBAR('play').source}`,
+);
+
+/*
+ * ⚠️ **No `PLAY_WRITE_ALLOWED` — deleted rather than migrated (#1128).** It was an EMPTY
+ * `Record<file, reason>` that skipped `scanPlayOrdering` for a whole case, and its docblock called
+ * that unspent, file-wide shape "the convention every other check in this file follows" — which was
+ * false (#1121 wrote it; the other ledgers were keyed file+token). Its first row would have
+ * pardoned every write-while-Playing in that case, not the one 409 the case is about. A case whose
+ * SUBJECT is the 409 gets a counted row through `spendLedger` when it exists; the detector is
+ * pinned on synthetic input by the `scanPlayOrdering` cases at the bottom of this file.
+ */
+
+/**
+ * Cases that end their procedure with the editor still Playing (#1121). Frozen so a NEW one fails
+ * and a DRAINED one must be removed in the same commit.
+ *
+ * **Empty — fully drained.** Ten cases gained a trailing `## Cleanup` Stop. The eleventh,
+ * `editor/cmd-s-during-play-saves-assets-not-scene.md`, was never an offender: it Stops at step 10
+ * and again in its own Cleanup, and was listed only because the scan read the `## Note on
+ * selectors` line at the foot of the file as a button press. It left this list when `TOOLBAR` got
+ * its call anchor, with no edit to the case — adding a third redundant Stop to a compliant case to
+ * satisfy a defective scanner would have been fixing the measurement to match the instrument.
+ */
+const LEAVES_EDITOR_PLAYING: string[] = [];
+
+/** A procedure section. `qa/README.md` calls the headings a CONVENTION, so this accepts the four
+ *  spellings the corpus actually uses (`## Steps`, `## Steps — Part A`, `### Steps`, `## Part A`)
+ *  rather than the one the spec suggests — matching only `## Steps` missed 4 of the 52 cases that
+ *  press Play, silently. */
+const PROCEDURE_HEADING = /^#{2,3}\s+(?:.*\bSteps\b|Part\b)/i;
+
+export interface PlayOrderingScan {
+  /** false when no procedure heading was found — the state the coverage floor exists to catch. */
+  scannable: boolean;
+  /** One entry per scene write issued while Playing. */
+  offenders: string[];
+  /** True when the procedure ends without returning to Stopped (#1121). */
+  endsPlaying: boolean;
+}
+
+/**
+ * Play/Stop/scene-write ordering scanner for the guards above.
+ *
+ * Scans from the FIRST procedure heading to the END of the body, not one `## Steps` block: the
+ * corpus has multi-part cases (`## Steps — Part A` / `Part B`) and cases whose Play/mutate pair
+ * lives in a later section entirely (`assets/sprite-anim-editor-clip-authoring.md`). It must NOT
+ * start earlier than that, though — `rendering/postfx-stack-composes.md` mentions a Play in its
+ * `## Preconditions`, before the Steps' deliberately pre-Play mutate, so scanning the whole body
+ * false-positives on a correct case.
+ *
+ * Ordering is by match POSITION, not line by line: the original defective step wrapped between
+ * `modoki_mutate_scene` and its `{ops:`, so a line scanner would have missed the very thing this
+ * guards. Position ordering also makes a same-line "Stop FIRST, then mutate" read correctly.
+ *
+ * TRANSPORT IS NOT JUST `play_control`. Six cases drive it by tapping the Game panel's toolbar,
+ * whose own case title says that button "drives the same play-state machine"; and `load_scene` /
+ * `new_scene` return to Stopped (their tool descriptions say so). Missing the tap forms cost
+ * accuracy in BOTH directions — a missed Play hides a real defect, but a missed STOP flags a
+ * correct case, which is the direction that gets a guard disabled.
+ *
+ * ⚠️ DELIBERATELY CONSERVATIVE, with the bounds stated rather than left to be discovered:
+ *
+ * - A write counts only where the tool name is followed by an opening BRACE, i.e. an actual call.
+ *   Cases legitimately NAME these tools in prose, including to warn against them —
+ *   QA-TIMELINE-0002's own step 5 reads *"Do NOT fall back to `modoki_mutate_scene`"*, which a bare
+ *   name match would flag as the defect it warns about. The cost is a false NEGATIVE on a braceless
+ *   prose call; `video/delivery-bundled-and-remote-cache.md` step 11 has one and is CORRECT (it
+ *   Stops first, and says why).
+ * - TRANSPORT obeys that same rule, and for the same reason — see `TOOLBAR` above. `play_control`
+ *   is self-anchoring (the verb only appears inside the call's own arguments), but the toolbar ids
+ *   are bare identifiers that four cases document in prose, so they count only inside a
+ *   `data-ui-id` selector. This symmetry was missing for a while and cost one false accusation and
+ *   one near-miss in the masking direction (#1121).
+ * - `modoki_save_all` is out of scope. It is blocked during Play too, but by `editorAction`
+ *   ('save-all'), NOT by this 409 — and it takes no arguments, so cases write it bare far more often
+ *   than braced: the brace rule would give it near-zero coverage and the bare rule would flag every
+ *   prose mention.
+ * - `pause` does not clear the hazard (the route refuses `paused` as well as `playing`), and
+ *   `resume` cannot reach an accepting state either (`resume` from stopped is itself refused), so
+ *   only `stop` transitions out.
+ * - Timeline `preview`/`scrub` run modes collapse to `stopped` in the `playState` the route reads,
+ *   so a mutate during a preview does not hit this 409 and is correctly not modelled here.
+ */
+/** The scanned procedure region, or null when the case has no procedure heading. Shared with the
+ *  toolbar-prose guard so the two cannot drift into asserting about different spans of the file. */
+export function procedureRegion(body: string): string | null {
+  const lines = body.split(/\r?\n/);
+  const start = lines.findIndex((l) => PROCEDURE_HEADING.test(l));
+  return start < 0 ? null : lines.slice(start + 1).join('\n');
+}
+
+export function scanPlayOrdering(body: string): PlayOrderingScan {
+  const region = procedureRegion(body);
+  if (region === null) return { scannable: false, offenders: [], endsPlaying: false };
+
+  // `[^}]` cannot cross a `}`, so nested braces in `{ops:[{op:'setTrait'…}]}` cannot bleed into the
+  // next call and two adjacent calls cannot be spanned as one. The window is bounded rather than
+  // brace-anchored so the forms the corpus already uses all match: JSON-quoted keys
+  // (`{"action":"stop"}`, the style inside `modoki_batch`), spaces around the colon, a
+  // batch-wrapped `{tool:'modoki_play_control', args:{action:'stop'}}`, and an intervening backtick.
+  const TRANSPORT = (verb: string) =>
+    new RegExp(`play_control[^}]{0,80}?["']?action["']?\\s*:\\s*["']${verb}["']`, 'g');
+  const events: { at: number; kind: 'play' | 'stop' | 'write'; text?: string }[] = [];
+  const add = (re: RegExp, kind: 'play' | 'stop') => {
+    for (const m of region.matchAll(re)) events.push({ at: m.index ?? 0, kind });
+  };
+  add(TRANSPORT('play'), 'play');
+  add(TOOLBAR('play'), 'play');
+  add(TRANSPORT('stop'), 'stop');
+  add(TOOLBAR('stop'), 'stop');
+  add(/\b(?:modoki_)?(?:load_scene|new_scene)`?\s*\{/g, 'stop');
+  for (const m of region.matchAll(/\b(modoki_mutate_scene|modoki_set_transform)`?\s*\{/g)) {
+    events.push({ at: m.index ?? 0, kind: 'write', text: m[1] });
+  }
+  events.sort((a, b) => a.at - b.at);
+
+  const offenders: string[] = [];
+  let playing = false;
+  for (const e of events) {
+    if (e.kind === 'play') playing = true;
+    else if (e.kind === 'stop') playing = false;
+    else if (playing) {
+      offenders.push(
+        `${e.text} is called while Playing — /api/scene-mutate answers 409 there, so that step ` +
+          `never runs. Write the value BEFORE the Play, or Stop first (qa/knowledge.md § 4). To ` +
+          `drive a Director mid-Play use engine.director. A case whose SUBJECT is the 409 needs a ` +
+          `counted ledger row (spendLedger) with a reason — none exists today.`,
+      );
+    }
+  }
+  return { scannable: true, offenders, endsPlaying: playing };
+}
+
+/**
+ * The scanner's OWN accept and reject sides. Not gated on `HAS_CASES`: the corpus assertions are
+ * green today, so they prove nothing about whether the scanner works — only these do, and they must
+ * keep working in the OSS snapshot, which ships `tests/**` without `qa/`.
+ */
+describe('scanPlayOrdering', () => {
+  const wrap = (steps: string, heading = '## Steps') => `## Preconditions\n\np\n\n${heading}\n\n${steps}\n`;
+  const offenders = (steps: string, heading?: string) => scanPlayOrdering(wrap(steps, heading)).offenders;
+
+  it('FLAGS a mutate issued after Play — the defect itself (#1093)', () => {
+    const found = offenders("1. `modoki_play_control {action:'play'}`.\n2. `modoki_mutate_scene {ops:[]}`.");
+    expect(found).toHaveLength(1);
+    expect(found[0]).toContain('modoki_mutate_scene');
+  });
+
+  it('FLAGS it when the brace wraps to the next line, as the original step 5 did', () => {
+    expect(
+      offenders("1. `modoki_play_control {action:'play'}`.\n2. then `modoki_mutate_scene\n   {ops:[]}`."),
+    ).toHaveLength(1);
+  });
+
+  it('FLAGS a mutate after a PAUSE — the route refuses `paused` as well as `playing`', () => {
+    expect(
+      offenders(
+        "1. `modoki_play_control {action:'play'}`.\n2. `modoki_play_control {action:'pause'}`.\n" +
+          '3. `modoki_mutate_scene {ops:[]}`.',
+      ),
+    ).toHaveLength(1);
+  });
+
+  it('FLAGS a mutate after Play entered by TAPPING the Game toolbar', () => {
+    expect(
+      offenders(
+        '1. `modoki_tap {selector:\'[data-ui-id="gameView.toolbar.play"]\'}`.\n' +
+          '2. `modoki_mutate_scene {ops:[]}`.',
+      ),
+    ).toHaveLength(1);
+  });
+
+  it('FLAGS it inside a `## Steps — Part B` section, which the first draft could not see', () => {
+    expect(
+      offenders("1. `modoki_play_control {action:'play'}`.\n2. `modoki_mutate_scene {ops:[]}`.", '## Steps — Part A'),
+    ).toHaveLength(1);
+  });
+
+  it('accepts a mutate BEFORE the Play — the shape qa/knowledge.md § 4 prescribes', () => {
+    expect(offenders("1. `modoki_mutate_scene {ops:[]}`.\n2. `modoki_play_control {action:'play'}`.")).toEqual([]);
+  });
+
+  it('accepts a Stop written with JSON-quoted keys, as `modoki_batch` steps are', () => {
+    expect(
+      offenders(
+        "1. `modoki_play_control {action:'play'}`.\n2. `modoki_play_control {\"action\":\"stop\"}`.\n" +
+          '3. `modoki_mutate_scene {ops:[]}`.',
+      ),
+    ).toEqual([]);
+  });
+
+  it('accepts a Stop wrapped in a `modoki_batch` step', () => {
+    expect(
+      offenders(
+        "1. `modoki_play_control {action:'play'}`.\n" +
+          "2. `modoki_batch {steps:[{tool:'modoki_play_control', args:{action:'stop'}}]}`.\n" +
+          '3. `modoki_mutate_scene {ops:[]}`.',
+      ),
+    ).toEqual([]);
+  });
+
+  it('accepts a Stop performed by TAPPING the toolbar — the false-positive direction', () => {
+    expect(
+      offenders(
+        "1. `modoki_play_control {action:'play'}`.\n" +
+          '2. `modoki_tap {selector:\'[data-ui-id="gameView.toolbar.stop"]\'}`.\n' +
+          '3. `modoki_mutate_scene {ops:[]}`.',
+      ),
+    ).toEqual([]);
+  });
+
+  it('accepts a mutate after a `load_scene`, which returns to Stopped', () => {
+    expect(
+      offenders(
+        "1. `modoki_play_control {action:'play'}`.\n2. `modoki_load_scene {path:'/a.scene.json'}`.\n" +
+          '3. `modoki_mutate_scene {ops:[]}`.',
+      ),
+    ).toEqual([]);
+  });
+
+  it('accepts a mutate after an intervening Stop, even on the same line', () => {
+    expect(
+      offenders(
+        "1. `modoki_play_control {action:'play'}`.\n" +
+          "2. `modoki_play_control {action:'stop'}` FIRST, then `modoki_mutate_scene {ops:[]}`.",
+      ),
+    ).toEqual([]);
+  });
+
+  it('does NOT flag a prose WARNING against the tool — QA-TIMELINE-0002 step 5 says exactly this', () => {
+    expect(
+      offenders(
+        "1. `modoki_play_control {action:'play'}`.\n" +
+          '2. ⚠️ **Do NOT fall back to `modoki_mutate_scene`** — it 409s during Play by design.',
+      ),
+    ).toEqual([]);
+  });
+
+  it('does NOT read a Play mentioned in Preconditions, before the procedure begins', () => {
+    // postfx-stack-composes.md is exactly this: a Play in Preconditions, a deliberate pre-Play
+    // mutate in step 2. Scanning the whole body would flag a correct case.
+    expect(
+      scanPlayOrdering(
+        "## Preconditions\n\n- `modoki_play_control {action:'play'}` first.\n\n## Steps\n\n" +
+          '1. `modoki_mutate_scene {ops:[]}` while STOPPED.\n',
+      ).offenders,
+    ).toEqual([]);
+  });
+
+  it('reports `scannable:false` for a body with no procedure heading — the coverage floor case', () => {
+    const r = scanPlayOrdering('## Why this case exists\n\nprose only.\n');
+    expect(r.scannable).toBe(false);
+    expect(r.offenders).toEqual([]);
+  });
+
+  it('reports `endsPlaying` for a procedure that never returns to Stopped (#1121)', () => {
+    expect(scanPlayOrdering(wrap("1. `modoki_play_control {action:'play'}`.")).endsPlaying).toBe(true);
+    expect(
+      scanPlayOrdering(
+        wrap("1. `modoki_play_control {action:'play'}`.\n2. `modoki_play_control {action:'stop'}`."),
+      ).endsPlaying,
+    ).toBe(false);
+  });
+
+  /**
+   * The four below pin `TOOLBAR`'s call anchor, in both directions. Before it, transport was a bare
+   * name match and the first of these read `endsPlaying: true` for a case that Stops twice.
+   */
+  it('does NOT read a prose mention of the play id as a button press — the `## Note on selectors` shape (#1121)', () => {
+    const r = scanPlayOrdering(
+      wrap(
+        '1. `modoki_tap {selector:\'[data-ui-id="gameView.toolbar.play"]\'}`.\n' +
+          '2. `modoki_tap {selector:\'[data-ui-id="gameView.toolbar.stop"]\'}` — back to stopped.\n\n' +
+          '## Note on selectors\n\n`gameView.toolbar.play` · `.stop` exist (`GameView.tsx`).',
+      ),
+    );
+    expect(r.endsPlaying).toBe(false);
+  });
+
+  it('still reads a real toolbar TAP as a Play — the accept side, without which the test above passes by measuring nothing', () => {
+    expect(
+      scanPlayOrdering(wrap('1. `modoki_tap {selector:\'[data-ui-id="gameView.toolbar.play"]\'}`.')).endsPlaying,
+    ).toBe(true);
+  });
+
+  it('does NOT let a prose mention of the STOP id clear a real Play — the MASKING direction (#1121)', () => {
+    // `editor/ai-capture-contact-on-play-wiring.md` read clean only because its own closing note
+    // names `.play` before `.stop`, so two false events cancelled. Reordering two words in that
+    // sentence would have switched its check off with nothing going red.
+    // ⚠️ The prose must name ONLY `.stop`. A first draft named `.stop` / `.play`, which the OLD
+    // bare-name matcher also scored as `true` (stop then play) — so the test passed under the very
+    // bug it was written to catch, and the mutation check is what said so.
+    const r = scanPlayOrdering(
+      wrap(
+        "1. `modoki_play_control {action:'play'}`.\n\n" +
+          '## Note on selectors\n\n`gameView.toolbar.stop` is a real `data-ui-id` (`GameView.tsx`).',
+      ),
+    );
+    expect(r.endsPlaying).toBe(true);
+  });
+
+  it('accepts the ESCAPED selector spelling, when it is a real tap', () => {
+    // Future-proofing rather than an observed shape: no case writes an escaped `.play`/`.stop`
+    // selector today (the escaped spelling appears only for `.step`/`.pause`, which TOOLBAR does
+    // not match). The tolerance is kept so the first one is read rather than silently ignored.
+    expect(
+      scanPlayOrdering(wrap('1. `modoki_tap {selector: "[data-ui-id=\\"gameView.toolbar.play\\"]"}`.'))
+        .endsPlaying,
+    ).toBe(true);
+  });
+
+  it('does NOT let a selector NAMED in prose clear a real Play — the masking hole that survived the first fix', () => {
+    // The review's own repro, which was GREEN against the first draft: call-anchoring on the
+    // SELECTOR alone made a prose sentence in selector form both invisible to the ledger (it
+    // counted as a call, so `bare` stayed 0) and a phantom Stop. A case could then say in so many
+    // words that it leaves the editor Playing and pass. The press is the TAP, not the id.
+    const r = scanPlayOrdering(
+      wrap(
+        "1. `modoki_play_control {action:'play'}`.\n" +
+          '2. **Leave the world Playing** for the follow-up case. The Stop button is tagged\n' +
+          '   `[data-ui-id="gameView.toolbar.stop"]` if you need it — do NOT press it here.',
+      ),
+    );
+    expect(r.endsPlaying).toBe(true);
+  });
+
+  it('does NOT read a selector that is merely QUERIED as a press — the phantom-transport shape', () => {
+    // `gameview/toolbar-buttons-drive-play-pause-step-stop.md` reads a button's `disabled`/`title`
+    // through `querySelector('[data-ui-id="gameView.toolbar.step"]')` five times. Those are
+    // `.step`/`.pause` so TOOLBAR ignores them, but the first case to inspect `.play`/`.stop` state
+    // the same way would otherwise gain a transport event in whichever direction it happened to
+    // query — a Stop that nobody pressed silently clears the hazard.
+    const r = scanPlayOrdering(
+      wrap(
+        "1. `modoki_play_control {action:'play'}`.\n" +
+          '2. `modoki_eval {js: "document.querySelector(\'[data-ui-id=\\"gameView.toolbar.stop\\"]\').disabled"}`.',
+      ),
+    );
+    expect(r.endsPlaying).toBe(true);
+  });
+});
+
+export interface AssetRowOpenScan {
+  /** false when no procedure heading was found. */
+  scannable: boolean;
+  /** One entry per `[data-asset-path]` tap/dnd with no reveal before it. */
+  offenders: string[];
+  /** How many row taps/dnds the scan read — the corpus floor keys off this. */
+  rowActions: number;
+}
+
+/**
+ * Asset-row reveal scanner (#1143). An Assets row, `[data-asset-path="…"]`, is in the DOM only
+ * while its group is expanded, and both halves of that are PERSISTED per profile — `viewMode`
+ * globally, `expanded` per project, defaulting to the top section alone (`assetFolderState.ts`). A
+ * case that taps a row with nothing revealing it first is testing the runner's profile: it passes
+ * wherever an earlier session left the group open and is refused *"no element matches selector"*
+ * everywhere else. `qa/knowledge.md` § 3 prescribes the two reveals this accepts:
+ *
+ * - **`modoki_set_selection {asset: {path…}}` on THAT path.** Keyed by path, because a selection
+ *   expands only its own group: selecting a texture does not reveal a material row.
+ *   A `*=` substring selector counts when the selected path contains the substring. A sliced-sprite
+ *   row `path#sub` needs a selection of THAT path: selecting the parent texture reveals the texture
+ *   row, not its children, which render only while the texture row itself is expanded.
+ * - **The § 3 header probe, or a triangle-expand idiom** — any `^▶`, `[▶▼]` or `'▶'` literal, or
+ *   the probe's return field `` `collapsed` `` backticked (a case citing a sibling's probe).
+ *
+ * Ordering is by match POSITION within the procedure region, as in `scanPlayOrdering`. A row action
+ * or a selection counts only as a CALL, so prose naming a selector (including a warning about exactly
+ * this refusal) is not read as a tap. That means a braced `modoki_tap`/`modoki_dnd`/`modoki_set_selection`,
+ * or the same tool as a `modoki_batch` step (`{"tool":"tap","args":{…}}`, prefix optional).
+ *
+ * ⚠️ **What this does NOT prove, stated so a green result is not over-read.** A probe is not keyed:
+ * it opens ONE group, but this accepts it for every later row, so a case that expands `materials`
+ * and then taps a `meshes` row passes. A backticked `` `collapsed` `` counts as a probe even in a
+ * sentence that only WARNS about the collapsed state. It cannot see a row collapse again between
+ * the reveal and the tap (a relaunch, a project switch), and a call whose selector sits more than
+ * 400 characters into its own braces is not read. And it proves a reveal is WRITTEN, not that it
+ * works — the live run is what shows the row resolves.
+ */
+export function scanAssetRowOpens(body: string): AssetRowOpenScan {
+  const region = procedureRegion(body);
+  if (region === null) return { scannable: false, offenders: [], rowActions: 0 };
+
+  type Ev = { at: number; kind: 'select' | 'probe' | 'row'; path: string; substring?: boolean; call?: string };
+  const events: Ev[] = [];
+  // `[^}]` stops at the first close brace, so `{asset: {path: '…'` is read but a later call is not.
+  // The two call spellings: `modoki_x {…}` in prose-code, and a `modoki_batch` step
+  // `{"tool":"x","args":{…}}` (the `modoki_` prefix is optional there).
+  // A batch `tool` key must sit in OBJECT-KEY position (after `{` or `,`), so prose like "the tool:
+  // 'tap'" or `my-tool:` is not a call. The quotes may be JSON-escaped (`\"tool\"`).
+  const Q = `\\\\?["']`;
+  const CALL = (tools: string) =>
+    `(?:\\b(?:modoki_(${tools}))\`?\\s*\\{|[{,]\\s*(?:${Q})?tool(?:${Q})?\\s*:\\s*${Q}(?:modoki_)?(${tools})${Q})`;
+  // `asset` must be the call's FIRST argument key — `{asset:` directly, or `"args":{"asset":` in a batch —
+  // so a `subasset:` or a later argument is not read as the reveal.
+  const SELECT = new RegExp(
+    `${CALL('set_selection')}(?:\\s*,\\s*(?:${Q})?args(?:${Q})?\\s*:\\s*\\{)?\\s*(?:${Q})?asset(?:${Q})?\\s*:\\s*\\{[^}]*?(?:${Q})?path(?:${Q})?\\s*:\\s*${Q}([^"'\\\\]+)${Q}`,
+    'g',
+  );
+  for (const m of region.matchAll(SELECT)) events.push({ at: m.index ?? 0, kind: 'select', path: m[3] });
+  // The probe's own return field, backticked, is how a case CITES § 3's probe rather than restating it
+  // (`particles/undo-to-opened-value-unparks-asset.md` borrows QA-PARTICLE-0007's).
+  const PROBE = /\^\[?▶|\[▶▼\]|['"]▶['"]|`collapsed`/gu;
+  for (const m of region.matchAll(PROBE)) events.push({ at: m.index ?? 0, kind: 'probe', path: '' });
+  // The selector's own quotes may be escaped (`\"`) when the call sits inside a JSON string.
+  const ROW = new RegExp(`${CALL('tap|dnd')}[^}]{0,400}?data-asset-path(\\*?)=\\\\?["']([^"'\\\\]+)\\\\?["']`, 'g');
+  for (const m of region.matchAll(ROW)) {
+    events.push({ at: m.index ?? 0, kind: 'row', call: `modoki_${m[1] ?? m[2]}`, substring: m[3] === '*', path: m[4] });
+  }
+  events.sort((a, b) => a.at - b.at);
+
+  const selected: string[] = [];
+  let probed = false;
+  let rowActions = 0;
+  const offenders: string[] = [];
+  for (const e of events) {
+    if (e.kind === 'select') selected.push(e.path);
+    else if (e.kind === 'probe') probed = true;
+    else {
+      rowActions += 1;
+      const revealed =
+        probed ||
+        selected.some((p) => (e.substring ? p.includes(e.path) : p === e.path));
+      if (!revealed) {
+        offenders.push(
+          `${e.call} on [data-asset-path${e.substring ? '*' : ''}="${e.path}"] with nothing revealing the row ` +
+            `first — it exists only while its group is expanded, which is persisted profile state. Add ` +
+            `\`modoki_set_selection {asset: {path: '${e.path}', …}}\` before it, or § 3's header probe when ` +
+            `the case needs a different Inspector selection (qa/knowledge.md § 3).`,
+        );
+      }
+    }
+  }
+  return { scannable: true, offenders, rowActions };
+}
+
+/** The scanner's own accept and reject sides — not gated on `HAS_CASES`, same reason as above. */
+describe('scanAssetRowOpens', () => {
+  const wrap = (steps: string) => `## Preconditions\n\np\n\n## Steps\n\n${steps}\n`;
+  const offenders = (steps: string) => scanAssetRowOpens(wrap(steps)).offenders;
+  const TAP = (path: string) => `\`modoki_tap {selector:'[data-asset-path="${path}"]', clickCount:2}\``;
+
+  it('FLAGS a row tap with nothing revealing it — the defect itself (#1143)', () => {
+    const found = offenders(`1. search.\n2. ${TAP('/assets/particles/a.particle.json')}.`);
+    expect(found).toHaveLength(1);
+    expect(found[0]).toContain('/assets/particles/a.particle.json');
+  });
+
+  it('FLAGS a modoki_dnd whose source is an unrevealed row', () => {
+    expect(
+      offenders(`1. \`modoki_dnd {from: {selector: '[data-asset-path="/assets/p.prefab.json"]'}, to: {x: 1, y: 2}}\`.`),
+    ).toHaveLength(1);
+  });
+
+  it('accepts a tap after set_selection on THAT asset — the default reveal', () => {
+    expect(
+      offenders(
+        "1. `modoki_set_selection {asset: {path: '/assets/particles/a.particle.json', type: 'particle', name: 'a'}}`.\n" +
+          `2. ${TAP('/assets/particles/a.particle.json')}.`,
+      ),
+    ).toEqual([]);
+  });
+
+  it('FLAGS a tap after set_selection on a DIFFERENT asset — a selection reveals only its own group', () => {
+    expect(
+      offenders(
+        "1. `modoki_set_selection {asset: {path: '/assets/textures/t.png', type: 'texture', name: 't'}}`.\n" +
+          `2. ${TAP('/assets/materials/m.mat.json')}.`,
+      ),
+    ).toHaveLength(1);
+  });
+
+  it('FLAGS a set_selection that comes AFTER the tap — order, not presence', () => {
+    expect(
+      offenders(
+        `1. ${TAP('/assets/a.json')}.\n` +
+          "2. `modoki_set_selection {asset: {path: '/assets/a.json', type: 'x', name: 'a'}}`.",
+      ),
+    ).toHaveLength(1);
+  });
+
+  it('accepts a tap after the § 3 header probe, and after a probe cited by its `collapsed` field', () => {
+    expect(offenders(`1. \`const HDR = /^[▶▼](📁)?particles?\\(\\d+\\)$/i;\`\n2. ${TAP('/assets/a.json')}.`)).toEqual([]);
+    expect(offenders(`1. Use the step-2 probe; tap only if it reports \`collapsed\`.\n2. ${TAP('/assets/a.json')}.`)).toEqual([]);
+  });
+
+  it('accepts a `*=` substring selector after selecting a path that contains it', () => {
+    expect(
+      offenders(
+        "1. `modoki_set_selection {asset: {path: '/assets/materials/grass.mat.json', type: 'material', name: 'grass'}}`.\n" +
+          "2. `modoki_tap {selector:'[data-asset-path*=\"grass.mat.json\"]'}`.",
+      ),
+    ).toEqual([]);
+  });
+
+  it('FLAGS a sliced-sprite row `path#sub` after only its parent texture was selected — that reveals the texture row, not its children', () => {
+    expect(
+      offenders(
+        "1. `modoki_set_selection {asset: {path: '/assets/t/head.png', type: 'texture', name: 'head'}}`.\n" +
+          `2. ${TAP('/assets/t/head.png#default')}.`,
+      ),
+    ).toHaveLength(1);
+  });
+
+  it('FLAGS an unrevealed row tapped inside a `modoki_batch` step, JSON-quoted or not', () => {
+    expect(
+      offenders('1. `modoki_batch {"steps":[{"tool":"modoki_tap","args":{"selector":"[data-asset-path=\\"/assets/a.json\\"]","clickCount":2}}]}`.'),
+    ).toHaveLength(1);
+    expect(offenders("1. `modoki_batch {steps:[{tool:'tap', args:{selector:'[data-asset-path=\"/assets/a.json\"]'}}]}`.")).toHaveLength(1);
+  });
+
+  it('accepts a batch-wrapped set_selection as the reveal for a later tap', () => {
+    expect(
+      offenders(
+        '1. `modoki_batch {"steps":[{"tool":"set_selection","args":{"asset":{"path":"/assets/a.json","type":"x","name":"a"}}}]}`.\n' +
+          `2. ${TAP('/assets/a.json')}.`,
+      ),
+    ).toEqual([]);
+  });
+
+  it('does NOT read prose naming a tool, or a `subasset:` argument, as a call or a reveal', () => {
+    // Neither sentence is a call: no `tool` key in object position, and `asset` is not the first argument.
+    expect(
+      offenders(
+        "1. The tool: 'set_selection' with asset: {path: '/assets/a.json'} would reveal it.\n" +
+          "2. `modoki_set_selection {subasset: {path: '/assets/a.json'}}`.\n" +
+          `3. ${TAP('/assets/a.json')}.`,
+      ),
+    ).toHaveLength(1);
+    expect(scanAssetRowOpens(wrap("1. A my-tool: 'tap' on [data-asset-path=\"/assets/a.json\"] is prose.")).rowActions).toBe(0);
+  });
+
+  it('reads a batch step whose JSON quotes are escaped inside a string', () => {
+    const step = String.raw`{\"tool\":\"tap\",\"args\":{\"selector\":\"[data-asset-path='/assets/a.json']\"}}`;
+    expect(scanAssetRowOpens(wrap(`1. \`modoki_eval {code:"return modoki.batch([${step}])"}\`.`)).offenders).toHaveLength(1);
+  });
+
+  it('reads a tap whose selector comes after other arguments longer than the old 120-character window', () => {
+    const pad = `note: '${'x'.repeat(200)}', `;
+    expect(offenders(`1. \`modoki_tap {${pad}selector:'[data-asset-path="/assets/a.json"]'}\`.`)).toHaveLength(1);
+  });
+
+  it('does NOT read a selector merely NAMED or QUERIED as a tap — the warning shape', () => {
+    const r = scanAssetRowOpens(
+      wrap(
+        '1. ⚠️ if `[data-asset-path="/assets/a.json"]` matches nothing the group is collapsed.\n' +
+          "2. `modoki_eval {code:\"return !!document.querySelector('[data-asset-path=\\\"/assets/a.json\\\"]');\"}`.",
+      ),
+    );
+    expect(r.offenders).toEqual([]);
+    expect(r.rowActions).toBe(0);
+  });
+
+  it('does NOT count a reveal written in Preconditions, before the procedure begins', () => {
+    const body =
+      "## Preconditions\n\n- `modoki_set_selection {asset: {path: '/assets/a.json', type: 'x', name: 'a'}}`\n\n" +
+      `## Steps\n\n1. ${TAP('/assets/a.json')}.\n`;
+    expect(scanAssetRowOpens(body).offenders).toHaveLength(1);
   });
 });

@@ -3,3 +3,5 @@
 export declare function collect(dir: string, skipPrefix: string, out?: Map<string, Buffer>): Map<string, Buffer>;
 export declare function newFilesOutsideScope(dir: string, skipPrefix: string, snapshot: Map<string, Buffer>): string[];
 export declare function restoreSnapshot(snapshot: Map<string, Buffer>, projectRoot: string): { restored: string[]; failed: string[] };
+
+// `resolveIconInputs` / `stampExtrasFrom` moved to `iconInputs.mjs` (#827) — see `iconInputs.d.mts`.

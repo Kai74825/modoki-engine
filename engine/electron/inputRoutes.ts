@@ -25,12 +25,17 @@ import type { MouseButton, InputModifier } from './rendererOps';
 // Type-only: no renderer/DOM code is pulled into the Node main process. Imported rather
 // than re-declared because both sides speak this shape over the bridge, and a second copy
 // of a wire contract silently drifts.
+import type { AimGesture } from '../app/debug/domPointContract';
 import type { DomPointResolution } from '../app/debug/domPointContract';
 // A VALUE, not a type — the refusal messages branch on it. From the DOM-free contract module for
 // the reason its header gives: importing domResolve.ts would pull `document` into this program.
 import { NOTHING_AT_POINT } from '../app/debug/domPointContract';
 import type { EntityPointSpec, EntityPointResolution, OcclusionScope, AimedAt } from '../app/debug/entityPointContract';
 import type { ErrorCode } from '../tools/shared/mcpResult';
+import {
+  EDITOR_INPUT_MODIFIERS, MOUSE_BUTTONS, POINTER_ACTIONS, normalizeKeyName, refuseUnknownKey,
+  refuseUnknownValue, refuseUnknownValues, type VocabularyRefusal,
+} from '../tools/shared/inputVocabulary';
 
 /** The trusted-input primitives, pre-bound to the live window by the caller. */
 export interface InputOps {
@@ -106,6 +111,13 @@ export type HeldLossReason = 'idle' | 'superseded' | 'reload';
  *  callers for no gain). */
 export interface PointSpec {
   x?: number; y?: number; selector?: string; entity?: EntityPointSpec;
+  /** Editor chrome by its LABEL (#1153) — resolved in the renderer over the same set
+   *  `modoki_handles {editor:'chrome'}` lists. Ranks with `selector` (both name a DOM thing), so
+   *  combining it with `selector` or `entity` is REFUSED rather than settled by precedence:
+   *  unlike `selector`-over-`{x,y}` there is no legacy call shape that sends both incidentally. */
+  label?: string;
+  /** CSS selector scoping a `label` aim to one panel or dialog. */
+  within?: string;
   /** Aim at the target even though something covers it. Default false = REFUSE.
    *
    *  A resolvable aim (`entity`, `selector`) names a THING, so a press the surface would deliver
@@ -151,7 +163,17 @@ export interface ResolvedPoint {
 }
 
 const json = (body: unknown, status?: number): BackendResult => ({ kind: 'json', ...(status ? { status } : {}), body });
-const bad = (error: string, code?: ErrorCode) => json({ error, ...(code ? { code } : {}) }, 400);
+const bad = (error: string, code?: ErrorCode, options?: string[]) =>
+  json({ error, ...(code ? { code } : {}), ...(options ? { options } : {}) }, 400);
+
+/** The first vocabulary refusal among `checks`, as a 400 carrying its options (#1076). These routes
+ *  OWN the input tables — nothing sits between them and the trusted dispatch — so an unknown button
+ *  or modifier is refused here, BEFORE the aim resolves and before any `ops.*` call, instead of being
+ *  coerced into a press the caller did not ask for. */
+function refuseVocabulary(...checks: Array<VocabularyRefusal | null>): BackendResult | null {
+  const hit = checks.find((c): c is VocabularyRefusal => c !== null);
+  return hit ? bad(hit.error, 'REFUSED_BY_OP', hit.options) : null;
+}
 
 /** Resolve a `{selector}` in the renderer, or pass `{x,y}` through. Returns the point or
  *  a prefixed error string — never throws, so a bad selector is a 400, not a 500. */
@@ -184,7 +206,22 @@ export async function resolvePoint(
   spec: PointSpec | undefined,
   which: string,
   requestRenderer: InputRouteDeps['requestRenderer'],
+  // ⚠️ No default: every one of the six routes names its own, and an absent gesture reaching the
+  // renderer is read as NOT click-shaped there (`isClickShaped`). A default of `'tap'` here would
+  // have re-introduced the permissive path this parameter exists to remove.
+  gesture?: AimGesture,
 ): Promise<{ point: ResolvedPoint } | { error: string; code?: ErrorCode }> {
+  const hasEntity = !!spec?.entity && typeof spec.entity === 'object' && Object.keys(spec.entity).length > 0;
+  if (spec && spec.label !== undefined && (spec.selector || hasEntity)) {
+    return {
+      error: `${which}: give ONE of label, selector or entity — ${spec.selector ? 'label and selector' : 'label and entity'} `
+        + 'are two addresses for one target, and picking one by precedence would silently ignore the other.',
+      code: 'AMBIGUOUS',
+    };
+  }
+  if (spec && spec.within !== undefined && spec.label === undefined) {
+    return { error: `${which}: \`within\` scopes a \`label\` aim and has no meaning without one — pass label, or drop within.`, code: 'REFUSED_BY_OP' };
+  }
   // ── entity: resolve {guid}/{name}/{id} to the entity's LIVE screen rect in the renderer. ──
   // Highest precedence: it is the most specific thing the caller can say, and (unlike a
   // selector) there is no legacy call shape that passes it incidentally.
@@ -193,7 +230,14 @@ export async function resolvePoint(
     // A top-level `allowOccluded` means the same thing whichever aim is used, so forward it —
     // otherwise the flag would silently do nothing on the aim an agent is most likely to combine
     // it with. An explicit `entity.allowOccluded` still wins.
-    const entitySpec = { ...spec.entity, allowOccluded: spec.entity.allowOccluded ?? spec.allowOccluded };
+    // ⚠️ `gesture` rides the SAME payload — one field, no extra round trip (#1016). It is separate
+    // from `which` on purpose: `which` is prose for the error messages below and the pointer route
+    // passes `` `pointer ${action}` `` into it, so deriving intent from it would be string-matching
+    // a display label (§5: "classify structurally, never by message prefix").
+    const entitySpec = {
+      ...spec.entity, gesture,
+      allowOccluded: spec.entity.allowOccluded ?? spec.allowOccluded,
+    };
     try {
       res = (await requestRenderer('resolve-entity-point', entitySpec)) as EntityPointResolution | null;
     } catch (e) {
@@ -259,15 +303,26 @@ export async function resolvePoint(
       },
     };
   }
-  if (spec && typeof spec.selector === 'string' && spec.selector) {
+  // A `label` rides the selector path: both name a DOM element, so the occlusion, scrolled-out and
+  // settling diagnoses below are the same code for both rather than a second copy that drifts (§9).
+  const byLabel = !!spec && spec.label !== undefined;
+  if (spec && ((typeof spec.selector === 'string' && spec.selector) || byLabel)) {
+    const aimName = byLabel ? `label ${JSON.stringify(spec.label)}` : JSON.stringify(spec.selector);
     let res: DomPointResolution | null;
     try {
-      res = (await requestRenderer('resolve-dom-point', { selector: spec.selector })) as DomPointResolution | null;
+      // The selector path needs the gesture just as much: `UINode.tsx` stamps `data-entity-id` on
+      // every game UI node, so a selector aim reaches game UI and hits the same tap zones (#1016).
+      res = (await requestRenderer('resolve-dom-point', byLabel
+        ? { label: spec.label, within: spec.within, gesture }
+        : { selector: spec.selector, gesture })) as DomPointResolution | null;
     } catch (e) {
-      return { error: `${which}: renderer could not resolve selector (${e instanceof Error ? e.message : String(e)})` };
+      return { error: `${which}: renderer could not resolve ${byLabel ? 'label' : 'selector'} (${e instanceof Error ? e.message : String(e)})` };
     }
     if (!res || !res.ok || typeof res.x !== 'number' || typeof res.y !== 'number') {
-      return { error: `${which}: ${res?.error ?? 'selector did not resolve'}${await settlingHint(requestRenderer)}` };
+      return {
+        error: `${which}: ${res?.error ?? `${byLabel ? 'label' : 'selector'} did not resolve`}${await settlingHint(requestRenderer)}`,
+        ...(res?.code ? { code: res.code } : {}),
+      };
     }
     if (res.occluded && !spec.allowOccluded) {
       // Two different diagnoses, because they want different actions and the covering element's
@@ -278,11 +333,11 @@ export async function resolvePoint(
       const settling = await settlingHint(requestRenderer);
       return {
         error: (res.clipped
-          ? `${which}: ${JSON.stringify(spec.selector)} is SCROLLED OUT of its own container — its `
+          ? `${which}: ${aimName} is SCROLLED OUT of its own container — its `
             + `rect is real but nothing is drawn there, so the point lands on ${res.hitTarget ?? 'other chrome'} `
             + 'instead. Scroll it into view (modoki_scroll over that panel) or enlarge the panel, then '
             + 're-aim; allowOccluded:true would press the chrome behind it.'
-          : `${which}: ${JSON.stringify(spec.selector)} resolves to a point covered by `
+          : `${which}: ${aimName} resolves to a point covered by `
             + `${res.hitTarget ?? 'something else'} — the input would land on THAT, not on your target. `
             + 'Dismiss/move what covers it (an open menu, a modal, a panel that overlaps), scroll the '
             + 'target clear, or pass allowOccluded:true to aim there anyway and see what happens.') + settling,
@@ -294,7 +349,7 @@ export async function resolvePoint(
   if (spec && typeof spec.x === 'number' && typeof spec.y === 'number') {
     return { point: { x: spec.x, y: spec.y } };
   }
-  return { error: `${which}: provide an entity {guid|name|id}, a selector, or {x,y}` };
+  return { error: `${which}: provide an entity {guid|name|id}, a selector, a label, or {x,y}` };
 }
 
 /** Strip the undefined provenance fields so a coordinate-addressed call's response stays
@@ -344,13 +399,26 @@ export interface InputDeliverability { visibilityState?: string; hasFocus?: bool
  *
  *  Exported because `/api/input/*` is NOT the only route that dispatches trusted input —
  *  `/api/capture-gesture` drives its own drag through `rendererOps` — and a gate only one of
- *  them passes through is a gate with a hole in it. */
-export async function inputDeliverability(
+ *  them passes through is a gate with a hole in it.
+ *
+ *  Returns WHY it could not answer (#1096) — the same conflation, and the same fix, as the device
+ *  router's `probeInputDeliverability` one module over. A bare `null` meant both "the page answered,
+ *  and it is fine" and "I could not ask", and every consumer reads the first. The POLARITY is
+ *  unchanged and deliberate (above: a refused tap is a broken tool); what changes is that the second
+ *  case is now sayable, so a dispatch that could not be qualified says so instead of looking checked.
+ *
+ *  A `null` REPLY counts as unchecked too: the op answers an object, so nothing is not an answer. */
+export async function inputDeliverabilityResult(
   requestRenderer: InputRouteDeps['requestRenderer'],
-): Promise<InputDeliverability | null> {
+): Promise<{ live: InputDeliverability | null; unchecked: string | null }> {
   try {
-    return (await requestRenderer('input-deliverability', {})) as InputDeliverability | null;
-  } catch { return null; }
+    const live = (await requestRenderer('input-deliverability', {})) as InputDeliverability | null;
+    return live
+      ? { live, unchecked: null }
+      : { live: null, unchecked: 'the renderer answered nothing' };
+  } catch (e) {
+    return { live: null, unchecked: e instanceof Error ? e.message : String(e) };
+  }
 }
 
 /** The 409 for a hidden window, or null when the input can go ahead (including the
@@ -559,7 +627,7 @@ export function createInputRoutes(deps: InputRouteDeps) {
     // letting `dispatchInput`'s trailing `return null` decide keeps that true: the gate below
     // would otherwise answer 409 for a path this file does not own.
     if (!DISPATCHED_INPUT_ROUTES.has(urlPath)) return null;
-    const live = await inputDeliverability(requestRenderer);
+    const { live, unchecked } = await inputDeliverabilityResult(requestRenderer);
     // `/api/input/focus` is exempt: it is the one route here that dispatches NO OS input —
     // `focusElement` is `wc.focus()` plus `executeJavaScript`, which a hidden window still runs.
     // Refusing it would state a reason ("Chromium would drop this input") that is untrue for it,
@@ -581,6 +649,31 @@ export function createInputRoutes(deps: InputRouteDeps) {
     // commit-on-blur field is the classic). Reported, not refused: the input itself is real.
     if (r && r.kind === 'json' && live && live.hasFocus === false && r.body && typeof r.body === 'object' && !Array.isArray(r.body)) {
       (r.body as Record<string, unknown>).windowFocused = false;
+    }
+    // #1096: same shape as `windowFocused` above, for the case where the probe could not answer at
+    // all. The input WAS dispatched (the gate fails open on purpose), but neither the hidden-window
+    // refusal nor the focus hint above could run — so an `ok` here is not the qualified `ok` it
+    // looks like, and this is the one line that says so for all eight dispatched routes.
+    // ⚠️ SUCCESS ONLY, the same rule the device router follows. The note's claim is that something
+    // WAS dispatched unqualified; stamping it on a 400 (`bad()` — a vocabulary refusal, a bad aim)
+    // or on an `ok:false` type-text reply says the opposite of what happened, about a call that
+    // dispatched nothing. `status` is set only by `bad()`/refusals here, so its absence plus a
+    // non-false `ok` is what "this reply reports success" means at this seam.
+    // Two clauses, and exactly two: an HTTP error status (every `bad()` refusal) or `ok:false` (the
+    // type-text no-editable-target reply). A third clause testing `error === undefined` was dropped
+    // — it caught BOTH of those as a side effect, which made all three mutually redundant and left
+    // every one of them individually unfalsifiable. With just these, breaking either goes red.
+    // `/api/input/focus` is exempt from the hidden-window refusal 35 lines above, so the note's own
+    // words — "a hidden page would have been refused" — are FALSE for it. The same reason that route
+    // is exempt there makes it exempt here; stating a cause that does not apply is worse than silence.
+    const dispatched = urlPath !== '/api/input/focus'
+      && r && r.kind === 'json' && r.status === undefined
+      && r.body && typeof r.body === 'object' && !Array.isArray(r.body)
+      && (r.body as { ok?: unknown }).ok !== false;
+    if (unchecked && dispatched) {
+      (r!.body as Record<string, unknown>).deliverabilityUnchecked =
+        `the renderer could not be asked whether this input is deliverable (${unchecked}), so it was `
+        + 'dispatched unqualified — a hidden page would have been refused, and was not checked for here.';
     }
     return r;
   }) as InputRoutesHandler;
@@ -626,8 +719,24 @@ export function createInputRoutes(deps: InputRouteDeps) {
   async function dispatchInput({ urlPath, body }: HostRequest): Promise<BackendResult | null> {
 
     if (urlPath === '/api/input/tap') {
-      const { x, y, selector, entity, allowOccluded, button, clickCount, modifiers } = (body ?? {}) as PointSpec & { button?: MouseButton; clickCount?: number; modifiers?: InputModifier[] };
-      const r = await resolvePoint({ x, y, selector, entity, allowOccluded }, 'tap', requestRenderer);
+      const { x, y, selector, label, within, entity, allowOccluded, button, clickCount, modifiers } = (body ?? {}) as PointSpec & { button?: MouseButton; clickCount?: number; modifiers?: InputModifier[] };
+      const unknownVocab = refuseVocabulary(
+        refuseUnknownValue('tap button', button, MOUSE_BUTTONS),
+        refuseUnknownValues('tap modifiers', modifiers, EDITOR_INPUT_MODIFIERS),
+      );
+      if (unknownVocab) return unknownVocab;
+      // ⚠️ **`button` narrows the gesture, and this is the route that HAS one** (#1016 close-out F5').
+      // The carve-out first landed in `bridge.ts`, where `device_tap`'s schema is `{selector,x,y}`
+      // and no button can arrive — unreachable there, and missing here, where `modoki_tap` takes
+      // `z.enum(['left','right','middle'])` and hands it to a real Electron mouse event.
+      // Chromium fires `click` for the primary button only (right -> `contextmenu`, middle ->
+      // `auxclick`) and `pressOrigin.ts` listens on `'click'`, so the runtime does NOT redirect a
+      // right-press. Modelling one reports `occluded:false` for a press that then lands on the
+      // zone: the false success this whole change exists to prevent, one parameter in.
+      const r = await resolvePoint({ x, y, selector, label, within, entity, allowOccluded }, 'tap', requestRenderer,
+        // `== null`: a JSON `button:null` is "not given" (the vocabulary check passes it), so it clicks
+        // LEFT and must be modelled as the tap it is, not the stricter press (#1076 close-out).
+        button == null || button === 'left' ? 'tap' : 'press');
       if ('error' in r) return bad(r.error, r.code);
       await ops.tap(r.point.x, r.point.y, { button, clickCount, modifiers });
       return json({ ok: true, tapped: { x: r.point.x, y: r.point.y, button: button ?? 'left', clickCount: clickCount ?? 1 }, ...provenance(r.point) });
@@ -635,12 +744,17 @@ export function createInputRoutes(deps: InputRouteDeps) {
 
     if (urlPath === '/api/input/drag') {
       const { from, to, steps, button, modifiers, allowOccluded } = (body ?? {}) as { from?: PointSpec; to?: PointSpec; steps?: number; button?: MouseButton; modifiers?: InputModifier[]; allowOccluded?: boolean };
+      const unknownVocab = refuseVocabulary(
+        refuseUnknownValue('drag button', button, MOUSE_BUTTONS),
+        refuseUnknownValues('drag modifiers', modifiers, EDITOR_INPUT_MODIFIERS),
+      );
+      if (unknownVocab) return unknownVocab;
       // A top-level flag covers BOTH ends; a per-endpoint one still wins, so a caller can allow a
       // covered destination while keeping the press honest.
       const withFlag = (p?: PointSpec) => (p ? { ...p, allowOccluded: p.allowOccluded ?? allowOccluded } : p);
-      const rf = await resolvePoint(withFlag(from), 'from', requestRenderer);
+      const rf = await resolvePoint(withFlag(from), 'from', requestRenderer, 'drag');
       if ('error' in rf) return bad(rf.error, rf.code);
-      const rt = await resolvePoint(withFlag(to), 'to', requestRenderer);
+      const rt = await resolvePoint(withFlag(to), 'to', requestRenderer, 'drag');
       if ('error' in rt) return bad(rt.error, rt.code);
       // A zero-length drag is a CLICK, not a drag: mouseDown+mouseUp at one pixel is what Blink
       // synthesizes a `click` from. Measured — `modoki_drag {from:{700,200},to:{700,200}}` over
@@ -668,11 +782,18 @@ export function createInputRoutes(deps: InputRouteDeps) {
     // slingshot pull, a charge meter, a drag-to-aim rubber-band — with get_scene_state / eval /
     // a screenshot mid-gesture, which the atomic drag can't expose.
     if (urlPath === '/api/input/pointer') {
-      const { action, x, y, selector, entity, allowOccluded, button, modifiers } =
+      const { action, x, y, selector, label, within, entity, allowOccluded, button, modifiers } =
         (body ?? {}) as PointSpec & { action?: 'down' | 'move' | 'up'; button?: MouseButton; modifiers?: InputModifier[] };
       if (action !== 'down' && action !== 'move' && action !== 'up') {
-        return bad(`pointer: action must be 'down', 'move', or 'up' (got ${JSON.stringify(action)})`);
+        return bad(`pointer: action must be 'down', 'move', or 'up' (got ${JSON.stringify(action)})`, 'REFUSED_BY_OP', [...POINTER_ACTIONS]);
       }
+      // Checked on move/up too: a valid button is ignored there (the held one is reused), but an
+      // unknown one is a caller mistake either way, and refusing it is the only way it is seen.
+      const unknownVocab = refuseVocabulary(
+        refuseUnknownValue('pointer button', button, MOUSE_BUTTONS),
+        refuseUnknownValues('pointer modifiers', modifiers, EDITOR_INPUT_MODIFIERS),
+      );
+      if (unknownVocab) return unknownVocab;
       if (action === 'down' && heldPointer) {
         return json({ error: `a pointer is already held (button '${heldPointer.button}' down at ${heldPointer.x},${heldPointer.y}). Release it with action:'up' before pressing again.` }, 409);
       }
@@ -704,11 +825,24 @@ export function createInputRoutes(deps: InputRouteDeps) {
       const held = action !== 'down';
       const r = await resolvePoint(
         {
-          x, y, selector,
+          x, y, selector, label, within,
           entity: held && entity ? { ...entity, allowOccluded: true } : entity,
           allowOccluded: held ? true : allowOccluded,
         },
         `pointer ${action}`, requestRenderer,
+        // ⚠️ `'press'`, never `'tap'`, for all three of down/move/up — but NOT for the reason the
+        // first version of this comment gave. It claimed "a lone press has no release paired with
+        // it, so the redirect does not run"; that is false. `down` then `up` at the same point IS
+        // a click in Chromium, and `pressOrigin.ts`'s release gate (`up.closest(TAP_ZONE) !== zone`)
+        // passes when both land on the zone — so the runtime DOES redirect that sequence.
+        //
+        // The real reason is that this route cannot know yet. A `down` may be completed by an `up`
+        // here (a click, redirected) or by a `move` elsewhere (a drag, not redirected), and the
+        // aim is resolved at `down` time. The strict side is the safe one: the redirect only ever
+        // REMOVES refusals, so guessing `tap` risks a false success while guessing `press` costs at
+        // most a refusal `allowOccluded` can override. It also preserves #1016's stale refusal for
+        // the click case — a known, accepted residue rather than an oversight.
+        'press',
       );
       if ('error' in r) {
         if (heldPointer) armIdleRelease(); // the press survived a refused move — it must not lose its timer
@@ -741,16 +875,20 @@ export function createInputRoutes(deps: InputRouteDeps) {
     }
 
     if (urlPath === '/api/input/hover') {
-      const { x, y, selector, entity, allowOccluded, modifiers } = (body ?? {}) as PointSpec & { modifiers?: InputModifier[] };
-      const r = await resolvePoint({ x, y, selector, entity, allowOccluded }, 'hover', requestRenderer);
+      const { x, y, selector, label, within, entity, allowOccluded, modifiers } = (body ?? {}) as PointSpec & { modifiers?: InputModifier[] };
+      const unknownVocab = refuseVocabulary(refuseUnknownValues('hover modifiers', modifiers, EDITOR_INPUT_MODIFIERS));
+      if (unknownVocab) return unknownVocab;
+      const r = await resolvePoint({ x, y, selector, label, within, entity, allowOccluded }, 'hover', requestRenderer, 'hover');
       if ('error' in r) return bad(r.error, r.code);
       await ops.hover(r.point.x, r.point.y, modifiers);
       return json({ ok: true, hovered: { x: r.point.x, y: r.point.y }, ...provenance(r.point) });
     }
 
     if (urlPath === '/api/input/scroll') {
-      const { x, y, selector, entity, allowOccluded, deltaX, deltaY, modifiers } = (body ?? {}) as PointSpec & { deltaX?: number; deltaY?: number; modifiers?: InputModifier[] };
-      const r = await resolvePoint({ x, y, selector, entity, allowOccluded }, 'scroll', requestRenderer);
+      const { x, y, selector, label, within, entity, allowOccluded, deltaX, deltaY, modifiers } = (body ?? {}) as PointSpec & { deltaX?: number; deltaY?: number; modifiers?: InputModifier[] };
+      const unknownVocab = refuseVocabulary(refuseUnknownValues('scroll modifiers', modifiers, EDITOR_INPUT_MODIFIERS));
+      if (unknownVocab) return unknownVocab;
+      const r = await resolvePoint({ x, y, selector, label, within, entity, allowOccluded }, 'scroll', requestRenderer, 'scroll');
       if ('error' in r) return bad(r.error, r.code);
       // A scroll with no delta is a no-op wearing an action's name (S3.15). `deltaY` documents no
       // default and the tool shape is non-strict about intent — a misspelled `dy` reaches here as
@@ -758,7 +896,7 @@ export function createInputRoutes(deps: InputRouteDeps) {
       // `ok:true, scrolled:{deltaX:0,deltaY:0}`. Refuse, exactly as /api/input/drag and
       // /api/input/drag-handle refuse a zero-length gesture, and for the same reason.
       if (!deltaX && !deltaY) {
-        return bad('scroll is a no-op: neither deltaX nor deltaY is a non-zero number, so no wheel movement would be delivered. Pass deltaY (~120 ≈ one wheel tick down, negative = up) and/or deltaX. Accepted keys: x, y, selector, entity, deltaX, deltaY, modifiers.');
+        return bad('scroll is a no-op: neither deltaX nor deltaY is a non-zero number, so no wheel movement would be delivered. Pass deltaY (~120 ≈ one wheel tick down, negative = up) and/or deltaX. Accepted keys: x, y, selector, label, within, entity, deltaX, deltaY, modifiers.');
       }
       await ops.scroll(r.point.x, r.point.y, deltaX ?? 0, deltaY ?? 0, modifiers);
       return json({ ok: true, scrolled: { x: r.point.x, y: r.point.y, deltaX: deltaX ?? 0, deltaY: deltaY ?? 0, ...(modifiers?.length ? { modifiers } : {}) }, ...provenance(r.point) });
@@ -767,6 +905,16 @@ export function createInputRoutes(deps: InputRouteDeps) {
     if (urlPath === '/api/input/key') {
       const { key, modifiers, panel } = (body ?? {}) as { key?: string; modifiers?: InputModifier[]; panel?: string };
       if (typeof key !== 'string' || !key) return bad('key is a required string');
+      // Before the focus-scope change and the reach probe: a refused press must move nothing.
+      const unknownVocab = refuseVocabulary(
+        refuseUnknownValues('key modifiers', modifiers, EDITOR_INPUT_MODIFIERS),
+        refuseUnknownKey('key', key),
+      );
+      if (unknownVocab) return unknownVocab;
+      // Everything below this line speaks the CANONICAL name (#1094): `Esc` and `escape` both become
+      // `Escape`, so the reach probe resolves the chord the press will actually send, and the device
+      // relay one module over accepts the same spellings. Non-null — `refuseUnknownKey` just passed.
+      const canonicalKey = normalizeKeyName(key)!;
       // Panel-scoped chords resolve against the FOCUSED panel, so a bare `w` sent with the
       // wrong panel focused does nothing — silently, since the dispatcher yields rather than
       // erroring. `panel` sets the keyboard scope first so the caller can steer a chord
@@ -784,7 +932,7 @@ export function createInputRoutes(deps: InputRouteDeps) {
       // whether a warning rides along. Same policy as withAgentAttribution above.
       let reach: KeyReachReply = null;
       try {
-        reach = (await requestRenderer('probe-key-reach', { key, modifiers })) as KeyReachReply;
+        reach = (await requestRenderer('probe-key-reach', { key: canonicalKey, modifiers })) as KeyReachReply;
       } catch { /* unreachable renderer — press anyway, unwarned */ }
       // Echo the scope on EVERY press, not only when the caller set it. Not knowing where the
       // scope was is what made QA-PHYS-0003 unanswerable from the responses alone: 80 presses
@@ -792,7 +940,7 @@ export function createInputRoutes(deps: InputRouteDeps) {
       if (focusedPanel === undefined && reach && typeof reach === 'object' && 'focusedPanel' in reach) {
         focusedPanel = reach.focusedPanel ?? null;
       }
-      const r = await ops.pressKey(key, modifiers);
+      const r = await ops.pressKey(canonicalKey, modifiers);
       // The key IS dispatched (DOM hotkeys fire regardless), so this stays ok:true — but if a
       // field is focused the GAME never samples it, so surface that so a silent no-reach is
       // visible. (C7 re-audit.)
@@ -825,7 +973,12 @@ export function createInputRoutes(deps: InputRouteDeps) {
         warnings.push(`the editor keyboard scope is ${JSON.stringify(reach!.focusedPanel ?? null)}, so the input gate blocked this key from the RUNNING GAME — it moved nothing there. Pass panel:"game" if you meant to drive the game. A bare modoki_focus {} does NOT do this: it clears DOM focus only, and the keyboard scope is separate state. (Editor shortcuts scoped to that panel are unaffected and may still have fired.)`);
       }
       return json({
-        ok: true, pressed: { key, modifiers: modifiers ?? [] }, activeElement: r.activeElement,
+        // Echo what was DISPATCHED, not what was asked for: `{key:'Esc'}` presses `Escape`, and a
+        // reply that echoed `Esc` back would leave the caller unable to tell a rewrite from a
+        // pass-through. `normalizedFrom` rides along only when the two differ (#1094).
+        ok: true,
+        pressed: { key: canonicalKey, modifiers: modifiers ?? [], ...(canonicalKey !== key ? { normalizedFrom: key } : {}) },
+        activeElement: r.activeElement,
         ...(focusedPanel !== undefined ? { focusedPanel } : {}),
         // The resolved chord rides along ONLY with the scope warning. `keyReach` computes it
         // either way and this used to drop it on the floor while the field's own docstring
@@ -841,7 +994,14 @@ export function createInputRoutes(deps: InputRouteDeps) {
     if (urlPath === '/api/input/type') {
       const { text, clearFirst, submitKey } = (body ?? {}) as { text?: string; clearFirst?: boolean; submitKey?: string };
       if (typeof text !== 'string') return bad('text is a required string');
-      const r = await ops.typeText(text, { clearFirst, submitKey });
+      // #1094: `submitKey` named exactly three legal values in its own tool description and enforced
+      // none of them. An unrecognised one is not an error downstream — it becomes a keydown with an
+      // EMPTY `key`, so `{text:'abc', submitKey:'Retrun'}` answered `ok, typed:3` having submitted
+      // nothing. Refused BEFORE the text is typed, so a refusal leaves the field untouched rather
+      // than half-done.
+      const unknownSubmit = refuseVocabulary(refuseUnknownKey('submitKey', submitKey));
+      if (unknownSubmit) return unknownSubmit;
+      const r = await ops.typeText(text, { clearFirst, submitKey: submitKey ? normalizeKeyName(submitKey)! : undefined });
       // Nothing editable focused ⇒ the chars went nowhere. Report ok:false (isFailureBody surfaces
       // it) with WHERE focus actually is, instead of the old {ok:true, typed:N} into the void. (C7 re-audit.)
       if (!r.editable) {
@@ -869,7 +1029,35 @@ export function createInputRoutes(deps: InputRouteDeps) {
     }
 
     if (urlPath === '/api/input/focus') {
-      const { selector, panel } = (body ?? {}) as { selector?: string; panel?: string };
+      const { selector: rawSelector, panel, label, within } = (body ?? {}) as { selector?: string; panel?: string; label?: string; within?: string };
+      if (label !== undefined && rawSelector !== undefined) {
+        return bad('focus: give a label OR a selector, not both — two addresses for one target.', 'AMBIGUOUS');
+      }
+      if (within !== undefined && label === undefined) {
+        return bad('focus: `within` scopes a `label` aim and has no meaning without one — pass label, or drop within.', 'REFUSED_BY_OP');
+      }
+      // A label resolves through the SAME renderer op every aimed route uses (#1153 — §9: this route
+      // used to be the one with its own resolver), then focuses the element it named by its
+      // data-ui-id. Resolved BEFORE the panel scope moves, so a refused label changes nothing.
+      let selector = rawSelector;
+      if (label !== undefined) {
+        let res: DomPointResolution | null;
+        try {
+          res = (await requestRenderer('resolve-dom-point', { label, within, gesture: 'press' })) as DomPointResolution | null;
+        } catch (e) {
+          return bad(`focus: renderer could not resolve label (${e instanceof Error ? e.message : String(e)})`);
+        }
+        if (!res?.ok || !res.uiId) return bad(`focus: ${res?.error ?? 'label did not resolve'}`, res?.code);
+        // Focus acts on an ELEMENT, found again by id — so an id another element shares would focus
+        // THAT one and report ok (#1153 close-out: every crashed panel renders the same
+        // `panel-error.reload-panel`). Refuse rather than focus the wrong twin.
+        if (res.uiIdAddressable === false) {
+          return bad(`focus: label ${JSON.stringify(label)} resolved to ${res.matched ?? res.uiId}, but its data-ui-id `
+            + `${JSON.stringify(res.uiId)} is shared with another element, so focusing it by id would focus the first `
+            + 'of them instead. Aim at it with modoki_tap {label, within} only if ACTIVATING it is fine — a tap focuses what it lands on, but also presses it (a button runs its action).', 'AMBIGUOUS');
+        }
+        selector = `[data-ui-id=${JSON.stringify(res.uiId)}]`;
+      }
       // `panel` sets the KEYBOARD SCOPE; `selector` sets DOM focus. Genuinely different:
       // clicking a Hierarchy row moves the scope but leaves document.activeElement on
       // <body>. Both may be given — the scope is set first. (P7)
@@ -897,6 +1085,12 @@ export function createInputRoutes(deps: InputRouteDeps) {
         allowOccluded?: boolean;
       };
       if (typeof h.id !== 'string' || !h.id) return bad('id (handle id) is required');
+      const verb = urlPath === '/api/input/tap-handle' ? 'tap-handle' : 'drag-handle';
+      const unknownVocab = refuseVocabulary(
+        refuseUnknownValue(`${verb} button`, h.button, MOUSE_BUTTONS),
+        refuseUnknownValues(`${verb} modifiers`, h.modifiers, EDITOR_INPUT_MODIFIERS),
+      );
+      if (unknownVocab) return unknownVocab;
       // Carry the aimability annotations computeHandles already produces — the old closure narrowed
       // the result to {id,x,y} and DROPPED them, so tap/drag fired unconditionally: an off-screen
       // handle taps nothing, an occluded one hits the covering element, a disabled one is inert, and

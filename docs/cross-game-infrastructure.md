@@ -128,11 +128,15 @@ missing tarball on open.
 | Capability | Where | Note |
 |---|---|---|
 | IAP mechanism | `engine/packages/modoki/src/runtime/iap/**` | Product-agnostic, exposes `configureIap({ onGrant })`. `games/iap-test` proves it with zero game-side state |
+| **Store shelf** (the store SCREEN's decisions and state) | `engine/packages/modoki/src/runtime/iap/shelf.ts` + `shelfSession.ts` | Promoted in #925 (2026-09-13) for wordweave's store screen — the second game with one, and #659's reopen condition. Consumers: Court and wordweave (both landed under #925). `shelf.ts` is pure: a shelf is a list of `ShelfOffer`s (key, product id, kind, coins, `noAds: 'forever' \| 'pass'`, `requires`), and `buildShelfCatalog`/`shelfEffectOf`/`visibleShelfOffers`/`shelfView`/`quickBuyView`/`noAdsRemaining` each return a DECISION. `ShelfSession` holds the stateful guards Court paid for on device: the price-fetch tri-state and idle backstop (#463), the stalled-not-released watchdog (#580), the per-product in-flight set and its reset generation (the double-charge bar), and the refusal latch (#952). ⚠️ **Carries no copy** — rows, notices and the quick-buy label are worded by the game (`rowWords`, `notice`), the #675 line. ⚠️ **Does not own entitlements**: who records a forever unlock is the game's (Court: ours, a consumable carried by cloud save; wordweave: the store's, a non-consumable), so `ShelfInputs.owned` is passed in. Court kept every historical export as a thin adapter (`store.ts`'s `courtShelfOffers`) and its store tests ran unchanged against it |
 | Firebase analytics + crashlytics | official `@capacitor-firebase/*` | Crashlytics needs **no** game-side call sites — the engine reads `appServices().crashlytics` in `globalErrors.ts`, `gameStore.ts` and `ErrorBoundary.tsx` |
 | AppsFlyer attribution | `engine/packages/capacitor-appsflyer` | iOS Swift + Android Java + TS; `devKey`/`appleAppId` are call parameters |
+| AppLovin MAX plugin | `engine/packages/capacitor-applovin-max` | Promoted out of Court in #931 so wordweave can become the second consumer; that wiring is #932 and has NOT landed. **The base plugin only**: `sdkKey`/`adUnitId` are call parameters, and the wrapper (`ads.ts`) and pacing policy (`adPolicy.ts`) stay per game. Court vendors it but keeps it PARKED out of `includePlugins` (#342). `games/3d-test` still carries a pre-promotion fork ([native-and-sdks.md](./native-and-sdks.md) § "Standalone Capacitor Plugin Pattern (iOS SPM)") |
 | Scene-chrome patching | `engine/packages/modoki/src/runtime/ui/sceneChrome.ts` | See [ui-system.md](./ui-system.md) § "Pushing live values onto scene-authored chrome" |
 | Scroll views / recycled entries | `UIScrollView` + `UIEntries` | `games/scroll-demo` is a deliberate non-Court proof |
 | Trusted clock | `engine/packages/modoki/src/runtime/core/trustedClock.ts` | Server-time/monotonic anchor, promoted in #660. Pure arithmetic, **zero imports**; the GAME owns fetching and persisting. Passes the determinism guard with no allowlist entry. ⚠️ Defends the *instant*, NOT the timezone — see the daily-challenge bullet below |
+| **Daily challenge calendar model** | `engine/packages/modoki/src/runtime/core/dailyCalendar.ts` | Promoted out of `games/court/runtime/daily.ts` in #928 (2026-09-13), when wordweave's daily chose to copy Court's rules. Civil `DateKey`s (LOCAL, never UTC), the high-water "today" (`effectiveNowMs`, #764), the 42-cell `daysForMonth` grid and its seven `DayState`s, the two-month paid window, `pickDailyLevel` and `isDailyUnlocked`. Pure, **zero imports**, takes `nowMs` — reads no clock. ⚠️ **Carries no copy** (month/weekday names stay per game) and **no rating rule**: a game passes `starsOf` to `daysForMonth` — REQUIRED, so a call site that forgets the game's rating rule fails to compile rather than drawing every done cell with 0 stars (a game with no rating passes `() => 0`). ⚠️ Does NOT use `trustedClock.ts` and must not — see the daily-challenge bullet below |
+| **Login bonus wheel decisions** | `engine/packages/modoki/src/runtime/core/loginBonus.ts` | Promoted out of `games/court/runtime/loginBonus.ts` in #926 (2026-09-14), when wordweave ported Court's wheel (owner: shared, not copied). Composing the wheel from a policy, the weighted draw, the no-ads substitution, the availability verdict with its **strictly-later day key** (the time-zone faucet fix — it is the lock; the `clock-behind` check before it only names a wound-back clock), and the claim record. Pure, one import (`dateKeyOf`), takes `nowMs` and `roll`. ⚠️ **Carries no numbers and no art**: each game authors its weights/payouts (Court keeps `LOGIN_BONUS_DEFAULTS` and its wedge geometry) and owns every side effect — the clock, the RNG roll, the one durable write of grant + claim, the reveal latch, the welcome-back gift. Court re-exports it unchanged from `runtime/loginBonus.ts` |
 | **Cloud-save protocol** (the sync-guaranteed GROUP) | `engine/packages/modoki/src/runtime/sync/**` | ⚠️ **This row's absence is what made #658 wrong.** Landed #532 Phase A (2026-09-01); Court moved onto it the same day. Generic over `T` — `SyncGroupSpec<T>` (`fingerprint`/`isFreshAndEmpty`/`merge`/`adopt`/`onFork`/`atomicity`), `GroupStore<T>`, `GroupTransport`, `runCloudSync`, `decideGroup`, `resolveGroupFork`. Firebase-free, clock-free, imports no other L2 folder; one `court` token in the whole folder and it is a docstring. Tested over an anonymous `Content` type (`tests/runtime/syncGroups.test.ts`, 39 tests). **The GAME owns what its save MEANS; the engine owns the protocol** |
 | **Cloud-sync coordinator** (*when* a sync runs) | `engine/.../runtime/sync/coordinator.ts` | Promoted in #658 (2026-09-04). Debounces a burst of progression writes, suppresses further syncs while a fork dialog is unanswered, coalesces overlapping triggers into ONE follow-up rather than a queue, and carries the #506 generation guard for sign-out-mid-sync. Generic over the **fork**, not the save — `CloudSyncCoordinator<TFork extends SyncFork>`, with `resolve`'s document reached as `TFork['serverDoc']`. ⚠️ **It must never read a field off a save document** — that property is the whole basis of the type parameter, and its test's `{ version }` stub document is the tripwire: needing a richer one there means it has stopped being generic |
 | **Account decisions** (provider, state machine, re-auth choice) | `engine/.../runtime/account/**` | Promoted in #675 (2026-09-04, `f3a32f79a`) — `AccountProvider`, `AccountState`, `SignInFailure`, `AvailableProviders`, `reauthProviderFor`. ⚠️ **Carries ZERO player-visible copy, and `tests/runtime/accountNoCopy.test.ts` fails if any lands** — there is no i18n mechanism anywhere in this repo, so an engine module that hardcodes English is a localisation blocker a game cannot reach. The GAME owns every rendered word; the engine owns the vocabulary that UI programs against |
@@ -155,15 +159,27 @@ reopen it.
   labels (a shipped bug). **Two clear short functions beat one generic one.** Reopens only if a
   second game gets a player-facing selector — a *product* decision, not an extraction, since it
   needs its own answer to "do this game's levels lock?".
+  ⚠️ **That condition FIRED on 2026-09-12 (#917) and the answer is: still deferred, now with
+  evidence.** Wordweave got its picker, and the owner's answer to the locking question came back
+  DIFFERENT from Court's — bands, not a per-level high-water mark, chosen partly *because* Court's
+  shape carries #383's bug class. So the second consumer shrank the shared surface instead of
+  growing it: the two games now disagree on the one rule an extracted selector would have to own.
+  What was worth copying was the SHAPE, not the code — the owner's brief was literally "copy cat
+  Court" — and `games/wordweave/runtime/levelSelect.ts` reproduces the card/tabs/16-tile-pager
+  layout while importing nothing from Court. **A third game does not reopen this either unless it
+  answers the locking question the same way one of the first two did.**
   ⚠️ Whoever revisits it: the source side is not liftable as-is.
   `games/court/runtime/levelManifest.ts` value-imports the difficulty tables, dragging the whole solver behind anything
   that touches it, while `levelSelect.ts` needs only the frontier function and one entry type,
   both solver-free. **Split the manifest into a solver-free ladder half first.**
-- **A daily challenge — deferred.** Zero second consumers: the other game's progress model has no
-  date dimension at all, so a daily there would be a new game mode, not parity. Revisit when a
-  second game actually wants one.
+- **A daily challenge — the calendar model is SHARED since #928; the wiring is not.** This was
+  deferred on *"zero second consumers"* until wordweave wanted a daily and chose Court's rules
+  (owner, 2026-09-13), so the pure model moved to the engine (table above). Still per game, on
+  purpose: the pool of boards (Court carves its out of the ladder, wordweave generates a separate
+  one), persistence, the menu/calendar chrome, the price and unlock knobs, the rating, and every
+  player-visible word. The clock reasoning below still applies to both games.
   ⚠️ **Do NOT "ship a trusted clock alongside it" — an earlier version of this line said to, and it
-  does not work.** `trustedNow()` defends the *instant*; `dateKeyOf` (`games/court/runtime/daily.ts`)
+  does not work.** `trustedNow()` defends the *instant*; `dateKeyOf` (`engine/packages/modoki/src/runtime/core/dailyCalendar.ts`)
   converts that instant through the **device timezone** (`getFullYear`/`getMonth`/`getDate`, local by
   deliberate design — a UTC key hands a player east of Greenwich tomorrow's puzzle in the evening).
   A player shifting UTC−11 → UTC+14 moves the local civil CLOCK by 25 hours with a perfectly trusted
@@ -171,10 +187,13 @@ reopen it.
   enough to roll the civil DATE onto the next day. The farm still works and the code now *claims* a
   defence it does not have.
   A trusted daily needs a trusted **civil date** — an owner ruling on timezone policy — not a clock
-  swap. ⚠️ And the raw `Date.now()` the daily is fed today is **an accepted written ruling, not a
-  defect**: `games/court/daily.md` § "The clock is not trusted, and it is not defended either" states
-  it as an explicit *Ruling: accept it* (single-player, no leaderboard, every defence needs infra
-  Court does not have). So this work would **overturn a ruling**, not fill a gap — start there.
+  swap. ⚠️ **That ruling was since MADE, and it went both ways (#764, owner 2026-09-09):** the PAID
+  surface is defended and free-daily farming stays accepted, so the calendar's "today" is now a
+  high-water mark rather than a clock reading. `games/court/daily.md` § "The clock is not trusted"
+  carries the split and what is still deliberately open. The raw `Date.now()` the daily is fed
+  remains the accepted half, so this work would still **overturn a ruling**, not fill a gap — but
+  the ruling to read is now the newer one. wordweave took the same accept deliberately rather than
+  inheriting it (#928, 2026-09-10).
 - **Settings + ad policy — deferred on evidence (#661, closed 2026-09-04).** The mechanism in each
   generalizes; the field set does not; and the second consumer the extraction would be written
   against **does not exist and cannot yet**. Measured, not read: the only other shipping-shaped game
@@ -198,20 +217,39 @@ reopen it.
   **Reopens when a second game grows a settings SCREEN or an ad cooldown** — a product decision, not
   an extraction. Start with settings when it does: the legacy-field migration is the part that is
   genuinely painful to re-derive.
-- **A store SCREEN — deferred on assessment (#659, closed 2026-09-04).** `games/court/runtime/storeUi.ts`
-  is 581 lines / 228 code, and splits ~18% catalog-agnostic / ~42% generic mechanism wearing a
-  Court-shaped type / ~40% copy and catalog. Its two DIRECT imports are siblings — no
-  `@modoki/engine`, no `@court/*`, and it never names an IAP type itself — but the generic ~42%
-  cannot move until `StoreSlot`/`StoreConfig` become a catalog descriptor, and those live in
-  `store.ts`. **The two files are ORDERED, not neighbours.** The genuinely reusable asset is four
-  rules totalling ~40 lines: *no price, no row*; *no verdict while the question is still open*;
-  *a cancel is not an error*; *hidden, not greyed*.
-  **Reopens when a second game acquires a store SCREEN** — verified not met: `storeRows`/
-  `StoreRowView`/`shortfallCard` appear in no game outside `games/court/`.
-  ⚠️ A second game already ships the IAP MECHANISM with no such screen
-  (`games/wordweave/runtime/store.ts`), and the two `store.ts` export surfaces are **disjoint** —
-  Court's is catalog/entitlements/passes, wordweave's is coin-credit/idempotency. They share a
-  posture, not an API, so this is not duplication awaiting extraction.
+
+  ⚠️ **REOPENED AND RE-RULED, 2026-09-09 (#918, `work-ai`) — VERDICT: accept two copies.** The
+  condition above was met: wordweave grew `runtime/settings.ts` and a settings SCREEN. ⚠️ **The
+  measurement this deferral rested on is now FALSE and must not be re-quoted** — "no audio subsystem
+  at all, `audio|music|sfx|sound` at 0 and 0" stopped being true when `2040d02ed` landed
+  `runtime/audio.ts` and `runtime/haptics.ts` (#920/#922), an hour after #918 was even filed.
+
+  The re-ruling, on what the second implementation actually looked like:
+  - **The shared part is ~15 lines**: clamp-to-range, per-field fallback, normalise-on-read. The
+    divergent part is the whole field set plus Court's legacy `soundOn` branch, which wordweave has
+    no equivalent of and never will. Extracting the mechanism means describing the field set as
+    data, which is more machinery than the duplication costs — #661's original finding
+    ("mechanism generalizes, field set does not") survived contact with the second consumer intact.
+  - **The envelope did NOT need extracting, because it was written on the FIRST try.** Wordweave's
+    document is enveloped from day one specifically so #679 registers a group rather than migrates a
+    format. That removes the expensive half this entry warned about, rather than sharing it.
+  - ⚠️ **The extraction candidate that actually emerged is a different one**: the **0..1 ↔ 0..100
+    conversion** between a settings document and the engine mixer store. Both games now own a copy,
+    it is pure, it has no field set to generalise, and it belongs with the mixer that *defines* the
+    scale (`runtime/actions/audioControls.ts`) rather than with either game. That is a far better
+    ratio than the module this row was about — file it as its own ticket if a third consumer
+    appears, or when someone gets the direction wrong once.
+- **A store SCREEN — deferred on assessment (#659, closed 2026-09-04), REOPENED and landed by #925
+  (2026-09-13).** The reopen condition ("a second game acquires a store SCREEN") is wordweave's
+  store, built on the shelf under #925, and the move followed the ordering #659 found: the catalog DESCRIPTOR first
+  (`StoreSlot`/`StoreConfig` → `ShelfOffer[]`), then the view-model, then the stateful half — now the
+  table row "Store shelf" above. What stayed per game, and why: the WORDS (every row title, notice
+  and card), the ENTITLEMENT STORE (Court's consumable-forever vs wordweave's store-owned unlock),
+  the grant path (`courtOnGrantImpl`'s durability gate is Court's document shape), and the cards
+  (Court's post-purchase card offers sign-in; wordweave has no account).
+  ⚠️ #659's other finding still holds for the GRANT side: the two games' `store.ts` export surfaces
+  remain disjoint — Court's wallet is a cloud-sync group, wordweave's a coin-credit/idempotency
+  document. The shelf is shared; what a purchase WRITES is not.
 
 ## Blocked: the default-art layer
 
@@ -255,7 +293,8 @@ What *does* work with zero authoring: flat colour boxes with `borderRadius` on `
   `storeUi.ts` that is genuine generic mechanism cannot move until `StoreSlot`/`StoreConfig` are
   parameterised into a catalog descriptor — and those live in `store.ts`, the most coupled file in the
   audit. The two were surveyed as neighbours; they are actually **ordered**. Any attempt that starts
-  with the UI file because it reads cleaner stalls on the config file anyway.
+  with the UI file because it reads cleaner stalls on the config file anyway. (#925 did it in that
+  order and it held: the descriptor landed first, and `storeUi.ts` then shrank to Court's words.)
 - **The reusable asset can be a set of RULES, not code.** The most valuable thing found in
   `storeUi.ts` was four design rules totalling ~40 lines — *no price, no row*; *no verdict while the
   question is still open*; *a cancel is not an error*; *hidden, not greyed*. Worth stating explicitly
@@ -283,7 +322,7 @@ that produced them reversed itself on three of the four rows it originally cover
 actually read the code:
 
 **All four are now settled** (2026-09-04). **#660** (the trusted clock) was PROMOTED — see the table
-in § "What is shared today". **#659** (the store screen) and **#661** (settings + ad policy) were
+in § "What is shared today". **#659** (the store screen — since landed by #925) and **#661** (settings + ad policy) were
 assessed and DEFERRED — see § "What is deliberately NOT shared", which carries each one's reopening
 condition.
 
@@ -322,6 +361,17 @@ account and conflict-dialog UI is GAME-SPECIFIC.** Court's dialog keeps its self
   the same breath: ~51 of those lines are player-visible English, and there is no i18n mechanism in
   this repo. The UI ruling resolves that by subtraction rather than by care — move the vocabulary,
   move zero strings. `accountNoCopy.test.ts` is what holds the line, and it was mutation-tested twice.
+
+  ⚠️ **The gap that ruling points at now has an answer: ENGLISH ONLY, for now** (owner, 2026-09-10,
+  #941). The subtraction above is not a placeholder waiting on an i18n mechanism — it is the shape
+  the repo keeps. **Weaveling is English-only permanently**: it is a word game built on a 173k-word
+  English dictionary, a commonness-score sidecar, a definitions sidecar and a generator tuned to
+  English letter frequency, so localising it is a second corpus and a second generator tuning per
+  language, not a translated interface — a different product, not a port. **Court is English-only
+  until it is commercially successful**, at which point the UI half becomes worth doing; its copy is
+  the tractable case precisely because it is interface text, not content. So `accountNoCopy.test.ts`
+  stays as the line and the engine keeps owning vocabulary while the game owns every rendered word —
+  now for a stated reason rather than for want of a mechanism.
 - **#673 — CLOSED, won't do.** Its proposal was *"the engine owns the two-column layout and the
   choice; the game owns every noun"*, and the ruling above deletes the first half. What remains — a
   view-model of one game's nouns, rendered by that game — is already correctly placed.

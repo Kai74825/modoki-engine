@@ -8,7 +8,22 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import React from 'react';
 import { render, cleanup } from '@testing-library/react';
 
-const h = vi.hoisted(() => ({ tree: { current: [] as Array<{ entityId: number }> } }));
+const h = vi.hoisted(() => ({
+  tree: { current: [] as Array<{ entityId: number }> },
+  overflowInstalls: [] as Array<{ root: HTMLElement; dispose: () => void }>,
+}));
+// The overflow scan's own behaviour is covered in uiOverflow.test.ts; here only WHETHER and WHERE
+// UIRenderer installs it.
+vi.mock('../../src/runtime/ui/uiOverflowScan', async () => {
+  const { vi: v } = await import('vitest');
+  return {
+    installUIOverflowScan: (root: HTMLElement) => {
+      const dispose = v.fn();
+      h.overflowInstalls.push({ root, dispose });
+      return dispose;
+    },
+  };
+});
 
 vi.mock('../../src/runtime/ui/useUIEntities', () => ({
   useUIEntities: () => h.tree.current,
@@ -21,6 +36,8 @@ vi.mock('../../src/runtime/ui/UINode', () => ({
 import { UIRenderer } from '../../src/runtime/ui/UIRenderer';
 import { isPointerBlocked, clearPointerBlockers } from '../../src/runtime/core/pointerBlockers';
 import { resetSafeAreaInsets } from '../../src/runtime/ui/safeArea';
+import { VIEWPORT_LENGTH_UNITS, viewportUnitVar } from '../../src/runtime/traits/uiLength';
+import { setUIOverflowCheckEnabled } from '../../src/runtime/ui/uiOverflow';
 
 // jsdom has no ResizeObserver — install a controllable fake that records instances.
 class FakeRO {
@@ -81,6 +98,19 @@ describe('UIRenderer', () => {
     expect(root.style.getPropertyValue('--ui-vh')).toBe('8px');
     expect(root.style.getPropertyValue('--ui-vmin')).toBe('4px');
     expect(root.style.getPropertyValue('--ui-vmax')).toBe('8px');
+  });
+
+  // The publisher is the copy #1064 was filed about: the old "update these files when adding a
+  // unit" docblock left it out, and a reader of an unpublished var falls back to the browser's own
+  // `1vw` without a word. Iterating the table means a unit added there must be published here.
+  it('publishes a var for EVERY viewport unit in the table', () => {
+    sizeDom(400, 800);
+    h.tree.current = [{ entityId: 1 }];
+    const { container } = render(<UIRenderer />);
+    const root = container.firstElementChild as HTMLElement;
+    for (const u of VIEWPORT_LENGTH_UNITS) {
+      expect(root.style.getPropertyValue(viewportUnitVar(u)), u).toMatch(/^\d+(\.\d+)?px$/);
+    }
   });
 
   it('does not publish vars when the container measures 0 (still-laying-out)', () => {
@@ -199,6 +229,36 @@ describe('UIRenderer', () => {
       expect(isPointerBlocked(root)).toBe(true);
       unmount();
       expect(isPointerBlocked(root)).toBe(false);
+    });
+  });
+
+  // #1126 — the text-overflow scan. Runtime mode only (SceneView's preview is a second mount of the
+  // same tree, at a simulated size, into the same per-world store) and only with the gate on.
+  describe('text-overflow scan installation', () => {
+    beforeEach(() => { h.overflowInstalls.length = 0; });
+    afterEach(() => { setUIOverflowCheckEnabled(false); });
+
+    it('installs on the runtime root when the check is enabled, and disposes on unmount', () => {
+      setUIOverflowCheckEnabled(true);
+      h.tree.current = [{ entityId: 1 }];
+      const { container, unmount } = render(<UIRenderer />);
+      expect(h.overflowInstalls).toHaveLength(1);
+      expect(h.overflowInstalls[0].root).toBe(container.firstElementChild);
+      unmount();
+      expect(h.overflowInstalls[0].dispose).toHaveBeenCalledTimes(1);
+    });
+
+    it('does NOT install in the SceneView preview (onSelectEntity set)', () => {
+      setUIOverflowCheckEnabled(true);
+      h.tree.current = [{ entityId: 1 }];
+      render(<UIRenderer onSelectEntity={() => {}} />);
+      expect(h.overflowInstalls).toHaveLength(0);
+    });
+
+    it('does NOT install when the check is disabled (a release build)', () => {
+      h.tree.current = [{ entityId: 1 }];
+      render(<UIRenderer />);
+      expect(h.overflowInstalls).toHaveLength(0);
     });
   });
 });

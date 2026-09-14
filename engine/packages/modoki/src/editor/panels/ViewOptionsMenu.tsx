@@ -7,6 +7,7 @@
 
 import { useEffect, useRef, useState } from 'react';
 import { useOverlayEscape } from '../input/useOverlayEscape';
+import { namedBadgeLabel } from './badgeLabel';
 
 export interface ViewOption {
   key: string;
@@ -15,6 +16,24 @@ export interface ViewOption {
   onToggle: () => void;
   title?: string;
   uiId: string;
+  /** This option REMOVES content from the surface below when on (rather than adding an overlay), so
+   *  it must survive {@link viewBadgeLabel}'s two-name cap. Without it the cap works in items order,
+   *  and `colliders` is last in both menus — so FX + Focus + Colliders rendered `View: FX, Focus +1`,
+   *  hiding the one option the badge exists to surface. */
+  notable?: boolean;
+}
+
+/** The trigger's label: names the checked options instead of counting them (#1003).
+ *
+ *  `View` when nothing is on, `View: Colliders` for one, `View: Grid, Colliders` for two, and
+ *  `View: Grid, Colliders +2` beyond that. The naming rule itself is `namedBadgeLabel`, shared with the
+ *  tree panels' `Type ▾` filter (#1021); what is THIS menu's own is the order names reach the cap in. */
+export function viewBadgeLabel(items: readonly ViewOption[]): string {
+  // `notable` first, order otherwise preserved — so a content-removing option is never the one the
+  // cap drops. A stable partition rather than a sort, so the menu's own ordering still reads through.
+  const checked = items.filter((i) => i.checked);
+  const on = [...checked.filter((i) => i.notable), ...checked.filter((i) => !i.notable)];
+  return namedBadgeLabel('View', on.map((i) => i.label));
 }
 
 /** One checkable row inside {@link ViewOptionsMenu}. */
@@ -32,8 +51,8 @@ function ViewOptionItem({ label, checked, onToggle, title, uiId }: ViewOption) {
 }
 
 /** Self-contained: closes on outside-click or Escape (`useOverlayEscape`), and renders its own
- *  leading divider so callers just drop it into a toolbar. The trigger shows a `(N)` badge for
- *  how many items are currently checked. */
+ *  leading divider so callers just drop it into a toolbar. The trigger NAMES the checked items
+ *  ({@link viewBadgeLabel}). */
 export function ViewOptionsMenu({ items, uiId }: { items: ViewOption[]; uiId: string }) {
   const [open, setOpen] = useState(false);
   const ref = useRef<HTMLDivElement>(null);
@@ -46,6 +65,11 @@ export function ViewOptionsMenu({ items, uiId }: { items: ViewOption[]; uiId: st
   useOverlayEscape(open, () => setOpen(false), 'sceneview-view-options');
 
   const activeCount = items.filter((i) => i.checked).length;
+  // NAME the active options rather than counting them (#1003). `View (1)` could not answer "which
+  // one?", and worse, in 3D it is the DEFAULT resting state because Grid is checked by default —
+  // so the badge read the same whether the content-hiding Colliders mode was on or off, and carried
+  // no signal at all. Capped at two names so the toolbar cannot grow without bound.
+  const activeLabel = viewBadgeLabel(items);
   return (
     <>
       <div style={{ width: 1, height: 18, background: '#444', margin: '0 6px' }} />
@@ -57,7 +81,7 @@ export function ViewOptionsMenu({ items, uiId }: { items: ViewOption[]; uiId: st
             border: `1px solid ${activeCount ? '#5a9fd4' : '#444'}`,
             borderRadius: 3, color: activeCount ? '#5a9fd4' : '#666', fontSize: '10px',
             cursor: 'pointer', fontWeight: 'bold', fontFamily: 'monospace', lineHeight: 1,
-          }}>View{activeCount ? ` (${activeCount})` : ''} <span style={{ fontSize: 8, opacity: 0.7 }}>▾</span></button>
+          }}>{activeLabel} <span style={{ fontSize: 8, opacity: 0.7 }}>▾</span></button>
         {open && (
           <div style={{
             position: 'absolute', top: '100%', right: 0, marginTop: 3, zIndex: 1000,

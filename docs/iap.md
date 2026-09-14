@@ -111,6 +111,15 @@ direction:
   on every launch instead of remembering. Survives reinstall and a new device for free, and no local
   corruption can lose it. **Expiry, refunds and revocation are applied by the platform** — which is
   what makes serverless verification correct rather than merely cheap.
+  ⚠️ **On Android a finished non-consumable or subscription is ALSO re-delivered to the grant hook,
+  every launch** (#1183). `unfinished()` is `queryPurchasesAsync` (INAPP and SUBS), which returns every
+  non-CONSUMED purchase, and neither kind is ever consumed; the engine runs the hook even for an
+  already-granted transaction. iOS never re-delivers a finished transaction. Harmless for a pure
+  unlock. A purchase that also pays game state (wordweave's bundle pays
+  coins) must keep its idempotency marker forever, and a data-losing reinstall pays it again on
+  Android only. Kept as is (owner, 2026-09-14): dropping acknowledged non-consumables from
+  `unfinished()` would lose the grant of one acknowledged before a crash, and the early acknowledge
+  exists for Play's 3-day refund clock.
 - **`consumable` → WE own it.** The store forgets a consumable the moment it is consumed, so the
   grant exists only in our ledger. This is the only kind for which durability is our problem, and
   therefore **the only kind the ledger is load-bearing for**.
@@ -193,9 +202,9 @@ close.
 `stillActive`-style check there.** `resetIap()` clears `cfg` and `entitled` but deliberately does
 NOT clear `settling`, so a settle for the same transaction id restarting in the next session still
 sees it busy via `settle()`'s in-flight check, and the stale `finally` releasing it later is correct,
-not a leak. Court's `storeInFlight` (`games/court/runtime/systems.ts`) is the mirror image and needs
-the OPPOSITE fix — a generation check IS required there — because `resetStoreUi` DOES clear its set
-on teardown, so a next-session entry can be added right after, and only a generation check stops the
+not a leak. `ShelfSession`'s in-flight set (`runtime/iap/shelfSession.ts`, Court's `storeInFlight`
+until #925) is the mirror image and needs the OPPOSITE fix — a generation check IS required there —
+because `reset()` DOES clear its set on teardown, so a next-session entry can be added right after, and only a generation check stops the
 stale `finally` from deleting the NEW entry. Same shape, opposite requirement, because exactly one of
 the two teardown functions clears its set: check which before copying either fix elsewhere.
 
@@ -271,6 +280,26 @@ Prices must come from the store (`productInfo()`), never hardcoded.
 immediately, and reading pre-hydration boots an EMPTY ledger, which makes `isProcessed()` answer
 false for transactions already granted and re-grants every unfinished consumable. A double-credit
 bug caused by wiring, with the state machine behaving exactly as designed on a ledger that lied.
+
+### A store SCREEN is built on the shelf, not from scratch (#925)
+
+A game with a store screen does not re-derive its rules. `runtime/iap/shelf.ts` and
+`shelfSession.ts` carry what Court learned on device, and every game with a shelf reads through them
+(Court and wordweave, both since #925 — wordweave's store screen is the reason they were promoted). The full description and the per-game split
+live in [cross-game-infrastructure.md](./cross-game-infrastructure.md) § "What is shared today";
+the rules a wiring must not break:
+
+- **Describe the shelf as `ShelfOffer[]`** built from authored config. `buildShelfCatalog` is what
+  goes to `configureIap`, so the catalog, the effect and the visibility filter can never read two
+  different product lists.
+- **Words are the game's.** `shelfView` takes `rowWords` and `notice`; `quickBuyView` returns the
+  price for the game to label. Nothing in `runtime/iap/` renders a sentence.
+- **`owned.foreverOwned` is passed in, because who owns the unlock is a PRODUCT decision** (§ 2): a
+  `non-consumable` unlock is `isEntitled(id)` after `refreshEntitlements()`/`reconcile()`, a consumable
+  one is whatever the game recorded. Getting this wrong offers a second sale of something owned.
+- **One `ShelfSession` per screen, reset in the game's teardown.** Its `inFlightCount` is what a
+  reload blocker reads — not `state.kind === 'buying'`, which the watchdog and a grant both release
+  while the payment is still queued.
 
 ---
 
@@ -473,72 +502,145 @@ someone re-attaches it and unknowingly tests against a stale product list.
 
 [tn3186]: https://developer.apple.com/documentation/technotes/tn3186-troubleshooting-in-app-purchases-availability-in-the-sandbox
 
-### ⚠️ OPEN (#580): every purchase stalls 20-40 s on the iPhone 8
+### #580: the iPhone 8 purchase stall
 
-**OPEN, root cause not established.** Observed on the iPhone 8 (iOS 16.7.16) on 2026-09-02 across
-two separate test rounds. Recorded here so the measurement is not lost, not as a diagnosis.
+**RESOLVED 2026-09-08 — and mostly not a defect.** Established by five real sandbox purchases on the iPhone 8 (iOS 16.7.16), timed against
+`storekitd`'s own wall clock rather than journal ticks. The headline: **most of the reported 20-40 s
+is normal sandbox StoreKit latency plus the player's own time at Apple's confirmation sheet.** Two
+real Court defects were found underneath it, both now fixed; both were about what Court does DURING
+the wait, not about the wait itself.
 
-Every purchase attempt spanned 1400-2300 journal ticks between `iap.purchase.started` and its
-outcome, regardless of which outcome it settled on.
+#### What the wall clock says
 
-⚠️ **The seconds column is DERIVED, not measured, and the assumption behind it is unverified.** It
-divides ticks by 60. On a live device the journal tick is `time.frame`, incremented once per
-**rendered** frame (`timeSystem()` in `engine/packages/modoki/src/runtime/core/timeSystem.ts`) on a real-clock
-delta — not a fixed dt. (`stepSimulation()`'s `1/60` default governs the HEADLESS deterministic
-stepper, and the original report cited it here in error; it does not apply to a device run.) So if
-Court rendered at ~30fps on an iPhone 8 the real spans are 40-80 s, not 20-40 s — and if rAF is
-throttled while the StoreKit sheet is up, ticks stop entirely and the figure understates by an
-unknown amount. **Nobody measured the frame rate during these attempts.** The tick counts are the
-hard data; treat the seconds as a lower bound.
+`InAppTransactionTask` start/end and the `SBRemoteTransientOverlaySession` activate/invalidate pair
+bracket the sheet exactly, so the human's dwell separates cleanly from machine time:
 
-| attempt | ticks started→settled | derived seconds (assumes 60fps — NOT measured) | outcome |
-|---|---|---|---|
-| coins300 | 216→2207 | ~33.2s | cancelled |
-| coins1000 | 5199→6598 | ~23.3s | granted (via reconcile recovery) |
-| coins300 retry | 11239→12710 | ~24.5s | granted (via reconcile recovery) |
-| coins2500 | 14439→16101 | ~27.7s | cancelled |
-| coins2500 retry | 28178→30467 | ~38.2s | cancelled |
-| coins300 (2nd session) | 1052→2811 | ~29.3s | granted |
+| run | entry → sheet up | dwell at the sheet (human) | **Apple's work AFTER the tap** | total |
+|---|---|---|---|---|
+| 1 | 1.81 s | 233.7 s | **63.4 s** | 298.9 s |
+| 2 | 1.41 s | 16.0 s | 16.0 s | 33.4 s |
+| 3 | 1.37 s | 15.2 s | 19.9 s | 36.5 s |
+| 4 | 1.15 s | 18.9 s | 19.6 s | 39.6 s |
+| 5 | 1.02 s | 157.4 s | 19.4 s | 177.8 s |
 
-**The shape of the failure:** both `granted` outcomes arrived through `reconcile()`'s
-`purchasesUpdated`-driven recovery path (`iap.recovered`), NOT through the direct `purchase()`
-settle. The direct call's own promise resolved LATER and was correctly de-duplicated
-(`iap.duplicate` / `iap.settle-in-flight`, no double-grant). That is consistent with `purchase()`
-itself stalling or resolving unreliably on this device/OS, with `reconcile()` independently
-recovering the transaction.
+- **Apple's post-confirmation work is 16-20 s in four runs of five.** Run 1's 63.4 s is a genuine
+  outlier and is not explained; a long dwell is NOT the explanation (run 5 dwelled 157 s and still
+  took 19.4 s).
+- **Entry → sheet is 1.0-1.8 s, every run.** ⚠️ This kills a plausible-looking suspect: `purchase()`
+  makes its OWN `Product.products(for:)` round-trip before `product.purchase()`, duplicating the
+  fetch `products()` already did for the shelf. It looks like a stall and is not one — **do not
+  "fix" it expecting this symptom to move.**
+- Runs 2-4 totalled 33-40 s, i.e. **squarely inside the originally reported "20-40 s" band**, of
+  which 15-19 s was the human. The original figure was measuring the sum.
 
-**Ruled out**, recorded so nobody re-runs them: the settle-serialization race —
-`settling` is keyed by transaction id
-(the `settling` set in `engine/packages/modoki/src/runtime/iap/purchaseService.ts`, de-dup in `settle()`) and only one
-`court.coins.changed` fired per transaction; the StoreKit 2 `Transaction.updates` listener
-busy-looping — it is a `for await` over an AsyncSequence (`updatesTask` in `IapPlugin.swift`'s `load()`) and suspends
-between events by construction; and `markDirty()` (`games/court/runtime/systems.ts`), a
-trivial boolean set.
+#### The tick-derived seconds were right to be distrusted
 
-⚠️ **Two mechanisms look like they would cover this and do not.**
-- #583's stranded-purchase timeout is **Android-only**
-  (`engine/packages/capacitor-modoki-iap/android/src/main/java/com/modokiengine/capacitor/iap/ModokiIapPlugin.java`,
-  `armStrandTimeout` / `PARKED_PURCHASE_TIMEOUT_MS`), and the iOS Swift path has no equivalent.
-  ⚠️ **But do not read that as "port it to iOS and the stall is bounded".** `PARKED_PURCHASE_TIMEOUT_MS`
-  is `5 * 60_000L` — five minutes (`ModokiIapPlugin.java`), 7-15x the observed span. It would
-  never fire during this symptom, for exactly the reason the watchdog below is dismissed. Porting it
-  would be a no-op against this bug.
-- Court's `STORE_WATCHDOG_MS = 90_000` (`games/court/runtime/systems.ts`) is not a purchase
-  timeout — it only releases the full-screen overlay. It is also longer than the span, so it does
-  not fire during the symptom. ⚠️ That margin is thinner than it looks: it is comfortable only at
-  the assumed 60fps (20-40 s). At 30fps the derived span is 40-80 s and 90 s stops being a
-  comfortable margin — so **measure the frame rate before crossing the watchdog off**.
+The earlier caveat in this section — that `time.frame` counts RENDERED frames, so dividing by 60 is
+unsound — is **confirmed and mattered**. During run 1 the journal recorded `@tier` dropping
+`mid → low` with a *"median frame 23.0ms"* (~43 fps) mid-purchase, so the conversion rate was not
+even constant across a single attempt. **Never convert Court journal ticks to wall-clock seconds for
+a device measurement.** Use `storekitd`'s log, which is wall-clock and needs no assumption.
 
-**Not checked**, so the next session knows where to start: no CPU profiler was attached; whether
-disabling parts of the debug bridge or the analytics SDKs (Firebase, Crashlytics, AppsFlyer) changes
-it; whether it reproduces on newer hardware (the iPhone 8 is the oldest supported device in the
-fleet).
+#### Defect 1 — the watchdog counted human time at Apple's sheet (FIXED)
 
-⚠️ The co-occurring iOS "excessive wakeups" reports that were originally filed as part of this issue
-are **not** the cause and are not a defect. The evidence lives in `docs/devices.md` § "iOS
-`wakeups_resource` reports are expected cost, not a defect", **which is private and not part of the
-published snapshot** (hence a path rather than a link) — in short, the signal spans four bundle ids,
-two of which have no purchase flow at all.
+`STORE_WATCHDOG_MS = 90_000` is armed at purchase start and runs straight through the confirmation
+sheet, which is unbounded human time Court cannot bound: a 157 s dwell entering a sandbox password
+fired it **while the sheet was still up** — the exact thing `armStoreWatchdog`'s own header says it
+"must not" do. ⚠️ **This section previously asserted the watchdog "does not fire during the symptom";
+that is disproved — it fired in 2 of 5 runs.**
+
+It then dropped to `{ kind: 'shelf' }`, tearing Court's own "Buying…" overlay off mid-purchase
+(owner: *"I didn't see Buying…"*, *"the store window is dismissed too"*). Fixed by marking the
+purchase `stalled` and revealing `BusyOverlayClose` — an (X) on the busy panel — instead. The timer's
+purpose was never to hide the overlay; `BusyOverlay` authors no `UIAction`, so it was to stop the
+player being TRAPPED behind a buttonless backdrop. Offering the exit does that; taking the screen
+away did not.
+
+#### Defect 2 — the teardown then SILENCED the outcome (FIXED)
+
+The watchdog also called `beginStoreAttempt()`, so `settleStorePurchase` failed its
+`isCurrentStoreAttempt` guard and returned **before** the `switch (outcome)` that raises the outcome
+card — and before `journalState('court.store.settled')`, which is how it was spotted (4
+`iap.purchase.started`, 3 `court.store.settled`). The player confirmed a purchase, it came back
+`cancelled`, and Court said nothing at all.
+
+⚠️ **This was the FOURTH mechanism producing one symptom** — *the player gets no readable feedback
+about a purchase that did not complete*. The others: #498 (rendered, but as small near-black copy
+inside an `overflow: scroll` panel), the 2026-08-30 → 09-02 show-nothing-on-cancel reversal, and #484
+(an origin upgrade passing `null` erased it mid-read). Each was fixed at its own point in a
+five-point chain, and nothing stated the invariant, so a fourth point was free to go quiet.
+
+**The fix was a deletion, not a fifth guard.** The #464 grant path already releases the screen while
+deliberately NOT bumping the epoch, and says so in its own comment; the watchdog was the one site not
+following an existing documented rule. ⚠️ **Safe because `storeInFlight`, not `storeAttempt`, is the
+double-charge bar** — it is released in `settleStorePurchase`'s `finally`, BEFORE the attempt guard,
+so the same product is refused either way. The epoch bump only ever silenced the settle. (Both fields
+are `ShelfSession`'s since #925 — its in-flight set and its supersession token — with the same
+ordering.)
+
+#### Instrument notes — two things that read as "nothing happened" and are not
+
+Both cost a cycle here, and neither is discoverable from the tool description:
+
+- **`idevicesyslog` does not carry an app's own `os_log`.** Measured: 14 `App[]` lines in a 6-minute
+  capture, every one from the Xcode 16 launcher shim, with the plugin's own `NSLog` absent too. A
+  silent syslog is not evidence the code did not run.
+- **`device_native_logs source:'app'` is unusable on the iPhone 8** — it reads `OSLogStore` in-process
+  and exceeds the 5 s device timeout at EVERY window size, including 20 s unfiltered.
+- **What DOES work:** `storekitd`'s own entries in `idevicesyslog` (wall-clock, and it brackets the
+  sheet), plus `device_journal`. For app-side probes on this hardware, `print()` to stdout captured
+  by `idevicedebug run` is the only headless route — `Logger` alone is Xcode-only.
+- ⚠️ **A purchase can be driven headlessly**: `court.shopOpen` then `court.storeBuyCoins300` via
+  `device_dispatch_action`. The buy alone is refused (`court.store.buy-refused`, `why:
+  "not-on-shelf"`) because the shelf gates on fetched prices. **Only the tap on Apple's sheet needs a
+  human** — and while that sheet is up, Court's debug bridge stops accepting the Modoki lease, so the
+  agent is blind for exactly that window.
+
+#### Still open — but the INSTRUMENT now exists (#946, 2026-09-08)
+
+Whether run 5's `cancelled` was a real user cancel or a sandbox/account fault **misclassified** as
+one is still unanswered, and still needs a device run: a cancel and an ASD/AMS fault both surface as
+`"Request Canceled"`. What has changed is that the **next** occurrence can be told apart, which it
+could not before.
+
+⚠️ **The root cause was #499's fix failing to generalise, not a missing capability.** #499 added
+`classify()`/`errorDetail()` and threaded them into `purchase()`'s REJECT arm. The CANCEL arm — the
+one where the ambiguity actually lives — kept resolving a bare `null`, and `isCancellation()`
+short-circuited before the reject that would have carried the identity. `classify(error)` was
+already being computed four lines above for the timing probe, so **the answer was in hand at the
+exact moment it was discarded.** The fix widened #499 rather than adding a second mechanism.
+
+⚠️ **iOS reaches "cancelled" by TWO routes, and they are different facts.** StoreKit *returning*
+`.userCancelled` is unambiguous — the player said no. A *thrown* error that merely looks like a
+cancel is the ambiguous one. They now carry `'storekit.result.userCancelled'` and `classify()`'s
+string respectively, so nothing downstream can conflate them again. Android emits
+`'play.userCanceled'` from its response-code branch — no equivalent ambiguity there, but the field
+is emitted anyway so a journal entry means the same thing on both platforms, and a cancel carrying
+NO reason identifies an older plugin build rather than reading as Android.
+
+The reason rides `iap.purchase.cancelled` → `court.store.settled` → `track('purchase_cancelled',
+{ reason })`. ⚠️ **Nothing about behaviour changed**: a cancel is still resolved rather than
+rejected, still `purchase_cancelled` and never `purchase_failed`, and the player sees the same
+sentence. The analytics split is about the funnel, not about the error identity — which is the
+point, since a misclassified fault was previously counted as a player DECISION with nothing able to
+separate the two after the fact.
+
+⚠️ **Partly gated since #971 — but NOT the part that would settle run 5.** When this was written
+`npm run test:native` had legs for `capacitor-game-debug` and `capacitor-modoki-ota` only, and
+nothing in this repo compiled iap's Swift or Java at all. `ios/iap-core` and `android/iap-core` now
+replay the classification against shared vectors (§ 8), so the *rule* — that an ASD/AMS fault
+classifies as NOT a cancel while `storekit.userCancelled` does — is pinned in both languages and
+mutation-checked.
+
+What that still does **not** give you: the legs prove the CORE, not that `IapPlugin.swift` calls it
+correctly on a live purchase. The plugin classes themselves ARE compiled now, by `ios/class/*` (#981)
+and `android/class/*` (#992), but a compile runs nothing.
+The TS half is unit-tested (`iapFailurePaths.test.ts`, `analyticsPurchaseFunnel.test.ts`, with
+mutation checks). So the answer to run 5 is unchanged: **verifiable only on device, and only on the
+next occurrence.** A green gate still does not mean the iOS change works end-to-end.
+
+Reproduce, unchanged: `court.shopOpen`, `court.storeBuyCoins300`, leave Apple's sheet untouched past
+90 s, then tap **Purchase**.
 
 ### Android — every device iteration costs a Play upload
 
@@ -705,6 +807,68 @@ walkable on the phone with no rebuild.
 `acknowledge()` is never withheld — risking the player's actual money to test something else is a
 bad trade. The harness has its own tests, which is not ceremony: a silently-inert instrument is
 worse than none, because a device run would then "pass" having interrupted nothing.
+
+### The NATIVE halves are gated too, since #971 — and were not before
+
+Until #971, **nothing in this repo compiled `capacitor-modoki-iap`'s Swift or Java.** Not
+`npm run verify` (vitest cannot), not `npm run test:native` (it had no iap leg), not either CI leg.
+`npm run typecheck` covered the TS definitions and stopped there. So #946 changed the iOS
+`purchase()` catch arm and the Android `purchasesUpdated` listener and shipped both on a green gate
+that could not have caught a mistake in either.
+
+Two legs now close that, on the OTA model — a dependency-free core extracted from the shipping
+plugin, replayed against shared vectors, rather than a port living inside a test file:
+
+| leg | runs | replays |
+|---|---|---|
+| `ios/iap-core` | `swift test` on the host, no device or iOS SDK | `ModokiIapCore.IapClassification` — the REAL `StoreKitError` / `Product.PurchaseError` switches |
+| `android/iap-core` | bare `javac` + `java`, no gradle | `IapCore.java` — the Play response-code half |
+
+Both against `capacitor-modoki-iap/test-vectors/iap-classification-vectors.json` (19 iOS + 10
+Android vectors), whose JS end is `iapCancelVocabulary.test.ts`.
+
+⚠️ **The exclusion is CAPACITOR, not platform frameworks.** `import Capacitor` has no macOS
+xcframework, so the plugin target cannot be host-built at all — that is why a nested package exists.
+⚠️ **iap's is `iap-core/`, deliberately not `core/`:** SwiftPM derives a path-dependency's identity
+from the DIRECTORY BASENAME, and `capacitor-modoki-ota` already uses `core/`, so two plugins nesting
+`core/` in one app graph collide — surfacing as `product 'ModokiIapCore' … not found in package
+'core'`, which names the wrong thing entirely. Name the next one after its plugin too. StoreKit *does* ship on macOS 12+, so the core keeps the real enum switches instead of
+re-typing them into the test. That is what makes these legs stronger than `ios/lease-parity`, which
+tests a port of its spec (`engine/scripts/test-native.mjs`'s header keeps the per-leg ledger).
+
+⚠️ **Three things a green run still does NOT prove**, and they are the honest limits:
+
+1. **That the plugin CALLS the core correctly on a real purchase.** The extraction is a behavioural
+   native change; the legs prove the core, not the call site. Only a real cancelled purchase on
+   device shows that — which for #946's ambiguous case may be weeks away.
+2. **That `IapCore.RESPONSE_USER_CANCELED` still equals Play's own constant.** Checking that needs
+   the billing library, which would make the leg unrunnable, and **nothing checks it.** A `static`
+   comparison against `BillingResponseCode.USER_CANCELED` was written and then removed: both sides
+   are compile-time constants, so javac folds the comparison away and the shipped `<clinit>` was a
+   bare `return` — a guard that could not fire, this repo's dominant defect class. Had it fired it
+   would have thrown during plugin registration and failed app LAUNCH for everyone, which is worse
+   than the mislabelled analytics event it guarded. A hand-edit of the value IS caught by the
+   `android/iap-core` leg; an upstream renumbering is caught by nothing, accepted because it is a
+   wire-protocol constant that has never moved.
+3. **That the plugin CLASSES compile** — which these legs do not check, because they compile the
+   *cores*. That gap is closed by other legs: `ios/class/*` (#981) compiles `IapPlugin.swift`, and
+   `android/class/*` (#992) compiles `ModokiIapPlugin.java` against the real Capacitor core and the
+   billing library. ⚠️ **Neither would have caught the stray `@PluginMethod` on a private helper that
+   #971 found by reading**, nor the missing one on `products()`. Capacitor indexes plugin methods by
+   reflection at runtime, so both compile. That class is caught under `npm run verify` by
+   `engine/tests/architecture/pluginMethodParity.test.ts`, for every plugin package.
+
+**What the extraction surfaced immediately**, none of it reachable by any prior gate: an SPM
+platform-floor mismatch (the library defaulted to macOS 10.13 and would not build against the
+core's 12) — ⚠️ **scoped correctly on the second pass: that breaks a HOST `swift build`/`swift test`
+of the package, NOT an iOS build**, since SwiftPM validates floors only for the platform being built
+for; measured both ways, and the same latent mismatch was then found and fixed in
+`capacitor-modoki-ota`; a `cancelReason` doc in
+`types.ts` that named `'ASDErrorDomain:…'` as a possible value when an ASD fault is not a
+cancellation at all and takes the failed path; and a compiler warning that
+`StoreKitError.unsupported` and `Product.PurchaseError.paymentMethodBindingConfigurationRequired`
+fall into `@unknown default` — left as-is deliberately, since naming a case an older Xcode lacks is
+a minimum-toolchain decision, but now VISIBLE.
 
 ---
 

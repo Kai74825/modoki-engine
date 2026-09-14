@@ -53,6 +53,33 @@ describe('Watch — change-detection + stats', () => {
     expect(s.stats).toMatchObject({ first: 0, last: 2, min: 0, max: 5, delta: 2 });
   });
 
+  it('a guid-less entity\'s series reads back as guid:null + its id, never the id as a guid (#1199)', () => {
+    setup();
+    const bare = w.spawn(EntityAttributes({ name: 'Bare' }), WPos({ x: 0 }));
+    w.spawn(EntityAttributes({ guid: 'real', name: 'Real' }), WPos({ x: 0 }));
+    const started = startWatch({ component: 'WPos', fields: ['x'], epsilon: 0.001 });
+    tick(1);
+
+    const r = readWatch(started.id!) as { series: { guid: string | null; id?: number; name?: string }[] };
+    const bareSeries = r.series.find((x) => x.name === 'Bare')!;
+    expect(bareSeries.guid).toBeNull();
+    expect(bareSeries.id).toBe(bare.id());
+    expect(r.series.find((x) => x.name === 'Real')!.guid).toBe('real');
+  });
+
+  it('a NAME-scoped watch reports a guid-less spawn as guid:null + id too (#1199) — it is the path runtime spawns use', () => {
+    setup();
+    const bare = w.spawn(EntityAttributes({ name: 'Puck' }), WPos({ x: 0 }));
+    const started = startWatch({ component: 'WPos', names: ['puck'], fields: ['x'], epsilon: 0.001 });
+    expect(started.ok).toBe(true);
+    tick(1);
+
+    const r = readWatch(started.id!) as { series: { guid: string | null; id?: number; name?: string }[] };
+    expect(r.series).toHaveLength(1);
+    expect(r.series[0].guid).toBeNull();
+    expect(r.series[0].id).toBe(bare.id());
+  });
+
   it('ring-caps the series at maxSamples', () => {
     setup();
     const e = w.spawn(EntityAttributes({ guid: 'r', name: 'R' }), WPos({ x: 0 }));

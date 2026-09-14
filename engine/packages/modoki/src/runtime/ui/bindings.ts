@@ -20,6 +20,7 @@
  *  while playing are reverted by Stop (snapshot/revert) and Cmd+S is blocked in
  *  play, so runtime state never reaches disk. */
 
+import type { Entity } from 'koota';
 import { getCurrentWorld, findEntityByGuid, onWorldSwap } from '../core/ecs/world';
 import { getTraitByName } from '../core/ecs/traitRegistry';
 import { markUIDirty } from './uiTreeStore';
@@ -103,7 +104,7 @@ const lockLiveness = createTeardownToken();
 // to infer.
 
 // Reset on world/scene swap — a lock held by the previous world's action must not carry over
-// and brick the next one. Top-level, matching UINode.tsx:109 / uiValues.ts:56 / focusManager
+// and brick the next one. Top-level, matching the top-level onWorldSwap in UINode.tsx / uiValues.ts / focusManager
 // precedent (registered once at module load, not lazily). Routed through releaseLock() (not a
 // duplicate set of field writes) so the swap reset and every other release path bump lockGen
 // identically and can never drift apart.
@@ -262,8 +263,8 @@ function trackLockPromise(result: unknown, actionName: string): void {
 /** Resolve only the requested guids to entities via the maintained guid→entity
  *  index — O(1) per target. Replaces the old early-break world scan; matters for a
  *  range slider firing `change` continuously during a drag (F6). */
-function resolveGuids(world: ReturnType<typeof getCurrentWorld>, needed: Set<string>): Map<string, any> {
-  const out = new Map<string, any>();
+function resolveGuids(world: ReturnType<typeof getCurrentWorld>, needed: Set<string>): Map<string, Entity> {
+  const out = new Map<string, Entity>();
   if (needed.size === 0) return out;
   for (const guid of needed) {
     const entity = findEntityByGuid(guid, world);

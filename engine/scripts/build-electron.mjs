@@ -4,42 +4,25 @@
 // electron-vite would normally do this, but it only supports vite ≤7 (we're on 8).
 
 import esbuild from 'esbuild';
-import { fileURLToPath } from 'node:url';
 import { execSync } from 'node:child_process';
-import { existsSync, readFileSync } from 'node:fs';
+import { existsSync } from 'node:fs';
 import path from 'node:path';
+// The MCP bundle's options live in a DECLARATION-ONLY module so the test that verifies the
+// shipped artifact can import them instead of restating them (#945 B1) — this file runs
+// esbuild at top level, so it cannot be imported for them.
+import { mcpDir, mcpOpts } from './mcpBuildOpts.mjs';
+// Same split, same reason, for the MAIN bundle (#1035): the guard that proves no bare
+// `@modoki/*` require reaches main.cjs must build with the REAL options, and cannot import
+// them from here without running this build as a side effect.
+import { electronOpts } from './electronBuildOpts.mjs';
 
 const watch = process.argv.includes('--watch');
 
-// Resolve electron paths relative to this script (engine/scripts/ → engine/electron),
-// so the build works regardless of the CWD it's invoked from.
-const electronDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', 'electron');
-
-// The app version — the SINGLE source of truth is the root package.json. Bundle it in
-// as `__APP_VERSION__` so main.ts can show the real version in the window title even in
-// the DEV editor, where Electron is launched with a bare main.cjs (no app package.json)
-// and `app.getVersion()` returns ELECTRON's own version (e.g. 42.4.0) instead. Packaged
-// builds also get the same value (electron-builder injects package.json version).
-const repoRoot = path.resolve(electronDir, '..', '..');
-const appVersion = JSON.parse(readFileSync(path.join(repoRoot, 'package.json'), 'utf8')).version;
-
-/** @type {import('esbuild').BuildOptions} */
-const opts = {
-  entryPoints: [path.join(electronDir, 'main.ts'), path.join(electronDir, 'preload.ts')],
-  bundle: true,
-  platform: 'node',
-  format: 'cjs',
-  target: 'node20',
-  outdir: path.join(electronDir, 'dist'),
-  outExtension: { '.js': '.cjs' },
-  // Electron + every npm dependency (sharp, three, gltf-transform, chokidar, …)
-  // resolve from node_modules at runtime — only our own TS gets bundled.
-  external: ['electron'],
-  packages: 'external',
-  sourcemap: true,
-  logLevel: 'info',
-  define: { __APP_VERSION__: JSON.stringify(appVersion) },
-};
+// The build options — and `electronDir`, the app version, and the entry points with them — are
+// declared in electronBuildOpts.mjs so the packaging guard can read the SHIPPED ones instead of
+// restating them. Restating is the #945 B1 defect class: a test that mirrors a build's options
+// drifts from them silently and then cannot fail.
+const opts = electronOpts();
 
 // Bundle the modoki MCP server into a self-contained ESM dist/index.js so the
 // PACKAGED editor can spawn it with plain `node` — no tsx, no
@@ -49,7 +32,6 @@ const opts = {
 // `files: engine/**/*` and unpacks via `asarUnpack: **/engine/**`; the "Connect
 // Claude Code" flow points the packaged .mcp.json at it. Dev is unaffected — it
 // keeps running src/index.ts through tsx.
-const mcpDir = path.resolve(electronDir, '..', 'tools', 'modoki-mcp');
 
 // The tool is deliberately NOT a root workspace, so NOTHING in the standard install
 // flow populates its node_modules — a fresh clone, a `npm ci --ignore-scripts` CI
@@ -65,18 +47,6 @@ if (!existsSync(mcpSdkMarker)) {
   console.log('[build-electron] modoki-mcp deps missing → npm install in engine/tools/modoki-mcp');
   execSync('npm install --no-audit --no-fund', { cwd: mcpDir, stdio: 'inherit' });
 }
-/** @type {import('esbuild').BuildOptions} */
-const mcpOpts = {
-  entryPoints: [path.join(mcpDir, 'src', 'index.ts')],
-  bundle: true,
-  platform: 'node',
-  format: 'esm',
-  target: 'node20',
-  outfile: path.join(mcpDir, 'dist', 'index.js'),
-  packages: 'bundle', // inline node_modules (not external) → zero runtime deps
-  sourcemap: true,
-  logLevel: 'info',
-};
 
 if (watch) {
   const ctx = await esbuild.context(opts);

@@ -2,6 +2,7 @@
  *  Uses the trait registry — no hardcoded trait knowledge. */
 
 import { getAllEntities, readTraitData, findEntity, subtreeIds } from '../../runtime/core/ecs/entityUtils';
+import { hasDocKey } from '../../runtime/core/docKeys';
 import { orderEntitiesForSave } from '../../runtime/core/ecs/entityOrder';
 import { getAuthoredWritesWhileStopped, clearAuthoredWritesWhileStopped } from '../../runtime/core/ecs/authoredWrites';
 import { Transient } from '../../runtime/core/traits/Transient';
@@ -18,6 +19,7 @@ import { sceneManager } from '../../runtime/scene/SceneManager';
 import { isPrefabEditWorld } from './prefabEditWorld';
 import { useEditorStore } from '../store/editorStore';
 import { setPlayState, getRunMode } from '../../runtime/core/playState';
+import { beginWorldReplacement } from './authoringSettle';
 import { swapHistory, getEditVersion } from '../undo/undoManager';
 import { editorEmit } from '../editorJournal';
 import { captureInstanceOverrides, captureInstanceStructure, getPrefabSource, getCachedPrefabSync } from './prefab';
@@ -25,7 +27,7 @@ import type { AddedEntity, NestedOverridePaths } from '../../runtime/loaders/loa
 import { mergeOverrideMaps, descendNestedOverrides, mergeNestedOverridePaths, collectResourceRefsFromEntities, SceneFormatRefusedError } from '../../runtime/loaders/loadSceneFile';
 import { newGuid, isInternalAssetPath, getGuidForPath, registerAsset } from '../../runtime/loaders/assetManifest';
 import { isGuid } from '../../runtime/core/assetRefRules';
-import { clearAllSceneDirty, clearSceneDirty, dirtySceneGuidsSnapshot, isSceneDirty } from './sceneDirty';
+import { clearAllSceneDirty, clearSceneDirty, dirtySceneGuidsSnapshot, hasDirtyScenes, isSceneDirty } from './sceneDirty';
 import { WHITE_HDR_GUID } from '../../runtime/assets/builtinAssets';
 import { REF_FIELDS_BY_TRAIT } from '../../runtime/loaders/sceneValidation';
 import { SCENE_FORMAT_VERSION } from '../../runtime/core/version';
@@ -124,7 +126,10 @@ export function captureNestedSceneDelta(
     const rowTraits = rowOverrides?.[lid];
     for (const [traitName, fields] of Object.entries(traits)) {
       const rowFields = rowTraits?.[traitName];
-      if (rowFields) for (const f of Object.keys(fields)) if (f in rowFields) delete fields[f];
+      // `hasDocKey` (#986): `f` and `rowFields` both derive from scene/prefab JSON, so a
+      // prototype-named field tested TRUE against any rowFields object and was wrongly
+      // deleted from the serialized output.
+      if (rowFields) for (const f of Object.keys(fields)) if (hasDocKey(rowFields, f)) delete fields[f];
       if (Object.keys(fields).length === 0) delete traits[traitName];
     }
     if (Object.keys(traits).length === 0) delete all[lid];
@@ -793,41 +798,213 @@ export function markSceneSaved(atEditVersion?: number): void {
  *  this flag before writing a `.ts` that force-reloads the editor) would then discard the
  *  human's work believing there was none. */
 export function hasUnsavedChanges(): boolean {
-  return getEditVersion() !== _savedAtEditVersion || hasDirtyAssets() || dirtySceneGuidsSnapshot().size > 0
-    || hasPendingBaseScenes() || hasPendingMeta();
+  // Derived from CAUSE_SPECS, NOT a hand-written OR — see the table's own comment for why that
+  // matters. Iterates the pre-built list so this allocates nothing: it is called on hot paths and
+  // from a 1s poll in FindReferencesDialog, and `Object.values()` per call would be a new array
+  // every time. Short-circuits on the first dirty cause, exactly as the old OR did.
+  for (const spec of CAUSE_SPEC_LIST) if (spec.has()) return true;
+  return false;
 }
 
-/** WHICH kind of unsaved work exists — the three independent causes above, told apart.
+/** WHICH kinds of unsaved work exist, told apart. The causes themselves — what each one is, what
+ *  it is keyed by, and which half of a save writes it — are documented on `CAUSE_SPECS` below,
+ *  which this derives from; they are not re-listed here.
  *
- *  S3.11: the load_scene / new_scene refusal built one fixed string blaming
- *  create_entity/duplicate_entity/prefab, so an agent whose only pending work was a dirty
- *  particle/anim/timeline doc went looking for live entities it had never created. A refusal that
- *  names the wrong cause is worse than a generic one — it sends the reader somewhere specific and
- *  wrong. All three causes are cleared by the same `save_all`, but the caller has to be told what
+ *  S3.11 is why the distinction exists at all: the load_scene / new_scene refusal built one fixed
+ *  string blaming create_entity/duplicate_entity/prefab, so an agent whose only pending work was a
+ *  dirty particle/anim/timeline doc went looking for live entities it had never created. A refusal
+ *  that names the wrong cause is worse than a generic one — it sends the reader somewhere specific
+ *  and wrong. Every cause is cleared by the same `save_all`, but the caller has to be told what
  *  `force:true` would DISCARD.
  *
- *  `dirtyScenes` is the third cause (see `hasUnsavedChanges`): non-primary loaded scenes
- *  whose edits are still only in memory — typically a base whose write failed in a
- *  partial `saveAll`. It must be reported, or a refusal triggered by it alone would name
- *  no cause at all. */
-export function unsavedChangeCauses(): {
-  sceneDirty: boolean; dirtyAssetPaths: string[]; dirtyScenes: string[]; pendingBaseScenes: string[];
-  pendingImportSettings: string[];
-} {
-  return {
-    sceneDirty: getEditVersion() !== _savedAtEditVersion,
-    dirtyAssetPaths: getDirtyAssetPaths(),
-    dirtyScenes: [...dirtySceneGuidsSnapshot()],
-    // The fourth cause (#831): a `baseScene` ref set in the Scene inspector on a scene that is
-    // NOT the open one. It is neither a live-world edit nor an asset document, so without its own
-    // row a refusal triggered by it alone would name no cause at all — the S3.11 failure again.
-    pendingBaseScenes: getPendingBaseScenePaths(),
-    // The fifth cause (#845): an Inspector import-settings edit (a `.meta.json` field) parked
-    // instead of written immediately. Named for what a human reads in a banner ("unsaved import
-    // settings") — matching the Inspector section's own label — not for the sidecar's file
-    // extension, which means nothing to the reader of that banner.
-    pendingImportSettings: getPendingMetaPaths(),
+ *  ⚠️ **Every read is a PEEK** — this reads the registries and records nothing, so a probe can call
+ *  it without disarming the guard it is observing. */
+export function unsavedChangeCauses(): UnsavedCauses {
+  // Derived from the ONE table below. The cast is confined to this loop: `Object.entries` cannot
+  // express "key K gets exactly CAUSE_SPECS[K]['read']'s return type", so the per-key correlation
+  // is re-asserted at the boundary. `UnsavedCauses` itself IS derived from the table, so the
+  // signature cannot drift from what this actually returns even though the body is untyped.
+  const out: Record<string, boolean | string[]> = {};
+  for (const [key, spec] of CAUSE_SPEC_ENTRIES) out[key] = spec.read();
+  return out as UnsavedCauses;
+}
+
+/** One kind of unsaved work, as DATA rather than as five expressions spread across the repo.
+ *
+ *  ⚠️ **This table is the SCHEMA, and `UnsavedCauses` is derived FROM it — not the other way
+ *  round.** That inversion is the whole point (#972). Before it, `unsavedChangeCauses()` published
+ *  a VALUE and no schema: consumers that needed to act per-cause (test it, gate on it, name it,
+ *  flush it, remap it across a rename) had nowhere to ask "what are the causes, and what is each
+ *  one like", so TEN sites re-stated the population by hand — and TypeScript checked none of them,
+ *  because a hand-written subset of a wider object is a legal structural subtype. Three of those
+ *  ten were already under-reporting when the table landed. Adding a cause here now turns every
+ *  downstream `satisfies Record<keyof UnsavedCauses, …>` red until it is mapped.
+ *
+ *  ⚠️ **Never widen `UnsavedCauses` to `Record<string, …>`.** Every one of those exhaustiveness
+ *  checks silently degrades to nothing the moment `keyof` stops being a finite union — nothing
+ *  goes red, and the class is back. Guarded by a type-level assertion in
+ *  `tests/editor/unsavedCauseTable.test.ts` (a `tsc` guard: vitest erases types, so that test
+ *  cannot catch it at runtime).
+ *
+ *  Field notes:
+ *  - `has` is the CHEAP predicate and `read` the reporting one, kept separate on purpose:
+ *    exhaustiveness comes from the table, cheapness from `has`. Deriving the boolean from `read`
+ *    would allocate three arrays and spread a Set on every `hasUnsavedChanges()` call.
+ *  - `keying` says what a cause is addressed BY, which is what decides whether a file rename can
+ *    strand it. Only `'path'` causes need remapping when a file moves.
+ *  - `writtenBy` says which half of a save writes it: the scene write itself, or a parked-work
+ *    flush that runs before or after that write.
+ *  - The REGISTRY NAME is deliberately absent — that axis is cross-zone (a renderer union, a Node
+ *    union, `ALL_REGISTRIES`, `ALL_UNSAVED_REGISTRIES`, `HELPER_REGISTRIES`) and
+ *    `tests/architecture/unsavedGateCoverage.test.ts` already pins all six spellings by parsing
+ *    source. A copy here would be a SEVENTH spelling that guard does not read. */
+interface CauseSpec {
+  /** Allocation-free "is this cause dirty right now". */
+  readonly has: () => boolean;
+  /** The reportable value — a boolean for a pathless cause, else the keys it holds. */
+  readonly read: () => boolean | string[];
+  /** What the cause is addressed by. `'path'` is the one that a file move can strand. */
+  readonly keying: 'none' | 'guid' | 'path';
+  /** Which half of a save writes it, and — for parked work — HOW.
+   *
+   *  `'scene-write'` means the scene file itself carries it. Otherwise the cause is parked work
+   *  with its own flush, and `run` is that flush. Carrying the function here rather than naming it
+   *  at each save site is what makes a flush impossible to forget: `flushParked(phase)` runs
+   *  whatever the table declares for that phase, so a new flushing cause is written by every save
+   *  path the day it is added. (#972 P12 — the preview fast path spelled the set by hand and got
+   *  two of three, so Cmd+S under a timeline preview reported success and never wrote the parked
+   *  base-scene ref.)
+   *
+   *  ⚠️ The PHASE is load-bearing, not cosmetic. `after-scene` exists because `/api/scene-mutate`
+   *  refuses while `hasUnsavedChanges()` is true and those entries are part of that report — run
+   *  before the scene write and every mutation 409s against the very save trying to persist it. */
+  readonly writtenBy: 'scene-write' | {
+    readonly flush: FlushPhase;
+    readonly run: () => Promise<{ saved: string[]; failed: Array<{ path: string; error: string }> }>;
   };
+  /** Human phrasing. `bool` for a plain boolean cause; `noun` for one reported as a list
+   *  ("N <noun>(s)"). Consumed by the refusal messages, so it reads as prose, not as a field name. */
+  readonly label: { readonly bool?: string; readonly noun?: string };
+}
+
+const CAUSE_SPECS = {
+  // The PRIMARY live world, compared against its saved baseline. Pathless and in no registry
+  // module at all — which is why a probe that enumerates REGISTRIES is vacuous for the open scene
+  // (docs/mcp-persistence.md). ⚠️ Name collision worth knowing: this cause is `sceneDirty`, while
+  // the MODULE `sceneDirty.ts` supplies `dirtyScenes` below.
+  sceneDirty: {
+    has: () => getEditVersion() !== _savedAtEditVersion,
+    read: () => getEditVersion() !== _savedAtEditVersion,
+    keying: 'none',
+    writtenBy: 'scene-write',
+    label: { bool: 'unsaved scene changes' },
+  },
+  // A 'manual'-mode edit to an ASSET_SCHEMA_TYPES doc, parked instead of autosaved (#259/#831).
+  dirtyAssetPaths: {
+    has: hasDirtyAssets,
+    read: getDirtyAssetPaths,
+    keying: 'path',
+    writtenBy: { flush: 'before-scene', run: flushDirtyAssets },
+    label: { noun: 'unsaved asset edit' },
+  },
+  // Non-primary loaded scenes whose edits are still only in memory — typically a base whose write
+  // failed in a partial `saveAll` (which keeps its dirty flag by design, so a later save retries).
+  // Keyed by GUID, so a file rename cannot strand it.
+  dirtyScenes: {
+    has: hasDirtyScenes,
+    read: () => [...dirtySceneGuidsSnapshot()],
+    keying: 'guid',
+    writtenBy: 'scene-write',
+    label: { noun: 'unsaved edit in another loaded scene' },
+  },
+  // The fourth cause (#831): a `baseScene` ref set in the Scene inspector on a scene that is NOT
+  // the open one. Neither a live-world edit nor an asset document, so without its own row a
+  // refusal triggered by it alone would name no cause at all — the S3.11 failure again.
+  // ⚠️ Flushed AFTER the scene write, and that ordering is load-bearing — see `saveAll`.
+  pendingBaseScenes: {
+    has: hasPendingBaseScenes,
+    read: getPendingBaseScenePaths,
+    keying: 'path',
+    writtenBy: { flush: 'after-scene', run: flushPendingBaseScenes },
+    label: { noun: 'pending base-scene reference' },
+  },
+  // The fifth cause (#845): an Inspector import-settings edit (a `.meta.json` field) parked
+  // instead of written immediately. Named for what a human reads in a banner ("unsaved import
+  // settings") — matching the Inspector section's own label — not for the sidecar's file
+  // extension, which means nothing to the reader of that banner.
+  pendingImportSettings: {
+    has: hasPendingMeta,
+    read: getPendingMetaPaths,
+    keying: 'path',
+    writtenBy: { flush: 'before-scene', run: flushPendingMeta },
+    label: { noun: 'pending import-setting edit' },
+  },
+} as const satisfies Record<string, CauseSpec>;
+
+/** Pre-built so `hasUnsavedChanges()` allocates nothing per call. */
+const CAUSE_SPEC_LIST: readonly CauseSpec[] = Object.values(CAUSE_SPECS);
+const CAUSE_SPEC_ENTRIES: readonly (readonly [string, CauseSpec])[] = Object.entries(CAUSE_SPECS);
+
+/** WHICH kinds of unsaved work exist, told apart — derived from `CAUSE_SPECS`.
+ *
+ *  ⚠️ **Derived, so it cannot drift from the table.** Adding a cause to `CAUSE_SPECS` widens this
+ *  type, which is what makes every `satisfies Record<keyof UnsavedCauses, …>` in the repo go red. */
+export type UnsavedCauses = { [K in keyof typeof CAUSE_SPECS]: ReturnType<(typeof CAUSE_SPECS)[K]['read']> };
+
+/** The causes addressed BY PATH — the ones a file move or delete can strand on a dead key.
+ *
+ *  Exported as a TYPE and not as implementations on purpose: `serialize.ts` cannot import
+ *  `panels/assetEditorBindings.ts` without a cycle, so the move repair binds its own handlers
+ *  under `satisfies Record<PathKeyedCause, …>`. Exhaustiveness travels by type; code stays in its
+ *  layer. (#972 P11 — the repair covered two of these three, so a renamed `.scene.json` stranded
+ *  its parked baseScene edit and it never flushed.) */
+export type PathKeyedCause = {
+  [K in keyof typeof CAUSE_SPECS]: (typeof CAUSE_SPECS)[K]['keying'] extends 'path' ? K : never
+}[keyof typeof CAUSE_SPECS];
+
+/** The causes written by the SCENE write itself, rather than by a parked-work flush. */
+export type SceneWrittenCause = {
+  [K in keyof typeof CAUSE_SPECS]: (typeof CAUSE_SPECS)[K]['writtenBy'] extends 'scene-write' ? K : never
+}[keyof typeof CAUSE_SPECS];
+
+/** When a parked-work flush runs, relative to the scene write. See `CauseSpec.writtenBy`. */
+export type FlushPhase = 'before-scene' | 'after-scene';
+
+/** What `flushParked(phase)` returns: exactly the causes declared for THAT phase, each under its
+ *  own cause name and carrying that flush's own result type.
+ *
+ *  Derived, so a save site cannot pick up a flush the table does not declare, and cannot MISS one
+ *  it does. That is the whole of the P12 fix: the set is no longer spelled at each site. */
+export type ParkedFlushResults<P extends FlushPhase> = {
+  [K in keyof typeof CAUSE_SPECS as (typeof CAUSE_SPECS)[K]['writtenBy'] extends { readonly flush: P }
+    ? K : never]:
+  (typeof CAUSE_SPECS)[K]['writtenBy'] extends { readonly run: () => Promise<infer R> } ? R : never
+};
+
+/** Run every parked-work flush the table declares for `phase`, in table order.
+ *
+ *  ⚠️ **The two phases are not interchangeable** — `after-scene` exists because those entries are
+ *  part of the `hasUnsavedChanges()` report that `/api/scene-mutate` refuses on. Callers must run
+ *  `before-scene` ahead of the scene write and `after-scene` behind it; a caller that needs only
+ *  one phase (the preview fast path, which writes no scene) still gets every cause in it.
+ *
+ *  Within a phase the order is the table's own and carries no constraint: the two `before-scene`
+ *  causes are independent (#845 — `/api/write-meta` has no unsaved-work refusal, so it has none of
+ *  the base-scene flush's ordering requirement). */
+export async function flushParked<P extends FlushPhase>(phase: P): Promise<ParkedFlushResults<P>> {
+  const out: Record<string, unknown> = {};
+  for (const [key, spec] of CAUSE_SPEC_ENTRIES) {
+    const w = spec.writtenBy;
+    if (w === 'scene-write' || w.flush !== phase) continue;
+    out[key] = await w.run();
+  }
+  return out as ParkedFlushResults<P>;
+}
+
+/** Read-only view of the table, for the derivations that live outside this module (the flush
+ *  runner, the label-driven refusal messages). Not a mutable handle — callers derive, never edit. */
+export function causeSpecs(): Readonly<Record<keyof UnsavedCauses, CauseSpec>> {
+  return CAUSE_SPECS;
 }
 
 export interface SaveResult {
@@ -1014,7 +1191,7 @@ export function isSceneLoadInFlight(): boolean { return _loadsInFlight > 0; }
 
 /** `loadScene`'s outcome. `'superseded'` covers BOTH ways a load can lose to a newer one:
  *  cancelled early (SceneManager aborts the in-flight load — rejects with AbortError) and
- *  superseded in the winner's TAIL (`sceneManager.ts:885-900` — nothing left to cancel, so the
+ *  superseded in the winner's TAIL (`SceneManager.loadScene`'s step-11 tail guard — nothing left to cancel, so the
  *  loser's own `sceneManager.loadScene` resolves successfully and throws nothing). Neither case
  *  is `'failed'`: this op's own load did not fail, and it says nothing about whether the path
  *  exists. See the doc comment on `loadScene` for why this can't just be a boolean. */
@@ -1076,6 +1253,9 @@ export async function loadScene(
   // above a statement that could throw would leak the count, and the `finally` comment would be
   // a lie.)
   _loadsInFlight += 1;
+  // #1164: `setPlayState('stopped')` below is a settle edge, and a hot reload deferred during Play
+  // must not replay into the middle of this load — see `authoringSettle.ts`. Released in `finally`.
+  const releaseReplacement = beginWorldReplacement();
   try {
     setPlayState('stopped'); // a scene load always returns the editor to edit mode
     setSceneLoadStatus({ active: true, loaded: 0, total: 0 });
@@ -1088,7 +1268,7 @@ export async function loadScene(
       },
     });
     if (!stillLive()) {
-      // Superseded in the WINNER'S TAIL (sceneManager.ts:885-900): our own `sceneManager.loadScene`
+      // Superseded in the WINNER'S TAIL (SceneManager.loadScene's step-11 tail guard): our own `sceneManager.loadScene`
       // resolved successfully — nothing threw, so the `catch` below never sees this case — but a
       // newer `loadScene` call already won. Running the writes below now would stomp the winner:
       // `setCurrentScenePath` would persist OUR path over the winner's (localStorage too, so the
@@ -1156,6 +1336,9 @@ export async function loadScene(
     // Load-bearing: if anything above throws, this must still return to zero, or every later
     // reader of `isSceneLoadInFlight()` would believe a load is running forever.
     _loadsInFlight -= 1;
+    // Beside the count it mirrors, and above the store call, so a throw there cannot leak the token
+    // (a leaked token means no deferred reload ever replays again).
+    releaseReplacement();
     // Only the latest load owns the modal — a superseded load must not hide the
     // winner's progress bar (its `finally` can run after the winner set active).
     if (stillLive()) useEditorStore.getState().setSceneLoadStatus({ active: false });
@@ -1167,6 +1350,10 @@ export async function loadScene(
 export class NewSceneRefusedError extends Error {
   constructor(message: string) { super(message); this.name = 'NewSceneRefusedError'; }
 }
+
+/** Mutual exclusion for `newScene()` — see its refusal comment for why this is a lock rather than
+ *  one of `docs/async-lifetime.md`'s liveness tokens. */
+let _newSceneInFlight = false;
 
 /** Start a fresh untitled scene: clear ALL entities and spawn a ready-to-use
  *  starting world — a Camera, an Environment (built-in white.hdr, for reflections),
@@ -1184,8 +1371,32 @@ export class NewSceneRefusedError extends Error {
  *  so `onWorldSwap` actually fires. Pass `path` when the new scene already has a file
  *  target (Assets → Create Scene); omit it for an untitled scene.
  *
- *  ⚠️ THROWS `NewSceneRefusedError` while a prefab is being edited. */
+ *  ⚠️ THROWS `NewSceneRefusedError` while a prefab is being edited, and while another `newScene()`
+ *  is still in flight (#887). */
 export async function newScene(path: string | null = null): Promise<void> {
+  // ⚠️ REFUSED while another Create Scene is still running (#887). Two callers reach here and
+  // neither serialises against the other — Assets → Create Scene
+  // (`panels/builtinCreatableAssets.ts`) and the `new-scene` agent op (`app/editor/
+  // agentEditorOps.ts`) — so a double-click, or two `new_scene` ops in one turn (CLAUDE.md:
+  // parallel tool calls have no guaranteed order), used to interleave at the `await` below. The
+  // loser's populated world was discarded, `_currentScenePath` ended up decided by whichever
+  // write landed last rather than by which world won, both callers saved a file, and
+  // `swapHistory` ran twice against two different keys.
+  //
+  // ⚠️ REFUSE, not supersede — and that is forced by the code, not a preference. The two
+  // `setCurrentScenePath`/`setCurrentBaseScene` writes below run BEFORE the await on purpose
+  // (see their own comment), so a liveness token cannot help: the loser would bail in its tail
+  // having already stomped the path, and moving those writes after the await to make bailing
+  // possible would reopen the Hierarchy race that comment exists to close. `serialize.loadScene`
+  // 100 lines above supersedes instead, and it can precisely because it writes the same globals
+  // AFTER its await, behind `stillLive()`. This is the mirror case.
+  //
+  // First statement in the function, so a refused gesture touches no global at all.
+  if (_newSceneInFlight) {
+    throw new NewSceneRefusedError(
+      'A new scene is already being created — wait for it to finish, then try again.',
+    );
+  }
   // ⚠️ REFUSED while editing a prefab (owner, 2026-09-07). Before #853 this produced an
   // ambiguous half-state that two separate guards had to work around — the prefab-edit
   // world stayed live under a real scene path (`saveScene`'s conjunction below) and
@@ -1199,42 +1410,57 @@ export async function newScene(path: string | null = null): Promise<void> {
       + 'then create the scene.',
     );
   }
-  // Set the editor path BEFORE the swap, not after. `setCurrentWorld` fires `onWorldSwap`
-  // synchronously and the Hierarchy's restore reads `getCurrentScenePath()` one frame later;
-  // `aSceneSwapIsHappening()` is false on this path, so there is no settle-wait to save us
-  // from a path that is still the OUTGOING scene's. Setting it first removes the ordering
-  // dependency instead of racing it.
-  setCurrentScenePath(path);
-  setCurrentBaseScene(undefined);
-  // Replace the world CONTENT through SceneManager rather than deleting and respawning in
-  // place (#853). The in-place version was the one path in the repo that replaced every
-  // entity without emitting a world swap, so every id-keyed teardown keyed on `onWorldSwap`
-  // was skipped — and koota recycles ids LIFO and totally, so the outgoing scene's state
-  // aliased exactly onto the incoming scene's entities.
-  await sceneManager.replaceWorldContent((world) => {
-    spawnEntity(world,
-      Transform({ x: 0, y: 5, z: 10 }), Camera({ fov: 60 }), EntityAttributes({ name: 'Camera', sortOrder: 0 }),
-    );
-    spawnEntity(world,
-      Environment({ hdrPath: WHITE_HDR_GUID }), EntityAttributes({ name: 'HDR Environment', sortOrder: 1 }),
-    );
-    spawnEntity(world,
-      Transform({ x: 5, y: 10, z: 7 }),
-      Light({ lightType: 'directional', color: 0xffffff, intensity: 2 }),
-      EntityAttributes({ name: 'Directional Light', sortOrder: 2 }),
-    );
-    spawnEntity(world,
-      Light({ lightType: 'ambient', color: 0xffffff, intensity: 0.6 }),
-      EntityAttributes({ name: 'Ambient Light', sortOrder: 3 }),
-    );
-  });
-  // Keyed by the new scene's own path when it has one, so its undo stack is its own and the
-  // outgoing scene's is preserved under ITS key rather than dropped. '' is the untitled
-  // bootstrap context, which is what the agent `new-scene` op (no path) still gets.
-  swapHistory(path ?? '');
-  markSceneSaved(); // a fresh untitled scene has no unsaved WORK yet — new baseline (C7)
-  clearAllSceneDirty();
-  console.log('[Editor] New scene created');
+  // `try`/`finally` from here, not a clear at the end: `replaceWorldContent` can reject (a
+  // resource release or a world destroy in its tail), and a latch left stuck true would brick
+  // Create Scene for the rest of the session.
+  _newSceneInFlight = true;
+  try {
+    // Set the editor path BEFORE the swap, not after. `setCurrentWorld` fires `onWorldSwap`
+    // synchronously and the Hierarchy's restore reads `getCurrentScenePath()` one frame later;
+    // `aSceneSwapIsHappening()` is false on this path, so there is no settle-wait to save us
+    // from a path that is still the OUTGOING scene's. Setting it first removes the ordering
+    // dependency instead of racing it. ⚠️ This is also what makes the refusal above a LOCK
+    // rather than a supersession token — see there.
+    setCurrentScenePath(path);
+    setCurrentBaseScene(undefined);
+    // Replace the world CONTENT through SceneManager rather than deleting and respawning in
+    // place (#853). The in-place version was the one path in the repo that replaced every
+    // entity without emitting a world swap, so every id-keyed teardown keyed on `onWorldSwap`
+    // was skipped — and koota recycles ids LIFO and totally, so the outgoing scene's state
+    // aliased exactly onto the incoming scene's entities.
+    // Each starter gets its guid AT SPAWN (#1199). Without one it was unaddressable until the first
+    // save or undoable edit minted it: Assets → Create Scene saves straight away so a human never
+    // saw that, but the agent `new-scene` op does not save, and every guid-addressed op refused
+    // the starters. Minted before `markSceneSaved()` below, so it is part of the clean baseline.
+    await sceneManager.replaceWorldContent((world) => {
+      spawnEntity(world,
+        Transform({ x: 0, y: 5, z: 10 }), Camera({ fov: 60 }),
+        EntityAttributes({ name: 'Camera', sortOrder: 0, guid: newGuid() }),
+      );
+      spawnEntity(world,
+        Environment({ hdrPath: WHITE_HDR_GUID }),
+        EntityAttributes({ name: 'HDR Environment', sortOrder: 1, guid: newGuid() }),
+      );
+      spawnEntity(world,
+        Transform({ x: 5, y: 10, z: 7 }),
+        Light({ lightType: 'directional', color: 0xffffff, intensity: 2 }),
+        EntityAttributes({ name: 'Directional Light', sortOrder: 2, guid: newGuid() }),
+      );
+      spawnEntity(world,
+        Light({ lightType: 'ambient', color: 0xffffff, intensity: 0.6 }),
+        EntityAttributes({ name: 'Ambient Light', sortOrder: 3, guid: newGuid() }),
+      );
+    });
+    // Keyed by the new scene's own path when it has one, so its undo stack is its own and the
+    // outgoing scene's is preserved under ITS key rather than dropped. '' is the untitled
+    // bootstrap context, which is what the agent `new-scene` op (no path) still gets.
+    swapHistory(path ?? '');
+    markSceneSaved(); // a fresh untitled scene has no unsaved WORK yet — new baseline (C7)
+    clearAllSceneDirty();
+    console.log('[Editor] New scene created');
+  } finally {
+    _newSceneInFlight = false;
+  }
 }
 
 /** Report (and reset) the #124 probe: authored entity fields that a SYSTEM rewrote while the
@@ -1287,11 +1513,9 @@ export async function saveAll(opts: { path?: string; allowDialog?: boolean } = {
   // scrub/preview, in a prefab-edit world, with no path, with the Save-As dialog cancelled, or
   // with a failed scene write all silently dropped it. Once the panels park instead of autosaving,
   // four of those five are "the human pressed Cmd+S and nothing saved their edit".
-  const assets = await flushDirtyAssets();
-  // Alongside the asset flush — not before or after it in any load-bearing sense (#845). Unlike
-  // `/api/scene-mutate`, `/api/write-meta` carries no unsaved-work refusal, so this flush has none
-  // of `flushPendingBaseScenes`' "must run last" constraint below. See `pendingMeta.ts`'s header.
-  const importSettings = await flushPendingMeta();
+  // Both `before-scene` causes, derived from the table rather than named here (#972 P12) — the
+  // set used to be spelled by hand at three save sites and one of the three was short by one.
+  const { dirtyAssetPaths: assets, pendingImportSettings: importSettings } = await flushParked('before-scene');
   const withAssets = <T extends SaveResult>(r: T): T => ({
     ...r,
     ...(assets.saved.length || assets.failed.length ? { assets } : {}),
@@ -1302,11 +1526,13 @@ export async function saveAll(opts: { path?: string; allowDialog?: boolean } = {
   // and these entries are themselves part of that report. Run before the scene write and every
   // mutation 409s against the very save trying to persist it. See `pendingBaseScene.ts`'s header;
   // the take-first half of the same problem lives there.
-  // ⚠️ Declared AFTER `saveScene` on purpose — the textual order is what
-  // `tests/architecture/baseSceneEditIsManual.test.ts` reads, and it is the only place the
-  // "flush LAST" requirement is written down where a refactor will trip over it.
+  // ⚠️ The "flush LAST" requirement is now carried as DATA — `pendingBaseScenes`' spec declares
+  // `writtenBy: {flush:'after-scene'}`, and `flushParked` runs the phases in that order. It used
+  // to live in this function's textual layout, which `tests/architecture/baseSceneEditIsManual.ts`
+  // read as a regex over source; that test now asserts the phase tag instead, which is the same
+  // rule stated where a refactor cannot silently move it.
   const withBaseScenes = async (): Promise<{ baseScenes?: SaveResult['baseScenes'] }> => {
-    const r = await flushPendingBaseScenes();
+    const { pendingBaseScenes: r } = await flushParked('after-scene');
     return r.saved.length || r.failed.length ? { baseScenes: r } : {};
   };
   // A refused primary does NOT skip this, for the same reason the asset flush runs unconditionally

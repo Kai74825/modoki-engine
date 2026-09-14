@@ -552,6 +552,20 @@ export interface ProjectConfig {
      *  import-free (see header), so the two are pinned together by a vitest
      *  rather than a shared import. */
     engineApi: number;
+    /** Sub-game PROJECT IDS this shell publishes bundles for (#837): project folder names, never
+     *  paths, so a game stays self-contained. Looked up next to this project first, then under
+     *  `games/` / `demos/` of the repo. Each one is a Bundle choice in
+     *  Publish OTA Update… (and `modoki_ota_publish`'s `bundleName`), which builds THAT project with
+     *  `build-subgame.mjs` and publishes it into THIS project's bucket under its id. Only the
+     *  editor's publish path reads it: a device already treats every non-shell bundle in
+     *  `release.json` as a sub-game. Empty = this shell publishes only itself. */
+    subgames: string[];
+    /** How many published versions of each bundle stay fetchable in the bucket (#836). Every OTA
+     *  publish then deletes that bundle's older versions — except the one `release.json` points at,
+     *  however old. A device never needs an old version's bundle: it runs from its own staged copy,
+     *  and an old version is only ever fetched as a delta BASE manifest, whose absence falls back to
+     *  downloading the whole current bundle. Positive integer; a malformed value refuses the publish. */
+    retainVersions: number;
   };
   /** Runtime/lifecycle policy. Optional: absent means every knob here is at its off/default. */
   runtime?: {
@@ -764,6 +778,8 @@ export const DEFAULT_PROJECT_CONFIG: ProjectConfig = {
     publicKey: '',
     bundleName: 'shell',
     engineApi: 1,
+    subgames: [],
+    retainVersions: 5,
   },
   // Present (not omitted) despite `runtime` being an optional field on the interface: giving it
   // a default here — rather than leaving DEFAULT_PROJECT_CONFIG.runtime undefined — is what lets
@@ -843,6 +859,22 @@ function oneOf<T extends string>(
   if (issues) issues.push({ path, value, allowed: allowed as readonly string[], using: fallback, message });
   else console.warn(`[project-config] ${message}`); // a collector means someone is reporting it; don't double-log
   return fallback;
+}
+
+/** A `string[]` field, resolved the way {@link oneOf} resolves a union: a value that is not an array
+ *  falls back to the default, entries that are not non-empty strings are dropped, and either one
+ *  WARNS rather than passing through silently. Returns a fresh array, never the default itself. */
+function stringListOf(value: unknown, fallback: readonly string[], path: string): string[] {
+  if (value === undefined) return [...fallback];
+  if (!Array.isArray(value)) {
+    console.warn(`[project-config] ${path}: ${JSON.stringify(value)} is not a list of strings — using ${JSON.stringify(fallback)}.`);
+    return [...fallback];
+  }
+  const kept = value.filter((v): v is string => typeof v === 'string' && v.trim() !== '');
+  if (kept.length !== value.length) {
+    console.warn(`[project-config] ${path}: dropped ${value.length - kept.length} entry(s) that are not non-empty strings.`);
+  }
+  return kept;
 }
 
 /** One out-of-union value found while resolving a config (see {@link oneOf}). */
@@ -1015,7 +1047,14 @@ export function mergeProjectConfig(
       ...p.physics,
     },
     postprocessors: { ...d.postprocessors, ...p.postprocessors },
-    ota: { ...d.ota, ...p.ota },
+    ota: {
+      ...d.ota, ...p.ota,
+      // #837: a LIST, which neither `pick` nor a spread can validate. A non-array, or a non-string
+      // entry, would otherwise reach the publish route's bundle lookup as whatever the file said.
+      subgames: opts?.coerceUnions === false && p.ota?.subgames !== undefined
+        ? p.ota.subgames
+        : stringListOf(p.ota?.subgames, d.ota.subgames, 'ota.subgames'),
+    },
     runtime: { ...d.runtime, ...p.runtime },
   };
 }

@@ -25,6 +25,7 @@
  *  forget, which is the same reason the envelope-opening moved into `pose` in the first place.
  */
 
+import { notifyListeners } from '../../runtime/core/notifyListeners';
 import { getCurrentWorld } from '../../runtime/core/ecs/world';
 import { fireDirtyListeners } from '../../runtime/core/ecs/entityUtils';
 import { applyClipAtTime } from '../../runtime/animation/sampleClip';
@@ -92,14 +93,15 @@ export function applyPoseAtTime(clip: AnimationClipDef | null, rootId: number | 
  *  revert. Callers that need to observe the result must await this. */
 export async function poseClipAtTime(
   clip: AnimationClipDef | null, rootId: number | null, t: number, owner: 'animation' | 'timeline' = 'animation',
-): Promise<{ applied: number; openedSession: boolean }> {
+): Promise<{ applied: number; openedSession: boolean; refused?: true }> {
   if (!clip || rootId == null) return { applied: 0, openedSession: false };
   if (hasTimelinePreviewSession()) {
     return { applied: applyPoseAtTime(clip, rootId, t), openedSession: false };
   }
   enterScrubMode(owner);
+  let opened: boolean;
   try {
-    await beginTimelinePreviewSession();
+    opened = await beginTimelinePreviewSession();
   } catch (e) {
     // ⚠️ The run-mode is claimed SYNCHRONOUSLY on the line above, and the snapshot is what makes
     // it safe. If the snapshot fails (`serializeScene` throwing on a bad trait, a mid-flight I/O
@@ -108,6 +110,13 @@ export async function poseClipAtTime(
     // the mode back before rethrowing so the failure costs the caller a retry, not their editor.
     exitPreviewMode(owner);
     throw e;
+  }
+  if (!opened) {
+    // No session: a restore was in progress, or an Exit landed while the snapshot serialized (#1167).
+    // Pose nothing — it would be unrevertible — and hand the mode back, for the same reason as the
+    // throw above. `rootId` was also resolved before that swap, so it may name a dead entity.
+    exitPreviewMode(owner);
+    return { applied: 0, openedSession: false, refused: true };
   }
   return { applied: applyPoseAtTime(clip, rootId, t), openedSession: true };
 }
@@ -171,7 +180,7 @@ export async function exitPoseEnvelope(restore: boolean): Promise<{ exited: bool
     // and notifying is exactly what must survive a failed restore, because the failure is when
     // the editor most needs to be usable again.
     exitPreviewMode('animation');
-    for (const cb of exitListeners) { try { cb(); } catch { /* a bad listener must not block the exit */ } }
+    notifyListeners(exitListeners, 'poseClip:exit', []); // a bad listener must not block the exit
   }
   return { exited: true, rebound };
 }

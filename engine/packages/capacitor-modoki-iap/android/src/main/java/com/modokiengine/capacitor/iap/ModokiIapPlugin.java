@@ -94,7 +94,7 @@ public class ModokiIapPlugin extends Plugin {
      *   - The PARK runs on a Play Billing worker: `queryProductDetailsAsync` submits to
      *     `Executors.newFixedThreadPool(availableProcessors())` and invokes the callback directly
      *     with no Handler post, and the park sits inside that callback. NOT main, and NOT
-     *     Capacitor's `HandlerThread("CapacitorPlugins")` (`Bridge.java:138`/`:854`), which only
+     *     Capacitor's `HandlerThread("CapacitorPlugins")` (`Bridge`'s `handlerThread`, posted to by `callPluginMethod`), which only
      *     carries purchase()'s outer body.
      *   - `onPurchasesUpdated` and the WebViewListener run on MAIN.
      *   - `unpark()` is reached from both.
@@ -121,7 +121,7 @@ public class ModokiIapPlugin extends Plugin {
      *
      * ⚠️ On Android today the keep-alive is INERT rather than a leak, and #514 was filed on the
      * opposite reading — do not re-diagnose it. `Bridge.callPluginMethod` saves a call only if it
-     * is kept-alive at the moment the plugin METHOD RETURNS (Bridge.java:842-845), and this call
+     * is kept-alive at the moment the plugin METHOD RETURNS (Bridge.callPluginMethod's isKeptAlive check), and this call
      * is parked several async hops later, so it never reaches `savedCalls`; `native-bridge.js`
      * deletes a promise call's JS callback on settle whatever `save` says. This exists because
      * the lifecycle should be closed where the call is settled — and because the day someone
@@ -181,16 +181,16 @@ public class ModokiIapPlugin extends Plugin {
      * `BridgeWebViewClient.onPageStarted` right before this listener fires — clears
      * `savedCalls` and every plugin's event listeners. It does NOT touch plugin fields, so
      * `awaitingPurchase` keeps pointing at a call whose realm is gone, and every `purchase()`
-     * for that product hits the "already in progress" reject at `:536` forever after.
+     * for that product hits the "already in progress" reject in `purchase` forever after.
      *
      * `Bridge.addWebViewListener` survives every reset — the listener LIST is not cleared by
      * `Bridge.reset()` — so one registration lasts the life of the plugin instance.
      *
      * ⚠️ **Registered here, at park time, and NOT from `load()` — a listener added in `load()` is
-     * silently DISCARDED.** `Bridge`'s constructor calls `registerAllPlugins()` (`Bridge.java:231`),
+     * silently DISCARDED.** `Bridge`'s constructor calls `registerAllPlugins()` (in the `Bridge` constructor),
      * which is what runs `Plugin.load()`; `Bridge.Builder.create()` then calls
-     * `bridge.setWebViewListeners(...)` (`:1617`) eighteen lines later, and that setter REPLACES
-     * the whole list (`:1465`) instead of appending to it. So anything `load()` registered is gone
+     * `bridge.setWebViewListeners(...)` (in `Bridge.Builder.create`) right after, and that setter REPLACES
+     * the whole list (`Bridge.setWebViewListeners`) instead of appending to it. So anything `load()` registered is gone
      * before the first navigation, and `BridgeWebViewClient.onPageStarted` — which iterates
      * `bridge.getWebViewListeners()` — walks a list that never contained it.
      *
@@ -236,11 +236,19 @@ public class ModokiIapPlugin extends Plugin {
             + " parkedCall=" + (awaitingPurchase != null));
         PluginCall call = awaitingPurchase;
 
-        if (code == BillingClient.BillingResponseCode.USER_CANCELED) {
+        if (IapCore.isCancellation(code)) {
             if (call != null) {
                 unpark(call);
                 JSObject r = new JSObject();
                 r.put("transaction", JSObject.NULL);
+                // #946 — say WHICH cancel this was, so the two platforms answer the same question.
+                // Android reaches here by a response code rather than a thrown error, so unlike
+                // iOS there is no ambiguity to resolve: USER_CANCELED is checked before the generic
+                // failure branch and is the only route to a resolved-null cancel. The field is
+                // emitted anyway so a journal entry means the same thing on both platforms, and so
+                // that a cancel with NO reason attached identifies an older build rather than
+                // silently reading as Android.
+                r.put("cancelReason", IapCore.CANCEL_REASON);
                 call.resolve(r);
             }
             return;
@@ -449,7 +457,6 @@ public class ModokiIapPlugin extends Plugin {
         });
     }
 
-    @PluginMethod
     /**
      * Reject with a DIAGNOSIS, not just prose (#499).
      *
@@ -470,7 +477,7 @@ public class ModokiIapPlugin extends Plugin {
         detail.put("description", result.getDebugMessage());
         JSObject data = new JSObject();
         data.put("storeError", detail);
-        call.reject(message + " (code " + code + ")", "billing." + code, null, data);
+        call.reject(message + " (code " + code + ")", IapCore.rejectCode(code), null, data);
     }
 
     /** ⚠️ `@PluginMethod` is what puts this in `PluginHandle`'s method index — without it the
@@ -682,8 +689,11 @@ public class ModokiIapPlugin extends Plugin {
 
     @PluginMethod
     public void unfinished(PluginCall call) {
-        // queryPurchasesAsync returns only purchases NOT yet consumed/acknowledged — which is
-        // exactly "unfinished", and is answered from Google's record rather than anything local.
+        // queryPurchasesAsync returns every purchase NOT yet CONSUMED, answered from Google's record
+        // rather than anything local. ⚠️ That is wider than "unfinished" (#1183): an ACKNOWLEDGED
+        // non-consumable or active subscription is never consumed, so it comes back on every launch,
+        // where iOS never re-delivers a finished transaction. A game's grant hook for one re-runs
+        // every launch — see docs/iap.md § 2.
         queryAll(call, false);
     }
 

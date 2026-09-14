@@ -71,6 +71,41 @@ Two rules the helper's callers have to keep, both learned the expensive way:
   scene- and game-scoped managers only, and an **app-scoped** manager is never disposed by
   `unloadAll` at all — it activates at `registerManager` and stays active until unregister.
 
+#### The promote's notification cannot abort the promoter (#888)
+
+All three promoters free the replaced world on the lines **after** `setCurrentWorld`, and
+`setCurrentWorld` reassigns `_currentWorld` and then fires ~50 `onWorldSwap` subscribers. Those
+subscribers used to run in a bare loop, so one of them throwing committed the swap, permanently
+starved every subscriber behind it in `Set` order, and unwound into the promoter's tail:
+
+- `unloadAll` and `replaceWorldContent` skipped `destroyWorldWhenSafe` — the leaked slot above,
+  reached through an exception route rather than a missing call.
+- `loadScene` skipped `nextWorld = null` and `swapped = true`, so its `catch` read both stale flags
+  and did the two things they exist to prevent: released every `allocatedSceneId` — the resources
+  of the scene now ON SCREEN — and destroyed the world `_currentWorld` had just been pointed at.
+
+Listeners that can throw are ordinary, not exotic: Rapier world teardown, `Scene3D`'s six dispose
+helpers plus a `dispose()` per light, `Scene2D`'s per-slot and per-mask Pixi disposal, two full
+world scans in `selectionRestore`, the Hierarchy's whole-tree rebuild.
+
+`setCurrentWorld` now goes through **`runtime/core/notifyListeners.ts`**. Read that file's docblock
+for the reporting policy and the two publishers that must supply their own reporter.
+
+**Since #953 that helper is the engine's ONLY fan-out implementation.** It took two passes: #888
+migrated 36 call sites and claimed completion early, and #953 migrated or exempted the rest.
+`engine/tests/architecture/notifyIsShared.test.ts` enforces it: every loop matching the fan-out
+shape is on the helper or on a short EXEMPT list of shapes the helper cannot express (queries,
+loops that await each callback in order, and a registration that must fail loudly), within the
+blind spots that guard's header states — so a new one fails at authorship. The three promoters here are migrated — that part is not partial.
+
+⚠️ **The ownership latches deliberately stay AFTER the promote.** Moving them earlier looks like
+defence in depth and is the opposite: with the listener loop isolated, nothing after
+`_currentWorld = next` can throw, and every remaining throw source in `setCurrentWorld`
+(`getCurrentWorld()`'s koota allocation, the two `WeakMap.set` calls) happens *before* the mutation
+commits — the state in which `swapped === false` and `nextWorld === promotedWorld` are true and the
+existing cleanup is exactly right. Setting them early would make them lie in the other direction and
+turn a correct cleanup into a guaranteed leak.
+
 ### Replacing every entity IS a world swap
 
 **`setCurrentWorld` is the engine's only signal for "every entity you were holding is gone", so
@@ -107,6 +142,51 @@ Two constraints on any future caller:
   world they replace through the one `destroyWorldWhenSafe` helper, so the 16-world cap is no longer
   the argument here.
 
+### GAME systems tick before the first scene exists (#1110)
+
+⚠️ **A game system runs from the app's FIRST frame, several frames before `loadScene` — so a world
+with none of your authored entities in it is a state every game system must tolerate.** This is not
+an edge case on a slow device; it is every boot.
+
+`App.tsx` registers the ECS pipeline as a plain hook, and the run mode defaults to `playing`
+(`runtime/core/playState.ts`), so `SYSTEM_PRIORITY.GAME` systems are already ticking while the boot
+effect awaits, in order: `registerSystems()` → app services → `PlayerPrefs.init` → `loadConfig` →
+tier resolve → mount the renderers → **wait two frames** → `ensureManifestLoaded` →
+`checkAppOtaUpdate()` → and only then `sceneManager.loadScene`.
+
+The failure it produces is silent, and the shape is always the same: the system reads a scene-authored
+entity, gets nothing, and treats "nothing" as a legitimate value rather than as "not yet".
+`games/wordweave` spawned its entire board — 38 visible entities — parented to the world ROOT,
+because `world.queryFirst(Canvas2D)` returned nothing and its spawn helper took `0` as a parent id.
+Everything then worked anyway, because `setCurrentWorld` throws that world away and the real scene
+rebuilds under the real canvas, so the only visible symptom was a wall of `[Scene2D]` orphan warnings
+naming entities that were plainly on screen (a later generation of them, under the same names).
+
+**So: gate on the authored thing you need, not on a clock or a frame count.** wordweave refused to
+build while it had no host (#1110), and every 2D game now does the same through one engine seam.
+Two riders learned with it:
+
+- ⚠️ **Surface the refusal, but only where it is actually wrong** — and let the ENGINE decide which
+  case that is (#1135). Skipping work in the pre-scene window is routine and must stay silent; a
+  scene that genuinely lacks the entity is an authoring defect and has to say so, or the fix is a
+  net loss in diagnosability (before the gate, the engine reported it 38 times). Three games once
+  answered that three ways — Court said nothing, space-invader counted 60 frames (a timer: it fires
+  on a slow device whose scene merely took longer, and stays silent on a fast one whose scene never
+  loads), wordweave keyed off its own `WordweaveConfig` singleton (right, but only for a game that
+  nominates one). The engine's answer is **"the scene finished loading and still has none"**:
+  `SceneManager.loadScene` marks the world it promotes, just BEFORE `setCurrentWorld`
+  (`runtime/core/ecs/sceneLoaded.ts`, read with `loadedScenePath(world)`), and
+  `resolveCanvas2DHost(world, { report, prefer? })` (`runtime/scene/canvas2DHost.ts`) returns the
+  host or reports its absence once per world per report name. Only a scene FILE marks (`isSceneFilePath`) — an editor
+  Create Scene world, an untitled scene's Play/Stop snapshot reload (path `''`) and the prefab-edit
+  world do not, or every game system would call a blank scene an authoring defect —
+  and a headless test opts in with `createTestWorld({ scenePath })`. A game resolving some OTHER
+  authored entity should gate on `loadedScenePath` the same way rather than invent a fourth answer.
+- ⚠️ **Test fixtures reproduce this state by accident, and then pin it.** Fourteen wordweave
+  fixtures built the board into a canvas-less test world and passed, because nothing asserted where
+  the entities landed — which is exactly why the production defect survived a 7105-test suite. A
+  fixture that omits an entity the real scene always authors is modelling the bug.
+
 ## Resource cache with refcounting
 
 `runtime/loaders/meshTemplateCache.ts` is a content cache keyed by the resolved
@@ -127,6 +207,38 @@ through unchanged. See `runtime/loaders/assetManifest.ts` (`resolveRef`,
 | `.mat.json` | `acquireMaterial` / `releaseMaterial` | one `THREE.Material` + its texture |
 | `.prefab.json` | `acquirePrefab` / `releasePrefab` | parsed prefab JSON |
 | HDR environment | `acquireEnvironment` / `releaseEnvironment` | `THREE.DataTexture` (IBL) |
+
+**Preloaded, not owned: the lazily-cached asset DEFS** — `.anim.json` clips (#1097) and
+`.spriteanim.json`, `.rig2d.json`, `.animset.json`, `.particle.json` (#1162). Each has a per-frame
+consumer that SKIPS the entity while its def is null, so a def still in flight when the world went
+live painted the entity's authored state for as many frames as its fetch took. Each acquire case
+awaits its cache's `load…Now` (all five share `loaders/awaitLazyLoad.ts`) before the swap. The caches
+are plain data, not refcounted per scene, and never cleared in production (only the test-only
+`disposeAllCachedResources` clears them), so the window was the FIRST cold load of a def per session.
+
+| kind, cold, before the preload | measured (editor, local dev server) |
+|---|---|
+| Animator clip | Court's staged chrome at opacity 1 for 3 sim frames (`games/court/intro.md` § the pre-pose window) |
+| 2D rig (`skin-test` Zombie, from a scene without it) | rig def missing 1-2 frames (9-24 ms) after the swap, entity invisible for 2 |
+| animset + its source GLB (`3d-test` `skinned-test`, from `empty`) | set missing 2-3 frames, source GLB 3-4 frames (28-54 ms) |
+
+After: 0 frames for each, in 3 cold runs apiece. Flipbooks and particles are covered headlessly only
+(`engine/tests/ecs/assetDefPreload.test.ts`) — no corpus scene can show a flipbook's gap, because its
+authored sprite equals the clip's first frame.
+
+**The animset case also ACQUIRES the set's `source` GLB** under the loading scene. An
+`AnimationLibrary` merges its clips from that GLB, and the manifest walk does not list it (it lives
+inside the set), so without this a bare rig held its bind pose until the render sync's
+`lazyAcquireRiggedModel` fetched it after the swap.
+
+**What stays lazy, deliberately:** what a def points at in turn — flipbook frames, rig part textures,
+a particle's texture, and a particle's sub-emitter child effects (`subEmitters[].effect`, lazy-loaded
+by `cpuTslBackend`'s `tryBuildChild`, which drops a burst that fires before the child def arrives). 2D textures are never preloaded (`case 'texture'`), so after this a rig or a
+flipbook pops in exactly when a plain sprite does; a textured emitter still waits up to
+`TEXTURE_WAIT_BUDGET_MS`. Also lazy: `shader` (a Scene2D-owned cache the swap clears), `video`
+(streamed), and a prefab spawned by code the manifest never saw. (`.timeline.json` defs are loaded
+before the swap too, but earlier and for a different reason: `collectSceneResourceRefs` awaits
+`loadTimelineNow` to walk their inner refs, so their acquire case is a no-op over a warm cache.)
 
 `acquire*` adds the `sceneId` to the resource's owner set (kicking off the load
 on first owner); `release*` removes it and disposes the GPU resource only when
@@ -355,12 +467,13 @@ of surfacing as a mystery diff months later. It **skips any file whose prefab ke
 resolve rather than assuming a value** — a guard that guesses an input is a wrong oracle, and a
 wrong oracle fails the file the editor just wrote correctly.
 
-**Three files were deliberately left un-normalized**, because their re-save is not order-only
+**Three files were deliberately left un-normalized**, because their re-save was not order-only
 — `games/3d-test/…/skinned-test.scene.json` (a prefab-instance `added` child gains
 `castShadow`/`receiveShadow`, trait fields the engine grew after the file was written),
-`games/chess/…/chess.scene.json` (format `version` 9 → 12), and
-`games/iap-test/…/main.scene.json` (drops an orphan legacy top-level `id`). A save of one of
-those still produces a diff, and it is a content diff rather than a reorder.
+chess's `chess.scene.json` (format `version` 9 → 12; the project was deleted in #1191), and
+`games/iap-test/…/main.scene.json` (drops an orphan legacy top-level `id`). A save of such a file
+produces a content diff rather than a reorder. `qa/knowledge.md` records which of them have since
+been normalized.
 
 ### Only NON-DEFAULT trait fields are written
 
@@ -599,8 +712,8 @@ manifest's LENGTH, which is silent on a 1-for-1 swap: the space-invader re-save 
 legacy page-texture GUID for the sprite GUID the scene actually references, and the gate reported
 "0 semantic changes". A count is the one property a dropped ref can preserve while still being a drop.
 
-- **`games/chess` — was excluded (#124), now fixed on both halves.** Its game code spawns on
-  load; the save baked ~70 runtime entities (move highlights, rank/file labels, pieces) plus a
+- **`games/chess` — was excluded (#124), then fixed on both halves; deleted in #1191.** Its game
+  code spawned on load; the save baked ~70 runtime entities (move highlights, rank/file labels, pieces) plus a
   live progress-bar value into `chess.scene.json`. The **spawn** half is fixed by the `Transient`
   tag at the spawn site; the **mutation** half by `pauseWhileStopped` on its two store→ECS
   projections (both rules below). Verified live in an editor on `games/chess`: 83 entities in,
@@ -715,9 +828,10 @@ save for that world.
 
 **`engine/scripts/resave-prefabs.sh`** is the prefab sibling of `resave-scenes.sh`. Per project it
 launches this clone's editor, enumerates prefabs from `/api/scan-assets`, then runs
-edit-open → edit-save → edit-exit on each. Like the scene sweep it **refuses `games/chess` and
-`games/llm-test`** (the #124 exclusion) — entering prefab-edit saves the current scene, and those
-two games' code mutates authored state on load. Review with
+edit-open → edit-save → edit-exit on each. It **refuses any project in its `EXCLUDED` list** (the #124
+exclusion) — entering prefab-edit saves the current scene, so a project whose code mutates authored
+state on load would bake it. The list is empty today: its two entries, `games/chess` and
+`games/llm-test`, were deleted in #1191. Review with
 **`node engine/scripts/check-prefab-churn.mjs <same projects>`**, a semantic diff keyed by
 localId (a prefab has no entity GUIDs) reporting entities/traits/values gained or lost and any
 change to a nested-instance row's structure; it exits non-zero on a re-minted prefab `id` or a
@@ -1112,8 +1226,8 @@ is therefore scoped to same-file collisions deliberately, and says so in its own
   the flag, so state accumulated while stopped would never project: if the store went quiet
   before Play (the download finished), the first frame of Play would show authored values rather
   than live ones. Default is `false`, because a projection normally *should* run while stopped —
-  that is what makes an inspector/gizmo edit reflect immediately. Opted in today:
-  `games/chess` (state + chat) and `games/llm-test` (state + chat). Gate:
+  that is what makes an inspector/gizmo edit reflect immediately. ⚠️ **Opted in today: nothing.**
+  Its only users, `games/chess` and `games/llm-test`, were deleted in #1191. Gate:
   `engine/packages/modoki/tests/runtime/projection.test.ts`.
 
   **The class stays open by design, so a save warns instead.** Nothing stops the next game from
@@ -1137,7 +1251,11 @@ is therefore scoped to same-file collisions deliberately, and says so in its own
   primary wipe the marks the base just seeded — on *every* chain load, carry or not.
   `loadSceneFile` takes `clearMarks` (default `true`, so every other caller is
   unchanged); `SceneManager` clears once per staging world and passes `false` for its
-  chain and carry calls.
+  chain and carry calls. Marks are keyed by the **packed entity** (#868), so a carried entity's
+  marks are read off its old-world entity and re-seeded onto the new one (`restoreOverrideMarks`),
+  and an editor respawn gets them from its `EntitySnapshot.marks` — never from whatever entity last
+  held the recycled index. Spawns still `clearOverrideMarks` first: nothing sweeps a dead entity's
+  marks before the swap, and koota's 8-bit generation repeats a packed value after 256 reuses.
 - **Editing a base file on disk while a level is open** does not hot-reload by guid
   alone (a base's guid doesn't change when its file does). `agentBridge` matches the
   changed path against every `getLoadedScenes()` entry and reloads via

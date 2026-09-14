@@ -20,11 +20,13 @@
  *  back a `useSyncExternalStore` on the host side.
  *
  *  LIFECYCLE (F9): APP-LIFETIME, NOT scene-scoped — do NOT auto-clear on world swap.
- *  Games register their hook ONCE in `setup.ts` (e.g. chess, llm-test) with no paired
- *  `removeStoreHook`, expecting it to persist for the whole session; resetting on a
+ *  A game may register its hook ONCE in `setup.ts` with no paired `removeStoreHook`
+ *  (chess and llm-test did, before #1191 deleted them), expecting it to persist for the session; resetting on a
  *  scene swap would silently drop them on the first scene change and never re-add them.
  *  Owners that DO have a teardown (e.g. a per-scene manager) must call `removeStoreHook`
  *  themselves — removal is by hook identity, so it only drops that owner's own hook. */
+
+import { notifyListeners } from '../core/notifyListeners';
 
 export type StoreHook = () => Record<string, unknown>;
 
@@ -33,7 +35,7 @@ let _hooksVersion = 0;
 const _versionListeners = new Set<() => void>();
 
 function notifyVersionListeners() {
-  for (const fn of _versionListeners) fn();
+  notifyListeners(_versionListeners, 'storeHooks', []);
 }
 
 export function addStoreHook(hook: StoreHook) {

@@ -101,7 +101,18 @@ A game with no `ios/`/`android/` yet is **auto-scaffolded on the first native bu
 `capacitor.config.json` + vendor plugins → `npm install` → web build → `npx cap add` → heal.
 It then continues into the build, pausing first only if the scaffold surfaces a warning you
 must act on (e.g. missing Firebase config). The explicit **Add … Target** menu items do just
-the scaffold. **A folder left behind by an interrupted scaffold** (editor killed / dialog closed
+the scaffold.
+
+⚠️ **That pause is what made an unreadable `package.json` dangerous (#1096).**
+`detectMissingFirebase` read the project's manifest to decide whether Firebase is in use, and a
+single `catch` returned `[]` for *"no Firebase"* and *"could not read the manifest"* alike. `[]`
+means no warning, no warning means no pause, so a truncated or merge-conflicted `package.json` in a
+project that DOES use Firebase let the build run to completion and ship an app that crashes on
+launch in `FirebaseApp.configure` — with a `✅` on the console. It now reports the unreadable case
+as its own warning, which pauses the build the same way a genuinely missing
+`GoogleService-Info.plist` does. A **missing** `package.json` stays silent: several projects in this
+repo legitimately have none, and treating absent as unknown was the error #731's review caught at
+the twin site. **A folder left behind by an interrupted scaffold** (editor killed / dialog closed
 mid-`cap add`) **is detected as incomplete and repaired automatically on the next attempt**,
 rather than being permanently misread as "already scaffolded" (#581) —
 `isNativeTargetScaffolded` in `addNativeTarget.ts` is the authoritative check, not folder
@@ -214,6 +225,167 @@ git ls-files 'games/*/ios/**' 'games/*/android/**' | git check-ignore --stdin
 # must print nothing — no tracked source should be ignored
 ```
 
+#### Every generation input comes from `project.config.json` — flags are OVERRIDES (#1011)
+
+**The rule: `engine/scripts/generate-icons.mjs` resolves its own inputs from the project config, and a
+CLI flag only OVERRIDES one.** It also owns the freshness check, so both callers — the editor's
+`iconStep` and the CLI native build — participate in the same gate.
+
+Before this, the script took its **entire** input from flags and `iconStep`
+(`engine/plugins/vite-asset-scanner.ts`) was the only caller in the tree that supplied them from the
+config. That single seam produced four symptoms, all measured on `games/wordweave`:
+
+| | symptom |
+|---|---|
+| **A** | `build-web.mjs` ran **no** generation at all, so a CLI native build shipped whatever art was committed, with every gate green |
+| **B** | an absent `--splash` **deleted** the staged splash and rebuilt all 26 Android buckets from the icon, destroying an authored launch screen |
+| **C** | a mistyped asset path regenerated nothing and the shell reported **success** (exit 0) |
+| **D** | `--orientation` absent defaults to `'any'` while the config says `portrait`, so the two callers composed the wordmark in different places — and the hand-run version had already shipped |
+
+⚠️ **A and D are about different callers, and an earlier draft of this table read as though they were
+the same one.** Nothing `build-web.mjs` did could have shipped a differently-composed wordmark,
+because it generated nothing at all — that is A. D shipped through a **hand run** of the script,
+which is the third caller and the one facet B is also about. Three callers, not two: the editor's
+build plan, `build-web.mjs`, and a human at a shell.
+
+⚠️ **Absent is not cleared, and that distinction is the whole of facet B.** Deleting staged art is
+correct only when the config positively has **no** `splashSource` — a cleared setting, whose input
+#236 requires clearing because the staging dir is gitignored scratch that survives between builds. It
+is wrong when the operator merely did not type the flag. **When the config cannot be READ at all,
+nothing is cleared**: the packaged editor ships no esbuild, so `cfg` is legitimately null there, and
+reading that as "the author cleared every field" would destroy art.
+
+⚠️ **An unreadable REQUESTED icon is FATAL, and fails the build.** "Requested" means a flag or a
+non-empty `app.iconSource`. The old silent `return` is what made facet B hard to notice — an operator
+whose mental model becomes *"that command does nothing much"* does not go looking for destroyed art.
+
+#### `--strict`: a BUILD stops rather than shipping stale art (#1028)
+
+Facet C above made *one* of five failure modes non-zero. The other four exited 0, so
+`build-web.mjs`'s printed promise — *"not building; building on would ship the previously committed
+art"* — covered a fifth of what it claimed:
+
+| failure | without `--strict` | with it |
+|---|---|---|
+| icon source unreadable | `exit 1` (facet C) | `exit 1` |
+| `npx @capacitor/assets` non-zero | logs, exit 0 | **`exit 1`** |
+| splash source unreadable | logs, generation continues, exit 0 | **`exit 1`, before the generator runs** |
+| collateral could not be restored | logs, no stamp, exit 0 | **`exit 1`** |
+| post-processing threw | logs, no stamp, exit 0 | **`exit 1`** |
+
+The `npx` row is the one that mattered: it is a **network fetch**, so it is much the likeliest of
+the five, and it was the one the build-side guard did not catch. The rare failure aborted the build
+and the common one did not.
+
+**`--strict true` is passed by the two BUILD callers** — `build-web.mjs` and `iconStep` — and by
+nothing else. A bare hand run of the script keeps the forgiving behaviour, which is deliberate: a
+mistyped `splashSource` must not fail somebody poking at the generator. That split is pinned by a
+test asserting both callers pass it, because dropping it from either silently restores the defect.
+
+⚠️ **`strict` is deliberately NOT in the freshness stamp.** A flag that cannot change the output
+must not change the hash, or flipping it rewrites ~60 committed PNGs in every project for nothing.
+
+⚠️ **This changed the editor's Build menu**, which is where it will be noticed: Build → iOS/Android
+now fails on a flaky `npx` fetch where it previously logged past it. The comment in
+`vite-asset-scanner.ts` claiming an icon failure *"never aborts the app build"* was already false
+before this — the build runner aborts on any non-zero step, so "non-fatal" was only ever a property
+of the script choosing to exit 0.
+
+⚠️ **A degrade must WITHHOLD THE FRESHNESS STAMP, or `--strict` is disarmable.** Every strict check
+sits downstream of the "already current" early return, so a stamped-but-degraded result means no
+later build ever reaches a strict branch — the flag gets passed and never executes. Four of the five
+degrades already withheld the stamp; the splash-staging one did not, and one forgiving hand run over
+a renamed `splashSource` would therefore stamp an icon-derived splash as current **forever**. It now
+withholds too, which also makes the state self-healing: the next run re-attempts, so repairing the
+path recovers on its own. **When adding a degrade path here, withholding the stamp is the rule, not
+the exception.**
+
+⚠️ **`build-web.mjs` loops the two platforms, and iOS can stamp before Android's strict exit** — so a
+failed native build can leave iOS art rewritten and Android's untouched. Self-healing, because the
+stamp is per-platform and the next run redoes only what is stale; worth knowing before reading a
+half-updated `git status` under `demos/` as a second bug.
+
+⚠️ **The config load DEGRADES rather than failing** (`loadEnginePluginModuleResult`, warning with
+*which* cause), because this script is spawned by the packaged editor too. The precedent and the
+reason are `build-web.mjs`'s `validateProjectConfig`.
+
+**Consequence worth knowing:** `npm run build -- --target native` now generates icons, and can now
+FAIL on a config pointing at a missing file. Re-measured 2026-09-10 across `games/**` and `demos/**`:
+**14 source fields across 8 projects, all 14 resolve.** (It said "eight fields, only court and
+wordweave declare an icon source at all" — true when written, and stale the moment the six demos
+gained one. The check is correspondingly less narrow than that caveat implied.)
+
+#### The bundled-icon default is shared, not per-caller (#1027)
+
+**A project that declares no `iconSource` gets the bundled Modoki icon, and BOTH callers agree on
+that** — `BUNDLED_ICON_REL` / `bundledIconPath()` in **`engine/scripts/iconAssets.mjs`**, read by
+`resolveIconInputs` and by `iconStep`.
+
+It was in `iconStep` alone until #1027, which is why facet A's fix was incomplete: the editor's
+build plan generated from `build/icon.png` for the 22 native projects that author no icon, and the
+CLI native build printed "nothing to generate" and exited 0. Same project, same config, two answers.
+That mattered most when the stamp was invalidated for a reason other than the art — editing
+`splashCompose.mjs` or `iconVariants.mjs` invalidates every project's stamp by design, at which
+point the editor regenerated 25 projects and a CLI native build regenerated 2.
+
+It lives in the plain-Node module rather than `plugins/iconAssets.ts` because `generate-icons.mjs`
+reaches the TS module through esbuild, which the **packaged editor does not ship** — a default that
+vanished there would be a third answer rather than a fix.
+
+⚠️ **The fallback is gated on the config having been READ, and that gate is the whole safety of
+it.** A config that could not be read means UNKNOWN, not "authors no icon" — precisely the state in
+which a project MIGHT have real art configured, so defaulting there would overwrite it with the
+bundled icon. Same distinction as facet B's `splashCleared`, one field over.
+
+⚠️ **"Was it read?" is NOT `loadProjectConfig() !== null`, and getting that wrong is how this
+becomes the art-destroying bug it was written to prevent.** `loadProjectConfig` catches its own
+`JSON.parse` throw and returns merged defaults — its docstring says so: *"A missing file or
+unparseable JSON falls back to the defaults."* So a trailing comma in a hand-edited
+`project.config.json` arrives as a perfectly clean config with an empty `iconSource`. The
+sanctioned way to ask is **`readProjectConfigParseErrors`**, which exists precisely because humans
+edit these files; `generate-icons.mjs` calls it and treats a parse error as UNKNOWN. This was
+shipped wrong once, in the commit that added the fallback, and caught in review.
+
+⚠️ **The bundled icon lives under `engine/assets/`, NOT `build/`.** `electron-builder.yml`'s `files:`
+ships `engine/**` + `dist/**` + `package.json`; `build/` reaches the package only as `build/bin` via
+`extraResources`. A default under `build/` therefore does not exist in the **packaged editor**, where
+`iconStep` resolves no icon, passes none, and the script silently generates nothing — a third answer for the same
+project. Identical to the trap that moved the splash badge art out of `build/`. Guarded by
+`engine/tests/plugins/bundledIconExists.test.ts`.
+
+⚠️ **`bundledIconPath()` returns `undefined` when the file is absent** rather than a path that does
+not resolve. Facet C makes an unreadable *requested* icon fatal, so a confident default would turn
+"this checkout has no `build/icon.png`" into a failed build for every project that authors none.
+
+**The CLI says which icon it used.** `iconStep` never needed to, having no other possibility to be
+confused with; the CLI does, because the `cfg === null` path also names no icon and deliberately
+does not default — so "it generated something" alone cannot tell an operator whether they shipped
+their own mark or the bundled one.
+
+**Measured cost of switching this on**, because the fear that kept it filed was bigger than the
+fact. Simulated on `games/sling` (no `iconSource`, 28 committed icon artifacts): `@capacitor/assets`
+reproduced **every committed mipmap and splash PNG byte-identically**, the wrapper undid the one
+piece of collateral it wrote (`ios/…/project.pbxproj`), and the only diff was **8 files** — #397's
+Android *monochrome* adaptive-icon variant, which these projects never received because it landed
+after their art was committed and only the editor's Build menu ever regenerated. So this completes
+art that was never generated; it is not #162/#236's churn re-created.
+
+⚠️ **`--splash-cleared` is how a caller states what an absent flag cannot.** The packaged editor has
+no esbuild, so `cfg` is null there and the script cannot tell "cleared" from "not passed" — which
+silently dropped #236's cleanup on the one build that ships. `iconStep` passes the flag from the
+config it has already parsed. Absent flag + readable config still infers it; absent flag + no
+readable config still clears nothing.
+
+⚠️ **`MODOKI_ICONS_HANDLED=1` makes `build-web.mjs` stand down.** The editor's native plan runs
+`build-web.mjs --target native` and then its own `iconStep`, so without it the editor build
+generates everything twice — and since `generateNativeIcons` does BOTH platforms whenever both dirs
+exist, an iOS-only editor build also rewrote tracked Android art. `iconStep` wins because it is
+per-platform and has the bundled-icon fallback above.
+
+#1011 first landed as the sixth hand-application of the pattern #827 existed to extract — the owner's
+call while the icon defects were live. #827 then folded it: `iconStep` and `generate-icons.mjs` now
+resolve through the one `resolveIconInputs` (§ "One entry point per operation").
+
 ### App icons + splash are GENERATED, but still tracked
 
 `res/` counts as tracked source above, yet its icons and splashes are produced by
@@ -222,13 +394,28 @@ git ls-files 'games/*/ios/**' 'games/*/android/**' | git check-ignore --stdin
 
 **Where the source image comes from, and the trap in it.** `app.iconSource` in
 `<project>/project.config.json` is a **project-relative** path (absolute is honoured too). When it
-is **empty — the scaffolder's default — the build falls back to the repo-root `build/icon.png`,
-which is the Modoki EDITOR's own icon**, so an unconfigured project silently ships Modoki's panda
-as its app icon and looks authored. ⚠️ **`<project>/assets/icon.png` is NOT the source**, however
+is **empty — the scaffolder's default — the build falls back to
+`engine/assets/app-icon-default.png`, the Modoki editor's own icon**, so an unconfigured project
+silently ships Modoki's panda as its app icon and looks authored. (It was `build/icon.png` until
+#1027's close-out; `build/` is not shipped in the packaged editor, so the default did not exist
+there — see the shared-default section above.) ⚠️ **`<project>/assets/icon.png` is NOT the source**, however
 much it reads like one: `generate-icons.mjs` COPIES the resolved source there because that is
 `@capacitor/assets`' input convention, and `games/*/assets/` + `demos/*/assets/` are **gitignored**.
 Editing that file changes nothing and is overwritten on the next run — put the master somewhere
 tracked (`games/court/art/icon-app-master.png` is the worked example) and point `iconSource` at it.
+
+**The demo icon family is the house style** (owner-approved 2026-09-10, after seeing the icons
+extracted from the APKs on an S22). The six `demos/<id>` icons are **flat two-colour line art,
+cream (~`#f2ded0`) on dark navy, one motif per demo** (pendulum, stacked cubes, particle burst,
+camera aperture, play button), with masters at `demos/<id>/art/icon-app-master.png` wired through
+`iconSource`. They were generated with 3D AI Studio at **1K**, which is exactly `@capacitor/assets`'
+source size; a 2K request returns `400 INVALID_ARGUMENT`. Two consequences:
+- **The other projects still ship the bundled default.** The owner scoped the icon work to "6
+  demos only", so authoring icons for the rest is a fresh decision, not an implied one. If it is
+  made, match this style rather than inventing a new direction.
+- **A generated icon is not CC0.** Each demo's `ATTRIBUTION.md` had to narrow "every asset is
+  CC0" to "every THIRD-PARTY asset" — see [art-tools-3daistudio.md](./art-tools-3daistudio.md)
+  for the license terms.
 
 **Keep the committed value project-relative** (#394). `project.config.json` is tracked, so
 `/Users/<name>/Projects/modoki/games/court/art/…` is dead on every other clone, dead on `win`, and
@@ -509,6 +696,88 @@ pid/TTL staleness, the shape `deviceClaimsStore.mjs` already uses for hardware).
 take the claim and **refuse and exit** rather than waiting: a scripted build must not hang on an
 interactive editor, which is what the routes already do.
 
+**Every other project writer takes the claim too (#1160).** The six above share `dist/`, but the
+claim guards the whole project a build heals: its native folders, `plugins/`, `package.json`,
+lockfile and `node_modules`. #1160's census found nine paths writing those with no claim. Each now
+takes it, in one of three shapes, chosen by what a refusal should do:
+
+| Writer | On a held claim | Why |
+|---|---|---|
+| `vendor-plugins.mjs`, `generate-icons.mjs` and `ota-embed-manifest.mjs` run by hand, and the two smoke scripts (before their `rmSync` of `dist/`/`ads/`) | **refuse, exit 1** (`claimProjectOrExit`, `scripts/cliBuildClaim.mjs`) | a one-shot script has nothing else useful to do. Spawned by a claimed build, each inherits the token and passes through |
+| `bootstrap-game-deps.mjs` (the root `postinstall`) | **skip that project**, warn, name it again in the summary | a root `npm install` must not hang or fail because one game is building. The summary says to re-run it |
+| Electron's heal-on-open (`healAndInstallOnOpen` → `claimProjectForOpen`, `electron/openClaim.ts`) | **skip if a COMPLETED install is present; otherwise wait for the claim**; skip with a warning if the claim is unreadable; stop waiting if another project is opened | the owner's call on #1160. The editor opens instantly when it can, and cannot start Vite without deps when it cannot |
+| `scaffoldNativeTarget` | **throws at entry** (`holdsBuildClaim`) | both callers already claim. The gate catches a future caller that forgets |
+
+⚠️ **A skip leaves the project as it is. It is not a promise that the holder repairs it.** A native
+build does (`healNativeProject`). A web build, `generate-icons` or a smoke script does not, so a
+stale plugin extraction the open would have re-installed stays stale until the next open. The log
+says "left as they are" for that reason.
+
+⚠️ **"Present" means npm FINISHED, and a started wait ends only on the claim.** The #1160 review
+caught the first version ending its wait on a bare `node_modules`. npm creates that directory early:
+measured on a fresh install of three + typescript, it appears at +1.1s, the last package at +4.9s,
+and npm's hidden lockfile `node_modules/.package-lock.json` at +5.0s. So the question uses the hidden
+lockfile (`projectDepsMissing(…, { completedInstall: true })`), and it is asked once, before
+waiting. When an open WAITED and the tree still has no hidden lockfile after it acquires, it forces
+the install `ensureProjectDeps`' bare existence check would skip: the holder died mid-way through a
+fresh install or an `npm ci`. Residues, all accepted:
+- A holder killed while RE-installing over a complete tree leaves the old hidden lockfile behind, and
+  that still reads as present. npm writes it only at the end and does not delete it first.
+- A holder that died BEFORE the open started leaves a stale claim. The first acquire succeeds, so
+  nothing was waited on and nothing is forced.
+- A holder's `build:plugins` running after its install is invisible to the check.
+
+⚠️ **Project opens are SERIALIZED, and a newer request supersedes every older one at once**
+(`createOpenSequencer`, `electron/openClaim.ts`). The editor has one dev server and one
+`state.root`, and each open restarts both. So two concurrent opens corrupt each other: one open's
+`startDevServer` stops the other's child mid-start. On the launch path that quit the app. The wait
+made that window minutes long. The first two fixes guarded one moment inside it: a generation check
+before Vite, then a root comparison, which A → B → A defeated. Review then found the race in every
+await of the open (provisioning, the install, Vite's own start), so the fix became structural:
+- Each open runs only after the previous one has settled.
+- A newer request flips the older open's ticket at once, so its claim wait returns early instead of
+  holding the newer open in the queue.
+- A superseded open that has not started does nothing, and a superseded failure shows no dialog.
+- The launch RESERVES its turn before the menu goes live, so an Open Project picked during a
+  first-launch Node download queues behind the launch instead of being overridden by it.
+- A superseded launch (including one superseded right after its own Vite came up) waits for the
+  queue to go idle. It then requires a dev server rooted at `state.root` before creating the window.
+  If the open that replaced it failed, the launch reports that rather than opening a window onto no
+  server or the wrong one.
+- Open Project and Open Recent skip a pick equal to the newest REQUESTED root (`requestedRoot`), not
+  `state.root`. With opens queued, `state.root` holds the last root an open STARTED, so re-picking
+  a project while another was queued was silently dropped.
+
+- A queued open that runs before any window exists reports its progress (including a claim wait)
+  on the splash, not on a title bar nobody can see.
+
+⚠️ **A changed failure mode, on purpose:** when an open queued during launch FAILS, even after the
+launch's own Vite came up, the launch now ends in the fatal "could not open the project" dialog and
+quits. Before #1160 it opened a split editor (Vite on one project, the backend on another) behind a
+"relaunch" dialog. Relaunching reopens the launch project, because a failed open never reaches
+recents.
+
+Residues, accepted: an Open Project picked after the launch's `idle()` but before its window loads
+still races that load; and a newer open whose Vite timed out with the child still alive passes the
+root check, and the window then waits out its own timeout.
+
+⚠️ **The editor's own build claim does NOT cover its heal-on-open.** The routes run in the Vite child
+(`devServer.ts` spawns it), and the claim is held by that pid. The heal runs in Electron main, a
+different process that held nothing, so opening a project while a CLI build healed it raced
+freely. That is why the open takes its own claim. It releases it before spawning Vite, so the child
+never inherits a token for a claim that is already gone.
+
+**The guard is derived, not listed.** `cliBuildClaims.test.ts` below names its scripts one by one,
+which is exactly how those nine went unseen. `projectWritersTakeBuildClaim.test.ts` walks every
+production file under `engine/scripts`, `engine/electron` and `engine/plugins` that calls a project
+mutator (`vendorEnginePlugins`, `healNativeConfig`, `installProjectDeps`, …) and requires a claim
+spelling in the same file. Its header states what it cannot see: file-level granularity, direct `fs`
+writes to a project path, and a new helper nobody added to its list. The behavioural tests
+(`openClaim`, `bootstrapGameDepsClaim`, `cliScriptsTakeBuildClaim`) cover those specific paths.
+Out of scope on purpose: the config-only writers (`/api/project-settings`, `migrate-*`,
+`seed-quality-tiers`) do not touch what the claim guards, and the two project scaffolders refuse a
+non-empty target, so they cannot race a build.
+
 ⚠️ **The holder SPAWNS a child that wants the same claim, and that nearly shipped as a deadlock.**
 Every route's first pipeline step is `node engine/scripts/build-web.mjs` with
 `MODOKI_PROJECT=<projectRoot>` — the child then asks for a claim on the identical key and, without
@@ -684,6 +953,12 @@ becomes editor-editable (drag a texture onto the field to reskin).
 
 `games/<id>/asset-keep.json` is the escape hatch, and it is a **patch, not a fix**: hand-maintained,
 and nothing fails when someone forgets an entry. That is precisely why the guard below exists.
+
+Its schema is `{ keep?: string[], playable?: { keep?: string[], drop?: string[] } }`. `keep` applies
+to every target; the **per-target section (#934)** is added or removed only on a build of that
+target, and is what lets a playable ship a different asset set rather than merely smaller textures.
+⚠️ A `drop` naming no file on disk fails the build, like a stale `keep`. Contract and the reasoning:
+[playable-export.md](playable-export.md) § "Per-target assets".
 
 **Guard**: `engine/tests/assets/codeAssetRefs.test.ts` (in `npm test`) fails on an asset ref held in
 game code, in either form — a GUID **literal**, or an imported **engine constant** such as
@@ -910,6 +1185,38 @@ the walk.
 ⚠️ **It reads FILES ON DISK.** An unsaved live-world edit is invisible to it, so a user who just
 wired something up and did not save will be told "0 references". Save first.
 
+## What verifies a copied-into-place artifact (#945)
+
+Several steps in this pipeline COPY, bundle, stage or vendor a file into the place it actually
+runs: `build-electron.mjs` bundles the MCP into `engine/tools/modoki-mcp/dist/index.js`;
+`before-pack.cjs` stages `toktx`/`msdf-atlas-gen` into `build/bin/`; `copy-three-addons.cjs`
+(`afterPack`) restores `three/examples/jsm` into `app.asar.unpacked`; `scaffold-project.mjs` copies
+the starter template.
+
+⚠️ **A verification aimed at the SOURCE, or at a private rebuild, cannot fail when what ships is
+stale or wrong** — the whole class, its closed members and the fix shape are in
+[falsifiable-tests.md](falsifiable-tests.md) § "Shape (C): the test drives the WRONG COPY".
+Before adding a step here, read it: the rule is that **the test drives the artifact the shipping
+path produces**, and a faithful-looking rebuild of the build options is a second implementation
+that drifts.
+
+Two consequences worth knowing when touching this pipeline:
+- **`mcpOpts` lives in `engine/scripts/mcpBuildOpts.mjs`**, a declaration-only module, so the test
+  and the builder share one copy. Do not restate those options anywhere.
+- ⚠️ **A hook that can now THROW must not strand `beforePack`'s output.** `after-pack.cjs` runs
+  `cleanViteConfig` in a `finally`, because it deletes the `engine/vite.config.cjs` that
+  `beforePack` emitted into the SOURCE tree — skip it and `packagedViteConfig.test.ts` reddens
+  `npm run verify` until a human deletes the file, and every later dev build uses a config frozen
+  at the failed pack.
+- ⚠️ **A stager that fails must remove what it staged.** Both win32 stagers short-circuit on
+  `fs.existsSync(out)` *before* their sanity run, so a broken binary left in `build/bin` makes the
+  NEXT pack skip staging AND verification and sign an app around it. macOS re-copies every run and
+  does not have this hole — the asymmetry is the idempotence early-return.
+- **A stager that finds its tool ABSENT still skips gracefully** (`before-pack.cjs`'s contract — a
+  build machine may legitimately lack `toktx`). A stager that stages a binary which then FAILS TO
+  RUN now throws and stops the pack, and `copy-three-addons` throws on a missing source rather
+  than shipping an app in which no GLB or HDR loads. Those two states are different; keep them so.
+
 ## Packaged editor loop (test the DMG faithfully, fast)
 
 ⚠️ **Why the packaged reaper is anchored to a bundle PATH, and must stay that way.** For months,
@@ -1043,13 +1350,14 @@ thing it was watching was broken:
    gracefully here is a dead build for them. The assertion compares against `PINNED_NODE.version`
    read from `engine/toolchain/nodeProvision.ts`, so it also catches a **stale packaged build**
    shipping an older Node than the tree pins.
-4. **Nothing leaked in from another clone.** The launch passes `--user-data-dir`, because
-   `resolveUserDataDir` scopes the profile per clone only for **dev** — packaged returns the single
-   `<appData>/Modoki Editor`, correctly assuming a shipped app is installed once. Our harnesses break
-   that assumption: four clones each build and smoke their own packaged app. Since
+4. **Nothing leaked in from another run.** The launch passes `--user-data-dir`. When this was written,
+   `resolveUserDataDir` scoped the profile per clone only for **dev** and packaged returned one
+   `<appData>/Modoki Editor`, so four clones each smoking their own packaged app shared it: since
    `modoki-last-scene:<project name>` is keyed by project NAME with a clone-ABSOLUTE value, a run
    restored another clone's scene, `/@fs` correctly 403'd it, and assertion 2 failed for a reason
-   unrelated to the commit. `shouldOverrideUserData()` stands down for that switch precisely so a
+   unrelated to the commit. Since #1036 the packaged profile is per INSTALL
+   (`<appData>/Modoki Editor/<install-id>`), which ends the cross-clone collision; a gate still passes
+   the flag so each run boots from a fresh profile rather than its own previous run's residue. `shouldOverrideUserData()` stands down for that switch precisely so a
    harness can isolate itself. `assert-app-renders.sh` (the release gate) does the same.
    Guarded by `engine/tests/architecture/packagedLaunchIsolation.test.ts`.
 
@@ -1191,6 +1499,287 @@ Four bugs found stress-testing the very first packaged DMG (`dist:dir`), each in
 All four verified end-to-end on a clean-from-source repackage: renderer mounts, `/api/scene-state`
 returns 200 entities, a "Build → Web" run on a clean packaged install completes and deploys.
 
+### ⚠️ Main-process code must not import `@modoki/engine` by BARE specifier (#1035)
+
+**The rule: nothing the main bundle inlines may reach the engine package by a BARE specifier —
+use a RELATIVE path**, `../packages/modoki/src/…`, which is already the local convention across
+`engine/plugins/**` and `engine/electron/**`. (Deliberately no count here: this section carried
+"~10", then "34 files / 73 sites" — the second was miscounted, because the grep swept a gitignored
+`dist/*.map`, and it was hand-copied into three files. A derived number that three files restate is
+the shadowing-constant trap this repo's own rules ban. Run the grep if you want today's figure.)
+
+⚠️ **The rule is scoped to the BUNDLE's inputs, not to those two trees.** Measured 2026-09-10 from
+esbuild's metafile: the main bundle has **154 non-`node_modules` inputs across 8 roots**, and those
+two trees are only 91 of them. `engine/electron/inputRoutes.ts` value-imports
+`engine/app/debug/domPointContract.ts`, and 19 of *that* file's siblings use the bare specifier as
+their local convention — so `engine/app/**`, `engine/toolchain/**`, `engine/packages/modoki/src/**`,
+`engine/scripts/*.mjs`, `engine/tools/shared/**` and `engine/project-config.ts` are all in scope
+too. Guarded by `engine/tests/electron/mainBundleExternals.test.ts`, which derives its corpus from
+the metafile rather than listing trees — the first version listed them and had a green path through
+this exact bug.
+
+`engine/scripts/build-electron.mjs` sets **`packages: 'external'`**, so a bare specifier is not
+bundled — it survives into `dist/main.cjs` as a runtime `require` that plain Node must resolve
+inside the packaged app. And **`@modoki/engine` has no `main` and no `module`**: its `exports` map
+points only at `.ts` source. That is correct for every other consumer, all of which reach it
+through Vite, and unloadable by Node, which refuses to strip types under `node_modules`
+(`ERR_UNSUPPORTED_NODE_MODULES_TYPE_STRIPPING`). A relative path has neither problem — esbuild
+inlines it, and the same TypeScript compiles.
+
+**What it looks like when it happens, because the answer is "nothing".** The throw lands during
+`main.cjs` module evaluation, and an uncaught main-process exception raises **Electron's own error
+dialog** — a native modal with **no visible window**: a full-screen `screencapture` taken while the
+process was blocked in `-[NSAlert runModal]` shows no alert anywhere. (The modal LOOP is running —
+that is what `runModal` on the stack means — so "nobody can answer it" is the observation; "it is
+never drawn" would be an inference past it.) So the app hangs alive with no window, **no child
+processes**, no stdout, an empty `--user-data-dir`, and `exitCode=null`,
+having never reached `initFileLog()` near the top of `main.ts`. Every diagnostic this repo has is
+empty at once, which is what made one import cost a day: `smoke:packaged` reported `scene never
+loaded`, `no 'provisioned Node' line`, and `could not read logs/main.log: ENOENT`, none of which
+names the cause.
+
+Three traps this laid, each of which cost a session:
+
+- **`verify` cannot see this class at all** — it never loads the packaged bundle — so the source
+  change that breaks the mandated packaging gate lands green. The guard therefore **builds the
+  bundle itself**, with the shipped options imported from `engine/scripts/electronBuildOpts.mjs`
+  (the declaration-only split `mcpBuildOpts.mjs` established for #945 B1), and asks the artifact
+  rather than a list of files. It also checks the `dist/main.cjs` on disk — but **`skipIf` when
+  it is absent, not a failure**: `dist/` is gitignored, no gate builds it, and the free public CI
+  runs `npm test` over the OSS snapshot on three OSes, so requiring it would redden all three on
+  a file nothing has built. No mtime check either, in either direction: with 154 inputs, touching
+  any of the other 153 leaves an mtime comparison green against a genuinely stale bundle, and a
+  `git merge` that rewrites an input's mtime gives a false red.
+- **It is NOT `showErrorBox` (#1034).** Three sessions concluded the hang was one of `main.ts`'s own
+  modal error boxes and that #1034 had to be fixed first to make anything readable. It isn't and it
+  didn't: execution never reaches them. #1034 is a real, separate defect on the same theme.
+**Considered and DECLINED: aliasing the package in the bundler** (owner, 2026-09-10). An esbuild
+`alias` mapping `@modoki/engine` → `engine/packages/modoki/src` in `build-electron.mjs` would make
+this class *unreachable* rather than guarded — a bare import would resolve to the same file the
+relative path does, from every tree and whatever the call form, demoting the guard to defence in
+depth. It was declined because of a risk nobody has measured: the alias would also make the
+`@modoki/engine/runtime` **barrel** bundleable, and that barrel is what drags the browser runtime
+(DOM, three, pixi) into what is a `platform: 'node'` build. Today those imports are external and
+simply never fire; under an alias they would be inlined, which could bloat `main.cjs` or fail the
+build outright. Recorded so the next reviewer does not re-propose it and re-derive the objection —
+if anyone revisits it, **measure the barrel first**.
+
+- **The modal cannot be read, so make the app talk instead.** What worked: extract `app.asar` to
+  `Resources/app/`, rename the asar so the extracted tree becomes the entry point (Electron prefers
+  `app.asar` when both exist — instrumenting without the rename silently changes nothing), and
+  prepend an `uncaughtException` recorder to `main.cjs`. `sample <pid>` confirms the modal
+  (`-[NSAlert runModal]` under `node::StartExecution`) but never names its text.
+
+### Never sequence termination after a dialog (#1034)
+
+`dialog.showErrorBox` — and every `show*Sync` sibling — is **synchronous**: it runs a *nested native
+modal loop*. So anything written after it does not run until somebody clicks OK, and on an unattended
+launch (headless smoke, CI, launchd, a shell script) that is never. All three of main.ts's
+startup-failure paths were `console.error → showErrorBox → app.exit(1)`, which means the process sat
+alive with no window, no stdout and **no exit code** — a harness saw a hang instead of a failure,
+which is the exact state the handler existed to prevent. Measured: the main thread parked in
+`-[NSAlert runModal]` → `_DPSNextEvent` → `_BlockUntilNextEventMatchingListInMode`.
+
+**The rule has TWO halves, and the first one alone does not work.**
+
+1. **Arm the exit BEFORE showing the dialog.**
+2. ⚠️ **Never open a PARENTLESS modal on a path that must terminate.**
+
+`engine/electron/fatalDialog.ts` (`reportFatalStartup`) is the one way to report a fatal startup
+failure. It arms a bounded timer, then asks for a parent window: with one, it shows the async
+`dialog.showMessageBox` **as a sheet** and whichever settles first terminates exactly once; with
+none, it shows **nothing** and terminates immediately. Guarded by `fatalDialog.test.ts`, which also
+bans the whole `*Sync` dialog family across `engine/electron/**`.
+
+⚠️⚠️ **Why half 2 exists — this was found the expensive way.** The first fix did only half 1: arm a
+timer, then show the *async* `showMessageBox`. It passed `verify`, `verify:packaged` and 34 unit
+tests **and it still hung** — 4m51s against a 10s timer, in a real packaged launch. Instrumented,
+neither racer ever ran. `sample` on the real Electron main process:
+
+```
+-[NSAlert runModal] → _NSTryRunModal → -[NSApplication _doModalLoop:peek:]
+  → _DPSNextEvent → _BlockUntilNextEventMatchingListInMode
+```
+
+**`dialog.showMessageBox` with no parent window is APP-MODAL on macOS: it runs a nested native modal
+loop on the main thread even though it returns a Promise.** Node is single-threaded, so the blocked
+loop cannot run the timer meant to rescue it — the Promise says "async" and behaves synchronously.
+The general lesson is worth more than the fix: **a timeout can only rescue you if the thing you are
+timing out cannot block the loop the timer runs on.**
+
+⚠️ **This mechanism is not confined to the startup paths — see #1044 below**, which is where the
+ordinary (non-terminating) dialogs are dealt with.
+
+⚠️ **`reportFatalStartup`'s parent probe deliberately ACCEPTS the splash, where `show()` rejects
+it** — the two want opposite things and neither is wrong. `show()` needs the user's *answer*, so it
+refuses to parent to a window that may vanish mid-question (the splash is destroyed the instant the
+renderer mounts, taking an open sheet down with it unanswered). `reportFatalStartup` needs only to
+*not block the loop*, and it terminates on the armed timer whether or not the sheet survives — so any
+live window will do, and the splash is usually the only one there is. Copying `show()`'s stricter
+probe here would hand back the parentless case, i.e. the hang.
+
+Two shapes that look like fixes and are not:
+
+- ⚠️ **A TTY check is wrong in both directions.** The `.app` a real user double-clicks has no TTY
+  either, so it would suppress the dialog in exactly the case the dialog exists for.
+- ⚠️ **A harness env var is worse.** It makes correctness depend on the caller remembering to set it,
+  and an unattended launch that is not our own smoke still hangs.
+
+⚠️ **`terminate` is injected, not hardcoded**, because the three sites do not agree: two want
+`app.exit(1)`, while the dev-server failure must keep going through `closeSplash()` +
+`quitExitCode = 1` + `app.quit()` so the deferred teardown runs and a failed launch still reports
+non-zero. Collapsing them onto one exit fixes #1034 and reintroduces #68.
+
+⚠️ **A dialog this early does not render at all** — a full-screen `screencapture` during a real
+`runModal` block showed no alert anywhere. Any argument that rests on "the human can still click OK"
+is protecting a path that, at this point in startup, does not exist. Separately, a failure *before*
+`initFileLog()` used to write nothing at all — that was #1043, fixed below, and is still not this.
+
+
+### A crash before `initFileLog()` leaves a file anyway (#1043)
+
+`fileLog.ts` registers the `uncaughtException` / `unhandledRejection` handlers **inside**
+`initFileLog()`, which `main.ts` calls near the top of its body. But **ES imports are hoisted**, so the forty
+imports written *below* that call — `assetBackend`, `../toolchain`, `backendServer`, `rendererOps`,
+`ssrLoader`, `devServer`, `connectClaude`, `vendorPlugins`, `autoUpdate`, the eight reimport
+plugins — are fully evaluated first, as is `setUserDataDir()`. A throw anywhere in that window
+produced **nothing at all**: no stdout (a Finder-launched `.app` and any Windows GUI launch have no
+terminal) and no `main.log`, because the file had not been opened and no handler existed to write
+to it. That is how #1035 presented; reading the real exception took extracting `app.asar`, renaming
+it so the extracted tree won, and hand-patching `main.cjs`.
+
+**`engine/electron/crashSink.ts` is imported FIRST in `main.ts` and writes to
+`os.tmpdir()/modoki-logs/early-crash.log`.** ⚠️ **That path is the artifact to ask a user for when
+a packaged editor dies with an empty `main.log`** — `initFileLog` also prints it into `main.log` on
+every successful boot, so a reader holding one file can find the other.
+
+⚠️ **A SINK, not a buffer.** Buffering early output and flushing it once the real log opens is the
+shape this repo has retired three times — #861 named the class (*"a buffer whose only delivery path
+sits behind the boot that fills it"*), with #859 and #825 as instances. A boot that dies at module
+evaluation never reaches the flush, so the buffer dies holding the only copy of why.
+
+⚠️ **tmpdir, not userData, and that is not laziness.** WHICH userData is itself decided inside the
+unlogged window, and `main.ts` §"userData MUST be decided FIRST" exists because an early reader once
+silently relocated the shipped editor's entire profile for weeks. `os.tmpdir()` needs no decision.
+The dir is created `0700`: `tmpdir()` is per-user on macOS and Windows but SHARED on Linux.
+
+⚠️ **The import POSITION is the mechanism, and what ships is bundled CJS, not ESM.** Measured
+against the repo's real esbuild options rather than assumed: esbuild inlines bundled modules in
+SOURCE ORDER and leaves an external `require("electron")` at its own source position rather than
+hoisting it above them — so a first-position import runs before every other module and before
+electron itself. `crashSinkOrder.test.ts` pins the source position AND rebuilds with the shipped
+options to pin the emitted order, then drives a real module-eval throw in a real child process,
+because a test covering only a post-`initFileLog` throw cannot fail on this bug. It carries its own
+falsification: the same fixture with the imports REVERSED must write nothing.
+
+⚠️ **Known, measured trade: an `uncaughtException` listener suppresses Node's default
+termination**, and this one covers a window that previously had none — so under bare `node` a boot
+that exited 1 now exits 0. Under ELECTRON nothing changes: its own loader wraps the main-module
+load in a try/catch and raises a native modal, so the process hangs with or without the sink (the
+#1035 shape described above). Only the stack on disk is new. The exit code is asserted in the suite
+so the trade cannot drift unnoticed.
+
+### Every main-process dialog gets a parent when one exists (#1044)
+
+The #1034 mechanism above — a parentless box is app-modal and blocks the single-threaded main
+process — is not specific to a terminate path. While one is up, **nothing else in main runs**: no
+timers, no renderer IPC, no backend HTTP. That is a stall rather than a hang, but it is a stall the
+editor takes in its ORDINARY operation.
+
+**`engine/electron/mainDialog.ts` owns the rule and every main-process dialog goes through it.**
+`showMessageBox` / `showOpenDialog` parent to a real window whenever one exists and go free-floating
+only when there is genuinely none.
+
+⚠️ **The defect was not a forgotten parent — it was a bypassed helper.** `autoUpdate.ts` already
+had the right thing (`show()`, which parents to a visible non-splash window) and **three sites in
+that same file called `dialog.showMessageBox` directly**, passing no parent *unconditionally* rather
+than "when there is no window". So they took the app-modal path with a perfectly good editor window
+open — the ordinary case, not an edge one. **Those three are the whole behavioural surface of the
+fix.**
+
+⚠️ The other eight are routed for UNIFORMITY, not for effect — saying otherwise overstates the
+blast radius. Six (`show()` itself, three in `main.ts`, both `projects.ts` pickers) already parented
+whenever a window existed and only fell back to parentless on a null `mainWindow`. The two in
+`main.ts`'s first-run picker run inside `whenReady` at `resolveInitialProject()`, **before**
+`showSplash()` and `createWindow()`, so there is provably no window to parent to and they stay
+app-modal either way — which is fine there, because nothing else is running yet to be starved.
+
+Because a correct helper sitting beside incorrect callers is invisible to a unit test,
+**`mainDialog.test.ts` bans the `dialog` IMPORT everywhere under `engine/electron/**` except the
+owning module** (plus the one escape a specifier ban cannot see, `import * as electron`). Corpus is
+derived RECURSIVELY from the directory and read through `readScannedSource`, so a docblock mention
+neither satisfies nor hides a match (#812), with a non-vacuity test that the owner really does call
+what it bans.
+
+⚠️ **It bans the import rather than the member access, and that distinction is the whole guard.**
+The first version matched `dialog.show*` in the source and review broke it in one word:
+`import { dialog as __d } from 'electron'` slips past a regex bound to the literal identifier
+`dialog`, whether the call is `__d.showMessageBox(…)` or a destructured `const { showMessageBox } =
+__d`. The real defect was then reinstated at `autoUpdate.ts`'s error handler through such an alias
+and **all 1072 electron tests stayed green.** Banning the specifier is unspoofable by renaming,
+because the rename is IN the specifier.
+
+⚠️ **A source guard was never enough on its own, either.** The three bypassing sites had no
+behavioural test at all: every assertion on them read only `lastBox().title`, `boxAt` is
+deliberately parent-agnostic, and they all ran under a fixture with `windows = []` — so they were
+parentless BY FIXTURE and could not have observed parenting even had they asked.
+`autoUpdate.test.ts` now puts a window in the fixture and asserts the PARENT for all three.
+
+**Two policies, both correct, and the caller says which** — this is the constraint that stopped the
+two rules being merged into one:
+
+| policy | who | why |
+|---|---|---|
+| `visibleNonSplash` | `autoUpdate.ts`, `main.ts`, `projects.ts` | needs the user's ANSWER. The splash is destroyed at renderer-mount and would take an open sheet down unanswered; the editor window is hidden until reveal |
+| `anyWindow` | `fatalDialog.ts`'s probe | only needs "not app-modal" — it terminates on its own timer either way, so an unanswered sheet costs it nothing |
+
+⚠️ **`isDestroyed()` is filtered BEFORE `isVisible()`, and the order is load-bearing**:
+`isVisible()` throws on a destroyed window, so a window torn down between `getAllWindows()` and the
+probe turned a dialog into an exception. `show()` had that shape.
+
+⚠️ **When there is no window the box is still shown, parentless — deliberately.** The alternative,
+skipping it and writing to the log, re-creates the defect #1032 spent a whole issue removing: a
+user-visible outcome reported somewhere the user never looks (a packaged editor's `main.log` is not a
+UI). `fatalDialog.ts` is the ONE caller that must not take that trade, because a blocked loop kills
+the timer that does the terminating — it keeps its own "no parent ⇒ show nothing, exit now" refusal.
+
+⚠️ **But it is NOT independent of `mainDialog`, and reading it as such is the trap.** `main.ts`
+wires BOTH its injected deps through this module: the parent probe is
+`resolveDialogParent('anyWindow')` and the show is `showMessageBox(o, parent)`. What `fatalDialog`
+keeps is the DECISION — it returns early on a null parent, so `mainDialog`'s "resolve one anyway"
+branch is unreachable from there. It does not keep the plumbing. So a change to the default policy
+here, or anything that makes these retry or queue, **is inherited by the terminate path silently.**
+
+### An editor state file's absent-case default is a MIGRATION question (#1041)
+
+`editorStateDir()` is the subKey-less profile `base`, and `3c61ce6fe` (#1036) moved the packaged one
+from `<appData>/Modoki Editor` to `<appData>/Modoki Editor/<install-id>`. That moved **where we look,
+not the data** — so for an upgraded install every reader keyed off it saw its file as *absent*, and
+every one of them reads absent as "the user never chose".
+
+Mostly that is harmless and self-heals. Once it was not: `readCdpEnabled` returns **true** for an
+absent `cdp.json`, so a 127.0.0.1 remote-debugging port a user had deliberately unchecked came back
+on. It is the only item in #1036's reset list a user cannot notice by looking — the AI panel's
+checkbox reads the same missing file and agrees with the wrong answer.
+
+**The rule: a state file whose absent-case default is not the SAFE one must be covered by
+`adoptLegacyEditorState`** (`engine/electron/userDataDir.ts`), which runs at profile-decision time,
+packaged only, before the first read.
+
+- **Matched by EXTENSION, not a list of names.** The enumerated first draft was already wrong:
+  `ui-prefs.json` is a bare literal in `zoom.ts`, not an exported constant, so a hand-maintained set
+  shipped missing one, invisibly. A `*.json` at the profile root is ours by construction — Chromium's
+  own files there are extension-less (`Preferences`, `Local State`, `Cookies`, `DIPS`) or directories.
+  Verified against a real pre-#1036 profile.
+- **COPY, not rename** (owner, 2026-09-10) — the one place this departs from `adoptLegacyToolchain`.
+  That dir is shared by every packaged install on the machine, and a rename lets the first upgraded
+  one strip the opt-out from the others: this bug again, rarer and harder to spot.
+- ⚠️ **The two dotfiles there are out of scope, not missed.** `.updaterId` and `.vite-cache-build` are
+  read from `app.getPath('userData')` — the possibly SUB-KEYED dir — not from `editorStateDir()`, so
+  copying them into `base` would not put them where their readers look.
+- ⚠️ **Use `samePath`, never `path.resolve(a) === path.resolve(b)`**, for "is the target already the
+  legacy dir" — the architecture guard catches it, and it fails open on Windows (#869/#899).
+
 ### The packaged editor must not write inside its own bundle (#326)
 
 A packaged editor's `REPO_ROOT` is `<Resources>/app.asar.unpacked` — **inside the signed `.app`**.
@@ -1282,6 +1871,226 @@ exercises the asset pipeline**: `games/anim-bug` has no rigged model, so it buil
 or without the `--configLoader runner` that was wrongly declared good on it; `demos/forest-camp` is
 the distinguishing fixture.
 
+### `files` ships the WORKING TREE, not the repo (#1050)
+
+`files: engine/**/*` packages every **gitignored** artifact under `engine/` unless a `!` glob says
+otherwise. Measured 2026-09-11: `engine/` held **2,802 tracked files and 20,770 on disk**, and the
+delta shipped. Five SwiftPM caches alone were **731 MB / 9,609 files** — `codesign` was still walking
+`capacitor-modoki-ota/core/.build/debug/index/store/v5/records/…` **58 minutes** into a local
+`dist:mac`, producing a 1.8 GB app against CI's 881 MB. It never reached a user (releases are cut on a
+clean runner with no such caches), but it cost every developer who packaged locally, and a Swift index
+database inside a signed, notarized bundle is content nobody intended to ship.
+
+**This is the third list in [#885's class](verify-and-ci.md) — "N hand-maintained ignore lists must
+agree, and nothing makes them".** #885 reconciled `.gitignore` with ESLint's `ignores`; `files` was
+never enumerated, and #1050 is the eighth instance it predicted.
+
+⚠️ **`files` cannot be DERIVED from `.gitignore` the way ESLint's `ignores` was.**
+`engine/electron/dist/`, `engine/packages/*/dist/`, `engine/tools/*/dist/`, `node_modules/` and
+`engine/vite.config.cjs` are all gitignored and all **required at runtime** — the packaged editor
+spawns `engine/tools/modoki-mcp/dist/index.js` directly, and #326 turns on `vite.config.cjs` being
+present. "Gitignored" carries no packaging verdict at all. So the rule enforced by
+`engine/tests/electron/packagingManifest.test.ts` is **exhaustive classification**: every `.gitignore`
+pattern that can match under a shipped root carries a row saying `ship`, `exclude` or `absent`, with
+its reason. A pattern with no row is a RED, which turns the ninth instance into a failing test the
+day the artifact appears.
+
+#### ⚠️ The trap: an artifact arrives at TWO paths, and the on-disk one is the wrong one
+
+**npm workspaces symlink every `engine/packages/<dir>` into the root `node_modules` under its package
+NAME, and electron-builder DEREFERENCES those links at pack time.** So the SwiftPM caches reach the
+app as `node_modules/capacitor-modoki-ota/.build/…` and **never** as
+`engine/packages/capacitor-modoki-ota/.build/…` — which is the path every `find`, every `du` and
+#1050's own table reports, because that is where the bytes sit.
+
+The first fix for #1050 was `engine/**`-anchored. It passed every assertion in the packaging guard
+and **still shipped 3,506 `.build` files into a 1.1 GB app.** The unit test and the packaged build
+disagreed; the packaged build was right. Hence:
+
+- The artifact excludes are **unanchored** (`!**/.build/**`, `.swiftpm`, `.spm-cache`, `DerivedData`,
+  `*.xcuserdata`, `.gradle`, `android/**/build`, `.modoki`, `*.tsbuildinfo`, `*.meta.local.json`,
+  logs, `.DS_Store`, and the secret-class patterns). Only `engine/coverage/` and
+  `engine/tsconfig.app.scoped*.json` stay anchored — they have no workspace twin.
+- The guard checks **both** path shapes, deriving the twin from each package's own `name` field
+  rather than a hand-written table, so a renamed or added workspace package cannot fall out of
+  coverage.
+
+#### Verifying a change here
+
+`npm run verify:packaged` is mandatory, but it is not sufficient on its own: **the unit test models
+electron-builder, and a model can be wrong in exactly the way above.** Build the real thing and count:
+
+⚠️ The path below is **macOS-only** — `/var/folders/…` is the macOS temp root, and the artifact is
+a `.app` bundle. On Windows `smoke-packaged.sh` stages under the platform temp dir and produces an
+unpacked `win-unpacked/` directory instead; read the path the script prints rather than assuming
+either shape. (This repo has a standing scar for Mac-shaped assumptions in shared tooling — see
+[windows.md](windows.md).)
+
+```bash
+npm run smoke:packaged     # builds the faithful packaged .app, launches it headless
+APP=$(find /var/folders/*/*/T/modoki-pkg-smoke-* -maxdepth 3 -name '*.app' | head -1)   # macOS
+find "$APP" -type d -name .build -exec find {} -type f \; | wc -l      # must be 0
+du -sh "$APP"                                                         # 905 MB, not 1.1 GB
+```
+
+⚠️ **Check the accept side in the same pass** — an over-broad glob drops a required binary and fails
+at RUNTIME, never at build time. `Contents/Resources/bin/{toktx,msdf-atlas-gen}` and
+`app.asar.unpacked/engine/tools/modoki-mcp/dist/index.js` must all still be there.
+
+**Result of #1050:** 1.1 GB → **905 MB**, 19,548 → 16,039 files, zero `.build` / `.swiftpm` /
+`.gradle` / `.modoki` / `DerivedData` / `*.tsbuildinfo` / `*.meta.local.json`, smoke green (scene
+loaded, no Vite resolve errors, no renderer console errors, CSP enforced). Two secret-class gaps were
+closed at the same time — nothing matching `.env`, `*.p8`, `*.jks`, `*.keystore` or
+`project.user.json` existed under `engine/` (verified), but nothing excluded them either, and
+`asarUnpack` is a real directory on disk rather than a sealed archive.
+
+## Editor self-update (`engine/electron/autoUpdate.ts`)
+
+The packaged editor updates itself with electron-updater over the **public** `lsgmasa33/modoki-engine`
+GitHub Releases feed (`publish:` in `electron-builder.yml`, baked into the app's `app-update.yml`).
+`npm run dist` uses `--publish never`, so packaging only records WHERE to look; the `v*` release
+workflow is what uploads `latest-mac.yml` / `latest.yml` + the zip/blockmap.
+
+**The flow, and every dialog in it.** Both entry points — the silent launch check and
+`Check for Updates…` (the macOS app menu, under About; a Help menu elsewhere — see
+`installAppMenu` in `projects.ts`) — run the same sequence:
+
+| Event | What the user sees |
+|---|---|
+| `update-not-available` | "Modoki Editor is up to date" — **interactive check only**, the launch check stays quiet |
+| `update-available` | **"Modoki Editor X.Y.Z is available — Download & Install / Later"**, on BOTH paths |
+| `download-progress` | the dock/taskbar progress bar (`win.setProgressBar`, 0→1); no dialog |
+| `update-downloaded` | "Update Ready — Restart Now / Later"; the bar goes **indeterminate**, not away |
+| `error` | reported when the check was interactive **or** a download/install was in flight; a silent launch check's feed error stays silent |
+
+⚠️ **`update-downloaded` does not mean the bytes are on disk — on macOS it fires EARLY.**
+`MacUpdater.dispatchUpdateDownloaded` runs when electron-updater's local proxy server starts
+listening, *before* it asks Squirrel to pull the ~294 MB zip through it. So the progress bar goes
+indeterminate there rather than being cleared, and — the sharper consequence — **`quitAndInstall()`
+can be a no-op**: with `squirrelDownloadedUpdate` still false and `autoInstallOnAppQuit` true,
+`MacUpdater.quitAndInstall` adds a listener and returns, so a user who clicked **Restart Now** within
+a few seconds of the prompt got no quit until Squirrel finished on its own — an unannounced quit,
+which from the user's side is the editor closing itself.
+
+**Fixed in #1033: the RESTART PROMPT now waits for Squirrel, not for the proxy.** #1032 established
+the early fire and applied it to the progress bar, then armed the prompt on that same event two lines
+below — so the fact was already written down and only its consequence for the button was missed.
+
+The real signal is public API rather than a private field: `MacUpdater` does
+`this.nativeUpdater = require("electron").autoUpdater` and flips `squirrelDownloadedUpdate` on THAT
+emitter's `update-downloaded`. `autoUpdate.ts` listens to the same one.
+
+- **darwin only.** Windows' `NsisUpdater` has no proxy dance — its `update-downloaded` means the file
+  IS downloaded and there is no native emitter to wait for. Gating it there would hang the prompt
+  forever, which is worse than the bug. ⚠️ The suite PINS `process.platform` per test rather than
+  reading the host's, or the three legs of public CI would each test a different branch and only the
+  macOS one could catch a regression.
+- **No timeout that prompts anyway** — that re-arms the original defect. A transfer that never
+  completes is not silent: electron-updater rejects it through `nativeUpdater.once("error", reject)`,
+  which surfaces on our `error` handler as "Update Download Failed".
+- **Readiness re-arms per download.** Squirrel having finished 1.0 says nothing about 2.0.
+- **A "Restart Now" that has not quit within a grace window now says so.** This is the one path where
+  we cannot see inside Squirrel, and a click answered with neither a quit nor a message is the shape
+  #1032 existed to remove.
+
+⚠️ **Still do not "fix" any of this by flipping `autoInstallOnAppQuit`** — that flag is what stages
+the update for the next ordinary quit, which is the fallback the "Later" button promises.
+
+⚠️ **NOT verified on a device.** Confirming it needs a Developer-ID-signed, notarized build at a
+version BELOW the feed's latest (`updateBlockedReason` skips ad-hoc builds, so `npm run dist` will
+not do — `dist:notarized` will), and the window is seconds wide. The unit tests prove the decision
+table, not Squirrel.
+
+⚠️ **A dialog is never parented to the splash.** At launch `getAllWindows()[0]` IS the splash
+(`main.ts` shows it, creates the editor window *hidden*, then calls `setupAutoUpdate`), and
+`closeSplash()` destroys it the instant the renderer mounts — taking an open sheet down with it,
+unanswered. A feed round-trip beats a React mount often enough that this is the normal case, not a
+race. `show()` picks the first **visible non-splash** window and otherwise goes free-floating.
+
+⚠️ **`autoDownload` is deliberately `false` (#1032), and nothing downloads without consent.** It used
+to be `true` with `update-available` answered by a bare `console.log` — so the ONE outcome the menu
+item exists to report was the ONE with no UI. Clicking it silently began a ~294 MB fetch and showed
+nothing for minutes; it read as a dead menu item. Confirmed on the owner's Mac 2026-09-10: an
+installed, notarized 0.6.0 against a 0.7.0 feed left a 94%-complete
+`~/Library/Caches/modoki-engine-updater/pending/temp-Modoki-Editor-0.7.0-arm64.zip` abandoned when
+the app was quit mid-silence. **Flipping `autoDownload` back to `true` re-creates the whole defect** —
+`engine/tests/electron/autoUpdate.test.ts` fails if you do.
+
+**Eligibility is ONE rule (`updateBlockedReason`) shared by both entry points**, because they
+disagreed: the launch check skipped unsigned builds and the menu check did not, so an ad-hoc local
+build would happily download a few hundred MB that Squirrel then refuses to install. A build is
+ineligible when it is unpackaged (dev / `MODOKI_PROD`), has `MODOKI_NO_AUTOUPDATE=1` (the `--dir`
+packaged smoke), or is **ad-hoc signed** — a locally-built DMG, which Squirrel.Mac rejects a
+Developer-ID update for ("code failed to satisfy specified code requirement(s)"). Ineligible launches
+also force `autoInstallOnAppQuit = false`, so a build staged by a PRIOR eligible session cannot
+silently replace this one on quit. The interactive check now *says* why instead of going to the feed.
+
+**A repeat check always re-reads the feed, and the `update-available` handler decides**: mid-download
+it reports "already downloading"; a staged build of the SAME version re-offers the restart; a staged
+build the feed has since **superseded** falls through and is offered as a fresh download. Those guards
+exist because the payload is a few hundred MB — a duplicated fetch is not a cosmetic bug.
+
+⚠️ Do NOT re-add a `if (downloadedVersion) return` short-circuit to `checkForUpdatesInteractive`.
+It looks like a saving and is a bug: once 0.7.0 was staged and the user picked "Later", every later
+check re-offered 0.7.0 for the life of the process and 0.8.0 could never be seen. It also put a
+second copy of the guards where they drift from the handler's — the copy the tests then reach, while
+the handler's stay green-when-deleted. One copy, in the handler, which knows the feed's version.
+
+**One prompt at a time** (`promptOpen`). `downloading` cannot stand in for it: it is set *inside* the
+dialog's `.then`, after the await, so two unanswered `update-available` events stacked two identical
+dialogs. electron-updater happens to dedupe the second `downloadUpdate()` by returning the in-flight
+promise — its invariant, not ours, and the duplicate dialog was ours regardless.
+
+⚠️ **"Restart Now" sets `installing`, and main's `before-quit` MUST defer to Squirrel from there** —
+calling its own `app.exit(0)` hard-exits before the install handshake completes and leaves the update
+unapplied until the next quit. `isUpdateInstalling()` is that seam.
+
+⚠️ **…and a FAILED install must release that flag.** `before-quit` returns EARLY while it is set,
+skipping the whole awaited teardown — including `releaseDeviceResourcesOnExit()`. A device claim is
+**machine-wide**, so a flag stuck by a refused install would lock a phone out of every other clone on
+every later quit, hours after the update failed and with nothing on screen connecting the two. The
+`error` handler releases it and says "Update Install Failed".
+
+### The win32 short-circuit is MEASURED, not merely reasoned (#1049)
+
+`installableNow()` returns true immediately off darwin, and the risk that justified a ticket was that
+a wrong or lost short-circuit would make Windows wait for a native emitter that never fires — **no
+prompt at all**, a worse failure than the macOS one #1033 fixed, and invisible to every gate we run.
+Driven end-to-end on the `win` clone on 2026-09-11 against the real GitHub feed:
+
+```
+main.log  2026-09-11T00:28:51.089Z  [auto-update] downloaded: 0.7.0
+window            09:28:51.225      "Update Ready"        ← +136 ms (clocks are 9h apart)
+```
+
+**136 ms is an upper bound** — the window poller ran at 250 ms — against the macOS baseline of
+**~5.0 s** in the same flow. "Restart Now" then quit and ran the real NSIS installer, and the app
+came back as 0.7.0. So the two platforms differ exactly as the code claims, and the gap is not a
+race that happens to be short: on Windows there is nothing to wait for.
+
+⚠️ **The measurement is only worth something because the instrument was proved first.** A window
+detector that sees nothing and a prompt that never appears are the same observation, and the FAIL
+this ticket hunts is precisely "nothing appeared" — so a blind probe fabricates the headline. The
+`Update Available` dialog is the positive control: it is the same `dialog.showMessageBox` code path,
+it necessarily comes first, and the detector caught **and drove** it (`ENTER` → Download & Install)
+before being trusted on `Update Ready`. Never read a FAIL out of a run that saw neither dialog.
+
+Three things a repeat run needs, all of which cost the first one time:
+
+- **The log is NOT at `%APPDATA%\Modoki Editor\logs\main.log`.** It is nested under an install hash
+  AND a project hash — `%APPDATA%\Modoki Editor\<installHash>\<project>-<hash>\logs\main.log`
+  (measured: `66ca4fef\3d-test-59a376d1\`). Looking at the shallow path finds no file at all, which
+  reads like "the app never logged" rather than "you are looking in the wrong place".
+- **There is no Windows signing, and the update works anyway.** No cert is configured, so SmartScreen
+  blocks the test build on first launch (a human must click through) — but `app-update.yml` carries
+  no `publisherName`, and `NsisUpdater.verifySignature` returns early on `publisherName == null`, so
+  the downloaded installer is never signature-checked. Do not "fix" the ticket's instruction to cut a
+  *signed* build by hunting for a certificate; there is none to find.
+- **A `/S` install can still land in `C:\Program Files`.** `perMachine: false` is the *preference*,
+  not a guarantee — accept the elevation prompt and NSIS takes the machine-wide path, after which the
+  update's own install needs elevation too. Per-user vs per-machine changes who can apply an update,
+  so note which one a run actually produced rather than assuming the config.
+
 ## CLI recipes
 
 The examples use `games/<id>`; substitute the project and its appId. Note the **project-dir cwd**
@@ -1297,18 +2106,25 @@ the SAME command run for an iOS/Android pre-`cap sync` build must say `--target 
 (base `"/"`, since Capacitor serves the dist from the app root). There is no default in either
 direction: defaulting would be silently wrong for one of the two callers.
 
-#### `--target native` runs the same in-process heals as the editor (#148, #150), then verifies (#685)
+⚠️ **A web build must be SERVED over HTTP.** Opening `games/<id>/dist/index.html` as `file://`
+fails with module, CORS and asset-fetch errors that look exactly like build bugs, and that
+misreading has cost time. Serve the `dist/` folder (any static server) before diagnosing anything.
 
-Before its shell steps, `build-web.mjs` runs the SAME three in-process heals as the editor's
-`/api/build`, in the same order, for the same reason each exists — and then BOTH paths verify the
-result:
+#### `--target native` heals through the same function as the editor (#148, #150, #685, #827)
 
-| In-process heal | Editor `/api/build` | CLI `--target native` |
-|---|---|---|
-| `healNativeConfig` — sync `build.appleTeamId` → iOS `DEVELOPMENT_TEAM`, Android `local.properties` | ✅ | ✅ |
-| `ensureCapacitorDeps` — add engine-REQUIRED Capacitor plugins the project predates | ✅ | ✅ |
-| `vendorEnginePlugins` — re-pack + install a changed engine plugin | ✅ | ✅ |
-| `verifyInstalledMatchesTarballResult` — **verification, not a heal** (#685): fail if `node_modules` holds a PREVIOUS tarball's bytes | ✅ | ✅ |
+Before its shell steps, a native build heals the project through **one function,
+`healNativeProject` (`engine/plugins/healNativeProject.ts`)**, and both entry points call it: the
+editor's `/api/build` in-process, and `build-web.mjs --target native` through
+`loadEnginePluginModuleResult`. The steps, in order:
+
+| Step | What it does |
+|---|---|
+| gate | refuse unless this process (or the build that spawned it) holds the project's **build claim** — every step below writes the project |
+| `healNativeConfig` | sync `build.appleTeamId` → iOS `DEVELOPMENT_TEAM`, Android `local.properties` |
+| `ensureCapacitorDeps`, per platform | add engine-REQUIRED Capacitor plugins the project predates |
+| `vendorEnginePlugins` | re-pack a changed engine plugin's tarball |
+| `npm install` | iff either of the two steps above changed something |
+| `verifyInstalledMatchesTarballResult` | **verification, not a heal** (#685): refuse if `node_modules` holds a PREVIOUS tarball's bytes |
 
 Games don't build `engine/packages/capacitor-*` from source — they depend on a content-addressed
 tarball committed into the project (`"capacitor-game-debug": "file:plugins/…-<hash>.tgz"`). So a
@@ -1318,40 +2134,59 @@ gets one just by building; and `build.appleTeamId` only reaches a device build o
 into the generated native project. On `web`/`playable` none of this runs (every heal here is a
 native-artifact concern; a web build has nothing to keep fresh and must not pay for it).
 
-⚠️ **The fourth row is a CHECK, and it runs UNCONDITIONALLY — not behind the install condition
-the three heals share.** The state it catches is `node_modules` holding a previous tarball's
-contents while the dep spec, both lockfiles and the install marker all agree the current one is
-installed. In that state nothing looks changed, `npm install` reports "up to date", and the install
-step does nothing — so a check gated on "did a heal change something?" could never fire in the one
-case it exists for. It fails the build rather than repairing: an `rm -rf` inside `node_modules`
-mid-build is itself a mutation, and — the load-bearing reason — this check knows only that the
-tarball and `node_modules` DISAGREE, not which side is right. `vendorEnginePlugins` may rewrite a
-tracked lockfile mid-build because it just packed the tarball and knows it is correct; this check
-has no such knowledge, and one of its reachable causes is a mis-resolved `.tgz` merge conflict
-where the committed tarball is the wrong generation. The remedy is printed per plugin — and it is NOT a
-bare `rm -rf <project>/node_modules/<plugin> && npm install`, which leaves the stale integrity in
-place; see the ⚠️ npm-cache-trap block a few sections below for the recipe that actually works.
+**Why one function, and what it replaced.** Every step was always single-sourced; what each entry
+point wrote by hand was *which* steps run and *in what order* — and those copies drifted. The CLI
+ran none of the editor's heals (#148, which added one), then two were still missing (#150), then it
+lacked the stale check (#685); each fix copied one more step into one more file, and following the
+CLI recipe after a plugin edit produced an IPA/APK containing the PREVIOUS native code while every
+signal reported success. A step added to `healNativeProject` now runs on both. The function takes
+its I/O as ports (`log`, `warn`, `install` — the route streams over SSE and aborts with its client,
+the CLI prints and blocks) and nothing else: there is no option that skips a step.
 
-⚠️ **Both paths, deliberately.** A check in only one recreates #148's asymmetry — and the editor's
-Build menu is the canonical path, so a CLI-only guard would protect the path fewer humans use.
-`cliNativeBuildHeals.test.ts` pins the call's position in both, brace-matched rather than by string
-match, so the two cannot drift apart.
+⚠️ **On a dev machine an editor native build heals TWICE, on purpose.** `/api/build` calls the
+function in-process and then spawns `build-web.mjs --target native`, which calls it again. The
+second run is a few idempotent reads. It is not a duplicate to remove: a PACKAGED editor ships no
+esbuild, so the spawned script cannot load the `.ts` module and degrades with a warning — there the
+route's in-process call is the only heal that runs. (That nesting — the editor route *wrapping*
+the CLI script rather than sitting beside it — is the general shape of the build entry points;
+§ "One entry point per operation" below.)
 
-Landed in two steps: #148 added only the third heal, which meant following the CLI recipes after a
-plugin edit produced an IPA/APK containing the PREVIOUS native code while every signal reported
-success; #150 closed the remaining two, using the exact editor semantics — same ordering, same
-install condition — rather than re-deriving them:
-
+- **The heal's claim gate is at the mutation, not in each caller's line order.** `holdsBuildClaim`
+  (`buildClaimsStore.mjs`) is true for the process that took the claim and for a child that
+  inherited its token on `MODOKI_BUILD_CLAIM_TOKEN`. An unreadable claims file reads as NOT held —
+  it answers a gate. Every build entry point already claimed before it healed (measured at #827),
+  so this closed no live race; it makes a build that heals unclaimed refuse instead of racing.
+  `scaffoldNativeTarget` carries the same gate at its entry since #1160. The Electron heal-on-open
+  calls `healNativeConfig` and `vendorEnginePlugins` directly, so it takes the claim itself instead
+  (§ "One build at a time" → "Every other project writer").
+  ⚠️ A claim older than `BUILD_CLAIM_TTL_MS` (60 min) reads as not held, so a route whose steps
+  before the heal ran that long would refuse. `/api/build` heals before the go-ios download and the
+  release-file writes for that reason; only an auto-scaffold precedes it.
 - **Order is load-bearing.** `ensureCapacitorDeps` runs BEFORE `vendorEnginePlugins`: when it adds
   `capacitor-game-debug`, it writes a placeholder dep spec (`'*'`), and `vendorEnginePlugins`
   rewrites that placeholder to the real `file:plugins/<name>-<ver>.tgz`. Vendoring first would
   leave the placeholder unrewritten — a project stuck depending on a spec npm can't install.
-- **Install is conditioned on EITHER heal changing something** (`depHeal.changed ||
-  v.needsInstall`), not just the vendor step — a newly-added dep spec is just as inert until
-  installed as a fresh tarball.
-- `ensureCapacitorDeps` needs a platform, and `--target native` covers both; the CLI heals
-  whichever of `ios/`/`android/` the project already has on disk (a project with neither yet is
-  the editor's scaffold-then-build path, which the CLI has no equivalent entry point for).
+- **Install is conditioned on EITHER step changing something**, not just the vendor step — a
+  newly-added dep spec is just as inert until installed as a fresh tarball. The install marker is
+  written only after the install succeeds; a failed install ends the heal before the stale check.
+- ⚠️ **The stale check runs UNCONDITIONALLY — not behind the install condition.** The state it
+  catches is `node_modules` holding a previous tarball's contents while the dep spec, both lockfiles
+  and the install marker all agree the current one is installed. In that state nothing looks
+  changed, `npm install` reports "up to date", and the install step does nothing — so a check gated
+  on "did a heal change something?" could never fire in the one case it exists for. It refuses
+  rather than repairing: this check knows only that the tarball and `node_modules` DISAGREE, not
+  which side is right (`vendorEnginePlugins` may rewrite a tracked lockfile because it just packed
+  the tarball and knows it is correct; one of this check's reachable causes is a mis-resolved `.tgz`
+  merge conflict where the committed tarball is the wrong generation). The remedy text is
+  `describeStaleNodeModules` — one producer, and NOT a bare `rm -rf <project>/node_modules/<plugin>
+  && npm install`, which leaves the stale integrity in place; see the ⚠️ npm-cache-trap block a few
+  sections below.
+- `ensureCapacitorDeps` needs a platform. The route passes the one it is building; `--target native`
+  covers both, so the CLI passes whichever of `ios/`/`android/` the project already has on disk (a
+  project with neither yet is the editor's scaffold-then-build path, which the CLI has no equivalent
+  entry point for).
+- Tests: the sequence's behaviour is `tests/plugins/healNativeProject.test.ts`; that each entry point
+  calls it and calls no step directly is the census in `tests/architecture/cliNativeBuildHeals.test.ts`.
 - ⚠️ **A PACKAGED editor must never let this chain BUILD a plugin, and that is decided by an env
   var, not by the call site.** `vendorEnginePlugins`'s `canBuild` defaults to
   `process.env.MODOKI_PACKAGED !== '1'`; `main.ts` sets `MODOKI_PACKAGED=1` when `app.isPackaged`,
@@ -1463,6 +2298,26 @@ Measured: that heals. It is also exactly what `vendorEnginePlugins` does after a
 (`invalidateLockfileEntry`, then the plain `npm install` both native build paths already run), which
 is why that path genuinely re-resolves.
 
+⚠️ **This is not specific to plugin tarballs — any dependency bump can land in the same state.**
+Measured 2026-09-05 (npm 11.12.1 / node v26) on a transitive security bump: after `npm install`
+exited 0 with "found 0 vulnerabilities", `fast-uri` was 3.1.5 on disk where the lockfile said
+3.1.7, and `@xmldom/xmldom` 0.8.13 where it said 0.8.15. `--ignore-scripts` behaves like PLO. What
+makes it dangerous is that **no npm command reports the truth**:
+- `npm audit` reads `package-lock.json`, not the disk, so it calls a stale tree clean.
+- `npm ls` reads the hidden `node_modules/.package-lock.json` and tells the same lie — measured
+  `qs@6.16.0` from `npm ls` while `node_modules/qs/package.json` said 6.15.2.
+- `npm install --dry-run` says "up to date", and a real `npm install` agrees and does nothing.
+
+**Detect by reading the package's own file**, the one source that cannot lie:
+`node -e 'console.log(require("./node_modules/<pkg>/package.json").version)'`, compared against
+the lockfile's `version`. **Fix** by forcing re-extraction: `rm -rf node_modules/<pkg>` (and any
+nested `node_modules/<parent>/node_modules/<pkg>` copy), then `npm install`, which reports "added N
+packages". `npm ci` also works but rebuilds the whole tree. ⚠️ **The state is per npm ROOT**:
+repairing the repo root fixes only the root, and every `games/*`, `demos/*`, `engine/tools/*` and
+`site/` keeps its own stale tree, so a sweep that bumps N lockfiles must check N trees. This is the
+general form of #215 ("present-but-STALE makes 'already installed' true and wrong") — a green
+install is not evidence the tree changed.
+
 ⚠️ **Do not confuse step 3 above with the SUPERSEDED recipe** — the one this doc and the guards
 printed until 2026-09-05, whose step 2 was `npm install --package-lock-only`. That one also ended
 up working, but only because its step 3 (`rm -rf node_modules/<plugin>`) undid the damage its own
@@ -1551,6 +2406,49 @@ Two notes worth carrying:
   grepping the new source string into `games/<id>/node_modules/<plugin>/...` before trusting a
   device build. A `git status` on `games/<id>/plugins/*.tgz`/`package.json` after re-vendoring
   confirms whether it actually changed.
+
+#### One entry point per operation
+
+**Every build operation has two entry points — an editor route and a CLI script — and every step
+both need is ONE function both call (#827).** The failure this closes was not a missing guard but a
+missing place to put one: each entry point composed its preamble by hand, so a guard or heal added to
+one did not exist on the other. Eight issues in six months were that shape (#148, #150, #582, #589,
+#649, #650, #685, #1011), each fixed by copying one more step into one more file.
+
+| Operation | Editor route | CLI script | Shared function |
+|---|---|---|---|
+| project-config validation | `/api/build`, `/api/add-native-target` | `build-web.mjs`, `add-native-targets.mjs` | `projectBuildConfigErrors` (`load-project-config.ts`) |
+| native heal | `/api/build` | `build-web.mjs --target native` | `healNativeProject` (`healNativeProject.ts`) — § above |
+| native scaffold | `/api/add-native-target` | `add-native-targets.mjs` | `scaffoldNativeTarget` (`addNativeTarget.ts`) |
+| OTA publish-request check | `/api/ota/publish` | `ota-publish.mjs` | `otaPublishPreflight` (`scripts/ota/publishPreflight.mjs`) — wording per side, keyed by `OTA_PUBLISH_REFUSALS` |
+| icon + splash inputs | `/api/build`'s `iconStep` | `generate-icons.mjs` (run by `build-web.mjs --target native`) | `resolveIconInputs` + its flag inverse `iconInputsToArgs` (`scripts/iconInputs.mjs`) |
+
+⚠️ **The route usually WRAPS the script rather than sitting beside it.** `/api/build` runs its own
+preamble and then spawns `build-web.mjs`; `/api/ota/publish` builds and then spawns
+`ota-publish.mjs`; `scaffoldNativeTarget` spawns `build-web.mjs --target native` mid-scaffold. So a
+step lives in the shared function and may run twice on one editor build — that is the price of the
+packaged editor, where a spawned `.mjs` cannot load `.ts` (no esbuild) and only the route's
+in-process call runs. Deleting the "duplicate" in-process call breaks the packaged editor.
+
+**When the script cannot read the config, the route resolves for it.** Icons are the worked
+example: `generate-icons.mjs` reads `project.config.json` itself, but in a packaged editor that read
+fails (no esbuild) and it would see nothing. So `iconStep` resolves the inputs in-process with the
+config it already parsed and passes them ALL as flags through `iconInputsToArgs`, the resolver's
+exact inverse — the script, resolving those flags with no config, gets the same inputs
+(`generateIcons.test.ts` round-trips it). Before #827 `iconStep` assembled fourteen flags by hand
+beside the resolver, and the two had already disagreed once (#1027).
+
+**The claim is the one step that stays per side**, because it genuinely differs: a route takes
+`acquireBuildSlot` (the in-process slot plus the cross-process claim, released together), a script
+takes `acquireBuildClaim` alone (a one-shot script, through `claimProjectOrExit`). What is shared is
+the rule: claim before any mutation. The native heal and the native scaffold enforce it inside
+themselves (`holdsBuildClaim`). `projectWritersTakeBuildClaim.test.ts` holds every other caller to it
+(§ "One build at a time" → "Every other project writer", #1160).
+
+**The shape a shared step takes**, and the one it must not: a function with its I/O injected
+(`log`, `install`, `send`, `runShell`), never one with booleans that skip steps. A required step
+behind an optional flag is how #150 shipped — `electron/main.ts` calls `healProjectOnOpen`
+explicitly for the same reason. A caller that should not run a step does not call the function.
 
 #### Why the vendored tarball's hash churns, and the fix
 

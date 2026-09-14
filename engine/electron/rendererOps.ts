@@ -23,6 +23,7 @@ import { pruneOldTempFiles } from '../plugins/backend/tempFiles';
 // `agentBridge.ts` are reached through, so a member rename here must redden this branch on
 // `frameLoop.status` too, not just those two (#682 close-out round 3, BLOCKER 2).
 import type { FrameLoopStatus } from '../packages/modoki/src/runtime/rendering/frameLoopStatus';
+import type { MouseButton as SharedMouseButton, EditorInputModifier } from '../tools/shared/inputVocabulary';
 
 const MAX_SIDE = 1568;
 const JPEG_QUALITY = 70;
@@ -199,6 +200,135 @@ export function explainCaptureFailure(
     '(nothing to capture), "hidden" means the window is occluded, "stalled" means a real wedge.' + ctx;
 }
 
+/** The compositor could not produce a frame. A CLASS, not a message prefix (#994): the host route
+ *  has to tell this apart from an ordinary failure (a bad `maxSide`, an unwritable temp dir) to
+ *  give it a §5 code, and `relayFailureStatus`'s scar in `editorBackendRouter.ts` is exactly what
+ *  string-matching an error costs — a bare word in one op's prose eventually collides with
+ *  another's. `cause` keeps the raw `UnknownVizError` for anyone who wants it. */
+export class CaptureUnavailableError extends Error {
+  /** The window + renderer facts `explainCaptureFailure` was given. Carried STRUCTURALLY so the
+   *  refusal can branch on the cause instead of grepping the sentence — the same reason this is a
+   *  class and not a message prefix. */
+  readonly facts: { window: CaptureWindowFacts | null; surface: RenderSurfaceFacts | null };
+
+  constructor(
+    message: string,
+    facts: { window: CaptureWindowFacts | null; surface: RenderSurfaceFacts | null },
+    cause?: unknown,
+  ) {
+    super(message, { cause });
+    this.name = 'CaptureUnavailableError';
+    this.facts = facts;
+  }
+}
+
+/** Is this an ORDINARY, supported editor state — or a broken editor? (#994 close-out F2.)
+ *
+ *  ⚠️ This distinction is what keeps the live gate armed, and getting it wrong DISARMS it.
+ *  `NO_RENDERER` is in `test-live-tools.ts`'s `ENV_CODES` — "editor state, not tool health" — and
+ *  `modoki_capture_viewport` is non-mutating, so it is swept every run. Answering `NO_RENDERER` for
+ *  a CRASHED renderer or a lost GPU would turn a red gate green through a genuinely dead editor,
+ *  which is the one thing #994 must not do.
+ *
+ *  So it answers on POSITIVE evidence of a supported state, never by defaulting to one. Absence of
+ *  a known fault is not the same as a healthy editor: with no renderer facts at all the probe
+ *  itself failed, and `explainCaptureFailure` says so in as many words ("the renderer could not be
+ *  asked why"). "Could not look" is exactly `NOT_AVAILABLE_HERE`, and it is not environmental — so
+ *  an unknown cause reddens the sweep rather than being waved through.
+ *
+ *  ⚠️ It must mirror `explainCaptureFailure`'s branches EXACTLY — that function is the same
+ *  classification written as prose, and the first cut of this one silently dropped its
+ *  answered-probe-with-no-fault-fields branch, which is the HEALTHY shape. See that branch below.
+ *
+ *  ⚠️ The FAULTS are checked FIRST, and the order matters: a destroyed window can still report a
+ *  stale `frameLoop: 'idle'` from the last successful probe, and reading that as "no viewport is
+ *  mounted" is precisely the green-through-a-dead-editor outcome. */
+function isOrdinaryState(f: { window: CaptureWindowFacts | null; surface: RenderSurfaceFacts | null }): boolean {
+  const w = f.window;
+  const s = f.surface;
+  // Faults — none of these self-recovers, and every one means the editor is broken, not busy.
+  if (w?.destroyed || w?.wcDestroyed || w?.crashed) return false;
+  if (s?.gpu?.deviceLost) return false;                        // explicitly "must be relaunched"
+  if (s?.frameLoop?.status === 'stalled') return false;        // a real wedge
+  if (s?.rendererGate?.status === 'failed') return false;      // "never self-recovers"
+  // Positive evidence of a supported state.
+  if (w?.minimized || w?.visible === false) return true;       // put it back on screen and retry
+  if (w && (w.width === 0 || w.height === 0)) return true;     // collapsed pane
+  const loop = s?.frameLoop?.status;
+  if (loop === 'idle' || loop === 'hidden' || loop === 'running') return true;
+  const gate = s?.rendererGate?.status;
+  if (gate === 'pending' || gate === 'ready') return true;
+  // ⚠️ AN ANSWERED PROBE WITH NO FAULT FIELDS IS THE HEALTHY SHAPE — not a missing one, and this
+  // branch is why the first cut of this function was wrong in mirror image.
+  //
+  // `agentEditorOps.ts`'s producers OMIT the fields above while healthy, deliberately, to keep the
+  // common payload small: `frameLoopFields()` returns `{}` for a running loop with no recoveries
+  // ("a running loop is the norm and needs no words"), `rendererGateFields()` returns `{}` for a
+  // ready gate, `gpuFields()` returns `{}` with no fault. So a perfectly healthy editor answers
+  // with NONE of them, every check above misses, and the fall-through classified it as "could not
+  // look" — NOT_AVAILABLE_HERE, with options telling the reader to relaunch, while the `error`
+  // string in the SAME body said the renderer is NOT wedged and retrying usually works. It also
+  // scores DEFECT on the live sweep, which is #994's inversion one case over.
+  //
+  // `s` being a non-null object IS the evidence the probe answered — `explainCaptureFailure` uses
+  // exactly this test and reached it via the same mistake in its own 2026-07-30 review. Its comment
+  // there is the warning this function did not heed: "the unit tests passed because they hand-build
+  // `{frameLoop:{status:'running'}}`, a shape the real probe never produces."
+  if (s && !loop && (!gate || gate === 'ready')) return true;
+  // Only `s === null` reaches here — the probe failed, or none was offered. "The renderer could not
+  // be asked why" is precisely could-not-look, and NOT_AVAILABLE_HERE is not environmental, so an
+  // un-probeable failure reddens the sweep rather than being waved through.
+  //
+  // ⚠️ Known and accepted: a JS-wedged (not crashed) renderer on a MINIMISED window kills the probe
+  // (`s === null`) but `w.minimized` above answers first, so it scores NO_RENDERER/environmental.
+  // Fault-first ordering cannot help — every fault fact comes FROM the probe, and the probe is what
+  // died. Unminimising is still the correct first move, and the next capture reports the wedge.
+  return false;
+}
+
+/** The §5 refusal a failed capture answers with (#994).
+ *
+ *  It used to escape as a throw, which `backendServer.ts`'s catch-all turns into a **500** — read
+ *  by the MCP client as `NOT_AVAILABLE_HERE`, "could not look: the route is absent". For an
+ *  ordinary state (minimised, not visible, no viewport mounted) that is a lie about a healthy
+ *  editor, and `NO_RENDERER` — "nothing is rendering" — is what those actually are.
+ *
+ *  ⚠️ But NOT for every cause, and the first cut of this got that wrong by returning one code and
+ *  one options list for all five. Two things were broken by it, both caught in review:
+ *  ① a CRASHED renderer or a lost GPU would have been reported as `NO_RENDERER`, which the live
+ *  gate treats as environmental — a green sweep through a dead editor (see `isOrdinaryState`);
+ *  ② the options said "unminimise the window / open a panel / read the scene as data" while the
+ *  `error` in the same body said the editor must be RELAUNCHED. A refusal that lists an exit which
+ *  does not exist is worse than one that lists none — this module's own test says so.
+ *
+ *  ⚠️ `OCCLUDED` is not used for the minimised case, though it reads tempting. §5 defines it as
+ *  "the target is covered, so the input would land elsewhere" — an AIMING failure, about where a
+ *  tap goes. A minimised window is not mis-aimed; it is not rendering. One code, one reaction.
+ *
+ *  `error` is passed through whole rather than re-summarised: `explainCaptureFailure` is the thing
+ *  that knows which cause it was, and restating it here would be a second place to keep honest. */
+export function captureRefusalBody(e: CaptureUnavailableError): {
+  ok: false; code: 'NO_RENDERER' | 'NOT_AVAILABLE_HERE'; error: string; options: string[];
+} {
+  const broken = !isOrdinaryState(e.facts);
+  return {
+    ok: false,
+    code: broken ? 'NOT_AVAILABLE_HERE' : 'NO_RENDERER',
+    error: e.message,
+    options: broken
+      ? [
+        'relaunch the editor — a crashed renderer, a destroyed window and a lost GPU device do NOT self-recover, and the message above says which one this is',
+        'modoki_get_console_logs / modoki_diagnose before relaunching, if you want the cause on the record — a relaunch destroys it',
+        'read the scene as DATA instead — modoki_get_scene_state needs no renderer at all, and works from a different process than the one that died only if the backend is still up',
+      ]
+      : [
+        'restore/unminimise the editor window and bring it to the front, then retry',
+        'if no viewport is mounted, open the Scene or Game panel — or use modoki_render_scene, which renders offscreen and needs no mounted viewport',
+        'read the scene as DATA instead — modoki_get_scene_state / modoki_diagnose need no renderer at all',
+      ],
+  };
+}
+
 /** `webContents.capturePage()` asks Chromium's compositor (Viz) for a frame. When the
  *  compositor cannot produce one it rejects with a bare `UnknownVizError` — no window
  *  state, no page state, nothing pointing at WHY. That opaque string is what agents have
@@ -230,7 +360,9 @@ async function capturePageOrExplain(win: BrowserWindow, probe?: SurfaceProbe) {
     } catch { /* the window died mid-inspection — the raw cause below still stands */ }
     let surface: RenderSurfaceFacts | null = null;
     try { surface = (await probe?.()) ?? null; } catch { /* explanation loses a paragraph, not the error */ }
-    throw new Error(`capture_viewport failed: ${String(e)}. ${explainCaptureFailure(facts, surface)}`, { cause: e });
+    throw new CaptureUnavailableError(
+      `capture_viewport failed: ${String(e)}. ${explainCaptureFailure(facts, surface)}`,
+      { window: facts, surface }, e);
   }
 }
 
@@ -309,10 +441,10 @@ export async function captureViewport(
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 
 /** Which mouse button a click/drag uses. `right` opens context menus; `middle`
- *  is orbit-pan in the 3D viewport. */
-export type MouseButton = 'left' | 'right' | 'middle';
+ *  is orbit-pan in the 3D viewport. Declared once in `tools/shared/inputVocabulary.ts` (#1076). */
+export type MouseButton = SharedMouseButton;
 /** Chromium input modifier keys (as `sendInputEvent` expects them). */
-export type InputModifier = 'shift' | 'control' | 'alt' | 'meta' | 'cmd' | 'command';
+export type InputModifier = EditorInputModifier;
 
 export interface TapOpts {
   /** Mouse button (default 'left'). 'right' → context menu. */
@@ -423,8 +555,12 @@ export async function drag(
   await sleep(16);
   for (let i = 1; i <= n; i++) {
     const t = i / n;
-    const x = Math.round(from.x + (to.x - from.x) * t);
-    const y = Math.round(from.y + (to.y - from.y) * t);
+    // NOT rounded: mouseDown/mouseUp carry fractional coordinates, so whole-px moves put the
+    // press and the moves on different grids. A drag with dy:0 then travelled 0.37 CSS px on its
+    // first move, which a canvas editor reads as real travel (#1176: a horizontal slice resize
+    // lost 1 px of height at zoom 1.0954). captureGesture below keeps the same grid for the same reason.
+    const x = from.x + (to.x - from.x) * t;
+    const y = from.y + (to.y - from.y) * t;
     wc.sendInputEvent({ type: 'mouseMove', x, y, button, modifiers: heldModifiers } as unknown as Electron.MouseInputEvent);
     await sleep(16);
   }
@@ -556,9 +692,39 @@ export const KEYCODE_ALIAS: Record<string, string> = {
   ArrowUp: 'Up', ArrowDown: 'Down', ArrowLeft: 'Left', ArrowRight: 'Right',
 };
 
+/** Characters a `char` event cannot carry under their own name, with the Accelerator spelling that
+ *  DOES insert them. MEASURED on Electron 43.2.0 against a real `<textarea>` (#1081):
+ *
+ *    keyCode sent   down+char+up   char only   down+up only
+ *    '\n'           "abc"          "abc"       "abc"    ← what typeText used to send: nothing lands
+ *    'Return'       "abc\n"        "abc\n"     "abc"
+ *    '\r'           "abc\n"        "abc\n"     "abc"
+ *    'Tab'          "abc"          "abc\t"     "abc"
+ *
+ *  Three things that table decides, none of them guessable from Electron's docs:
+ *   - a newline keeps the bracketing keyDown/keyUp (so Enter-to-commit handlers still see a press),
+ *     but a TAB must be sent as the char ALONE — its keyDown moves focus first, and the char then
+ *     lands in the next field or nowhere, which is why the `down+char+up` column is unchanged;
+ *   - `down+up only` inserts NOTHING for any spelling — that column is exactly what `submitKey` and
+ *     `pressKey` send, and is why `submitKey:'Enter'` reported success having inserted nothing;
+ *   - the set is CLOSED on purpose. An unrecognised Accelerator name does not fail, it inserts a
+ *     FRAGMENT OF ITS OWN NAME ('NumpadEnter' → "Num"), so passing an arbitrary spelling through
+ *     would silently corrupt the field. Anything not in this map and not printable is REFUSED and
+ *     named, rather than guessed at. */
+const CHAR_KEYCODE: Record<string, { keyCode: string; charOnly: boolean }> = {
+  '\n': { keyCode: 'Return', charOnly: false },
+  '\t': { keyCode: 'Tab', charOnly: true },
+};
+
+/** Keys whose press inserts TEXT as well as firing handlers, so a bare keyDown/keyUp is not the
+ *  whole press. Measured in the same table above. */
+const KEY_INSERTS_TEXT = new Set(['Return', 'Enter']);
+
 export async function pressKey(win: BrowserWindow, key: string, modifiers?: InputModifier[]): Promise<{ activeElement: string | null; gameSwallows: boolean }> {
   const wc = win.webContents;
-  const keyCode = KEYCODE_ALIAS[key] ?? key;
+  // An own-key read, not `KEYCODE_ALIAS[key] ?? key`: `key` is agent-supplied, and `'toString'` would
+  // index the inherited FUNCTION — not nullish, so the fallback never fires (#993's shape, #1076).
+  const keyCode = Object.prototype.hasOwnProperty.call(KEYCODE_ALIAS, key) ? KEYCODE_ALIAS[key] : key;
   // Keyboard sendInputEvent dispatches to the FOCUSED web contents — unlike mouse events,
   // which hit-test by coordinate. When the editor window isn't the OS-focused window (agent-
   // driven, headless), a keyDown otherwise never reaches the page's window listeners. Focus
@@ -571,6 +737,19 @@ export async function pressKey(win: BrowserWindow, key: string, modifiers?: Inpu
   // element so a caller can see a text field is intercepting it. (C7 re-audit.)
   const active = await readActiveElement(wc);
   wc.sendInputEvent({ type: 'keyDown', keyCode, modifiers } as Electron.KeyboardInputEvent);
+  // Enter/Return INSERT as well as fire (#1081). A keyDown/keyUp pair alone inserts nothing — see
+  // the `down+up only` column in CHAR_KEYCODE's table — so pressing Enter in a textarea was a
+  // silent no-op, which is not what the key does for a human. The char rides with the press for
+  // the keys that carry text, and no other key gains one (a Tab char would insert a literal tab
+  // into a field whose focus move was swallowed).
+  // ⚠️ Only for an UNMODIFIED press. Cmd/Ctrl+Enter is the standard "commit, do not insert" chord, and
+  // a char event under it would insert a newline as well as firing the chord — leaving a stray
+  // trailing newline in a field that had just committed. Shift+Enter does insert for a human; not
+  // emitting it there is a deliberate, stated limitation, because the measured table behind
+  // CHAR_KEYCODE was taken with no modifiers and nothing here has measured the modified case.
+  if (KEY_INSERTS_TEXT.has(keyCode) && !modifiers?.length) {
+    wc.sendInputEvent({ type: 'char', keyCode } as Electron.KeyboardInputEvent);
+  }
   await sleep(48); // ≈3 frames @60fps — spans a frame boundary so the per-frame sampler catches it
   wc.sendInputEvent({ type: 'keyUp', keyCode, modifiers } as Electron.KeyboardInputEvent);
   await sleep(8);
@@ -767,7 +946,7 @@ async function readFocusedValue(wc: Electron.WebContents): Promise<string | null
 
 export async function typeText(
   win: BrowserWindow,
-  text: string,
+  rawText: string,
   opts?: { clearFirst?: boolean; submitKey?: string },
 ): Promise<{
   typed: number; editable: boolean; activeElement: string | null;
@@ -778,6 +957,10 @@ export async function typeText(
   error?: string;
 }> {
   const wc = win.webContents;
+  // Chromium normalises a <textarea>'s value to LF, so a CRLF (or a lone CR) in the request could
+  // never be found in the field afterwards and would read as dropped characters. Normalise once,
+  // up front, and measure against what the field can actually hold.
+  const text = rawText.replace(/\r\n?/g, '\n');
   // A trusted `char` event only INSERTS text when an editable element holds focus. With nothing
   // (or a non-editable div/canvas) focused, the chars land nowhere yet `sendInputEvent` can't
   // fail — so the route used to report {ok:true, typed:N} typing into the void. Check first and
@@ -792,12 +975,31 @@ export async function typeText(
   let clearError: string | undefined;
   if (opts?.clearFirst) clearError = await clearFocusedField(wc);
   const before: string | null = await readFocusedValue(wc);
+  /** Characters this tool could not put on the wire at all — reported as ITS limit, not the field's. */
+  const unsendable: string[] = [];
   for (const ch of text) {
-    // Only the `char` event inserts text; keyDown/keyUp bracket it so key handlers
-    // (shortcut guards, Enter-to-commit) still see a real press.
-    wc.sendInputEvent({ type: 'keyDown', keyCode: ch } as Electron.KeyboardInputEvent);
-    wc.sendInputEvent({ type: 'char', keyCode: ch } as Electron.KeyboardInputEvent);
-    wc.sendInputEvent({ type: 'keyUp', keyCode: ch } as Electron.KeyboardInputEvent);
+    // Own-key read, not `CHAR_KEYCODE[ch] ?? …`: `ch` is caller-supplied, and 'constructor'/'toString'
+    // would index the inherited FUNCTION — not nullish, so a `??` fallback never fires (#993's shape,
+    // #1076; `pressKey` carries the same note for KEYCODE_ALIAS).
+    const special = Object.prototype.hasOwnProperty.call(CHAR_KEYCODE, ch) ? CHAR_KEYCODE[ch] : undefined;
+    if (special) {
+      // Only the `char` event inserts text; keyDown/keyUp bracket it so key handlers
+      // (shortcut guards, Enter-to-commit) still see a real press — EXCEPT where the bracket is
+      // what breaks the insert: Tab's keyDown moves focus, and the char then lands elsewhere.
+      if (!special.charOnly) wc.sendInputEvent({ type: 'keyDown', keyCode: special.keyCode } as Electron.KeyboardInputEvent);
+      wc.sendInputEvent({ type: 'char', keyCode: special.keyCode } as Electron.KeyboardInputEvent);
+      if (!special.charOnly) wc.sendInputEvent({ type: 'keyUp', keyCode: special.keyCode } as Electron.KeyboardInputEvent);
+    } else if (ch < ' ' || ch === '\u007F') {
+      // A control character with no MEASURED spelling. Guessing an Accelerator name for it does not
+      // fail safely — it inserts that name's own text (CHAR_KEYCODE's table: 'NumpadEnter' → "Num")
+      // — so it is not sent, and it is named in the error instead (#1081).
+      unsendable.push(ch);
+      continue;
+    } else {
+      wc.sendInputEvent({ type: 'keyDown', keyCode: ch } as Electron.KeyboardInputEvent);
+      wc.sendInputEvent({ type: 'char', keyCode: ch } as Electron.KeyboardInputEvent);
+      wc.sendInputEvent({ type: 'keyUp', keyCode: ch } as Electron.KeyboardInputEvent);
+    }
     await sleep(8);
   }
   // MEASURE before the submitKey: 'Tab'/'Escape' blur the field, after which there is nothing
@@ -805,16 +1007,42 @@ export async function typeText(
   const after = await readFocusedValue(wc);
   if (opts?.submitKey) {
     wc.sendInputEvent({ type: 'keyDown', keyCode: opts.submitKey } as Electron.KeyboardInputEvent);
+    // Enter/Return carry TEXT as well as firing handlers (#1081). Without the char event this pair
+    // inserts nothing at all — CHAR_KEYCODE's `down+up only` column — so `submitKey:'Enter'` on a
+    // textarea reported ok:true having done nothing. 'Tab'/'Escape' keep the bare pair: their job
+    // here is to BLUR, and a Tab char would insert a literal tab wherever the focus move was
+    // swallowed.
+    if (KEY_INSERTS_TEXT.has(opts.submitKey)) wc.sendInputEvent({ type: 'char', keyCode: opts.submitKey } as Electron.KeyboardInputEvent);
     wc.sendInputEvent({ type: 'keyUp', keyCode: opts.submitKey } as Electron.KeyboardInputEvent);
     await sleep(8);
   }
   // The measured insert. `before` is null for an unreadable target (a contentEditable canvas
   // wrapper, say) — then there is nothing to measure and `typed` falls back to the request, which
   // is at least no worse than before and is not dressed up as an observation.
+  // (#1081, found by this change's own review) The unsendable report has to survive EVERY return path.
+  // It was read only inside the `!landed` branch at the very end — so an unreadable target, the case
+  // immediately below, returned ok:true having silently dropped characters. That is the exact defect
+  // #1081 is about, surviving on the one path where the tool cannot measure what landed.
+  const unsendableNote = unsendable.length
+    ? `${unsendable.length} character(s) could not be SENT at all — `
+      + `${unsendable.map((c) => JSON.stringify(c)).join(', ')} — so this is THIS TOOL's limit, not `
+      + `the field's: a trusted char event carries a key, and these have no key spelling to carry `
+      + `them. Newline and tab DO and are sent normally; for anything else, drive the value through `
+      + `the control the app gives it.`
+    : '';
+  const withNote = (rest: string) => [unsendableNote, rest].filter(Boolean).join(' ');
+
   if (before === null || after === null) {
+    const error = withNote(clearError ?? '');
     return {
-      typed: text.length, editable: true, activeElement: active.descriptor, valueAfter: after,
-      ...(clearError ? { error: clearError } : {}),
+      // Not `text.length` (#1081 review): on the unreadable path there is nothing to measure, so this
+      // falls back to the request — but characters this tool REFUSED to send were never part of it,
+      // and counting them contradicts the error in the same reply.
+      typed: text.length - unsendable.length,
+      editable: true,
+      activeElement: active.descriptor,
+      valueAfter: after,
+      ...(error ? { error } : {}),
     };
   }
   // WHAT LANDED, not how much the length grew (independent review, 2026-07-30). A length delta is
@@ -835,7 +1063,9 @@ export async function typeText(
   if (clearError) {
     return {
       typed: inserted, editable: true, activeElement: active.descriptor, valueAfter: after,
-      error: clearError,
+      // Both failures are reported, not just the one that returns first: a field that would not clear
+      // AND a character that could not be sent are independent, and hiding either loses a cause.
+      error: withNote(clearError),
     };
   }
   return {
@@ -848,12 +1078,17 @@ export async function typeText(
       // input and recommend modoki_eval; both halves were wrong (bug `xaewBYMBYXoeuiTllsI8`) —
       // non-ASCII types fine, and modoki_eval is a non-input write a controlled input never sees,
       // so the "workaround" was more fragile than the path it replaced.
-      error: `the requested text is NOT in the field after typing — ${inserted} of ${text.length} `
-        + `character(s) appear to have reached it (before: ${JSON.stringify(before)}, after: `
-        + `${JSON.stringify(after)}). The usual cause is a field that reformats, truncates or `
-        + `rejects input as you type (a numeric field, a max-length, an input mask), so `
-        + `\`valueAfter\` above is what it actually accepted. Retype in the shape the field wants, `
-        + `or drive the value through the control the app gives it.`,
+      // ⚠️ And it must not blame the FIELD for this tool's OWN limit (#1081). A character with no key
+      // spelling was never put on the wire, so "the field rejected it" is false — and a session
+      // reading that goes hunting a bug in a field that is working. Say which party failed.
+      error: unsendableNote
+        ? `${unsendableNote} The field holds ${JSON.stringify(after)}.`
+        : `the requested text is NOT in the field after typing — ${inserted} of ${text.length} `
+          + `character(s) appear to have reached it (before: ${JSON.stringify(before)}, after: `
+          + `${JSON.stringify(after)}). The usual cause is a field that reformats, truncates or `
+          + `rejects input as you type (a numeric field, a max-length, an input mask), so `
+          + `\`valueAfter\` above is what it actually accepted. Retype in the shape the field wants, `
+          + `or drive the value through the control the app gives it.`,
     }),
   };
 }
@@ -884,8 +1119,9 @@ export async function captureGesture(
   await sleep(16);
   for (let i = 1; i <= n; i++) {
     const t = i / n;
-    const x = Math.round(from.x + (to.x - from.x) * t);
-    const y = Math.round(from.y + (to.y - from.y) * t);
+    // Unrounded, like drag(): the press and release are fractional, so the moves must be too.
+    const x = from.x + (to.x - from.x) * t;
+    const y = from.y + (to.y - from.y) * t;
     send('mouseMove', x, y, { button: 'left' });
     await sleep(16);
     frames.push({ t, x, y, sample: await opts.sample().catch(() => null) });

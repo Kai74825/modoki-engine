@@ -8,7 +8,7 @@
 import { z } from 'zod';
 import type { ToolDef } from '../toolDef.js';
 import type { ToolContext } from '../context.js';
-import { DISCARD_UNSAVED_BASE, discardUnsavedParam, flatEntityAlias, foldEntityRef } from '../shapes.js';
+import { DISCARD_UNSAVED_BASE, TIMEOUT_MS_BASE, discardUnsavedParam, flatEntityAlias, foldEntityRef } from '../shapes.js';
 
 export function registerEditorTools(tool: ToolDef, ctx: ToolContext): void {
   const { getJson, postJson, editorAction, fail } = ctx;
@@ -138,6 +138,56 @@ export function registerEditorTools(tool: ToolDef, ctx: ToolContext): void {
     },
   );
 
+  // ── wait_for — park until a condition holds (#1154) ──
+  const chromeCond = z.object({
+    label: z.string().optional().describe('Visible label, matched like modoki_tap\'s label aim (normalized, exact).'),
+    id: z.string().optional().describe('The control\'s data-ui-id (from modoki_handles editor=chrome).'),
+    absent: z.boolean().optional().describe('Wait until NO control matches (a dialog closed, a spinner gone).'),
+    disabled: z.boolean().optional(), value: z.string().optional(), checked: z.boolean().optional(),
+    expanded: z.boolean().optional(), mixed: z.boolean().optional(),
+    state: z.string().optional().describe('The control\'s data-ui-state.'),
+  }).strict();
+  const entityCond = z.object({
+    guid: z.string().optional(), name: z.string().optional().describe('Case-insensitive substring, as get_scene_state.'),
+    where: z.string().optional().describe('get_scene_state\'s predicate: "Trait.field <op> value", op ∈ = != > >= < <= ~.'),
+    absent: z.boolean().optional().describe('Wait until NO entity matches (destroyed, filtered out).'),
+  }).strict();
+  tool(
+    'modoki_wait_for',
+    'PARK until a condition holds, instead of sleeping a guessed number of ms (an eval setTimeout, ' +
+      'a batch `wait`). Give EXACTLY ONE of: `chrome` (an editor control appears/goes away or reaches ' +
+      'a state — the same state modoki_handles reports), `entity` (a get_scene_state guid/name/where ' +
+      'matches, or `absent`), `console` (a line containing `match` is logged after the call starts, or ' +
+      'within `lookbackMs` before it — for the batch step that logged it), ' +
+      '`editor` (get_editor_state fields: playState/runMode/advancing/scenePath). Checks at once, then ' +
+      'polls. Satisfied → `{satisfied:true, elapsedMs, observation}`. A timeout is a NORMAL result, not ' +
+      'an error: `{satisfied:false, timedOut:true, lastObservation}` — read `lastObservation` to see ' +
+      'why (e.g. `ambiguous`: a state test needs exactly one control). `timeoutMs` defaults to 5000, ' +
+      'clamped to [50, 120000]. An unevaluable condition (no ' +
+      'label/id, unknown trait) is refused BEFORE parking. Works as a modoki_batch step and as ' +
+      'modoki.waitFor() in eval (whose 25s cap bounds it there).',
+    {
+      chrome: chromeCond.optional().describe('An editor control, aimed by label or id: present (default), `absent`, or reaching the given state fields.'),
+      entity: entityCond.optional().describe('A get_scene_state match by guid/name/where — present, or `absent`.'),
+      console: z.object({
+        match: z.string().describe('Case-sensitive substring of the logged text.'),
+        level: z.enum(['log', 'info', 'warn', 'error']).optional(),
+        lookbackMs: z.number().min(0).max(60_000).optional().describe('Also accept a line logged up to this many ms BEFORE the call — for the batch step that logged it just before this wait.'),
+      }).strict().optional().describe('A renderer console line logged after the call starts (or within lookbackMs before it).'),
+      editor: z.object({
+        playState: z.string().optional(), runMode: z.string().optional(),
+        advancing: z.boolean().optional(), scenePath: z.string().optional(),
+      }).strict().optional().describe('get_editor_state fields that must ALL equal the given values.'),
+      timeoutMs: z.number().optional().describe(`${TIMEOUT_MS_BASE}.`),
+    },
+    async ({ chrome, entity, console: consoleCond, editor, timeoutMs }) => {
+      // Transport must outlast the op's park AND the relay's headroom over it (+10s), or a
+      // legitimate long wait reads as an unreachable backend.
+      const transportTimeoutMs = Math.max(50, Math.min(120_000, timeoutMs ?? 5_000)) + 15_000;
+      return postJson('/api/wait-for', { chrome, entity, console: consoleCond, editor, timeoutMs }, transportTimeoutMs, 'wait for a condition in the editor');
+    },
+  );
+
   // ── wait_for_edit — the long-poll twin of editor_journal (#28) ──
   tool(
     'modoki_wait_for_edit',
@@ -156,7 +206,7 @@ export function registerEditorTools(tool: ToolDef, ctx: ToolContext): void {
       type: z.string().optional().describe('Only wake for this editor event type, e.g. !edit, !select, !transform. Omit to wake on any type.'),
       source: z.enum(['human', 'agent']).optional().describe('Who must have done it. Defaults to "human" — pass "agent" only if you specifically want to notice your own MCP-driven edits.'),
       since: z.number().optional().describe('Forward cursor (a prior `seq`/`nextSeq`). Omit to wait for the NEXT event from now, not to replay history.'),
-      timeoutMs: z.number().optional().describe('How long to park, in ms. Default 30000, clamped to [50, 120000].'),
+      timeoutMs: z.number().optional().describe(`${TIMEOUT_MS_BASE}. Default 30000, clamped to [50, 120000].`),
     },
     async ({ type, source, since, timeoutMs }) => {
       const q = new URLSearchParams();
@@ -200,6 +250,9 @@ export function registerEditorTools(tool: ToolDef, ctx: ToolContext): void {
       'PRECONDITIONS, refused rather than silently done: `pause` needs PLAYING, `resume` and ' +
       '`step` need PAUSED. In particular `resume` from stopped is NOT a play — it is refused, ' +
       'because running one would discard the state you were inspecting. ' +
+      '`play`, `resume` and `step` WAIT for the physics WASM the world\'s bodies need before any ' +
+      'frame runs, so a stepped frame always simulates. A permanent physics init failure is refused ' +
+      '(ok:false) by `resume`/`step` and by `play` from paused; `play` from stopped still starts and reports it as `physicsError`. ' +
       'This is how you TEST the game like a human pressing Play. After play, exercise it with ' +
       'modoki_tap/drag, read modoki_get_scene_state, then stop to revert. Returns editor state.',
     { action: z.enum(['play', 'stop', 'pause', 'resume', 'step'])
@@ -211,13 +264,23 @@ export function registerEditorTools(tool: ToolDef, ctx: ToolContext): void {
   tool(
     'modoki_history',
     'Undo or redo the last editor action (same stack as Cmd+Z / Cmd+Shift+Z). Your own ' +
-      'create/duplicate/delete/reparent edits are undoable; selection changes are not. ' +
+      'create/duplicate/delete/reparent edits are undoable. \u26a0 SELECTION IS ON THIS STACK TOO: a ' +
+      'selection made by a UI GESTURE (a Hierarchy or Assets click, so modoki_tap too) pushes its own ' +
+      '"Select ..." entry, so ONE undo can pop that instead of your edit. Steer by `undoLabel`, never ' +
+      'by counting calls. (modoki_set_selection is the exception — it writes selection raw and pushes ' +
+      'no entry.) ' +
       'Returns {did, ...editorState}. `did=false` means the stack END was reached — there was ' +
       'nothing to undo. `did=true` means an entry was POPPED and its closure ran; it is NOT a ' +
       'guarantee that the world now looks as it did before, because an entry captured against a ' +
       'PREVIOUS world (anything from before a scene hot-reload, which any file write triggers) ' +
       'undoes against entities that no longer exist. So verify with modoki_get_scene_state rather ' +
-      'than trusting `did` — the same rule as every other mutation on this surface.',
+      'than trusting `did` — the same rule as every other mutation on this surface. ' +
+      'REFUSES (REFUSED_BY_OP, stack untouched) during Play/Pause, and inside a scrub/preview envelope ' +
+      '(runMode scrub|preview) when the entry is a SCENE edit made BEFORE that preview — that world reverts on ' +
+      'Exit. Inside the envelope an asset-document edit (clip, timeline, rig, material), a selection step, and a ' +
+      'scene edit made during the preview still undo. Exit drops the preview\'s own scene edits from the stack ' +
+      '(the restore already discarded them). To undo an older scene edit, Stop the game or end the envelope ' +
+      '(modoki_exit_pose_envelope for an animation-owned one) first.',
     { action: z.enum(['undo', 'redo']).describe('Which direction to move the undo stack. This IS the editor-action op name on the wire.') },
     async ({ action }) => editorAction(action),
   );
@@ -324,8 +387,11 @@ export function registerEditorTools(tool: ToolDef, ctx: ToolContext): void {
         // direct curl call behave identically — they used to differ, and the direct path crashed.
         case 'primitive': spec = { kind, ...(mesh ? { mesh } : {}) }; break;
         case '2d': spec = { kind, ...(shape ? { shape } : {}) }; break;
-        case 'ui': spec = { kind, preset: preset ?? 'view' }; break;
-        case 'light': spec = { kind, light: light ?? 'point' }; break;
+        // ⚠️ No `?? 'view'` / `?? 'point'` here (#1070 close-out review): the op owns those defaults
+        // now (`resolveCreateEntitySpec`), and a copy in the tool would silently keep the OLD one if
+        // the runtime's ever changed — curl and the tool would build different entities again.
+        case 'ui': spec = { kind, ...(preset ? { preset } : {}) }; break;
+        case 'light': spec = { kind, ...(light ? { light } : {}) }; break;
         default: spec = { kind };
       }
       return editorAction('create-entity', { spec, parentId, parentGuid });
@@ -479,7 +545,11 @@ export function registerEditorTools(tool: ToolDef, ctx: ToolContext): void {
     'modoki_game_view_devices',
     'List the device presets the Game panel can preview at, plus the one selected now. Each row '
       + 'carries the LOGICAL size (CSS points — the space layout math runs in), the PHYSICAL size '
-      + '(device pixels), the dpr, and safe-area insets for both orientations. Read this instead of '
+      + '(device pixels), the dpr, and safe-area insets for both orientations — each with a '
+      + "safeAreaBasis saying where the numbers came from: 'measured' (read off real hardware), "
+      + "'published' (a vendor's spec table), 'inferred' (reasoned, or generalised from another device — "
+      + "NOT a measurement, so do not attribute a layout verdict to it), or 'no-device' (zeros by "
+      + 'construction). Read this instead of '
       + 'hardcoding a device table. Rows are PORTRAIT — landscape is a flip applied on selection, '
       + 'not a separate row, so pass `orientation` to modoki_set_game_view_device. Changes nothing.',
     {},
@@ -494,7 +564,7 @@ export function registerEditorTools(tool: ToolDef, ctx: ToolContext): void {
       + 'the catalog lacks — both together is refused as ambiguous. An unknown name is refused with '
       + 'the real list, never fuzzy-matched: previewing a screen other than the one you named makes '
       + 'every later measurement wrong. A custom size gets ZERO safe-area insets '
-      + "(safeAreaBasis:'custom-none') — there is no device to look them up from, so do not read "
+      + "(safeAreaBasis:'no-device') — there is no device to look them up from, so do not read "
       + 'those zeros as "no notch". Returns the resolved selection, which modoki_get_editor_state '
       + 'also reports as `gameView`. Editor-session state — nothing is written to disk, and a real '
       + 'device is unaffected.',

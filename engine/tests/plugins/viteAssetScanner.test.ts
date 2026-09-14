@@ -12,19 +12,20 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import pathMod from 'node:path';
 import path from 'path';
 import fs from 'fs';
-import os from 'os';
 import {
   findAssetRoots, resolveAssetPath, readAssetGuid, buildManifest, writeAssetGuid, detectType,
   classifySceneChange, isSseRoute, createEditorWriteGuard, normalizeWriteGuardKey, createBrowserRequestRegistry,
+  settleRelayReply, countLiveBridgeClients,
   handleExitRequest, scanAllAssets, resolveModokiAssetsDir, filterKeptAssets, gamesModuleSource,
   isUnderAssetRoot, absToAssetUrl, pathToClassifyForChange, isSiblingRaisedChange,
   isValidBuildPlatform, BUILD_PLATFORMS, playableBuildSteps,
-  otaPublishBundleNameAllowed, otaSigningKeyRefusal,
+  otaPublishTarget, otaSubgameProjectDir, otaResolveSubgameDir, otaPublishSteps, otaSigningKeyRefusal,
   otaPublishBuildStepEnv,
   type AssetRoot,
 } from '../../plugins/vite-asset-scanner';
 import { findGamesEntry } from '../../plugins/findGamesEntry';
 import { readScannedSource } from '@modoki/engine/testing';
+import { makeScratchDir } from '@modoki/engine/testing/scratchDir';
 
 // engine/tests/plugins/ → repo root (games/ + engine/packages/modoki live there).
 const PROJECT_ROOT = path.resolve(__dirname, '../../..');
@@ -246,7 +247,7 @@ describe('classifySceneChange (hot-reload broadcast classification)', () => {
 describe('pathToClassifyForChange (shader body → descriptor remap, #857)', () => {
   let tmpDir: string;
   beforeEach(() => {
-    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-shader-remap-'));
+    tmpDir = makeScratchDir('modoki-shader-remap-');
   });
   afterEach(() => {
     fs.rmSync(tmpDir, { recursive: true, force: true });
@@ -471,7 +472,7 @@ describe('createBrowserRequestRegistry (requestBrowser lifecycle)', () => {
     const t = manualTimers();
     const reg = createBrowserRequestRegistry(t);
     let sentId = -1;
-    const p = reg.request((id) => { sentId = id; }, 3000);
+    const p = reg.request((id) => { sentId = id; }, 3000, 'probe-op', 1);
     expect(reg.size).toBe(1);
 
     reg.settle(sentId, { ok: true });
@@ -485,7 +486,7 @@ describe('createBrowserRequestRegistry (requestBrowser lifecycle)', () => {
     const t = manualTimers();
     const reg = createBrowserRequestRegistry(t);
     let sentId = -1;
-    const p = reg.request((id) => { sentId = id; }, 3000);
+    const p = reg.request((id) => { sentId = id; }, 3000, 'probe-op', 1);
     reg.settle(sentId, undefined, 'scene not found');
     await expect(p).rejects.toThrow('scene not found');
     expect(reg.size).toBe(0);
@@ -494,7 +495,7 @@ describe('createBrowserRequestRegistry (requestBrowser lifecycle)', () => {
   it('rejects + cleans up when the timeout fires (no app open)', async () => {
     const t = manualTimers();
     const reg = createBrowserRequestRegistry(t);
-    const p = reg.request(() => { /* sent, never answered */ }, 3000);
+    const p = reg.request(() => { /* sent, never answered */ }, 3000, 'probe-op', 1);
     const rejected = expect(p).rejects.toThrow(/timed out waiting for the browser/);
     t.fire(1);                        // simulate the timeout
     await rejected;
@@ -504,7 +505,7 @@ describe('createBrowserRequestRegistry (requestBrowser lifecycle)', () => {
   it('rejects + clears the timer immediately when send throws (socket mid-teardown)', async () => {
     const t = manualTimers();
     const reg = createBrowserRequestRegistry(t);
-    const p = reg.request(() => { throw new Error('ws gone'); }, 3000);
+    const p = reg.request(() => { throw new Error('ws gone'); }, 3000, 'probe-op', 1);
     await expect(p).rejects.toThrow('ws gone');
     expect(reg.size).toBe(0);
     expect(t.cleared).toContain(1);   // timer NOT leaked until timeout
@@ -515,20 +516,199 @@ describe('createBrowserRequestRegistry (requestBrowser lifecycle)', () => {
     const t = manualTimers();
     const reg = createBrowserRequestRegistry(t);
     let sentId = -1;
-    const p = reg.request((id) => { sentId = id; }, 3000);
+    const p = reg.request((id) => { sentId = id; }, 3000, 'probe-op', 1);
     expect(reg.settle(999)).toBe(false);            // unknown id
     expect(reg.settle(sentId, 'first')).toBe(true);
     expect(reg.settle(sentId, 'second')).toBe(false); // already settled — ignored
     await expect(p).resolves.toBe('first');
   });
 
+  /** #1030 — the relay is a BROADCAST and used to settle on whichever reply came first. A tab on
+   *  the runtime route has no editor ops and rejects in ~1ms, so it beat the editor tab and
+   *  answered on its behalf; `applyMovesInRenderer` read that as "no editor exists" and skipped
+   *  the asset-path repair silently while a live editor still held bindings on the dead path. */
+  describe('a DECLINE is not an answer (#1030)', () => {
+    it('does NOT settle on a decline while other clients could still answer', async () => {
+      const t = manualTimers();
+      const reg = createBrowserRequestRegistry(t);
+      let sentId = -1;
+      const p = reg.request((id) => { sentId = id; }, 3000, 'apply-asset-path-moves', 2);
+
+      // The runtime tab answers first, and loses.
+      expect(reg.settle(sentId, undefined, undefined, true)).toBe(false);
+      expect(reg.size).toBe(1);                       // still in flight
+      expect(t.armed.size).toBe(1);                   // and its timeout is still armed
+
+      // The editor tab does the actual work and answers second — that is the reply that counts.
+      expect(reg.settle(sentId, { notes: ['repaired 3 bindings'] })).toBe(true);
+      await expect(p).resolves.toEqual({ notes: ['repaired 3 bindings'] });
+      expect(t.cleared).toContain(1);
+    });
+
+    it('settles absent once EVERY client has declined — with the same `unknown agent op` string', async () => {
+      // ⚠️ The string is load-bearing, not cosmetic: applyMovesInRenderer, relayProvesNoRenderer
+      // and relayFailureStatus all key off it and disagree about what it MEANS on purpose. This
+      // change must remove the race WITHOUT moving that string.
+      const t = manualTimers();
+      const reg = createBrowserRequestRegistry(t);
+      let sentId = -1;
+      const p = reg.request((id) => { sentId = id; }, 3000, 'apply-asset-path-moves', 2);
+      expect(reg.settle(sentId, undefined, undefined, true)).toBe(false);
+      expect(reg.settle(sentId, undefined, undefined, true)).toBe(true);
+      await expect(p).rejects.toThrow(/unknown agent op 'apply-asset-path-moves'/);
+      expect(reg.size).toBe(0);
+      expect(t.armed.size).toBe(0);                   // no leaked timer on the decline path
+    });
+
+    it('counts the LEGACY error string as a decline too — a stale tab must not re-open the race', async () => {
+      // A tab loaded before this change replies `error: "unknown agent op '<op>'"` with no flag.
+      // Treated as a real error it would settle the whole request the old way, reintroducing the
+      // defect for as long as one stale tab stays open.
+      const t = manualTimers();
+      const reg = createBrowserRequestRegistry(t);
+      let sentId = -1;
+      const p = reg.request((id) => { sentId = id; }, 3000, 'editor-state', 2);
+      expect(reg.settle(sentId, undefined, "unknown agent op 'editor-state'")).toBe(false);
+      expect(reg.settle(sentId, { unsaved: true })).toBe(true);
+      await expect(p).resolves.toEqual({ unsaved: true });
+    });
+
+    it('still settles a REAL error immediately — an op that threw is an answer, not a decline', async () => {
+      // ⚠️ The half that makes this a fix rather than a stall. Only the client that OWNS an op can
+      // throw from it, so its failure is authoritative and must not wait for anyone else. Folding
+      // the two together in either direction is the whole defect.
+      const t = manualTimers();
+      const reg = createBrowserRequestRegistry(t);
+      let sentId = -1;
+      const p = reg.request((id) => { sentId = id; }, 3000, 'scene-mutate', 3);
+      expect(reg.settle(sentId, undefined, 'entity not found')).toBe(true);
+      await expect(p).rejects.toThrow('entity not found');
+      expect(reg.size).toBe(0);
+    });
+
+    it('a single decline is final when the client count is unknown — the pre-#1030 fallback', async () => {
+      // `expected` defaults to 1, so a caller that cannot count its clients (a future Vite that
+      // stops exposing ws.clients) behaves exactly as it did before this change rather than
+      // hanging until the timeout.
+      const t = manualTimers();
+      const reg = createBrowserRequestRegistry(t);
+      let sentId = -1;
+      const p = reg.request((id) => { sentId = id; }, 3000, 'editor-state', 1);
+      expect(reg.settle(sentId, undefined, undefined, true)).toBe(true);
+      await expect(p).rejects.toThrow(/unknown agent op 'editor-state'/);
+    });
+
+    it('rides to the TIMEOUT when a client disconnects mid-flight instead of settling absent', async () => {
+      // The accepted bound. One of two clients declines and the other never replies; the request
+      // must NOT conclude "nothing has this op" from a single decline. A timeout is the honest
+      // answer, and every consumer already treats it as ambiguous (isRelayTimeout).
+      const t = manualTimers();
+      const reg = createBrowserRequestRegistry(t);
+      let sentId = -1;
+      const p = reg.request((id) => { sentId = id; }, 3000, 'editor-state', 2);
+      reg.settle(sentId, undefined, undefined, true);
+      const rejected = expect(p).rejects.toThrow(/timed out waiting for the browser/);
+      t.fire(1);
+      await rejected;
+      expect(reg.size).toBe(0);
+    });
+  });
+
+  /** #1030 close-out — the WIRING and the denominator, which the first round left untested.
+   *  Three one-line mutations at the production call sites made the whole fix inert with the
+   *  suite green; two are now compile errors (required params, no-arg call site) and these cover
+   *  the third plus the two logic defects the review found. */
+  describe('the relay wiring and its denominator (#1030 close-out)', () => {
+    it('settleRelayReply maps a {declined:true} reply onto the DECLINE path, not a resolve', async () => {
+      // ⚠️ The mutation this exists for is WORSE than the bug: with `declined` dropped, the reply
+      // has `error === undefined`, falls past the decline branch and RESOLVES with `undefined` —
+      // `applyMovesInRenderer` then reports `{kind:'applied', notes:[]}`, a fabricated success.
+      const t = manualTimers();
+      const reg = createBrowserRequestRegistry(t);
+      let sentId = -1;
+      const p = reg.request((id) => { sentId = id; }, 3000, 'apply-asset-path-moves', 2);
+      expect(settleRelayReply(reg, { id: sentId, declined: true }, 'client-a')).toBe(false);
+      expect(reg.size).toBe(1);                                   // counted, NOT resolved
+      expect(settleRelayReply(reg, { id: sentId, result: { notes: [] } }, 'client-b')).toBe(true);
+      await expect(p).resolves.toEqual({ notes: [] });
+    });
+
+    it('settleRelayReply still carries a real result and a real error through unchanged', async () => {
+      const t = manualTimers();
+      const reg = createBrowserRequestRegistry(t);
+      let a = -1, b = -1;
+      const p1 = reg.request((id) => { a = id; }, 3000, 'op-a', 1);
+      const p2 = reg.request((id) => { b = id; }, 3000, 'op-b', 1);
+      settleRelayReply(reg, { id: a, result: 42 });
+      settleRelayReply(reg, { id: b, error: 'entity not found' });
+      await expect(p1).resolves.toBe(42);
+      await expect(p2).rejects.toThrow('entity not found');
+    });
+
+    it('one client\'s DUPLICATE decline does not stand in for a second client\'s silence', async () => {
+      // #1030 close-out F3. `initAgentBridge` has no idempotency flag and Vite's `hot.on` appends,
+      // so a double-registration sends two responses per id from ONE client. Counting those as two
+      // declines rejects while the editor tab is still working — the original defect, reinstated.
+      const t = manualTimers();
+      const reg = createBrowserRequestRegistry(t);
+      let sentId = -1;
+      const p = reg.request((id) => { sentId = id; }, 3000, 'apply-asset-path-moves', 2);
+      expect(settleRelayReply(reg, { id: sentId, declined: true }, 'client-a')).toBe(false);
+      expect(settleRelayReply(reg, { id: sentId, declined: true }, 'client-a')).toBe(false);
+      expect(reg.size, 'the duplicate must not complete the count').toBe(1);
+      expect(settleRelayReply(reg, { id: sentId, result: 'the editor answered' }, 'client-b')).toBe(true);
+      await expect(p).resolves.toBe('the editor answered');
+    });
+
+    it('a reply carrying a RESULT is never COUNTED as a decline — it settles at once', async () => {
+      // #1030 close-out F4, the `result === undefined` half. A reply with both fields is malformed
+      // and `error` wins (pre-existing, unchanged) — the point here is WHICH PATH it takes: without
+      // that gate it would be counted as a decline and held until the other two clients answered,
+      // then reported under the OUTER op's name. `expected: 3` is what makes the difference
+      // observable: a counted decline could not settle here.
+      const t = manualTimers();
+      const reg = createBrowserRequestRegistry(t);
+      let sentId = -1;
+      const p = reg.request((id) => { sentId = id; }, 3000, 'outer-op', 3);
+      expect(settleRelayReply(reg, { id: sentId, result: 'ok', error: "unknown agent op 'inner'" }, 'c')).toBe(true);
+      await expect(p).rejects.toThrow(/unknown agent op 'inner'/);   // the reply's OWN message
+      expect(reg.size).toBe(0);
+    });
+
+    it('does NOT treat a nested "unknown agent op" message as a decline — the anchor', async () => {
+      const t = manualTimers();
+      const reg = createBrowserRequestRegistry(t);
+      let sentId = -1;
+      const p = reg.request((id) => { sentId = id; }, 3000, 'outer-op', 3);
+      // A real op failing, whose own message happens to contain the words. Authoritative:
+      // it must settle NOW, and must not be misreported under the OUTER op's name.
+      expect(settleRelayReply(reg, { id: sentId, error: "cannot proxy: unknown agent op 'inner'" }, 'c')).toBe(true);
+      await expect(p).rejects.toThrow(/cannot proxy: unknown agent op 'inner'/);
+    });
+
+    it('countLiveBridgeClients counts only ANNOUNCED clients that are still connected', () => {
+      // #1030 close-out F2. `ws.clients.size` counts SOCKETS: /@vite/client connects while
+      // index.html parses, but initAgentBridge is reached through a dynamic import much later —
+      // and never at all for a tab sitting on the Vite error overlay. Such a tab is counted-but-
+      // mute, its decline never arrives, and the request rides the CALLER's full budget: 1.5s on
+      // the move repair (which then warns about a live editor that was never at risk), 60s on eval.
+      const editor = { id: 'editor' }, game = { id: 'game' }, gone = { id: 'gone' };
+      const live = new Set<unknown>([editor, game, { id: 'still-booting-never-announced' }]);
+      expect(countLiveBridgeClients([editor, game, gone], live)).toBe(2);
+      expect(countLiveBridgeClients([], live)).toBe(0);
+      // No membership test available → assume present. Conservative on purpose: too HIGH degrades
+      // to the caller's timeout, too LOW would settle `absent` while a client could still answer.
+      expect(countLiveBridgeClients([editor, game, gone], undefined)).toBe(3);
+    });
+  });
+
   it('hands out monotonically increasing ids across concurrent requests', () => {
     const t = manualTimers();
     const reg = createBrowserRequestRegistry(t);
     const ids: number[] = [];
-    reg.request((id) => ids.push(id), 3000);
-    reg.request((id) => ids.push(id), 3000);
-    reg.request((id) => ids.push(id), 3000);
+    reg.request((id) => ids.push(id), 3000, 'probe-op', 1);
+    reg.request((id) => ids.push(id), 3000, 'probe-op', 1);
+    reg.request((id) => ids.push(id), 3000, 'probe-op', 1);
     expect(ids).toEqual([1, 2, 3]);
     expect(reg.size).toBe(3);
   });
@@ -591,7 +771,7 @@ describe('findAssetRoots (real project)', () => {
   // The 3d-test-specific versions proved nothing extra: what makes them pass is the SHAPE
   // (`<root>/games/<id>/runtime/assets`), not that particular game's content.
   it('discovers game asset directories under a monorepo-shaped root', () => {
-    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-mono-'));
+    const tmp = makeScratchDir('modoki-mono-');
     try {
       fs.mkdirSync(path.join(tmp, 'games/probe-game/runtime/assets/scenes'), { recursive: true });
       const roots = findAssetRoots(tmp);
@@ -604,7 +784,7 @@ describe('findAssetRoots (real project)', () => {
   });
 
   it('returns at least 2 roots (modoki + at least one game)', () => {
-    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-mono2-'));
+    const tmp = makeScratchDir('modoki-mono2-');
     try {
       fs.mkdirSync(path.join(tmp, 'games/probe-game/runtime/assets'), { recursive: true });
       const roots = findAssetRoots(tmp);
@@ -620,7 +800,7 @@ describe('findAssetRoots (real project)', () => {
 
   it('serves a flat one-game project\'s assets at /assets (no /games/<id>/ segment)', () => {
     // C4c flat convention: <projectRoot>/runtime/assets → /assets.
-    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-flat-'));
+    const tmp = makeScratchDir('modoki-flat-');
     try {
       fs.mkdirSync(path.join(tmp, 'runtime/assets/scenes'), { recursive: true });
       const roots = findAssetRoots(tmp);
@@ -637,7 +817,7 @@ describe('findAssetRoots (real project)', () => {
   it('serves the editor\'s own engine assets for an external project (no engine/ of its own)', () => {
     // C4c: an external project folder has its own games/ but no
     // engine/packages/modoki — the editor's built-in fonts must still be served.
-    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-ext-'));
+    const tmp = makeScratchDir('modoki-ext-');
     try {
       fs.mkdirSync(path.join(tmp, 'games/hello/runtime/assets'), { recursive: true });
       const roots = findAssetRoots(tmp);
@@ -693,7 +873,7 @@ describe('resolveModokiAssetsDir (fallback order)', () => {
 
 describe('findGamesEntry', () => {
   it('finds a flat single-game entry (game.ts)', () => {
-    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-single-'));
+    const tmp = makeScratchDir('modoki-single-');
     try {
       fs.writeFileSync(path.join(tmp, 'game.ts'), 'export const game = {};');
       const entry = findGamesEntry(tmp);
@@ -705,7 +885,7 @@ describe('findGamesEntry', () => {
   });
 
   it('ignores a legacy games/registry.ts (one project = one game)', () => {
-    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-reg-'));
+    const tmp = makeScratchDir('modoki-reg-');
     try {
       fs.mkdirSync(path.join(tmp, 'games'), { recursive: true });
       fs.writeFileSync(path.join(tmp, 'games/registry.ts'), 'export const ALL_GAMES = [];');
@@ -717,7 +897,7 @@ describe('findGamesEntry', () => {
   });
 
   it('returns null when no game.ts exists', () => {
-    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-none-'));
+    const tmp = makeScratchDir('modoki-none-');
     try {
       expect(findGamesEntry(tmp)).toBeNull();
     } finally {
@@ -789,7 +969,7 @@ describe('readAssetGuid', () => {
   let tmpDir: string;
 
   beforeEach(() => {
-    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-scanner-'));
+    tmpDir = makeScratchDir('modoki-scanner-');
   });
   afterEach(() => {
     fs.rmSync(tmpDir, { recursive: true, force: true });
@@ -933,7 +1113,7 @@ describe('buildManifest', () => {
 
 describe('buildManifest auto-heal', () => {
   let tmpDir: string;
-  beforeEach(() => { tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-heal-')); });
+  beforeEach(() => { tmpDir = makeScratchDir('modoki-heal-'); });
   afterEach(() => { fs.rmSync(tmpDir, { recursive: true, force: true }); });
 
   it("rewrites the later file's id in place when heal=true", () => {
@@ -1085,7 +1265,7 @@ describe('buildManifest auto-heal', () => {
 
 describe('writeAssetGuid', () => {
   let tmpDir: string;
-  beforeEach(() => { tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-wg-')); });
+  beforeEach(() => { tmpDir = makeScratchDir('modoki-wg-'); });
   afterEach(() => { fs.rmSync(tmpDir, { recursive: true, force: true }); });
 
   it('replaces the id of a JSON asset, preserving other fields', () => {
@@ -1170,7 +1350,7 @@ describe('writeAssetGuid', () => {
 // ── Sliced-sprite sub-entries (texture "multiple" mode) ──────────────────────
 describe('scanAllAssets — sprite sub-entries from texture meta', () => {
   let tmpDir: string;
-  beforeEach(() => { tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-sprites-')); });
+  beforeEach(() => { tmpDir = makeScratchDir('modoki-sprites-'); });
   afterEach(() => { fs.rmSync(tmpDir, { recursive: true, force: true }); });
 
   it('emits one "sprite" entry per slice, pointing at the parent texture', () => {
@@ -1246,7 +1426,7 @@ describe('scanAllAssets — sprite sub-entries from texture meta', () => {
 // ── Empty-folder visibility ──────────────────────────────────────────────────
 describe('scanAllAssets / buildManifest — empty folders', () => {
   let tmpDir: string;
-  beforeEach(() => { tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-emptydir-')); });
+  beforeEach(() => { tmpDir = makeScratchDir('modoki-emptydir-'); });
   afterEach(() => { fs.rmSync(tmpDir, { recursive: true, force: true }); });
 
   it('emits a guid-less "folder" entry for a dir with no file assets, but not for one with files', () => {
@@ -1372,20 +1552,177 @@ describe('the Electron watcher must not re-implement classifySceneChange', () =>
   });
 });
 
-describe('otaPublishBundleNameAllowed (/api/ota/publish bundle-identity guard)', () => {
-  it('allows publishing the project as its own configured bundle', () => {
-    expect(otaPublishBundleNameAllowed('shell', 'shell')).toBe(true);
+describe('otaPublishTarget (/api/ota/publish: which build a bundle name selects, #837)', () => {
+  const ota = { bundleName: 'shell', subgames: ['ota-subgame-test'] };
+
+  it('the project\'s own bundle name builds the project as itself', () => {
+    expect(otaPublishTarget('shell', ota)).toEqual({ kind: 'shell' });
   });
 
-  it('refuses a bundleName that differs from the project\'s own — the publish-corruption fix', () => {
-    // Before this guard, publishing "shell" content under "ota-subgame-test"'s name would
-    // silently ship the wrong bytes under someone else's identity. See ota-updates.md's
-    // Gotchas for the full failure scenario a code review caught.
-    expect(otaPublishBundleNameAllowed('ota-subgame-test', 'shell')).toBe(false);
+  it('a listed sub-game id builds that sub-game', () => {
+    expect(otaPublishTarget('ota-subgame-test', ota)).toEqual({ kind: 'subgame', id: 'ota-subgame-test' });
+  });
+
+  it('refuses an unlisted name — still the publish-corruption fix: shell content under another bundle\'s identity', () => {
+    // Before the original guard, publishing "shell" content under "ota-subgame-test"'s name
+    // silently shipped the wrong bytes under someone else's identity. Listing is now the only way
+    // a second name is accepted, and it selects a real sub-game build (see ota-updates.md § Gotchas).
+    expect(otaPublishTarget('ota-subgame-test', { bundleName: 'shell', subgames: [] })).toBeNull();
+    expect(otaPublishTarget('other', ota)).toBeNull();
   });
 
   it('is case-sensitive (no accidental leniency)', () => {
-    expect(otaPublishBundleNameAllowed('Shell', 'shell')).toBe(false);
+    expect(otaPublishTarget('Shell', ota)).toBeNull();
+    expect(otaPublishTarget('OTA-subgame-test', ota)).toBeNull();
+  });
+
+  it('refuses a name that is BOTH the shell\'s and a listed sub-game\'s — it cannot say which build it means', () => {
+    expect(otaPublishTarget('shell', { bundleName: 'shell', subgames: ['shell'] })).toBeNull();
+  });
+});
+
+describe('otaSubgameProjectDir (#837)', () => {
+  const projects = [
+    { name: 'ota-test', dir: '/repo/games/ota-test' },
+    { name: 'ota-subgame-test', dir: '/repo/games/ota-subgame-test' },
+    { name: 'twin', dir: '/repo/games/twin' },
+    { name: 'twin', dir: '/repo/demos/twin' },
+  ];
+  const hasEntry = () => true;
+  const errorOf = (r: ReturnType<typeof otaSubgameProjectDir>) => (r.ok ? '' : r.error);
+
+  it('resolves a listed id to its project folder', () => {
+    expect(otaSubgameProjectDir('ota-subgame-test', projects, '/repo/games/ota-test', hasEntry))
+      .toEqual({ ok: true, dir: '/repo/games/ota-subgame-test' });
+  });
+
+  it('refuses an id with no project', () => {
+    expect(errorOf(otaSubgameProjectDir('nope', projects, '/repo/games/ota-test', hasEntry))).toMatch(/no project of that name/);
+  });
+
+  it('refuses an id found under two roots', () => {
+    expect(errorOf(otaSubgameProjectDir('twin', projects, '/repo/games/ota-test', hasEntry))).toMatch(/names 2 projects/);
+  });
+
+  it('refuses the shell project itself', () => {
+    expect(errorOf(otaSubgameProjectDir('ota-test', projects, '/repo/games/ota-test', hasEntry))).toMatch(/this shell project itself/);
+  });
+
+  it('refuses a folder with no game entry for build-subgame.mjs', () => {
+    expect(errorOf(otaSubgameProjectDir('ota-subgame-test', projects, '/repo/games/ota-test', () => false))).toMatch(/no game\.ts/);
+  });
+});
+
+describe('otaResolveSubgameDir (#837 close-out: where the publish route looks for a listed sub-game)', () => {
+  let tmp: string;
+  beforeEach(() => { tmp = makeScratchDir('modoki-subgame-resolve-'); });
+  afterEach(() => { fs.rmSync(tmp, { recursive: true, force: true }); });
+  const mk = (...parts: string[]) => { const d = path.join(tmp, ...parts); fs.mkdirSync(d, { recursive: true }); return d; };
+  const game = (...parts: string[]) => { const d = mk(...parts); fs.writeFileSync(path.join(d, 'game.ts'), ''); return d; };
+  const hasGame = (d: string) => fs.existsSync(path.join(d, 'game.ts'));
+
+  it('finds a sub-game NEXT TO the shell when the editor root has no games/ (a packaged editor)', () => {
+    const editorRoot = mk('app.asar.unpacked');
+    const shell = game('MyGames', 'shell');
+    const mini = game('MyGames', 'mini');
+    expect(otaResolveSubgameDir('mini', editorRoot, shell, hasGame)).toEqual({ ok: true, dir: mini });
+  });
+
+  it('prefers the shell\'s own neighbour over a same-named game in the clone the editor runs from', () => {
+    game('repoA', 'games', 'mini');
+    const shell = game('repoB', 'games', 'shell');
+    const mine = game('repoB', 'games', 'mini');
+    expect(otaResolveSubgameDir('mini', path.join(tmp, 'repoA'), shell, hasGame)).toEqual({ ok: true, dir: mine });
+  });
+
+  it('reaches a demos/ sub-game of a games/ shell through the repo', () => {
+    const shell = game('repo', 'games', 'shell');
+    const mini = game('repo', 'demos', 'mini');
+    expect(otaResolveSubgameDir('mini', path.join(tmp, 'repo'), shell, hasGame)).toEqual({ ok: true, dir: mini });
+  });
+
+  it('skips a plain folder beside the shell that shares the name, rather than picking it or calling the id ambiguous', () => {
+    const shell = game('Out', 'shell');
+    mk('Out', 'mini'); // not a game
+    const repoMini = game('repo', 'games', 'mini');
+    expect(otaResolveSubgameDir('mini', path.join(tmp, 'repo'), shell, hasGame)).toEqual({ ok: true, dir: repoMini });
+  });
+
+  it('says a same-named folder is not a game, over a bare "not found", when nothing better exists', () => {
+    const shell = game('Out', 'shell');
+    mk('Out', 'mini');
+    const r = otaResolveSubgameDir('mini', mk('emptyRoot'), shell, hasGame);
+    expect(r.ok).toBe(false);
+    expect(!r.ok && r.reason).toBe('no-game-entry');
+  });
+
+  it('refuses an id that would leave the shell\'s parent, and the shell itself', () => {
+    const shell = game('Out', 'shell');
+    const up = otaResolveSubgameDir('..', mk('emptyRoot'), shell, hasGame);
+    expect(!up.ok && up.reason).toBe('not-found');
+    const self = otaResolveSubgameDir('shell', mk('emptyRoot2'), shell, hasGame);
+    expect(!self.ok && self.reason).toBe('shell-itself');
+  });
+
+  it('never looks up an id containing a path separator beside the shell', () => {
+    const shell = game('Out', 'shell');
+    game('Out', 'nested', 'mini'); // reachable only if the separator guard were gone
+    const r = otaResolveSubgameDir('nested/mini', mk('emptyRoot'), shell, hasGame);
+    expect(!r.ok && r.reason).toBe('not-found');
+  });
+
+  it('matches the sibling name EXACTLY — a case variant is not found, on every platform', () => {
+    const shell = game('Out', 'shell');
+    game('Out', 'mini');
+    const r = otaResolveSubgameDir('Mini', mk('emptyRoot'), shell, hasGame);
+    expect(!r.ok && r.reason).toBe('not-found');
+  });
+
+  it('is what the publish route actually calls, with the real game-entry probe — a reverted call site would leave every case above green', () => {
+    // Comments are stripped by readScannedSource, so a commented-out call cannot satisfy this.
+    const src = readScannedSource(path.join(PROJECT_ROOT, 'engine/plugins/vite-asset-scanner.ts')).code;
+    expect(src).toMatch(/otaResolveSubgameDir\(target\.id, buildCwd, projectRoot, \(dir\) => findGamesEntry\(dir\) !== null\)/);
+    expect(src).not.toMatch(/otaSubgameProjectDir\(target\.id,/);
+  });
+});
+
+describe('otaPublishSteps (#837)', () => {
+  const base = {
+    projectRoot: '/repo/games/ota-test', gcloudEnv: { PATH: '/gcloud/bin' }, buildCwd: '/repo',
+    bucket: 'gs://b/p', bundleName: 'shell', version: 'v2', keyName: 'ota-test', shellEngineApi: 4, mandatory: undefined,
+  };
+
+  it('a shell target builds this project with build-web.mjs and publishes its dist/ with the shell engine API', () => {
+    const s = otaPublishSteps({ ...base, target: { kind: 'shell' } });
+    expect(s.buildCmd).toBe('node engine/scripts/build-web.mjs --target native');
+    expect(s.buildEnv.MODOKI_PROJECT).toBe('/repo/games/ota-test');
+    expect(s.distDir).toBe(path.join('/repo/games/ota-test', 'dist'));
+    expect(s.publishCmd).toContain(`--dist ${JSON.stringify(path.join('/repo/games/ota-test', 'dist'))}`);
+    expect(s.publishCmd).toContain('--engine-api 4');
+    expect(s.publishCmd).toContain('--project "/repo/games/ota-test"');
+  });
+
+  it('a sub-game target builds THAT project, uploads its subgame-dist under its id into the SHELL project, and passes no --engine-api', () => {
+    const s = otaPublishSteps({
+      ...base, bundleName: 'ota-subgame-test', target: { kind: 'subgame', id: 'ota-subgame-test' }, subgameDir: '/repo/games/ota-subgame-test',
+    });
+    expect(s.buildCmd).toBe('node engine/scripts/build-subgame.mjs');
+    expect(s.buildEnv.MODOKI_PROJECT).toBe('/repo/games/ota-subgame-test');
+    expect(s.distDir).toBe(path.join('/repo/games/ota-subgame-test', 'subgame-dist'));
+    expect(s.publishCmd).toContain(`--dist ${JSON.stringify(path.join('/repo/games/ota-subgame-test', 'subgame-dist'))}`);
+    expect(s.publishCmd).toContain('--name "ota-subgame-test"');
+    expect(s.publishCmd).toContain('--project "/repo/games/ota-test"');
+    expect(s.publishCmd).not.toContain('--engine-api');
+  });
+
+  it('a sub-game target without its resolved folder throws rather than building the shell by accident', () => {
+    expect(() => otaPublishSteps({ ...base, target: { kind: 'subgame', id: 'x' } })).toThrow(/resolved project dir/);
+  });
+
+  it('carries the tri-state mandatory flag through to both targets', () => {
+    expect(otaPublishSteps({ ...base, target: { kind: 'shell' }, mandatory: true }).publishCmd).toMatch(/ --mandatory$/);
+    expect(otaPublishSteps({ ...base, target: { kind: 'shell' }, mandatory: false }).publishCmd).toMatch(/ --no-mandatory$/);
+    expect(otaPublishSteps({ ...base, target: { kind: 'shell' } }).publishCmd).not.toMatch(/mandatory/);
   });
 });
 
@@ -1491,13 +1828,29 @@ describe('/api/ota/publish route has no collision guard of its own (#577)', () =
    *  A line that opens `/*` and closes it before real code (`/* c8 ignore next *​/ execFile…`)
    *  is dropped whole and WOULD evade both assertions — that is the false-negative shape to
    *  watch; `^\s*\/\*.*\*\/\s*\S` currently matches nowhere in the plugin sources. */
-  const routeCode = (): string => routeBody()
+  /** Since #837 the commands the handler runs live in `otaPublishSteps`, one helper away. So the
+   *  scanned region is the handler PLUS that helper: a preflight re-added in either place is inside
+   *  it. Same throw-rather-than-shrink rule as `routeBody`. */
+  const HELPER_START = 'export function otaPublishSteps(';
+  const helperBody = (): string => {
+    const startIdx = source.indexOf(HELPER_START);
+    const endIdx = startIdx === -1 ? -1 : source.indexOf('\n}\n', startIdx);
+    if (startIdx === -1 || endIdx === -1) {
+      throw new Error(`#577 regression test: could not isolate otaPublishSteps in vite-asset-scanner.ts (anchor ${JSON.stringify(HELPER_START)}). Re-point it.`);
+    }
+    return source.slice(startIdx, endIdx + 2);
+  };
+
+  const routeCode = (): string => `${routeBody()}\n${helperBody()}`
     .split('\n')
     .filter((line) => !/^\s*(\/\/|\/\*|\*)/.test(line))
     .join('\n');
 
   it('isolates the route handler body between stable start/end anchors', () => {
     expect(routeBody().length).toBeGreaterThan(0);
+    // The handler must still run the helper's command, or scanning the helper covers nothing it does.
+    expect(routeBody()).toContain('steps.publishCmd');
+    expect(helperBody()).toContain('ota-publish.mjs');
     // The strip must not eat the body whole — a `routeCode()` of nothing would pass every
     // assertion below for the wrong reason.
     expect(routeCode()).toContain('ota-publish.mjs');
@@ -1545,8 +1898,6 @@ describe('/api/ota/publish route has no collision guard of its own (#577)', () =
     ).toBe(false);
   });
 });
-
-
 
 describe('isSiblingRaisedChange — a body write must not discard the descriptor\'s parked edit (#857 close-out)', () => {
   const DESC = '/games/g/assets/shaders/holo.shader.json';

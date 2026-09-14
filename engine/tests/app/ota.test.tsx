@@ -122,6 +122,29 @@ describe('#437 checkAppOtaUpdate / the blocking gate', () => {
     expect(snapshots[snapshots.length - 1]).toEqual({ phase: 'ready-to-restart', version: 'v1' });
   });
 
+  it('a gate listener that throws on ready-to-restart cannot let the app boot past a mandatory update (#953)', async () => {
+    // Pre-#953 `setGate` fanned out with a bare `forEach`. The throw escaped through
+    // `setGateIfCurrent` into `checkAppOtaUpdate`'s catch; there, `setGateIfCurrent(null)` was
+    // swallowed by `setGate`'s ready-to-restart backstop, and the call resolved `true`, so App.tsx
+    // loaded the scene underneath a gate the user cannot dismiss.
+    const ota = await freshOta();
+    h.addListener.mockResolvedValue({ remove: vi.fn(async () => {}) });
+    h.checkForUpdate.mockResolvedValueOnce({ outcome: 'staged', mandatory: true, version: 'v1' });
+    const errSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const seen: unknown[] = [];
+    ota.subscribeOtaGate((s) => { if (s?.phase === 'ready-to-restart') throw new Error('gate UI boom'); });
+    ota.subscribeOtaGate((s) => { seen.push(s); });
+
+    const result = await ota.checkAppOtaUpdate();
+
+    expect(result, 'a mandatory staged update must hold the launch').toBe(false);
+    expect(seen[seen.length - 1], 'the listener behind the thrower still saw the gate').toEqual({ phase: 'ready-to-restart', version: 'v1' });
+    expect(errSpy).toHaveBeenCalled();
+    errSpy.mockRestore();
+    warnSpy.mockRestore();
+  });
+
   it('once ready-to-restart, a later check resolves false without re-running the update check (terminal short-circuit)', async () => {
     const ota = await freshOta();
     h.addListener.mockResolvedValue({ remove: vi.fn(async () => {}) });
@@ -198,4 +221,43 @@ describe('#509 pending-restart must hold a mandatory gate the same as staged', (
   // deliberate: this file owns outcome → gate, `otaClient.test.ts` owns native state → outcome, and
   // neither can see a bug that lives in the composition (#509 was exactly one). Add a mapping case
   // here; add a race case there.
+});
+
+describe('#1132 delta-fallback reports reach the log (onDeltaFallback was never wired)', () => {
+  const info = { version: 'v7', reason: 'embedded base manifest is present but unusable: bad' };
+
+  it('the shell check passes onDeltaFallback, and a report is LOGGED, not warned', async () => {
+    const ota = await freshOta();
+    h.addListener.mockResolvedValue({ remove: vi.fn(async () => {}) });
+    h.checkForUpdate.mockImplementationOnce(async (opts: { onDeltaFallback?: (i: typeof info) => void }) => {
+      opts.onDeltaFallback?.(info);
+      return { outcome: 'staged', mandatory: false, version: 'v7' };
+    });
+    const log = vi.spyOn(console, 'log').mockImplementation(() => {});
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+
+    await expect(ota.checkAppOtaUpdate()).resolves.toBe(true);
+
+    expect(log).toHaveBeenCalledWith(expect.stringMatching(/OTA "shell" v7: delta fell back to a whole download — embedded base manifest is present but unusable: bad/));
+    expect(warn).not.toHaveBeenCalled();
+    log.mockRestore(); warn.mockRestore();
+  });
+
+  it('each sub-game check passes onDeltaFallback naming ITS bundle', async () => {
+    const ota = await freshOta();
+    h.fetchRelease.mockResolvedValueOnce({ ok: true, release: { bundles: { shell: 'v1', arcade: 'v3' } } });
+    h.checkForUpdate.mockImplementationOnce(async (opts: { onDeltaFallback?: (i: typeof info) => void }) => {
+      opts.onDeltaFallback?.(info);
+      return { outcome: 'up-to-date' };
+    });
+    const log = vi.spyOn(console, 'log').mockImplementation(() => {});
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+
+    await ota.checkAppSubgameUpdates();
+
+    expect(h.checkForUpdate).toHaveBeenCalledTimes(1);
+    expect(log).toHaveBeenCalledWith(expect.stringMatching(/OTA "arcade" v7: delta fell back to a whole download/));
+    expect(warn).not.toHaveBeenCalled();
+    log.mockRestore(); warn.mockRestore();
+  });
 });

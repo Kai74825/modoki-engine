@@ -6,7 +6,7 @@
  *  base; in `revert` mode they are reset back to the prefab base on this single
  *  instance (the prefab file is untouched). Same diff tree, opposite direction. */
 
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import { useEditorStore } from '../store/editorStore';
 import {
   getPrefabSource,
@@ -20,8 +20,12 @@ import { entityRef } from '../undo/entityRef';
 import { applyToPrefabWithUndo } from '../undo/applyPrefabUndo';
 import { getTraitByName } from '../../runtime/core/ecs/traitRegistry';
 import { getCurrentWorld } from '../../runtime/core/ecs/world';
+import { findEntity } from '../../runtime/core/ecs/entityUtils';
+import { livePinnedId } from '../../runtime/core/ecs/entityPin';
+import { subjectGoneNotice, runOnPinnedSubject } from './prefabDialogSubject';
 import type { AddedEntity } from '../../runtime/loaders/loadSceneFile';
 import { buildOverrideForest, type ForestNode } from './prefabOverrideForest';
+import { MixedCheckbox } from './assetViews/widgets';
 import {
   collectInstanceOverrideFields, addedKey, removedEntityKey, removedTraitKey,
   type EntityOverrideNode,
@@ -86,24 +90,18 @@ function describeAdded(node: AddedEntity): string {
   return parts.join(', ');
 }
 
-function TriCheckbox({ state, onChange, title }: {
+/** A row's tri-state checkbox. Through MixedCheckbox so it carries a handle (#1170): these rows were
+ *  untagged, so an agent could neither read a partly-selected entity nor tick one. */
+export function TriCheckbox({ state, onChange, title, dataUiId, dataUiLabel }: {
   state: 'on' | 'off' | 'mixed';
   onChange: (next: 'on' | 'off') => void;
   title?: string;
+  dataUiId: string;
+  dataUiLabel?: string;
 }) {
-  const ref = useRef<HTMLInputElement>(null);
-  useEffect(() => {
-    if (ref.current) ref.current.indeterminate = state === 'mixed';
-  }, [state]);
   return (
-    <input
-      ref={ref}
-      type="checkbox"
-      checked={state === 'on'}
-      onChange={(e) => onChange(e.target.checked ? 'on' : 'off')}
-      title={title}
-      style={{ marginRight: 6, cursor: 'pointer' }}
-    />
+    <MixedCheckbox checked={state === 'on'} mixed={state === 'mixed'} onChange={(v) => onChange(v ? 'on' : 'off')}
+      title={title} style={{ marginRight: 6, cursor: 'pointer' }} dataUiId={dataUiId} dataUiLabel={dataUiLabel} />
   );
 }
 
@@ -137,9 +135,10 @@ export function RevertPrefabDialog() {
 }
 
 function PrefabOverridesDialog({ mode }: { mode: Mode }) {
-  const { active, rootInstanceId } = useEditorStore((s) =>
+  const { active, subject } = useEditorStore((s) =>
     mode === 'apply' ? s.applyPrefabDialog : s.revertPrefabDialog,
   );
+  const rootInstanceId = subject?.id ?? null;
   const closeDialog = useEditorStore((s) =>
     mode === 'apply' ? s.closeApplyPrefabDialog : s.closeRevertPrefabDialog,
   );
@@ -148,8 +147,16 @@ function PrefabOverridesDialog({ mode }: { mode: Mode }) {
   const [collapsed, setCollapsed] = useState<Set<string>>(new Set());
   const [applying, setApplying] = useState(false);
 
+  /** #868: when the instance root the dialog was opened for no longer exists, the dialog closes with a
+   *  notice rather than acting on whatever entity now holds its index (see prefabDialogSubject.ts). */
+  const closeAsGone = (notice: string) => {
+    closeDialog();
+    useEditorStore.getState().showToast(notice, 'warn');
+  };
+
   useEffect(() => {
     if (!active || rootInstanceId === null) return;
+    if (livePinnedId(subject, findEntity, getCurrentWorld()) === null) { closeAsGone(subjectGoneNotice(mode)); return; }
     let cancelled = false;
     setLoadState({ kind: 'loading' });
     (async () => {
@@ -185,7 +192,7 @@ function PrefabOverridesDialog({ mode }: { mode: Mode }) {
       setLoadState({ kind: 'ready', entities, structural });
     })();
     return () => { cancelled = true; };
-  }, [active, rootInstanceId]);
+  }, [active, subject]);
 
   const totals = useMemo(() => {
     if (loadState.kind !== 'ready') return { total: 0, checked: 0 };
@@ -236,10 +243,15 @@ function PrefabOverridesDialog({ mode }: { mode: Mode }) {
     if (rootInstanceId === null || checked.size === 0 || applying) return;
     setApplying(true);
     try {
-      // Applies the selected overrides to the prefab AND pushes one undo entry.
-      // (Promotion-driven scene re-save now happens inside applyToPrefabWithUndo.)
-      await applyToPrefabWithUndo(rootInstanceId, checked);
-      closeDialog();
+      await runOnPinnedSubject({
+        subject, lookup: findEntity, world: getCurrentWorld(), mode, onGone: closeAsGone,
+        act: async (liveId) => {
+          // Applies the selected overrides to the prefab AND pushes one undo entry.
+          // (Promotion-driven scene re-save now happens inside applyToPrefabWithUndo.)
+          await applyToPrefabWithUndo(liveId, checked);
+          closeDialog();
+        },
+      });
     } finally {
       setApplying(false);
     }
@@ -249,29 +261,34 @@ function PrefabOverridesDialog({ mode }: { mode: Mode }) {
     if (rootInstanceId === null || checked.size === 0 || applying) return;
     setApplying(true);
     try {
-      const result = await revertOverridesSelective(rootInstanceId, checked);
-      if (result) {
-        // The rebuild assigns new ECS ids but preserves the instance root's guid
-        // (rebuildInstance carries it over), so a guid-based ref re-finds the live
-        // root across each rebuild AND across a world rebuild (Play→Stop).
-        const ref = entityRef(result.newRootId);
-        useEditorStore.getState().selectEntity(result.newRootId);
-        const { source, prefab, fullOverrides, fullStructure, reducedOverrides, reducedStructure } = result;
-        pushAction({
-          label: 'Revert prefab overrides',
-          undo: () => {
-            const cur = ref.resolve(); if (cur == null) return;
-            const id = rebuildInstance(cur, source, prefab, fullOverrides, fullStructure);
-            useEditorStore.getState().selectEntity(id);
-          },
-          redo: () => {
-            const cur = ref.resolve(); if (cur == null) return;
-            const id = rebuildInstance(cur, source, prefab, reducedOverrides, reducedStructure);
-            useEditorStore.getState().selectEntity(id);
-          },
-        });
-      }
-      closeDialog();
+      await runOnPinnedSubject({
+        subject, lookup: findEntity, world: getCurrentWorld(), mode, onGone: closeAsGone,
+        act: async (liveId) => {
+          const result = await revertOverridesSelective(liveId, checked);
+          if (result) {
+            // The rebuild assigns new ECS ids but preserves the instance root's guid
+            // (rebuildInstance carries it over), so a guid-based ref re-finds the live
+            // root across each rebuild AND across a world rebuild (Play→Stop).
+            const ref = entityRef(result.newRootId);
+            useEditorStore.getState().selectEntity(result.newRootId);
+            const { source, prefab, fullOverrides, fullStructure, reducedOverrides, reducedStructure } = result;
+            pushAction({
+              label: 'Revert prefab overrides',
+              undo: () => {
+                const cur = ref.resolve(); if (cur == null) return;
+                const id = rebuildInstance(cur, source, prefab, fullOverrides, fullStructure);
+                useEditorStore.getState().selectEntity(id);
+              },
+              redo: () => {
+                const cur = ref.resolve(); if (cur == null) return;
+                const id = rebuildInstance(cur, source, prefab, reducedOverrides, reducedStructure);
+                useEditorStore.getState().selectEntity(id);
+              },
+            });
+          }
+          closeDialog();
+        },
+      });
     } finally {
       setApplying(false);
     }
@@ -304,7 +321,8 @@ function PrefabOverridesDialog({ mode }: { mode: Mode }) {
             onClick={() => toggleCollapsed(`e:${e.localId}`)}
             style={{ cursor: 'pointer', color: '#888', width: 14, userSelect: 'none' }}
           >{entityCollapsed ? '▸' : '▾'}</span>
-          <TriCheckbox state={entityState} onChange={(next) => toggleMany(entityKeys, next)} />
+          <TriCheckbox state={entityState} onChange={(next) => toggleMany(entityKeys, next)}
+            dataUiId={`prefab.dialog.entity.${e.localId}`} dataUiLabel={e.name} />
           <span style={{ color: '#ddd', fontWeight: 'bold' }}>{e.name}</span>
           <span style={{ color: '#555', marginLeft: 8, fontSize: 10 }}>localId {e.localId}</span>
         </div>
@@ -319,7 +337,8 @@ function PrefabOverridesDialog({ mode }: { mode: Mode }) {
                   onClick={() => toggleCollapsed(`e:${e.localId}:t:${t.trait}`)}
                   style={{ cursor: 'pointer', color: '#888', width: 14, userSelect: 'none' }}
                 >{traitCollapsed ? '▸' : '▾'}</span>
-                <TriCheckbox state={traitState} onChange={(next) => toggleMany(traitKeys, next)} />
+                <TriCheckbox state={traitState} onChange={(next) => toggleMany(traitKeys, next)}
+                  dataUiId={`prefab.dialog.entity.${e.localId}.trait.${t.trait}`} dataUiLabel={t.trait} />
                 <span style={{ color: '#5dade2' }}>{t.trait}</span>
               </div>
               {!traitCollapsed && t.fields.map((f) => (
@@ -327,6 +346,7 @@ function PrefabOverridesDialog({ mode }: { mode: Mode }) {
                   <TriCheckbox
                     state={checked.has(f.key) ? 'on' : 'off'}
                     onChange={(next) => toggleKey(f.key, next)}
+                    dataUiId={`prefab.dialog.item.${f.key}`} dataUiLabel={f.field}
                   />
                   <span style={{ color: '#bbb', minWidth: 110 }}>{f.field}</span>
                   {isRevert ? (
@@ -392,6 +412,7 @@ function PrefabOverridesDialog({ mode }: { mode: Mode }) {
                   <TriCheckbox
                     state={checked.has(key) ? 'on' : 'off'}
                     onChange={(next) => toggleKey(key, next)}
+                    dataUiId={`prefab.dialog.item.${key}`} dataUiLabel={node.name || '(unnamed)'}
                     title={isRevert
                       ? 'Remove this added entity (and its subtree) from the instance'
                       : 'Add this entity (and its subtree) to the prefab base'}
@@ -415,6 +436,10 @@ function PrefabOverridesDialog({ mode }: { mode: Mode }) {
               <TriCheckbox
                 state={checked.has(r.key) ? 'on' : 'off'}
                 onChange={(next) => toggleKey(r.key, next)}
+                // A label of its own: without one `labelFor` falls back to `title`, and every row
+                // in this list shares the same title, so a label aim could not tell them apart. (Two
+                // removed children sharing a NAME still collide — aim those by id.)
+                dataUiId={`prefab.dialog.item.${r.key}`} dataUiLabel={r.name}
                 title={isRevert
                   ? 'Restore this prefab entity to the instance'
                   : 'Delete this entity from the prefab base — affects all instances'}
@@ -433,6 +458,7 @@ function PrefabOverridesDialog({ mode }: { mode: Mode }) {
               <TriCheckbox
                 state={checked.has(r.key) ? 'on' : 'off'}
                 onChange={(next) => toggleKey(r.key, next)}
+                dataUiId={`prefab.dialog.item.${r.key}`} dataUiLabel={`${r.trait} on ${r.entityName}`}
                 title={isRevert
                   ? 'Restore this component to the instance'
                   : 'Delete this component from the prefab base — affects all instances'}

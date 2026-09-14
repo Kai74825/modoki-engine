@@ -18,7 +18,7 @@ of `--target playable` is refused, #40). (Grew out of the `advideo-playable-expo
 | `engine/app/main.tsx` | Behind `__MODOKI_PLAYABLE__`, dynamically imports `bootPlayable`; the debug-bridge import is `!__MODOKI_PLAYABLE__`-gated so it DCEs |
 | `engine/app/playable/bootPlayable.tsx` | The runtime entry — audio gate, overlay mount, `playable:end` latch |
 | `engine/app/playable/mraid.ts` | MRAID v2 shim — `whenReady`/`whenViewable`/`onViewableChange`/`installClick`/`startTimeCap`/`isInAdContainer` |
-| `engine/app/playable/PlayableOverlay.tsx` | The CTA — a persistent Install pill + an end-card (Install + Replay) |
+| `engine/app/playable/PlayableOverlay.tsx` | The CTA — an end-card (Install + Replay) only; **no persistent pill** (#1139) |
 | `engine/app/playable/playableEnd.ts` | Latches `window 'playable:end'` so an end fired before the overlay mounts isn't lost |
 | `engine/scripts/smoke-playable.mjs` | `npm run smoke:playable` — the headless-Chromium artifact smoke |
 
@@ -37,9 +37,99 @@ load offline uniformly. `main.tsx` (behind `__MODOKI_PLAYABLE__`) runs `bootPlay
 `registerAppServices()` (no native SDKs in an ad).
 
 **Gating.** `bootPlayable` mutes audio at boot and unmutes only when the ad is **both viewable AND the
-user has interacted** (re-muting whenever it scrolls off-screen); it withholds the CTA overlay until
-viewable, routes Install through `mraid.open(storeUrl)`, caps a rewarded playable at 30 s, and shows
-the end-card on the cap or a game-dispatched `window 'playable:end'`.
+user has interacted** (re-muting whenever it scrolls off-screen); it mounts the overlay only once
+ready + viewable, routes Install through `mraid.open(storeUrl)`, caps a rewarded playable at 30 s,
+and shows the end-card on the cap or a game-dispatched `window 'playable:end'`.
+
+⚠️ **Since #1139 the end card is the ONLY call to action**, so `capSeconds` is load-bearing rather
+than a backstop: a creative that fires neither `playable:end` nor the cap has no way to click
+through at all.
+
+**The cap is therefore two-phase (owner, 2026-09-13), and each half serves a different viewer:**
+
+- **Armed on VIEWABILITY** — the overlay's mount effect, and `bootPlayable` holds that mount until
+  ready + viewable. This is what guarantees a call to action for someone who scrolls past and never
+  touches the ad.
+- **RESTARTED on the first user gesture** (`onFirstGesture`, `mraid.ts`) — so a player who taps at
+  4 s of a 5 s cap gets a full 5 s of play, not the 1 s that was left. Engaging with the ad must not
+  cost you the session.
+
+An engaged player can therefore reach the end card at up to ~2x `capSeconds`; that is the accepted
+cost of serving both viewers. **Replay re-arms it** — before #1139 a spent cap cost nothing because
+the persistent pill was always there, and now a replayed session without a timer has no CTA at all.
+
+⚠️ **`onFirstGesture` is shared with the audio gate, deliberately.** AppLovin require audio muted
+until first interaction, and the cap keys off the same event; two private copies of the gesture list
+drift the first time somebody adds `click` to one, and the ad then unmutes on an event that does not
+restart the timer, with nothing reporting the disagreement.
+
+⚠️ **Not verified:** whether AppLovin's own spec *requires* a rewarded timer to start only after
+first interaction. The relayed note on #1139 said so; the requirement list quoted there does not
+include it, and nobody has checked their docs. The two-phase shape satisfies the strict reading
+anyway for anyone who interacts.
+
+## Per-target assets (`asset-keep.json` → `playable`)
+
+**The module toggles below shrink the CODE. This shrinks the ASSETS, and for a text-heavy game it is
+the larger half.** A playable build already forces WebP textures at 512 and a downscaled HDR, but
+that only makes the kept set *smaller* — it never makes it *different*, and before #934 nothing
+could. `asset-keep.json` was `{ keep?: string[] }`: inclusion-only and target-agnostic, so every
+build of a project shipped the same asset set and the inliner embedded whatever survived.
+
+That is unfixable from the game side when the weight is data rather than pictures. Wordweave's word
+list, definitions blob and 333-level corpus come to **11.72 MiB — 2.34x the 5 MiB cap before a byte of
+engine JS** (8.63 MiB / 1.73x until #983 gave each word up to three senses). ⚠️ Both ratios are
+MiB against MiB; quoting 11.72 MiB against a decimal 5 MB would read 2.46x and is not comparable
+to the 1.73x it replaced — and they are fetched by PATH from game code, so they are reachable and cannot be
+unreferenced either.
+
+```jsonc
+{
+  "keep": ["/games/<id>/assets/data/words-dictionary.txt"],   // every target, as before
+  "playable": {
+    "keep": ["/games/<id>/assets/levels/playable.json"],      // added ONLY on a playable build
+    "drop": ["/games/<id>/assets/data/words-dictionary.txt"]  // removed from the final set
+  }
+}
+```
+
+- **`drop` applies to the FINISHED set** — everything reachable from a scene, plus the keep-list —
+  not just to the keep-list. Reachability is not a veto, deliberately: a playable's heaviest files
+  are usually the reachable ones.
+- ⚠️ **A `drop` entry that names no file on disk FAILS THE BUILD**, exactly as a stale `keep` entry
+  already does, globs included. Without that, renaming a file silently stops dropping it and the
+  artifact grows past its cap in a build nobody is watching.
+- ⚠️ **What a target drops, that target's code must not fetch.** This is the one rule the engine
+  cannot check for you — a fetch is a string in a `.ts` file — so the game branches on
+  `__MODOKI_PLAYABLE__` and reads a different path. A dropped asset that is still fetched 404s in
+  the ad, where nobody is watching a console.
+- ⚠️ **A dropped asset a surviving SCENE still references by GUID is WARNED about, not refused.**
+  Scene data cannot branch on a build define, so that ref simply resolves to nothing in the ad —
+  but dropping a referenced asset can be deliberate (a decorative model an ad does not need), so
+  it is a warning. `unreachableRefs`, the mechanism that would otherwise catch it, is computed
+  before the drop on purpose and is blind to it.
+- ⚠️ **`keep` is transitive; `drop` is NOT.** A keep-list entry is WALKED — listing a prefab pulls
+  its meshes, materials and textures in with it — while a drop removes exactly the path it names.
+  "Drop the level index and its levels go too" is the natural wrong assumption; list each file.
+- **Only the named target reads its section.** A web or native build ignores `playable` entirely
+  (a stale playable section cannot block them), and so do the editor's Clean Up Unused Assets and
+  Find References — a file the playable drops is not unused, and reporting it as an orphan would
+  invite someone to delete an asset the shipping game needs.
+- Sections are per-target: `playable` is the only one today, and `AssetTarget` is a union of one so
+  that a second target is a deliberate decision rather than a string that happens to parse.
+
+**Reading the byte figures.** The build prints the kept/dropped totals, and until #934 they counted
+only the extensions `TYPEABLE_EXTS` classifies — `.txt` by name and `.bin` by omission contributed
+NOTHING, while the copy loop shipped them regardless. For a text-heavy game that was most of the
+payload (wordweave: 10.70 MB of 11.72 MiB), so dropping all of it moved the summary line not at all.
+The totals now count every kept and every target-dropped file. The orphan report and the per-type
+histograms deliberately still do not: they drive the editor's Clean Up Unused Assets dialog, and a
+word list has never been a candidate for deletion.
+
+Guards: `engine/tests/plugins/assetTreeShaker.test.ts` § "per-target asset rules (#934)" — the
+accept side, the refuse side, the byte accounting (on `.txt`/`.bin` fixtures, because a `.json` one
+cannot fail for the class this feature targets), the guid warning, the keep/drop asymmetry, the
+Unicode-form case, and the back-compat case of a project with no target section at all.
 
 ## Engine module toggles (`build.modules`)
 
@@ -70,6 +160,55 @@ removes nothing" below for the two that were not, and why they are gone rather t
   [editor.md](./editor.md#createeditor--host-configuration)).
 
 ## Gotchas (the load-bearing, hard-won ones)
+
+- ⚠️ **A game must fetch every asset through `assetUrl()`, never a root-absolute path** (#934). A
+  playable serves itself from `file://` with every asset inlined as a `blob:` on
+  `__PLAYABLE_ASSETS__`, so `fetch('/assets/levels/levels.json')` is a CROSS-ORIGIN request there and
+  is refused. The ad then boots to a blank board — under its byte cap, self-extracting correctly,
+  passing every other check. `games/wordweave` shipped exactly that and the smoke below is what
+  caught it; `games/court` already did it right, so this is a convention to follow rather than a new
+  one. It is the same resolution a normal build needs under a non-root `webBasePath`, which is the
+  only reason the bug was invisible outside the playable.
+
+- ⚠️ **A creative must not contain an AD BANNER — and a scene cannot branch on the build target, so
+  this is a RUNTIME gate** (#1108). An MRAID creative has no ad SDK and never will, so a banner
+  placeholder there is not "an unfilled banner": `games/wordweave` shipped an opaque grey strip
+  labelled `Banner ad — 320x50` across **9.1%** of the ad, with the Install CTA of the day drawn on
+  top of it, and the game *also* gave up that strip as layout reserve — so the creative paid for it
+  twice.
+  Nothing build-time can remove it: `asset-keep.json` drops whole FILES, and per the warning above,
+  scene data cannot read a define. The fix is `if (__MODOKI_PLAYABLE__)` in the game's own runtime,
+  hiding the slot with one `patchUI(..., { isVisible: false })` (`UINode` renders `null` for a falsy
+  `isVisible`, so the label subtree goes with it).
+
+  ⚠️ **Hide the placeholder AND reclaim its space — but only because nothing is anchored there
+  any more (#1139).** This flipped twice, so read the history before changing it again.
+  `PlayableOverlay` used to paint an always-on Install pill into exactly that strip (`position:
+  fixed`, `bottom: max(16px, env(safe-area-inset-bottom))`, `zIndex: 2147483000`), and wordweave's
+  first reclaim was strictly worse than the placeholder: measured at 390x844, the letter board moved
+  down ~77 CSS px and the pill covered a whole tile — `elementFromPoint` at its centre returned the
+  Install button and a tap fired `mraid.open`, so a letter the level's own target word needed became
+  invisible, undraggable, and an exit from the ad. That reclaim was reverted.
+
+  **The owner then removed the pill itself (2026-09-13).** AppLovin's creative specs require MRAID
+  2.0, `mraid.open()` click-through, no store redirect on first tap and muted audio until first
+  interaction, and state that AppLovin supplies the close button — they require no install button,
+  overlay or end card of ours. Install now lives ONLY on the end card, which covers the screen when
+  it shows, so the bottom strip is empty and the reclaim is right after all.
+
+  ⚠️ **The rule is therefore about what OCCUPIES the strip, not about the target.** If a persistent
+  CTA ever comes back, the reclaim goes with it — and it cannot come back as "just clear 57 px",
+  because the two quantities scale differently: a CTA's demand is fixed CSS px (the old pill was
+  41 px tall plus a 16 px inset, so 57 px) while a banner reserve is a host PERCENTAGE. At the 9.1%
+  Court and wordweave both author, clearance held only above about a **626 px** viewport height
+  (451 px once the safe-area inset is ≥ 16 px); below it the pill overhung into the game by 5 px at
+  320x568 and **22 px at 844x390**. A project authoring a smaller percentage crosses that line on a
+  taller screen. Any future always-on CTA needs its footprint PUBLISHED and cleared as
+  `max(reserve, footprint)`, not assumed to fit.
+
+  ⚠️ And do not reach for "just zero the reserve" as the reclaim either: in a flex band solver that
+  hands the freed height to the split, so the band you were protecting grows too (wordweave
+  measured board +91, crossword +84 of 175). Two failures from one simplification.
 
 - **Gating `App.tsx`'s entry is NOT enough — one other reachable import re-roots the whole SDK**
   (#214). `games/space-invader` sets `render3d: false`, and the toggle genuinely reached the shell
@@ -259,7 +398,11 @@ removes nothing" below for the two that were not, and why they are gone rather t
 
 - **`npm run smoke:playable`** — builds the `space-invader` artifact and drives it in headless Chromium:
   self-extract, WebGL render, the `fflate` fallback, no-autoplay + unmute-on-tap, the MRAID viewable gate,
-  `mraid.open` CTA, and orientation reflow. Keep it in the loop for changes under `inlinePlayable.ts`,
+  `mraid.open` CTA from the END CARD (check 3c/3d; 3b asserts no persistent pill returns — #1139),
+  orientation reflow, and **no ad-banner placeholder in the creative** (check 1h,
+  #1108 — matched on rendered TEXT, because a geometry rule cannot tell a fake banner from a
+  legitimate bottom HUD row and would need an allowlist on day one; it cannot see an untexted or
+  canvas-drawn placeholder). Keep it in the loop for changes under `inlinePlayable.ts`,
   `app/playable/**`, or the `VITE_PLAYABLE` path in `vite.config.ts` — it has caught bugs the unit suite missed.
 - **Unit:** `inlinePlayable.test.ts`, `bootPlayable.test.tsx`, `mraid.test.ts`, `playableOverlay.test.tsx`,
   `hostCanvas.test.tsx`, `audioCueRetry.test.ts`.

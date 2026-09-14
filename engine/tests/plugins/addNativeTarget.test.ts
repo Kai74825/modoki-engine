@@ -2,23 +2,42 @@
  *  detection, exercised against temp project dirs. */
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import fs from 'node:fs';
-import os from 'node:os';
 import path from 'node:path';
 import { createRequire } from 'node:module';
 import { fileURLToPath } from 'node:url';
-import { ensureCapacitorDeps, ensureCapacitorConfig, detectMissingFirebase, isPlausibleProjectDir, isNativeTargetScaffolded, scaffoldNativeTarget } from '../../plugins/addNativeTarget';
+import { ensureCapacitorDeps, ensureCapacitorConfig, detectMissingFirebase, detectMissingFirebaseResult, isPlausibleProjectDir, isNativeTargetScaffolded, scaffoldNativeTarget } from '../../plugins/addNativeTarget';
 import { mergeProjectConfig } from '../../project-config';
+import { makeDirLink } from '../helpers/linkFixture';
+import { acquireBuildClaim, resetBuildClaimsForTests } from '../../scripts/buildClaimsStore.mjs';
+import { makeScratchDir } from '@modoki/engine/testing/scratchDir';
 
 let root: string;
 let editorRoot: string;
+let home: string;
+let prevHome: string | undefined;
+let releaseClaim: (() => void) | null;
 
 beforeEach(() => {
-  root = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-ant-'));
-  editorRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-ant-ed-'));
+  root = makeScratchDir('modoki-ant-');
+  editorRoot = makeScratchDir('modoki-ant-ed-');
   // Mark root as a real Modoki project so the D8 containment guard allows scaffolding.
   fs.writeFileSync(path.join(root, 'project.config.json'), '{}');
+  // scaffoldNativeTarget refuses unless this process holds the project's build claim (#1160), as
+  // both real callers do. Claimed in a private MODOKI_HOME so no test shares a claims file.
+  home = makeScratchDir('modoki-ant-home-');
+  prevHome = process.env.MODOKI_HOME;
+  process.env.MODOKI_HOME = home;
+  const claim = acquireBuildClaim(root, 'native scaffold (test)');
+  if (!claim.ok) throw new Error(`fixture could not claim: ${claim.message}`);
+  releaseClaim = claim.release;
 });
 afterEach(() => {
+  releaseClaim?.();
+  releaseClaim = null;
+  resetBuildClaimsForTests();
+  if (prevHome === undefined) delete process.env.MODOKI_HOME;
+  else process.env.MODOKI_HOME = prevHome;
+  fs.rmSync(home, { recursive: true, force: true });
   fs.rmSync(root, { recursive: true, force: true });
   fs.rmSync(editorRoot, { recursive: true, force: true });
 });
@@ -38,7 +57,7 @@ describe('isPlausibleProjectDir (D8 containment)', () => {
     expect(isPlausibleProjectDir(path.join(root, 'nope'))).toBe(false);
   });
   it('rejects a dir with no project markers', () => {
-    const bare = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-bare-'));
+    const bare = makeScratchDir('modoki-bare-');
     try {
       expect(isPlausibleProjectDir(bare)).toBe(false);
     } finally {
@@ -46,7 +65,7 @@ describe('isPlausibleProjectDir (D8 containment)', () => {
     }
   });
   it('ensureCapacitorDeps refuses to scaffold a non-project dir', () => {
-    const bare = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-bare-'));
+    const bare = makeScratchDir('modoki-bare-');
     try {
       expect(() => ensureCapacitorDeps(bare, 'ios', editorRoot)).toThrow(/doesn't look like a Modoki project/);
       expect(fs.existsSync(path.join(bare, 'package.json'))).toBe(false); // nothing written
@@ -270,6 +289,41 @@ describe('isNativeTargetScaffolded markers match the real @capacitor/cli templat
   });
 });
 
+describe('scaffoldNativeTarget — the claim gate (#1160)', () => {
+  it('refuses at entry, touching NOTHING, when this process does not hold the project\'s build claim', async () => {
+    releaseClaim?.();
+    releaseClaim = null;
+    writePkg();
+    const cfg = mergeProjectConfig({ app: { appId: 'com.x.y', appName: 'My Game', iconSource: '' } });
+    const before = fs.readFileSync(path.join(root, 'package.json'), 'utf8');
+    const shell: string[] = [];
+    await expect(scaffoldNativeTarget({
+      projectRoot: root, platform: 'android', buildCwd: editorRoot, cfg,
+      send: () => {}, runShell: async (label) => { shell.push(label); return true; },
+    })).rejects.toThrow(/does not hold its build claim/);
+    expect(shell).toEqual([]);
+    expect(fs.readFileSync(path.join(root, 'package.json'), 'utf8')).toBe(before);
+    expect(fs.existsSync(path.join(root, 'capacitor.config.json'))).toBe(false);
+  });
+
+  it('refuses when ANOTHER project is claimed — the claim is per project root', async () => {
+    releaseClaim?.();
+    const other = makeScratchDir('modoki-ant-other-');
+    try {
+      const c = acquireBuildClaim(other, 'someone else');
+      if (!c.ok) throw new Error(c.message);
+      releaseClaim = c.release;
+      writePkg();
+      const cfg = mergeProjectConfig({ app: { appId: 'com.x.y', appName: 'My Game', iconSource: '' } });
+      await expect(scaffoldNativeTarget({
+        projectRoot: root, platform: 'android', buildCwd: editorRoot, cfg, send: () => {}, runShell: async () => true,
+      })).rejects.toThrow(/does not hold its build claim/);
+    } finally {
+      fs.rmSync(other, { recursive: true, force: true });
+    }
+  });
+});
+
 describe('scaffoldNativeTarget repair (#581)', () => {
   it('removes an incomplete platform folder before calling cap add, then proceeds', async () => {
     writePkg();
@@ -323,6 +377,83 @@ describe('scaffoldNativeTarget repair (#581)', () => {
     })).rejects.toThrow(/GoogleService-Info\.plist/);
 
     expect(fs.existsSync(plist)).toBe(true); // never deleted
+  });
+
+  /** #1006/#883 — `rmSync(recursive)` acts on the NAME, not the data. A linked `<platform>/` is
+   *  severed, `cap add` regenerates a pristine project on top, and every step reports success
+   *  while the user's customised native project is orphaned somewhere else. */
+  describe('refuses a platform folder that is not self-contained (#1006)', () => {
+    it('REFUSES when <platform>/ is a link out of the project, and the payload survives', async () => {
+      writePkg();
+      const cfg = mergeProjectConfig({ app: { appId: 'com.x.y', appName: 'My Game', iconSource: '' } });
+      // The real native project lives elsewhere; `ios/` is only a link to it — the shape a user
+      // creates to keep a big native tree off a small volume, or to share one between checkouts.
+      const real = makeScratchDir('modoki-ant-real-');
+      const keeper = path.join(real, 'App', 'App.xcodeproj', 'project.pbxproj');
+      fs.mkdirSync(path.dirname(keeper), { recursive: true });
+      fs.writeFileSync(keeper, '// the user\'s customised project — must survive');
+      makeDirLink(real, path.join(root, 'ios'));
+
+      const runShell = async () => { throw new Error('must refuse before running anything'); };
+      await expect(scaffoldNativeTarget({
+        projectRoot: root, platform: 'ios', buildCwd: editorRoot, cfg, send: () => {}, runShell,
+      })).rejects.toThrow(/not self-contained/);
+
+      // ⚠️ THIS is the assertion that proves nothing was severed — not the throw. A guard that
+      // threw AFTER the rmSync would satisfy `rejects.toThrow` and still have destroyed the link.
+      expect(fs.existsSync(path.join(root, 'ios'))).toBe(true);
+      expect(fs.readFileSync(keeper, 'utf8')).toContain('must survive');
+      fs.rmSync(real, { recursive: true, force: true });
+    });
+
+    it('REFUSES on --force too — "regenerate" is not "sever whatever link is standing here"', async () => {
+      writePkg();
+      const cfg = mergeProjectConfig({ app: { appId: 'com.x.y', appName: 'My Game', iconSource: '' } });
+      // A COMPLETE target this time, so only `force` selects it for removal — the case the
+      // Firebase guard above already refuses for the same flag, and for the same reason.
+      const real = makeScratchDir('modoki-ant-real-');
+      const pbx = path.join(real, 'App', 'App.xcodeproj', 'project.pbxproj');
+      fs.mkdirSync(path.dirname(pbx), { recursive: true });
+      fs.writeFileSync(pbx, '// stub');
+      fs.writeFileSync(path.join(real, 'debug.xcconfig'), '// stub');
+      makeDirLink(real, path.join(root, 'ios'));
+      expect(isNativeTargetScaffolded(root, 'ios')).toBe(true);
+
+      const runShell = async () => { throw new Error('must refuse before running anything'); };
+      await expect(scaffoldNativeTarget({
+        projectRoot: root, platform: 'ios', buildCwd: editorRoot, cfg, send: () => {}, runShell, force: true,
+      })).rejects.toThrow(/not self-contained/);
+      expect(fs.existsSync(pbx)).toBe(true);
+      fs.rmSync(real, { recursive: true, force: true });
+    });
+
+    it('ACCEPTS an ordinary incomplete folder and still repairs it — the accept side', async () => {
+      // ⚠️ Without this the refusal above is indistinguishable from a guard that refuses every
+      // scaffold. The whole population of real `<platform>/` folders is self-contained, so a
+      // pre-flight that fired on them would break `cap add` for every project in the repo.
+      writePkg();
+      const cfg = mergeProjectConfig({ app: { appId: 'com.x.y', appName: 'My Game', iconSource: '' } });
+      const pbxproj = path.join(root, 'ios', 'App', 'App.xcodeproj', 'project.pbxproj');
+      fs.mkdirSync(path.dirname(pbxproj), { recursive: true });
+      fs.writeFileSync(pbxproj, 'stale — from an interrupted extraction');
+      // A nested link pointing INSIDE the folder (the npm .bin shim shape) must not trip it either.
+      fs.mkdirSync(path.join(root, 'ios', 'inner'), { recursive: true });
+      makeDirLink(path.join(root, 'ios', 'inner'), path.join(root, 'ios', 'shim'));
+
+      const runShell = async (_l: string, cmd: string) => {
+        if (cmd.startsWith('npx cap add')) {
+          expect(fs.existsSync(pbxproj)).toBe(false);        // the repair really did run
+          fs.mkdirSync(path.dirname(pbxproj), { recursive: true });
+          fs.writeFileSync(pbxproj, '// stub');
+          fs.writeFileSync(path.join(root, 'ios', 'debug.xcconfig'), '// stub');
+        }
+        return true;
+      };
+      await expect(scaffoldNativeTarget({
+        projectRoot: root, platform: 'ios', buildCwd: editorRoot, cfg, send: () => {}, runShell,
+      })).resolves.toBeTruthy();
+      expect(isNativeTargetScaffolded(root, 'ios')).toBe(true);
+    });
   });
 
   it('does NOT touch a directory that already contains a complete target', async () => {
@@ -431,6 +562,51 @@ describe('scaffoldNativeTarget repair (#581)', () => {
     expect(fs.existsSync(plist)).toBe(true);
     expect(fs.existsSync(pbxproj)).toBe(true); // nothing touched
   });
+
+  // #1051 — the app's privacy manifest is hand-written and `cap add` cannot regenerate it, so it is a
+  // survivor exactly like the Firebase config: a regenerated ios/ would build fine and ship without it.
+  it('force:true refuses when the iOS privacy manifest is present, and deletes nothing (#1051)', async () => {
+    writePkg();
+    const cfg = mergeProjectConfig({ app: { appId: 'com.x.y', appName: 'My Game', iconSource: '' } });
+    const pbxproj = path.join(root, 'ios', 'App', 'App.xcodeproj', 'project.pbxproj');
+    fs.mkdirSync(path.dirname(pbxproj), { recursive: true });
+    fs.writeFileSync(pbxproj, '// stub');
+    fs.writeFileSync(path.join(root, 'ios', 'debug.xcconfig'), '// stub');
+    const manifest = path.join(root, 'ios', 'App', 'App', 'PrivacyInfo.xcprivacy');
+    fs.mkdirSync(path.dirname(manifest), { recursive: true });
+    fs.writeFileSync(manifest, 'a hand-written declaration to Apple — must survive even under --force');
+    expect(isNativeTargetScaffolded(root, 'ios')).toBe(true);
+
+    const runShell = async () => true; // must never be reached
+    await expect(scaffoldNativeTarget({
+      projectRoot: root, platform: 'ios', buildCwd: editorRoot, cfg, send: () => {}, runShell, force: true,
+    })).rejects.toThrow(/PrivacyInfo\.xcprivacy/);
+    expect(fs.existsSync(manifest)).toBe(true);
+    expect(fs.existsSync(pbxproj)).toBe(true); // nothing touched
+  });
+
+  // #1051 close-out review: Court and Weaveling carry BOTH iOS survivors. Naming only the first
+  // meant move one file, rerun, and get refused again for the second.
+  it('names every survivor in one refusal when several are present', async () => {
+    writePkg();
+    const cfg = mergeProjectConfig({ app: { appId: 'com.x.y', appName: 'My Game', iconSource: '' } });
+    const pbxproj = path.join(root, 'ios', 'App', 'App.xcodeproj', 'project.pbxproj');
+    fs.mkdirSync(path.dirname(pbxproj), { recursive: true });
+    fs.writeFileSync(pbxproj, '// stub');
+    fs.writeFileSync(path.join(root, 'ios', 'debug.xcconfig'), '// stub');
+    const appDir = path.join(root, 'ios', 'App', 'App');
+    fs.mkdirSync(appDir, { recursive: true });
+    fs.writeFileSync(path.join(appDir, 'GoogleService-Info.plist'), 'firebase');
+    fs.writeFileSync(path.join(appDir, 'PrivacyInfo.xcprivacy'), 'manifest');
+
+    const runShell = async () => true; // must never be reached
+    const error = await scaffoldNativeTarget({
+      projectRoot: root, platform: 'ios', buildCwd: editorRoot, cfg, send: () => {}, runShell, force: true,
+    }).then(() => null, (e: Error) => e);
+    expect(error?.message).toMatch(/GoogleService-Info\.plist/);
+    expect(error?.message).toMatch(/PrivacyInfo\.xcprivacy/);
+    expect(error?.message).toMatch(/those files/);
+  });
 });
 
 describe('detectMissingFirebase', () => {
@@ -456,6 +632,40 @@ describe('detectMissingFirebase', () => {
     const dir = path.join(root, 'ios', 'App', 'App');
     fs.mkdirSync(dir, { recursive: true });
     fs.writeFileSync(path.join(dir, 'GoogleService-Info.plist'), '<plist/>');
+    expect(detectMissingFirebase(root, 'ios')).toEqual([]);
+  });
+});
+
+describe('an UNREADABLE package.json is not "no Firebase" (#1096)', () => {
+  // The docblock promised `empty = nothing missing / no Firebase` and one `catch` could not keep it.
+  // It matters because of what the caller does with the list: `vite-asset-scanner`'s build path
+  // PAUSES on a non-empty one, so `[]` from a truncated manifest let a Firebase build run to the end
+  // and ship an app that crashes on launch in FirebaseApp.configure, with a `✅` on the console.
+
+  it('a package.json that EXISTS and will not parse is reported as unknown', () => {
+    fs.writeFileSync(path.join(root, 'package.json'), '{"dependencies": {"@capacitor-firebase/analytics"');
+    expect(detectMissingFirebaseResult(root, 'ios')).toEqual({ warnings: [], reason: 'unreadable-package-json' });
+  });
+
+  it('⚠️ a MISSING package.json stays SILENT — absent is not unknown', () => {
+    // #731's own review found the opposite error at the twin site: reporting "could not check" for a
+    // file that legitimately does not exist was FALSE for four real projects in this repo. Only a
+    // manifest that exists and will not read is the genuine unknown.
+    expect(fs.existsSync(path.join(root, 'package.json'))).toBe(false);
+    expect(detectMissingFirebaseResult(root, 'ios')).toEqual({ warnings: [], reason: null });
+  });
+
+  it('ACCEPT: a readable manifest reports reason null, whether or not it uses Firebase', () => {
+    writePkg({ '@capacitor/core': '^8' });
+    expect(detectMissingFirebaseResult(root, 'ios')).toEqual({ warnings: [], reason: null });
+    writePkg({ '@capacitor-firebase/analytics': '^8' });
+    const used = detectMissingFirebaseResult(root, 'ios');
+    expect(used.reason).toBeNull();
+    expect(used.warnings).toHaveLength(1);
+  });
+
+  it('the plain helper still answers exactly as before, for callers that do not branch', () => {
+    fs.writeFileSync(path.join(root, 'package.json'), 'not json');
     expect(detectMissingFirebase(root, 'ios')).toEqual([]);
   });
 });

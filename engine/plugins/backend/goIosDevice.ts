@@ -87,6 +87,14 @@ export function pickHostSidePlatform(o: {
   /** Serials adb can see. */  androids: string[];
 }): 'ios' | 'android' | { error: string } {
   if (o.explicit === 'ios' || o.explicit === 'android') return o.explicit;
+  // An UNKNOWN explicit platform is refused, not ignored (#1072's mechanism, found by its close-out
+  // sweep). Ignoring `platform:'andriod'` fell through to the lease or to whatever is attached — so a
+  // caller who NAMED a platform could be answered about the other one, the exact wrong-device
+  // answer the refusal below exists to prevent. The MCP tools enum-validate it; the curl API does not.
+  // `!= null`: a JSON body's `platform: null` means "not given", as it does everywhere else here.
+  if (o.explicit != null && o.explicit !== '') {
+    return { error: `unknown platform ${JSON.stringify(o.explicit)} — pass platform:'ios' or platform:'android'` };
+  }
   if (o.leased === 'ios' || o.leased === 'android') return o.leased;
   if (o.iphones.length && o.androids.length) {
     return { error: `both an iPhone (${o.iphones.join(', ')}) and an Android (${o.androids.join(', ')}) are attached and no lease says which — pass platform:'ios' or platform:'android'` };
@@ -144,6 +152,9 @@ export function pickGoIosDevice(o: {
   devices: GoIosDevice[];
   /** The lease's hardware — ABSENT when there is no lease at all (see the router). */
   lease?: LeaseHardwareHint;
+  /** The UDID a USB lease tunnels to (#1065). Unlike `lease`, this is not evidence to match — the
+   *  lease was OPENED to this exact device through go-ios, so it names the leased phone outright. */
+  leaseUdid?: string;
 }): GoIosChoice | { error: string } {
   if (o.pinned) {
     const hit = o.devices.find((d) => d.udid === o.pinned);
@@ -152,6 +163,12 @@ export function pickGoIosDevice(o: {
       // Name what IS attached: "your pin matches nothing" plus an empty room is a dead end, and the
       // most common cause is a pin left over from a phone that has since been unplugged.
       : { error: `MODOKI_IOS_DEVICE_UDID=${o.pinned} is not attached (go-ios sees: ${o.devices.map((d) => d.udid).join(', ') || 'nothing'})` };
+  }
+  if (o.leaseUdid) {
+    const hit = o.devices.find((d) => d.udid === o.leaseUdid);
+    return hit
+      ? { device: hit }
+      : { error: `the USB lease's device ${o.leaseUdid} is not attached (go-ios sees: ${o.devices.map((d) => d.udid).join(', ') || 'nothing'}) — replug it, or disconnect the lease` };
   }
   if (o.devices.length === 0) return { error: 'no iOS device is attached (go-ios sees none) — check the cable and that the device is unlocked and trusted' };
 
@@ -204,6 +221,8 @@ export async function resolveGoIosDevice(opts: {
   goIos: string;
   env?: NodeJS.ProcessEnv;
   lease?: LeaseHardwareHint;
+  /** See `pickGoIosDevice`'s `leaseUdid`. */
+  leaseUdid?: string;
 }): Promise<GoIosChoice | { error: string }> {
   const env = opts.env ?? process.env;
   let udids: string[];
@@ -222,5 +241,5 @@ export async function resolveGoIosDevice(opts: {
     ? await Promise.all(udids.map(async (u) => ({ udid: u, ...await goIosDeviceInfo(opts.goIos, u) })))
     : udids.map((u) => ({ udid: u }));
 
-  return pickGoIosDevice({ pinned: env.MODOKI_IOS_DEVICE_UDID?.trim(), devices, lease: opts.lease });
+  return pickGoIosDevice({ pinned: env.MODOKI_IOS_DEVICE_UDID?.trim(), devices, lease: opts.lease, leaseUdid: opts.leaseUdid });
 }

@@ -3,6 +3,7 @@
  *  preventDefault+stopPropagation, the send payload, and (the regression fix) that a surface
  *  marked data-modki-wheel-zoom (the animation Curve Editor's value-axis zoom) is NOT hijacked. */
 import { describe, it, expect, vi, afterEach } from 'vitest';
+import { readScannedSource } from '../helpers/sourceScanner';
 import { forwardZoomWheel } from '../../src/editor/input/zoomWheel';
 
 afterEach(() => { document.body.innerHTML = ''; });
@@ -10,7 +11,7 @@ afterEach(() => { document.body.innerHTML = ''; });
 /** Dispatch a wheel on `target` through a capture-phase listener that runs the forwarder,
  *  mirroring how EditorApp attaches it. Returns the send spy + whether default was prevented.
  *
- *  `passive: false` is LOAD-BEARING and must match EditorApp.tsx:891. A `wheel` listener on
+ *  `passive: false` is LOAD-BEARING and must match EditorApp's Cmd/Ctrl+wheel zoom effect. A `wheel` listener on
  *  window/document/body is passive BY DEFAULT (per the DOM spec, and in every real browser), and
  *  `preventDefault()` from a passive listener is silently ignored — which would let the browser
  *  page-zoom on Ctrl+wheel instead of the editor's UI zoom. jsdom 26 did not implement the passive
@@ -66,12 +67,10 @@ describe('forwardZoomWheel', () => {
    *  EditorApp is a large component whose effect needs an electronBridge, and the invariant is one
    *  line of options. */
   it('EditorApp attaches the wheel listener non-passively (else preventDefault is ignored)', async () => {
-    const fs = await import('node:fs');
     const path = await import('node:path');
-    const src = fs.readFileSync(
+    const src = readScannedSource(
       path.resolve(__dirname, '../../src/editor/EditorApp.tsx'),
-      'utf8',
-    );
+    ).code;
     const attach = src.match(/addEventListener\(\s*'wheel'[^)]*\)/)?.[0];
     expect(attach, "EditorApp no longer attaches a 'wheel' listener — has the zoom moved?").toBeDefined();
     expect(attach, 'a wheel listener on window is passive BY DEFAULT; without an explicit ' +

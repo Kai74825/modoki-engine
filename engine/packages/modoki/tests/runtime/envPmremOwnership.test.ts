@@ -85,7 +85,7 @@ vi.mock('three/webgpu', () => ({
 import {
   disposeRetiredEnvironment, disposeAllCachedResources,
   acquireEnvironment, releaseEnvironment, invalidateEnvironment, getCachedEnvironment,
-  retiredEnvironments,
+  retiredEnvironments, registerEnvDisposeHook,
 } from '../../src/runtime/loaders/meshTemplateCache';
 import { getEnvPMREMTexture, getEnvCubeTexture, sourceForEnvDerived, disposeEnvDerivedFor } from '../../src/runtime/rendering/envPmrem';
 import { syncEnvironment } from '../../src/runtime/rendering/scene3DSync';
@@ -268,6 +268,26 @@ describe('disposeAllCachedResources runs the env dispose hooks too', () => {
 
     disposeAllCachedResources(); // full teardown — `source` is still live in envCache, not retired
     expect(sourceForEnvDerived(pmremTex), 'the env dispose hook must run from the envCache loop too').toBeUndefined();
+  });
+
+  it('a hook that throws does not skip the texture dispose or abort the teardown (#953)', async () => {
+    // Every caller of the hook fan-out disposes the texture on the NEXT statement. Pre-#953 the
+    // fan-out was a bare loop, so a throwing hook escaped `disposeAllCachedResources` before
+    // `tex.dispose()`, leaking the GPU texture and skipping the rest of the teardown.
+    const errSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    registerEnvDisposeHook('test-throws', () => { throw new Error('hook boom'); });
+    try {
+      await acquireEnvironment(1, GUID);
+      const source = getCachedEnvironment(GUID) as unknown as { dispose: ReturnType<typeof vi.fn> };
+      expect(source, 'the HDR fixture must actually load, or this test proves nothing').toBeTruthy();
+
+      expect(() => disposeAllCachedResources()).not.toThrow();
+      expect(source.dispose, 'the throwing hook must not skip the texture it was notified about').toHaveBeenCalled();
+    } finally {
+      // Hooks are keyed and have no unregister; re-registering the key replaces the thrower.
+      registerEnvDisposeHook('test-throws', () => {});
+      errSpy.mockRestore();
+    }
   });
 });
 
@@ -519,7 +539,7 @@ describe('a failed cube build restores the renderer and source state it dirtied'
 });
 
 describe('per-renderer discriminant (#775 — the cross-renderer bug this cache exists to avoid)', () => {
-  // envPmrem.ts:71-75 is explicit that the per-renderer WeakMap is deliberate, not incidental:
+  // envPmrem.ts's comment on `envDerivedBySource` is explicit that the per-renderer WeakMap is deliberate, not incidental:
   // holding a renderer strongly would pin a DISPOSED renderer alive (#720's shape), so the cache
   // must stay keyed by renderer identity rather than collapsing to a single Map<source, target>.
   // Every OTHER test in this file uses exactly one `const renderer = {}`, so a shared-Map
@@ -600,7 +620,7 @@ describe('per-renderer discriminant (#775 — the cross-renderer bug this cache 
       // A's cached failure" (no second generate call, straight to undefined) apart from "B made
       // its own real attempt and that attempt also failed" (a second generate call). The negative
       // cache is per-renderer (`envDerivedFailureCache` is a `WeakMap<renderer, ...>`,
-      // envPmrem.ts:89), so it must be the latter.
+      // in envPmrem.ts), so it must be the latter.
       cube.failSources.add(source);
 
       expect(getEnvCubeTexture(rendererA, source), 'A fails as instructed').toBeUndefined();

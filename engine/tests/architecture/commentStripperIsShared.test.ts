@@ -25,7 +25,10 @@
 import { describe, it, expect } from 'vitest';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
+import ts from 'typescript';
 import { assertScanIsSane, readScannedSource } from '@modoki/engine/testing';
+import { assertExemptionLedger } from '@modoki/engine/testing/exemptionLedger';
+import { boundIdentifier, callsTo, parseSource, readsOf, valueCarrier } from '@modoki/engine/testing/sourceAst';
 import { REPO_ROOT } from '../helpers/repoLayout';
 import { repoFiles } from '../../scripts/repoCorpus.mjs';
 
@@ -43,19 +46,55 @@ const BLOCK_LAZY = String.raw`\/\*[\s\S]` + String.raw`*?\*\/`;
 /** A `.replace(...)` whose pattern matches `//` — the other half of a hand-rolled stripper. */
 const LINE_STRIP = /\.replace\(\s*\/[^/\n]*\\\/\\\/[^/\n]*\/[a-z]*\s*,/;
 
+type LedgerRow = { item: string; count?: number; reason: string };
+
 /**
- * Files allowed to contain the banned shape, each for a stated reason.
+ * Hand-rolled strippers allowed to exist, each for a stated reason — ONE LEDGER PER BAN.
  *
- * ⚠️ Keep this SMALL and keep the reasons real. An entry here is a file that can silently delete
+ * ⚠️ Keep these SMALL and keep the reasons real. An entry here is a file that can silently delete
  * the code it inspects; "it was easier" is not a reason.
+ *
+ * ⚠️ **Split per ban and counted per occurrence (#1123/#1128).** This was one `Map<file, reason>`
+ * consulted by BOTH rules, with a staleness check that OR'd them — so the file could drop its block
+ * stripper, keep its line stripper, and the block-rule pardon stayed live and unreported; and a
+ * second, real stripper added beside the pinned fixture was green under a reason about ONE fixture.
  */
-const ALLOW = new Map<string, string>([
-  [
-    'engine/packages/modoki/tests/helpers/sourceScanner.test.ts',
-    'defines `brokenRegexStrip` deliberately, as the thing it pins the shared scanner against — '
-    + 'the one place the broken shape must exist so its failure can be asserted',
-  ],
-]);
+const BLOCK_ALLOW: readonly LedgerRow[] = [
+  {
+    item: 'engine/packages/modoki/tests/helpers/sourceScanner.test.ts',
+    reason: 'the ONE block-comment half of `brokenRegexStrip`, the fixture the shared scanner is '
+      + 'pinned against — the one place the broken shape must exist so its failure can be asserted',
+  },
+];
+const LINE_ALLOW: readonly LedgerRow[] = [
+  {
+    item: 'engine/packages/modoki/tests/helpers/sourceScanner.test.ts',
+    reason: 'the ONE line-comment half of the same `brokenRegexStrip` fixture — written as a second '
+      + 'row, not borrowed from the block ledger, because dropping one half must stale ITS row',
+  },
+];
+
+/** One entry per match of `re` (a global pattern) in each file, with the line derived from the
+ *  match offset.
+ *
+ *  ⚠️ **Over the WHOLE file, never split into lines first.** `LINE_STRIP` relies on `\s*` after
+ *  `.replace(` crossing a newline — a formatter wraps a long `.replace(` exactly that way. The first
+ *  per-occurrence version split on `\n` and went green on a wrapped stripper the old whole-file
+ *  `.test()` caught (close-out review of #1128). No file in the tree wraps one today, so only the
+ *  synthetic case below can see that regression. */
+function matchesIn(files: ReadonlyArray<{ rel: string; code: string }>, re: RegExp) {
+  const out: Array<{ item: string; site: string }> = [];
+  for (const f of files) {
+    for (const m of f.code.matchAll(re)) {
+      out.push({ item: f.rel, site: `${f.rel}:${f.code.slice(0, m.index).split('\n').length}` });
+    }
+  }
+  return out;
+}
+
+const escapeRe = (text: string): string => text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+const BLOCK_LAZY_ALL = new RegExp(escapeRe(BLOCK_LAZY), 'g');
+const LINE_STRIP_ALL = new RegExp(LINE_STRIP.source, 'g');
 
 /** Test roots that own source-scanning guards, git-enumerated (#771/#799) rather than a
  *  hand-rolled recursive walk. A root that is absent (the public OSS checkout has no `games/`)
@@ -101,43 +140,42 @@ describe('there is ONE comment scanner, and tests import it (#419)', () => {
   });
 
   it('no test file hand-rolls a block-comment stripper', () => {
-    const offenders = files
-      .filter((f) => !ALLOW.has(f.rel))
-      .filter((f) => f.code.includes(BLOCK_LAZY))
-      .map((f) => f.rel);
-    expect(
-      offenders,
-      'these files strip block comments with a lazy regex, which DELETES code whenever a `/*` '
-      + 'appears inside a line comment — and a forbidden-pattern guard reads the deletion as a '
-      + `PASS. Import { stripComments } from '@modoki/engine/testing' instead (#419):\n`
-      + offenders.join('\n'),
-    ).toEqual([]);
+    assertExemptionLedger({
+      label: 'BLOCK_ALLOW in commentStripperIsShared',
+      population: matchesIn(files, BLOCK_LAZY_ALL),
+      exempt: BLOCK_ALLOW,
+      // The fixture's own occurrence is always present (engine package, snapshot included).
+      // ⚠️ It is also the ONLY occurrence, so removing it reports "the detector has stopped
+      // matching" (the floor runs before over-blessed) rather than "blesses 1, found 0". Still red,
+      // never fail-open — read it as the row going stale, and delete the row.
+      floor: 1,
+      fix: 'this strips block comments with a lazy regex, which DELETES code whenever a `/*` '
+        + 'appears inside a line comment — and a forbidden-pattern guard reads the deletion as a '
+        + "PASS. Import { stripComments } from '@modoki/engine/testing' instead (#419).",
+    });
   });
 
   it('no test file hand-rolls a line-comment stripper', () => {
-    const offenders = files
-      .filter((f) => !ALLOW.has(f.rel))
-      .filter((f) => LINE_STRIP.test(f.code))
-      .map((f) => f.rel);
-    expect(
-      offenders,
-      'these files strip line comments with a private regex. Even where it does not delete, a '
-      + 'second stripper is a second thing to fix — that multiplicity is what let one copy be '
-      + `fixed twice while eleven carried the original bug. Use '@modoki/engine/testing' (#419):\n`
-      + offenders.join('\n'),
-    ).toEqual([]);
+    assertExemptionLedger({
+      label: 'LINE_ALLOW in commentStripperIsShared',
+      population: matchesIn(files, LINE_STRIP_ALL),
+      exempt: LINE_ALLOW,
+      floor: 1,
+      fix: 'this strips line comments with a private regex. Even where it does not delete, a second '
+        + 'stripper is a second thing to fix — that multiplicity is what let one copy be fixed twice '
+        + "while eleven carried the original bug. Use '@modoki/engine/testing' (#419).",
+    });
   });
 
-  it('every allowlist entry still exists and still needs to be there', () => {
-    // A stale allowlist is a hole nobody is looking at.
-    for (const [rel, reason] of ALLOW) {
-      const f = files.find((x) => x.rel === rel);
-      expect(f, `allowlisted file ${rel} no longer exists — drop the entry`).toBeDefined();
-      expect(
-        f!.code.includes(BLOCK_LAZY) || LINE_STRIP.test(f!.code),
-        `${rel} no longer hand-rolls a stripper — drop the allowlist entry (${reason})`,
-      ).toBe(true);
-    }
+  it('the line-stripper detector sees a call a formatter WRAPPED across lines, and the block one matches its literal (synthetic)', () => {
+    // Spelled in HALVES for the reason `BLOCK_LAZY` is: this scan keeps string content.
+    // ⚠️ Only the LINE half pins the wrap — `BLOCK_LAZY` holds no whitespace, so a line split can
+    // never change its count. The block half pins `escapeRe`: unescaped, the pattern stops matching.
+    const wrappedLine = 'export const s = (src: string) => src.replace(\n  /\\/\\' + '/.*$/gm,\n  \'\',\n);';
+    const wrappedBlock = `export const b = (src: string) => src\n  .replace(\n    /${BLOCK_LAZY}/g, '');`;
+    const f = [{ rel: 'x.test.ts', code: `${wrappedLine}\n${wrappedBlock}` }];
+    expect(matchesIn(f, LINE_STRIP_ALL).map((o) => o.site)).toEqual(['x.test.ts:1']);
+    expect(matchesIn(f, BLOCK_LAZY_ALL).map((o) => o.site)).toEqual(['x.test.ts:7']);
   });
 });
 
@@ -164,7 +202,7 @@ describe('there is ONE comment scanner, and tests import it (#419)', () => {
  * one level up.
  *
  * ⚠️ **That argument was true about the FILES and wrong about the RULE.** The exclusions below
- * (`WRAPPED_BEFORE`, `WRAPPED_AFTER`, `MARKDOWN_READ`) already discriminate a fixture read from a
+ * (`isWrapped`, `MARKDOWN_READ`) already discriminate a fixture read from a
  * source scan by WHAT IT IS; the directory was standing in for a test that had already been
  * written. Widening the roots needed no allowlist at all and found 28 real source-scanning guards
  * outside the original directory — in `assets`, `editor`, `electron`, `plugins`, `tools` and the
@@ -179,8 +217,8 @@ describe('there is ONE comment scanner, and tests import it (#419)', () => {
  * ⚠️ **This started as `engine/tests/architecture/` alone, and the narrowing was wrong.** The
  * argument was that of 1,234 test files only a minority scan repo source, so a repo-wide rule
  * would need a ~55-entry allowlist of files that legitimately read back their own fixtures. That
- * is true and it is not a reason to stop looking: the exclusions below (`WRAPPED_BEFORE`,
- * `WRAPPED_AFTER`, `MARKDOWN_READ`) do the discriminating, so a fixture read is excused by WHAT IT
+ * is true and it is not a reason to stop looking: the exclusions below (`isWrapped`,
+ * `MARKDOWN_READ`) do the discriminating, so a fixture read is excused by WHAT IT
  * IS rather than by which directory it happens to sit in. Widening the roots found real
  * source-scanning guards in every one of them.
  *
@@ -210,17 +248,30 @@ const SCANNED_ROOTS: string[] = (() => {
 })();
 
 /**
- * Every `readFileSync(…, 'utf8')` call, as source text.
+ * A `readFileSync`/`readFile` call that DECODES to text — `'utf8'`/`'utf-8'` as an argument, an
+ * `{ encoding: 'utf8' }` options object, or `.toString()` on the Buffer it returns — or `undefined`
+ * for a Buffer read. Returns the node carrying the decoded VALUE (the `.toString()` call where
+ * there is one), which is what a wrapper must receive.
  *
- * ⚠️ **Two steps, not one regex, and the one-regex version was WRONG.** An attempt to require the
- * repo-root token inside the call in a single pattern could not match `readFileSync(path.join(
- * repoRoot, 'engine/…'), 'utf8')` at all: a paren-balancing alternation has to consume
- * `path.join(…)` whole, which swallows the very token it then looks for. It reported zero
- * offenders against thirteen known ones — the silent-green direction, in the guard written to stop
- * exactly that.
+ * ⚠️ **From the call's own arguments (#1144).** This was `READ_CALL`, a regex that reached for the
+ * `'utf8'` across `[\s\S]{0,300}?` — a window, so a Buffer read three lines above a neighbour's
+ * `'utf8')` matched as one read spanning both. Its first version before that could not match
+ * `readFileSync(path.join(repoRoot, …), 'utf8')` at all: a paren-balancing alternation has to
+ * consume `path.join(…)` whole, which swallows the root token it then looks for. Both were the
+ * text standing in for the call; the parser has the call.
  */
-const READ_CALL =
-  /\bread(?:FileSync|File)\([\s\S]{0,300}?(?:['"]utf-?8['"]\s*\)|encoding\s*:\s*['"]utf-?8['"][\s\S]{0,40}?\)|\)\s*\.\s*toString\(\))/g;
+function decodedRead(call: ts.CallExpression): ts.Expression | undefined {
+  const isUtf8 = (e: ts.Expression): boolean => ts.isStringLiteralLike(e) && /^utf-?8$/i.test(e.text);
+  const decodes = call.arguments.some((arg) => isUtf8(arg) || (ts.isObjectLiteralExpression(arg) && arg.properties.some(
+    (p) => ts.isPropertyAssignment(p) && p.name.getText() === 'encoding' && isUtf8(p.initializer),
+  )));
+  if (decodes) return call;
+  const access = valueCarrier(call).parent;
+  const toString = access?.parent;
+  if (access && ts.isPropertyAccessExpression(access) && access.name.text === 'toString'
+    && toString && ts.isCallExpression(toString) && toString.expression === access) return toString;
+  return undefined;
+}
 
 /**
  * A path built from a repo-root token — what separates scanning the repo's own source from
@@ -254,38 +305,60 @@ const REPO_ROOTED =
  * gets its allowlist grown until it means nothing, which is how the thing it guards comes back.
  *
  * - `JSON.parse(readFileSync(…))` — parsed as DATA, never pattern-matched. Not a source scan.
+ *   `yaml.load`/`yaml.parse` too: `packagingManifest` reads electron-builder.yml straight into one
+ *   and was reported for it. A parser is a parser; the list is about SHAPE, not library.
  * - `stripComments(readFileSync(…))` — already stripped by hand at the call site. Routing it
  *   through the reader is tidier, but it is not fail-open, so it is not this guard's business.
+ *   `assertScanIsSane(raw, …)` is the same statement about a read.
  * - a `.md` path — Markdown has no code/comment distinction for a scan to be defeated by, and the
  *   guards reading it (`skillReferences`, `qaCaseReferences`' case bodies, `docCitations`) are
  *   scanning prose because prose is the subject.
  */
-const WRAPPED_BEFORE = [
-  // ⚠️ `\s*(?:[\w$]+\s*\.\s*)?$`, not `$`. Both wrappers are routinely written with the read on
-  // the NEXT line, and the read itself is usually `fs.readFileSync` — so the text between the
-  // wrapper and the match is a newline, indentation AND a `fs.` qualifier. Requiring adjacency made
-  // this exclusion match almost nothing, and the rule reported fifteen correct files as offenders.
-  /JSON\s*\.\s*parse\s*\(\s*(?:[\w$]+\s*\.\s*)?$/,
-  // ⚠️ `yaml.load` is `JSON.parse` for a different format — `packagingManifest` reads
-  // electron-builder.yml straight into it and was reported as an offender for it. A parser is a
-  // parser; the list is about SHAPE, not about which library.
-  /yaml\s*\.\s*(?:load|parse)\s*\(\s*(?:[\w$]+\s*\.\s*)?$/,
-  /strip(?:Comments|CommentsAndStrings)\s*\(\s*(?:[\w$]+\s*\.\s*)?$/,
-];
+const WRAPPERS = new Set(['JSON.parse', 'yaml.load', 'yaml.parse', 'stripComments', 'stripCommentsAndStrings', 'assertScanIsSane']);
 
 /**
- * The same two wrappers applied to the read's RESULT a line or two later, which is how most of
- * these are actually written:
+ * `value` goes STRAIGHT into a wrapper — as a direct argument, through nothing but parentheses,
+ * `as`, `!` or `await`.
+ *
+ * ⚠️ **Direct, not "somewhere inside the arguments".** `JSON.parse(summarise(raw))` parses what
+ * `summarise` returned, and `summarise` may well have pattern-matched the raw text first.
+ */
+const passedToWrapper = (value: ts.Expression): boolean => {
+  const carrier = valueCarrier(value);
+  const call = carrier.parent;
+  // No `arguments.includes(carrier)`: a read's carrier whose parent is a wrapper CALL can only be
+  // one of its arguments — as the callee it would BE the wrapper name. Mutation-checked redundant.
+  return !!call && ts.isCallExpression(call) && WRAPPERS.has(call.expression.getText().replace(/\s+/g, ''));
+};
+
+/**
+ * A read is WRAPPED when its value is passed to a wrapper directly, or bound to a `const` EVERY one
+ * of whose reads is passed to a wrapper — the two ways these are actually written:
+ *
+ *     const cfg = JSON.parse(readFileSync(join(repoRoot, rel), 'utf8'));
  *
  *     const raw = readFileSync(join(repoRoot, rel), 'utf8');
  *     const cfg = JSON.parse(raw);
  *
- * ⚠️ A deliberate false NEGATIVE: a read followed by an unrelated `JSON.parse` within the window
- * is excused. That is the conservative direction for a rule whose false POSITIVES are what get its
- * allowlist grown until it means nothing.
+ * ⚠️ **Along the read's OWN binding (#1144).** This was two text windows: 40 chars before the read
+ * for the first form, and 400 AFTER it for the second, matched against any wrapper token. So a
+ * NEIGHBOURING read's `JSON.parse(` excused this one — observed: a lone
+ * `const raw = fs.readFileSync(path.join(REPO_ROOT, 'engine/scripts/repoCorpus.mjs'), 'utf8');` was
+ * reported, and adding `const pkg = JSON.parse(fs.readFileSync(path.join(REPO_ROOT, 'package.json'),
+ * 'utf8'));` on the next line turned the guard green. The window was documented as "a deliberate
+ * false NEGATIVE", the right direction to be wrong in only while nothing could be exact.
+ *
+ * ⚠️ **EVERY read, not any (#1144 close-out).** "Some read is wrapped" still let one use vouch for
+ * another use of the same text: `manifestBlockPlumbing` stripped its read once for the interface
+ * fields and ran three `src.match(…)` on the RAW text beside it, and was excused. Reads are resolved
+ * by symbol (`readsOf`), so a sibling function's same-named parameter is not one of them.
  */
-const WRAPPED_AFTER =
-  /\b(?:JSON\s*\.\s*parse|yaml\s*\.\s*(?:load|parse)|strip(?:Comments|CommentsAndStrings)|assertScanIsSane)\s*\(/;
+const isWrapped = (value: ts.Expression): boolean => {
+  if (passedToWrapper(value)) return true;
+  const bound = boundIdentifier(value);
+  const reads = bound ? readsOf(bound) : [];
+  return reads.length > 0 && reads.every(passedToWrapper);
+};
 
 /**
  * Identifiers this file assigns from `mkdtemp`/`tmpdir` — scratch paths wearing a repo-root NAME.
@@ -307,46 +380,41 @@ const scratchRootIdents = (code: string): string[] =>
     .concat([...code.matchAll(/(?:const|let|var)\s+([\w$]+)\s*(?::[^=]*)?=\s*(?:await\s+)?makeScratch[\w$]*\s*\(/g)]
       .map((m) => m[1]));
 
-/** `.md` names a file with no comment syntax these guards can be blinded by. */
-const MARKDOWN_READ = /\.md['"]|\bMD\b|markdown/i;
+/** `.md` and `.txt` name files with no comment syntax these guards can be blinded by — prose, or
+ *  a data list like wordweave's `words-dictionary.txt` (#1144: two such reads were invisible to
+ *  this rule behind a trailing comma, and are data, not scans). */
+const MARKDOWN_READ = /\.(?:md|txt)['"]|\bMD\b|markdown/i;
 
 /**
- * The raw reads of repo source in one file, as matched text (empty when the file is clean).
- *
- * `before` is the text immediately preceding the read, which is where a `JSON.parse(` or
- * `stripComments(` wrapper sits.
+ * The raw reads of repo source in one file, as the calls' source text (empty when the file is
+ * clean). Throws when `code` does not parse — a stump would report no reads and pass.
  */
-const rawSourceReads = (code: string): string[] => {
+export const rawSourceReads = (code: string, label = 'guard.ts'): string[] => {
   const scratch = scratchRootIdents(code);
   const usesScratch = (call: string): boolean =>
     scratch.some((id) => new RegExp(`(^|[^\\w$])${id}\\b`).test(call));
-  return [...code.matchAll(READ_CALL)]
-    .filter((m) => REPO_ROOTED.test(m[0]))
-    .filter((m) => !usesScratch(m[0]))
-    .filter((m) => !MARKDOWN_READ.test(m[0]))
-    .filter((m) => {
-      const before = code.slice(Math.max(0, m.index - 40), m.index);
-      if (WRAPPED_BEFORE.some((re) => re.test(before))) return false;
-      // 400, not 150: the wrapper often sits past a blanked comment or a multi-line type
-      // annotation, and at 150 two correct files were still reported.
-      const after = code.slice(m.index + m[0].length, m.index + m[0].length + 400);
-      return !WRAPPED_AFTER.test(after);
-    })
-    .map((m) => m[0]);
+  const sf = parseSource(code, label);
+  return callsTo(sf, 'readFileSync', 'readFile')
+    .map((call) => ({ text: call.getText(sf), value: decodedRead(call) }))
+    .filter((r): r is { text: string; value: ts.Expression } => r.value !== undefined)
+    .filter((r) => REPO_ROOTED.test(r.text))
+    .filter((r) => !usesScratch(r.text))
+    .filter((r) => !MARKDOWN_READ.test(r.text))
+    .filter((r) => !isWrapped(r.value))
+    .map((r) => r.text);
 };
 
 /**
- * Files allowed to read repo source raw, each for a stated reason.
+ * ⚠️ **No raw-read allowlist — deleted, not left empty (#1128).** `RAW_READ_ALLOW` was an empty
+ * `Map<file, reason>` consulted with `.has(rel)`: nothing to spend, and the first row anybody added
+ * would have pardoned a whole FILE — the #1123 grain defect waiting on its first user. Every guard
+ * this rule reports was migrated in #812 rather than allowlisted. If a real exception ever appears,
+ * give it a counted row through `assertExemptionLedger`; do not bring the Map back.
  *
- * ⚠️ **Empty, and worth keeping that way.** Every guard this rule REPORTS was migrated in #812
- * rather than allowlisted, so an entry here is a NEW hole, not inherited debt.
- *
- * ⚠️ "Every guard this rule reports" is not the same as "every guard that scans repo source", and
- * an earlier version of this note claimed the latter — which was false. The rule's reach is bounded
- * by `REPO_ROOTED` below; the guards it cannot see are neither migrated nor allowlisted, they are
- * simply invisible to it. #816 tracks the ones in the other test roots.
+ * ⚠️ "Every guard this rule reports" is not the same as "every guard that scans repo source". The
+ * rule's reach is bounded by `REPO_ROOTED` below; the guards it cannot see are neither migrated nor
+ * allowlisted, they are simply invisible to it. #816 tracks the ones in the other test roots.
  */
-const RAW_READ_ALLOW = new Map<string, string>([]);
 
 /**
  * ⚠️ **`.raw` was a silent bypass of this whole rule, and it was live in the exemplar file.**
@@ -489,6 +557,37 @@ describe('an architecture guard reads source through the shared reader (#812)', 
     ].join('\n')), 'a tmpdir FALLBACK does not make a root scratch').toBe(1);
   });
 
+  it('classifies each read along its OWN binding — a neighbour\'s wrapper does not vouch (#1144)', () => {
+    const READ = 'read' + 'FileSync(';
+    const fires = (s: string): number => rawSourceReads(s).length;
+    const bare = `const raw = fs.${READ}path.join(REPO_ROOT, 'engine/scripts/repoCorpus.mjs'), 'utf8');`;
+    const parsedNeighbour = `const pkg = JSON.parse(fs.${READ}path.join(REPO_ROOT, 'package.json'), 'utf8'));`;
+    // Observed on the windowed version: 1 alone, 0 once the neighbour's `JSON.parse(` sat within 400.
+    expect(fires(bare)).toBe(1);
+    expect(fires(`${bare}\n${parsedNeighbour}`), 'the next line\'s JSON.parse is not this read\'s').toBe(1);
+    expect(fires(`${parsedNeighbour}\n${bare}`), 'nor the previous line\'s').toBe(1);
+    // The binding's own wrapper still excuses it, however far away — and only that binding's.
+    expect(fires(`${bare}\n${'const pad = 1;\n'.repeat(40)}const cfg = JSON.parse(raw);`)).toBe(0);
+    expect(fires(`${bare}\nconst other = '{}';\nconst cfg = JSON.parse(other);`)).toBe(1);
+    // Direct, not somewhere inside the wrapper's arguments: this parses what `summarise` returned.
+    expect(fires(`${bare}\nconst cfg = JSON.parse(summarise(raw));`)).toBe(1);
+    // EVERY read of the binding: one stripped use does not excuse a raw match beside it.
+    expect(fires(`${bare}\nconst code = stripComments(raw);\nexpect(raw).toMatch(/x/);`)).toBe(1);
+    // By symbol: a sibling function's parameter named `raw` is not a read of this `raw`.
+    expect(fires(`${bare}\nexpect(raw).toMatch(/x/);\nfunction parse(raw: string) { return JSON.parse(raw); }`)).toBe(1);
+  });
+
+  it('sees a read a formatter WRAPPED with a trailing comma — and the encoding from the call itself (#1144)', () => {
+    const READ = 'read' + 'FileSync(';
+    const fires = (s: string): number => rawSourceReads(s).length;
+    // Invisible to the old text pattern, which required `'utf8'` to be followed by `)`. Twenty-one
+    // real reads in eleven files were written this way and never reported: 19 of repo source in nine
+    // (18 migrated, 1 deleted) and 2 of wordweave's `.txt` dictionary, now excused as data.
+    expect(fires(`const src = fs.${READ}\n  path.join(__dirname, '../../src/x.ts'),\n  'utf8',\n);`)).toBe(1);
+    // A Buffer read has no encoding of its OWN; a neighbour's `'utf8')` does not lend it one.
+    expect(fires(`const buf = fs.${READ}path.join(REPO_ROOT, 'engine/x.png'));\nconst s = fs.${READ}tmpFile, 'utf8');`)).toBe(0);
+  });
+
   it('THE RULE IS WIRED: a planted offender is reported', () => {
     // ⚠️ Found by mutation: replacing the filter below with `() => false` left all nine tests in
     // this file GREEN. The detector had its own positive control, but nothing checked that the
@@ -498,8 +597,7 @@ describe('an architecture guard reads source through the shared reader (#812)', 
     const planted = { rel: 'engine/tests/architecture/__planted.test.ts',
       code: `const s = fs.${READ}path.join(REPO_ROOT, 'engine/x.ts'), 'utf8');\nexpect(s).toMatch(/x/);` };
     const reported = [...archFiles, planted]
-      .filter((f) => !RAW_READ_ALLOW.has(f.rel))
-      .filter((f) => rawSourceReads(f.code).length > 0)
+      .filter((f) => rawSourceReads(f.code, f.rel).length > 0)
       .map((f) => f.rel);
     expect(reported, 'the offender rule no longer reports a file that plainly matches the shape')
       .toContain(planted.rel);
@@ -507,8 +605,7 @@ describe('an architecture guard reads source through the shared reader (#812)', 
 
   it('no architecture guard matches a pattern against unstripped repo source', () => {
     const offenders = archFiles
-      .filter((f) => !RAW_READ_ALLOW.has(f.rel))
-      .filter((f) => rawSourceReads(f.code).length > 0)
+      .filter((f) => rawSourceReads(f.code, f.rel).length > 0)
       .map((f) => f.rel);
     expect(
       offenders,
@@ -529,23 +626,30 @@ describe('an architecture guard reads source through the shared reader (#812)', 
     // The two files that ARE the mechanism need the unstripped view to do their job, and neither
     // is a source scan: this guard hands `raw` to `assertScanIsSane` to prove the strip did not
     // eat code, and `sourceScanner.test.ts` has `.raw` as its literal subject under test.
-    const RAW_IS_THE_SUBJECT = new Map<string, string>([
-      ['engine/tests/architecture/commentStripperIsShared.test.ts',
-        'feeds `raw` to assertScanIsSane — comparing the real file against its stripped form IS '
-        + 'this rule; taking the stripped view on both sides would make that check vacuous'],
-      ['engine/packages/modoki/tests/helpers/sourceScanner.test.ts',
-        'the readScannedSource contract is what it tests, so `.raw` is the subject, not a bypass'],
-    ]);
-    const offenders = archFiles
-      .filter((f) => !RAW_IS_THE_SUBJECT.has(f.rel))
-      .filter((f) => undeclaredRawReads(f.code).length > 0)
-      .map((f) => f.rel);
-    expect(
-      offenders,
-      'these reach unstripped text through `.raw` without passing '
-      + "{ comments: 'include', reason }, so the strip is off and nothing recorded why:\n"
-      + offenders.join('\n'),
-    ).toEqual([]);
+    //
+    // ⚠️ Counted per `.raw` read, not per file (#1128): it was a `Map<file, reason>` skipped with
+    // `.has(rel)`, so a SECOND, undeclared `.raw` scan added to either file was green under a reason
+    // about the one read that IS the subject.
+    const RAW_IS_THE_SUBJECT: readonly LedgerRow[] = [
+      {
+        item: 'engine/tests/architecture/commentStripperIsShared.test.ts',
+        reason: 'its ONE `.raw` feeds assertScanIsSane — comparing the real file against its stripped '
+          + 'form IS this rule; taking the stripped view on both sides would make that check vacuous',
+      },
+      {
+        item: 'engine/packages/modoki/tests/helpers/sourceScanner.test.ts',
+        reason: 'the readScannedSource contract is what it tests, so its ONE `.raw` is the subject, '
+          + 'not a bypass',
+      },
+    ];
+    assertExemptionLedger({
+      label: 'RAW_IS_THE_SUBJECT in commentStripperIsShared',
+      population: archFiles.flatMap((f) => undeclaredRawReads(f.code).map((call) => ({ item: f.rel, site: `${f.rel} — ${call.slice(0, 60)}` }))),
+      exempt: RAW_IS_THE_SUBJECT,
+      floor: 1,
+      fix: "this reaches unstripped text through `.raw` without passing { comments: 'include', reason }, "
+        + 'so the strip is off and nothing recorded why.',
+    });
   });
 
   it('THE .raw RULE FIRES: a bare .raw is reported, a declared one is not', () => {
@@ -559,16 +663,5 @@ describe('an architecture guard reads source through the shared reader (#812)', 
     expect(undeclaredRawReads(bare), 'a bare .raw is the bypass').toHaveLength(1);
     expect(undeclaredRawReads(destructured), 'destructuring is the same bypass').toHaveLength(1);
     expect(undeclaredRawReads(declared), 'a declared prose read is legitimate').toHaveLength(0);
-  });
-
-  it('every raw-read allowlist entry still exists and still needs to be there', () => {
-    for (const [rel, reason] of RAW_READ_ALLOW) {
-      const f = archFiles.find((x) => x.rel === rel);
-      expect(f, `allowlisted file ${rel} no longer exists — drop the entry`).toBeDefined();
-      expect(
-        rawSourceReads(f!.code).length > 0,
-        `${rel} no longer reads raw source — drop the allowlist entry (${reason})`,
-      ).toBe(true);
-    }
   });
 });

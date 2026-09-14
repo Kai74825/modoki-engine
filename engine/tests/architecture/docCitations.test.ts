@@ -29,21 +29,25 @@
  *    This is the rule that carries the CONTEXT test the allowlist never had: a retired doc may
  *    be NAMED in prose (provenance) but never LINKED (a live pointer), decided by form rather
  *    than by guessing at wording.
- *  - Rule 2 (source paths) scans `docs/**` only, and skips `docs/reviews/**`: a review is a
- *    dated point-in-time snapshot, so citing the tree as it stood is correct by construction.
- *    Deleting a file a review discussed must not turn that review red.
+ *  - Rule 2 (source paths) scans every tracked `.md` (#1124) minus `SOURCE_PATH_CORPUS_EXCLUDED`,
+ *    and skips `docs/reviews/**`: a review is a dated point-in-time snapshot, so citing the tree as
+ *    it stood is correct by construction. Deleting a file a review discussed must not turn that
+ *    review red.
  *  - Both exemption lists are checked in BOTH directions (#578): the thing exempted must still
  *    be absent, AND the entry must still be exempting a real citation. An entry that has stopped
  *    covering anything reads as enforcement and enforces nothing, which is how 9 of 22 and 10 of
  *    14 entries came to be pure bookkeeping before anything asked.
- *  - No rule checks LINE numbers, only paths. A `file.ts:123` citation rots silently on
- *    every edit above line 123; the fix for that is to cite the symbol, not to guard the number.
+ *  - No rule checks WHERE a line number points — nothing could. What the "cite by SYMBOL" describe
+ *    below forbids is writing one at all (#686), over every tracked `.md` (#1124).
  */
 import { describe, it, expect } from 'vitest';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { repoFiles as repoCorpusFiles } from '../../scripts/repoCorpus.mjs';
-import { hasInternalGames } from '../helpers/repoLayout';
+import { assertExemptionLedger } from '@modoki/engine/testing/exemptionLedger';
+import { readScannedSource } from '@modoki/engine/testing';
+import { hasInternalGames, hasPrivateDocs } from '../helpers/repoLayout';
+import { SECTION_CITE, headingIds } from '../helpers/docSections';
 import {
   citesALine,
   citesALineByMarker,
@@ -94,26 +98,85 @@ function repoFiles(): string[] {
 }
 
 const rel = (p: string) => path.relative(repoRoot, p).split(path.sep).join('/');
+
+/** Every `.md` git knows about, for the two corpora #1124 derived. Deliberately NOT `repoFiles()`:
+ *  its `SKIP_DIRS` is a BUILD-OUTPUT list matched per path segment, and applied to Markdown it
+ *  silently dropped 164 tracked docs — all of `.agent-memory/` (agent-loaded context, holding 10
+ *  line citations at the time) plus every `.md` under a directory merely NAMED `build` or `ios`.
+ *  That is the "a named directory excludes the next file" defect this corpus exists to kill, one
+ *  layer down. Git already drops gitignored build output; what is skipped beyond that is a
+ *  reasoned ledger row, never a segment name. */
+function repoMarkdownFiles(): string[] {
+  return repoCorpusFiles({ match: /\.md$/, exclude: new Set(['node_modules']), floor: 50 })
+    .map((f) => rel(f.abs));
+}
+
+/** Markdown read for the line-citation rule: the prose IS the subject, so nothing is stripped. */
+const DOC_AS_PROSE = {
+  comments: 'include',
+  reason: 'Markdown — the doc text is what cites a line, so there is nothing to see past',
+} as const;
 const exists = (p: string) => fs.existsSync(path.join(repoRoot, p));
 
 /* ------------------------------------------------------------------ Rule 1 */
 
-/** Files whose `docs/**.md` mentions are NOT citations. Each needs a reason — an entry here is
- *  a hole in the guard, so it should be obviously-correct, not merely convenient. */
-const DOC_CITATION_EXEMPT: ReadonlyArray<{ file: string; reason: string }> = [
-  {
-    file: 'engine/tests/assets/scanPublishSafety.test.ts',
-    reason:
-      'Writes temp FIXTURE files under a scratch dir to exercise the publish scanner. Those are '
-      + 'inputs it creates, not pointers to real docs.',
-  },
-  {
-    file: 'engine/tests/architecture/docCitations.test.ts',
-    reason:
-      'This file. Its exemption reasons and error strings necessarily quote doc paths, including '
-      + 'absent ones — a guard that fails on its own explanation of why something is absent.',
-  },
+/** ⚠️ **This replaces `DOC_CITATION_EXEMPT`, a bare-FILE list that three different rules
+ *  consumed with no staleness check of any kind (#1123).** It held two rows and was read at three
+ *  call sites — rule 1 (doc-path citations), rule 2 (bare-name citations) and the markdown-link
+ *  rule — so one reason written about one rule excused a file in all three. Measured 2026-09-12 on work-ai2:
+ *  this file held **164** `docs/**.md` mentions and `scanPublishSafety.test.ts` **7**, all pardoned
+ *  wholesale, and nothing ever re-checked either row. Its docblock asked for entries that are
+ *  "obviously-correct, not merely convenient" — the grain was what made that unverifiable.
+ *
+ *  The replacement splits the two rows by what they actually are:
+ *
+ *  - **`SELF_QUOTING`** — this file. A guard whose error strings and exemption reasons must quote
+ *    doc paths, including absent ones, cannot be asked not to; any number of them is correct. That
+ *    is STRUCTURAL, not a reviewed exception, so it is not a ledger row — the split
+ *    `clientJsonWriteSeam.test.ts` makes, and the one `corpusProducerIsShared.test.ts` makes for
+ *    `repoCorpus.mjs` "structurally, not via EXEMPT".
+ *    ⚠️ **Stated hole:** a genuinely dangling citation added to THIS file is still invisible.
+ *    The alternative is 164 ledger rows, which nobody would read. Accepted knowingly.
+ *  - **`RULE1_FIXTURE_PATHS`** — named per cited PATH, so a new fixture path is a decision.
+ *
+ *  ⚠️ **And the other two rules now pardon `scanPublishSafety.test.ts` for nothing, because it
+ *  was pardoning nothing.** Measured by deleting its row and running the file: 23 of 24 tests stayed
+ *  green and only rule 1 reddened. Its pardon in rules 2 and 3 was inert — the cross-ban defect in
+ *  its mildest form, and the reason a row must belong to ONE rule. */
+const SELF_QUOTING: readonly string[] = [
+  'engine/tests/architecture/docCitations.test.ts',
 ];
+
+/** Fixture doc paths `engine/tests/assets/scanPublishSafety.test.ts` WRITES into a scratch dir to
+ *  exercise the publish scanner, then asserts on. They are inputs it creates, not pointers to real
+ *  docs — so they must not exist in the tree, which is the opposite of what rule 1 wants.
+ *
+ *  One row per cited PATH rather than per mention: the path is the identity, and three `w()` calls
+ *  plus four `expect`s naming the same fixture are one fact. A NEW fixture path is what has to be
+ *  looked at, and that is what goes red. */
+const RULE1_FIXTURE_PATHS = [
+  { item: 'engine/tests/assets/scanPublishSafety.test.ts::docs/history.md',
+    reason: "scratch fixture for that file's hard-FAIL case — see the `w('docs/history.md', …)` "
+      + 'call there for its content' },
+  { item: 'engine/tests/assets/scanPublishSafety.test.ts::docs/team.md',
+    reason: "scratch fixture for that file's review-but-not-hard-fail case — see the "
+      + "`w('docs/team.md', …)` call there" },
+  { item: 'engine/tests/assets/scanPublishSafety.test.ts::docs/unquoted-prose.md',
+    reason: "scratch fixture pinning that the scanner's ^/$ anchors do the work on a credential-"
+      + 'shaped token in prose' },
+] as const;
+
+/* ⚠️ **Those reasons name the fixtures by PATH and deliberately do not quote their CONTENT.** The
+ *  first cut did, and it was a publish blocker: `scanPublishSafety.test.ts` is one of seven files
+ *  the OSS manifest EXCLUDES (`scripts/publish-engine-oss.sh`), precisely because its fixtures embed
+ *  a real third-party brand name for the scanner to catch — and THIS file ships. Quoting the fixture
+ *  here carried that string from an excluded path to a published one, and
+ *  `scripts/scan-publish-safety.mjs` aborted the publish with a BLOCKING finding. Caught by review
+ *  on the close-out, not by `npm run verify`, which does not run the publish scanner.
+ *
+ *  The general rule, which is easy to get wrong in exactly this direction: **a ledger row that moves
+ *  a quotation across a publish boundary moves whatever the quotation contains.** Cite the fixture,
+ *  never its bytes. */
 
 /** Retired docs that are still NAMED on purpose, and the doc that absorbed each.
  *
@@ -135,7 +198,7 @@ const DOC_CITATION_EXEMPT: ReadonlyArray<{ file: string; reason: string }> = [
  *  free-form ("X — landed…", "X + Y; the superseded plan is preserved…",
  *  "games/court/{hints,levels,tutorial}.md"), and regex-guessing the live target back out of it
  *  would be exactly the kind of "merely convenient, not obviously correct" hole the comment on
- *  `DOC_CITATION_EXEMPT` above warns against.
+ *  `SELF_QUOTING` / `RULE1_FIXTURE_PATHS` above warns against.
  *
  *  ⚠️ NOT the same shape as `absorbedBy` itself — an entry whose prose STARTS "nothing" (no doc
  *  directly absorbed this one) can still have a non-empty `absorbedByPaths`, when the prose goes on
@@ -205,6 +268,12 @@ function isNonCitingSource(relFile: string): boolean {
   // fixing it means fixing the source doc. Failing on the copy would report every defect twice
   // and, worse, invite someone to "fix" a file the next build overwrites.
   if (relFile.startsWith('site/docs/reference/')) return true;
+  // The unit cover for the citation SYNTAX itself. Its fixtures are citation-shaped by
+  // construction — a deliberately dangling `§ 5A`, a `docs/thing.md` that must not exist, a
+  // relative link that resolves from a case file and not from here — because they exist to pin
+  // what `SECTION_CITE` captures, not to point at anything. Scanning them asks this guard to
+  // resolve strings whose whole purpose is to be parsed rather than followed.
+  if (relFile === 'engine/tests/architecture/docSections.test.ts') return true;
   return false;
 }
 
@@ -245,7 +314,7 @@ function docRootsFor(relFile: string): string[] {
   return m ? [...DOC_ROOTS, m[1]] : DOC_ROOTS;
 }
 
-/** True only where the FULL `docs/` tree is present.
+/*  The PRIVATE-DOCS gate: `hasPrivateDocs()` from helpers/repoLayout.
  *
  *  The OSS snapshot trims docs as well as games: `docs/plans/`, `docs/reviews/` and the private
  *  top-level docs are all dropped by publish-engine-oss.sh, whose `grep -vE` chain is the
@@ -257,11 +326,11 @@ function docRootsFor(relFile: string): string[] {
  *
  *  Gated on the docs tree rather than on project presence deliberately. Both happen to be false in
  *  the snapshot, but "are the private docs here" is what this rule actually depends on, and the
- *  repoLayout helpers warn in as many words against gating on a proxy that merely correlates. */
-function hasFullDocsTree(): boolean {
-  return fs.existsSync(path.join(repoRoot, 'docs/todo.md'))
-    && fs.existsSync(path.join(repoRoot, 'docs/plans'));
-}
+ *  repoLayout helpers warn in as many words against gating on a proxy that merely correlates.
+ *
+ *  This file used to roll its own `hasPrivateDocs()` for it — an `existsSync` of `docs/todo.md` and
+ *  `docs/plans` — which the layout ledger could not see, because the probe sat inside a function
+ *  (#1071). */
 
 /** Every markdown link target on `line` that names a `.md` file the filesystem can answer for.
  *
@@ -305,53 +374,64 @@ function markdownLinkTargets(line: string): string[] {
  *
  *  Returns cited-path → the `file:line` sites that named it. */
 function scanDocPathCitations(historical: ReadonlySet<string>): Map<string, Set<string>> {
-  const exempt = new Set(DOC_CITATION_EXEMPT.map((e) => e.file));
+  const exempt = new Set(SELF_QUOTING);
   const offenders = new Map<string, Set<string>>();
   for (const file of repoFiles()) {
     const relFile = rel(file);
     if (exempt.has(relFile) || isNonCitingSource(relFile)) continue;
-    const lines = fs.readFileSync(file, 'utf8').split(/\r?\n/);
-    lines.forEach((line, i) => {
-      // The match keeps any PREFIX the citation carries, because a `docs/…` tail can be the end
-      // of a longer, perfectly good relative path — `docs/projects.md` cites
-      // `../games/wordweave/docs/feel.md`, and reading only the `docs/feel.md` tail out of it
-      // asks whether a file exists at the repo root that was never claimed to be there.
-      for (const m of line.match(/(?:[A-Za-z0-9._-]+\/)*docs\/[A-Za-z0-9._/-]+\.md/g) ?? []) {
-        const full = m.replace(/[.,)]+$/, '');
-        const cited = full.slice(full.indexOf('docs/'));
-        if (historical.has(cited)) continue;
-        // A prefixed citation is relative to the CITING file's own directory. `path.relative`
-        // back to a repo-relative path so `exists` (which is repo-root-anchored) can answer.
-        if (full !== cited) {
-          const resolved = path.relative(
-            repoRoot, path.resolve(path.dirname(path.join(repoRoot, relFile)), full),
-          );
-          const ok = !resolved.startsWith('..') && exists(resolved);
-          // ⚠️ An EXPLICITLY relative citation (`./` or `../`) is judged only by that
-          // resolution — it names a path, and a path that does not exist is wrong however many
-          // other files share its tail. Falling through to the root union here was the whole
-          // defect this branch was added to fix, restored one line later: a bogus
-          // `../games/wordweave/docs/rendering.md` in `docs/projects.md` passed, satisfied by
-          // the repo-root `docs/rendering.md` twin. Unlike the documented bare-name blind spot
-          // below, nothing about this case is ambiguous.
-          //
-          // A NON-relative prefix keeps the fallback: `docs/api-reference.md` writes
-          // `site/.vitepress/config.ts` repo-anchored, which resolves under a root rather
-          // than beside the citing file.
-          if (/^\.\.?\//.test(full)) {
-            if (ok) continue;
-            if (!offenders.has(full)) offenders.set(full, new Set());
-            offenders.get(full)!.add(`${relFile}:${i + 1}`);
-            continue;
-          }
-          if (ok) continue;
-        }
-        if (docRootsFor(relFile).some((r) => exists(r ? `${r}/${cited}` : cited))) continue;
-        if (!offenders.has(cited)) offenders.set(cited, new Set());
-        offenders.get(cited)!.add(`${relFile}:${i + 1}`);
-      }
-    });
+    docPathOffendersInFile(relFile, fs.readFileSync(file, 'utf8').split(/\r?\n/), historical, offenders);
   }
+  return offenders;
+}
+
+/** Rule 1's per-FILE body, so the SELF_QUOTING load-bearing check (#1140) runs the same matcher on
+ *  the one file the scan skips, rather than a lookalike. Adds into `offenders` and returns it. */
+function docPathOffendersInFile(
+  relFile: string,
+  lines: readonly string[],
+  historical: ReadonlySet<string>,
+  offenders: Map<string, Set<string>> = new Map(),
+): Map<string, Set<string>> {
+  lines.forEach((line, i) => {
+    // The match keeps any PREFIX the citation carries, because a `docs/…` tail can be the end
+    // of a longer, perfectly good relative path — `docs/projects.md` cites
+    // `../games/wordweave/docs/feel.md`, and reading only the `docs/feel.md` tail out of it
+    // asks whether a file exists at the repo root that was never claimed to be there.
+    for (const m of line.match(/(?:[A-Za-z0-9._-]+\/)*docs\/[A-Za-z0-9._/-]+\.md/g) ?? []) {
+      const full = m.replace(/[.,)]+$/, '');
+      const cited = full.slice(full.indexOf('docs/'));
+      if (historical.has(cited)) continue;
+      // A prefixed citation is relative to the CITING file's own directory. `path.relative`
+      // back to a repo-relative path so `exists` (which is repo-root-anchored) can answer.
+      if (full !== cited) {
+        const resolved = path.relative(
+          repoRoot, path.resolve(path.dirname(path.join(repoRoot, relFile)), full),
+        );
+        const ok = !resolved.startsWith('..') && exists(resolved);
+        // ⚠️ An EXPLICITLY relative citation (`./` or `../`) is judged only by that
+        // resolution — it names a path, and a path that does not exist is wrong however many
+        // other files share its tail. Falling through to the root union here was the whole
+        // defect this branch was added to fix, restored one line later: a bogus
+        // `../games/wordweave/docs/rendering.md` in `docs/projects.md` passed, satisfied by
+        // the repo-root `docs/rendering.md` twin. Unlike the documented bare-name blind spot
+        // below, nothing about this case is ambiguous.
+        //
+        // A NON-relative prefix keeps the fallback: `docs/api-reference.md` writes
+        // `site/.vitepress/config.ts` repo-anchored, which resolves under a root rather
+        // than beside the citing file.
+        if (/^\.\.?\//.test(full)) {
+          if (ok) continue;
+          if (!offenders.has(full)) offenders.set(full, new Set());
+          offenders.get(full)!.add(`${relFile}:${i + 1}`);
+          continue;
+        }
+        if (ok) continue;
+      }
+      if (docRootsFor(relFile).some((r) => exists(r ? `${r}/${cited}` : cited))) continue;
+      if (!offenders.has(cited)) offenders.set(cited, new Set());
+      offenders.get(cited)!.add(`${relFile}:${i + 1}`);
+    }
+  });
   return offenders;
 }
 
@@ -435,14 +515,45 @@ function bareNameMentions(
   lines: string[], bases: ReadonlySet<string>,
 ): Array<{ line: number; base: string }> {
   const out: Array<{ line: number; base: string }> = [];
-  const matchers = [...bases].map((base) => ({
-    base, re: new RegExp(`(?:^|[^A-Za-z0-9._/-])${escapeRegExp(base)}`, 'g'),
-  }));
+  // ⚠️ Required, not defensive: an empty `bases` would build the alternation `(?:^|[^…])()`,
+  // whose empty branch matches at nearly every position — a guard that reports the whole repo.
+  // The matcher-per-base loop this replaced degenerated to zero matchers and returned [].
+  if (bases.size === 0) return out;
+  // ONE alternation, not one regex per base. This loop runs over every line of the whole repo
+  // corpus, so its per-line cost is multiplied by ~950k lines: measured unloaded on this clone
+  // (#1046), 27 separate matchers cost 2,790 ms against 333 ms for the same 27 joined —
+  // 8.4x, and it was ~80% of the bare-name scan. The shape to watch is O(lines × names): it
+  // grows every time `RETIRED_DOCS_NAMED_ON_PURPOSE` does, which is why one pass matters.
+  //
+  // ⚠️ LONGEST-FIRST, because JS alternation is leftmost-FIRST, not longest-match. The case that
+  // needs it is narrower than it first looks: a base that is a TAIL of another (`a.md` inside
+  // `xa.md`) is already impossible, because the `[^A-Za-z0-9._/-]` prefix rejects a match whose
+  // preceding character is a word char, `.`, `/` or `-`. What survives is a base that is a strict
+  // PREFIX of another — `plan.md` and `plan.md.old` both start at the same position — where
+  // leftmost-first would report the SHORTER one and lose the specific retired doc.
+  //
+  // ⚠️ This is NOT byte-equivalent to the matcher-per-base loop for such a pair, and the
+  // difference is deliberate: scanning each base independently reported BOTH `plan.md` and
+  // `plan.md.old` for one mention of `plan.md.old`, which is a false hit on `plan.md` — a
+  // different filename. Longest-first reports only the specific one. `noPrefixPairs` below pins
+  // that no such pair exists in the real list at all, so the corpus result is unchanged today.
+  const order = new Map([...bases].map((base, i) => [base, i] as const));
+  const alternation = [...bases]
+    .sort((a, b) => b.length - a.length)
+    .map(escapeRegExp)
+    .join('|');
+  const re = new RegExp(`(?:^|[^A-Za-z0-9._/-])(${alternation})`, 'g');
+  const hits: Array<{ base: string; at: number }> = [];
   lines.forEach((line, i) => {
-    for (const { base, re } of matchers) {
-      re.lastIndex = 0;
-      for (const _m of line.matchAll(re)) out.push({ line: i + 1, base });
-    }
+    re.lastIndex = 0;
+    hits.length = 0;
+    for (const m of line.matchAll(re)) hits.push({ base: m[1], at: m.index ?? 0 });
+    if (hits.length === 0) return;
+    // Emitted in the per-base grouping the matcher-per-base loop produced (base order, then
+    // position within the line) so this stays a PURE speed change. `scanBareNameCitations` keys
+    // a Map by base and cannot see the difference, but the fixture asserts exact order.
+    hits.sort((x, y) => (order.get(x.base)! - order.get(y.base)!) || x.at - y.at);
+    for (const h of hits) out.push({ line: i + 1, base: h.base });
   });
   return out;
 }
@@ -498,11 +609,31 @@ function ambiguousRetiredBasenames(): Set<string> {
   return ambiguousRetiredBasenamesCache;
 }
 
+/** `scanDocPathCitations` with the retirement allowlist EMPTIED — the "what would rule 1 flag if
+ *  nothing were exempt" view that both #578 sweeps below read.
+ *
+ *  Memoized because those two call sites passed an identical `new Set()` and each paid a full
+ *  corpus re-read for the same answer (~700 ms apiece, measured #1046). Deliberately a separate
+ *  zero-arg helper rather than a cache inside `scanDocPathCitations`: that function's OTHER caller
+ *  passes the real allowlist, and a memo keyed on the wrong thing would hand one of them the
+ *  other's answer — the allowlist is what it filters by, so the two results are genuinely
+ *  different maps.
+ *
+ *  ⚠️ Freezing this half narrows the skew its bare-name sibling's docblock records: both scans are
+ *  now snapshots, but they are taken at different moments and `scanDocPathCitations`'s allowlisted
+ *  call still re-walks. No test here writes into the repo tree. */
+let unfilteredDocPathCitationsCache: Map<string, Set<string>> | undefined;
+function scanDocPathCitationsUnfiltered(): Map<string, Set<string>> {
+  unfilteredDocPathCitationsCache ??= scanDocPathCitations(new Set());
+  return unfilteredDocPathCitationsCache;
+}
+
 /** Rule 1's bare-name companion (#621): every retired basename mentioned WITHOUT its `docs/`
  *  prefix, repo-wide. Bases = the retired basenames minus `ambiguousRetiredBasenames()`. Skips the
- *  same two things `scanDocPathCitations` skips, for the same reasons: `DOC_CITATION_EXEMPT` (this
- *  guard file must be able to quote bare names in its own explanations — this file does, in the
- *  `bareNameMentions` docblock above)
+ *  same two things `scanDocPathCitations` skips, for the same reasons: `SELF_QUOTING` (this guard
+ *  file must be able to quote bare names in its own explanations — this file does, in the
+ *  `bareNameMentions` docblock above; it is NOT pardoned for `scanPublishSafety.test.ts`, whose old
+ *  blanket row pardoned nothing under this rule — #1123)
  *  and `isNonCitingSource` (a review is a dated snapshot; the generated `site/docs/reference/`
  *  copy inherits whatever staleness the source doc has).
  *
@@ -515,15 +646,20 @@ function ambiguousRetiredBasenames(): Set<string> {
  *
  *  Returns basename → the `file:line` sites that named it. */
 let scanBareNameCitationsCache: Map<string, Set<string>> | undefined;
-function scanBareNameCitations(): Map<string, Set<string>> {
-  if (scanBareNameCitationsCache) return scanBareNameCitationsCache;
-  const exempt = new Set(DOC_CITATION_EXEMPT.map((e) => e.file));
+/** The basenames the bare scan looks for: retired basenames minus the ambiguous ones. Its own
+ *  function so the SELF_QUOTING load-bearing check (#1140) asks with the scan's exact bases. */
+function bareNameBases(): Set<string> {
   const ambiguous = ambiguousRetiredBasenames();
-  const bases = new Set(
+  return new Set(
     RETIRED_DOCS_NAMED_ON_PURPOSE
       .map((e) => retiredBasename(e.cited))
       .filter((b) => !ambiguous.has(b)),
   );
+}
+function scanBareNameCitations(): Map<string, Set<string>> {
+  if (scanBareNameCitationsCache) return scanBareNameCitationsCache;
+  const exempt = new Set(SELF_QUOTING);
+  const bases = bareNameBases();
   const offenders = new Map<string, Set<string>>();
   for (const file of repoFiles()) {
     const relFile = rel(file);
@@ -558,6 +694,23 @@ function sitesNamingEntry(
   return out;
 }
 
+/** The link rule's per-FILE body: every markdown link target in `abs` that does not resolve.
+ *  Its own function so the SELF_QUOTING load-bearing check (#1140) runs the rule's own matcher. */
+function unresolvedLinksInFile(abs: string): { checked: number; offenders: string[] } {
+  const relFile = rel(abs);
+  const offenders: string[] = [];
+  let checked = 0;
+  for (const { line: lineNo, target } of documentLinkTargets(fs.readFileSync(abs, 'utf8').split(/\r?\n/))) {
+    checked += 1;
+    const resolved = path.relative(repoRoot, path.resolve(path.dirname(abs), target));
+    // A target escaping the repo is wrong for the same reason a missing one is: nothing a
+    // reader can follow. Reported rather than skipped, so `../../../../etc/x.md` cannot hide.
+    if (!resolved.startsWith('..') && exists(resolved)) continue;
+    offenders.push(`${relFile}:${lineNo} → ${target}`);
+  }
+  return { checked, offenders };
+}
+
 describe('cited doc paths resolve (#194)', () => {
   it('the enumeration found the repo — a vacuous pass is a failure', () => {
     // Both rules below iterate `repoFiles()`, so if git returns nothing (run outside a checkout,
@@ -570,7 +723,7 @@ describe('cited doc paths resolve (#194)', () => {
   });
 
   it('every docs/**.md path mentioned anywhere in the repo exists', (ctx) => {
-    if (!hasFullDocsTree()) {
+    if (!hasPrivateDocs()) {
       ctx.skip();
       return;
     }
@@ -578,16 +731,78 @@ describe('cited doc paths resolve (#194)', () => {
       new Set(RETIRED_DOCS_NAMED_ON_PURPOSE.map((e) => e.cited)),
     );
 
-    const report = [...offenders.entries()]
-      .sort()
-      .map(([p, sites]) => `${p}\n    cited by: ${[...sites].sort().join(', ')}`);
+    // One population entry per (citing file, cited path) — not per mention, because the path is
+    // the identity. `site` keeps every line for the message, which is what a reader needs.
+    const byFileAndPath = new Map<string, { item: string; site: string }>();
+    for (const [cited, sites] of [...offenders.entries()].sort()) {
+      for (const site of [...sites].sort()) {
+        const item = `${site.replace(/:\d+$/, '')}::${cited}`;
+        const seen = byFileAndPath.get(item);
+        if (seen) seen.site += `, ${site}`;
+        else byFileAndPath.set(item, { item, site: `${cited}\n    cited by: ${site}` });
+      }
+    }
 
-    expect(
-      report,
-      'these docs were deleted or renamed without repointing their citations. '
+    assertExemptionLedger({
+      label: 'RULE1_FIXTURE_PATHS in docCitations (rule 1)',
+      population: [...byFileAndPath.values()].sort((a, b) => a.item.localeCompare(b.item)),
+      exempt: RULE1_FIXTURE_PATHS,
+      // ⚠️ A floor of 3 is the ledgered fixtures and nothing else, because on a clean tree
+      // rule 1's population IS exactly the pardons — there are no other offenders, by design. So
+      // this is the one place in this change where the floor necessarily equals the population, and
+      // FIXING a fixture reports "stopped matching" rather than "blesses 1, found 0". Read it that
+      // way. The real detector-broke check is the sibling test that floors repoFiles() at 200 and
+      // citing markdown files at 20; this floor only stops the ledger meeting an empty scan.
+      //
+      // ⚠️ **And the whole population lives in ONE file the OSS publish manifest STRIPS**
+      // (`engine/tests/assets/scanPublishSafety.test.ts`), while `verify:publish` runs
+      // `engine/tests/architecture/` against the stage. This floor is green there only because the
+      // test `ctx.skip()`s on `hasPrivateDocs()` — which reads a DIFFERENT excluded file, for
+      // reasons that have nothing to do with this rule. So the dependency is real and incidental: if
+      // `hasPrivateDocs()` ever becomes true on the stage, this floor reddens the free public CI,
+      // and the fix is to gate on the file the floor actually counts. The #1014/#1015 shape, and it
+      // did not exist before this floor did. Flagged by review.
+      floor: 3,
+      fix: 'these docs were deleted or renamed without repointing their citations. '
         + 'doc-conventions.md: repoint every citation in the SAME commit that moves the doc — '
         + 'fold the content into the feature doc and point there, or drop the pointer if the '
         + 'surrounding text stands on its own.',
+    });
+  });
+
+  it('SELF_QUOTING is load-bearing in EACH of the three scans that skip it (#1140)', (ctx) => {
+    // SELF_QUOTING is a whole-FILE exclusion on purpose (its docblock states the hole and why), so
+    // it is not spent per occurrence. What it lacked was any staleness check at all — and it is
+    // read by three independent scans, so "load-bearing" is three claims, not one. A scan in which
+    // this file no longer produces anything is a scan the exclusion pardons nothing in, and it
+    // should stop being applied there (rules 3 and 4 carried exactly that: an inline skip of this
+    // file that excused nothing, measured and deleted in #1140).
+    if (!hasPrivateDocs() || !hasInternalGames()) {
+      ctx.skip();
+      return;
+    }
+    const inert: string[] = [];
+    const bases = bareNameBases();
+    const historical = new Set(RETIRED_DOCS_NAMED_ON_PURPOSE.map((e) => e.cited));
+    for (const relFile of SELF_QUOTING) {
+      const abs = path.join(repoRoot, relFile);
+      const lines = fs.readFileSync(abs, 'utf8').split(/\r?\n/);
+      if (docPathOffendersInFile(relFile, lines, historical).size === 0) {
+        inert.push(`${relFile} — rule 1 (docs/**.md paths) finds nothing to excuse in it`);
+      }
+      if (bareNameMentions(lines, bases).length === 0) {
+        inert.push(`${relFile} — the bare-name scan finds nothing to excuse in it`);
+      }
+      if (unresolvedLinksInFile(abs).offenders.length === 0) {
+        inert.push(`${relFile} — the link rule finds nothing to excuse in it`);
+      }
+    }
+    expect(
+      inert,
+      'SELF_QUOTING is applied by a scan in which the file excuses nothing. Stop applying it in that '
+        + 'scan AND remove that scan\'s arm from this test in the same change (or drop the row, and '
+        + 'this test, if all three are listed) — an exclusion that pardons nothing would silently '
+        + 'pardon the first real defect written there.',
     ).toEqual([]);
   });
 
@@ -666,11 +881,81 @@ describe('cited doc paths resolve (#194)', () => {
     ]);
   });
 
+  it('bareNameMentions: a base that PREFIXES another does not shadow it (#1046)', () => {
+    // The one shape the single-alternation rewrite can get wrong. A base that is a TAIL of another
+    // is already safe (`sync.md` cannot match inside `group-sync.md` — the preceding `-` is in the
+    // excluded class), so the fixture has to use a strict PREFIX pair, where both candidates start
+    // at the SAME position and leftmost-first picks whichever the alternation lists first.
+    //
+    // ⚠️ The first version of this test used `sync.md`/`group-sync.md` and was GREEN with the sort
+    // deleted — it asserted a case the boundary rule already handled. Kept as a scar: a fixture for
+    // an ordering hazard has to exercise an actual ordering ambiguity.
+    //
+    // MUTATION CHECK: drop `.sort((a, b) => b.length - a.length)` in `bareNameMentions` and line 2
+    // reports `plan.md` instead of `plan.md.old` — red here, and nowhere else, because
+    // `noPrefixPairs` proves the real list has no such pair.
+    const bases = new Set(['plan.md', 'plan.md.old']);
+    const doc = [
+      'see plan.md here',            // 1: only the short base is present
+      'see plan.md.old here',        // 2: both start at the same column; the LONGER must win
+    ];
+    expect(bareNameMentions(doc, bases)).toEqual([
+      { line: 1, base: 'plan.md' },
+      { line: 2, base: 'plan.md.old' },
+    ]);
+  });
+
+  it('no retired-doc basename is a strict PREFIX of another — the alternation cannot shadow (#1046)', () => {
+    // The precondition that makes the single-alternation scan equivalent to the matcher-per-base
+    // loop on the REAL corpus. Longest-first ordering makes a prefix pair resolve to the specific
+    // doc rather than the general one, but it still reports ONE where the old loop reported two —
+    // so rather than rely on that, pin that the ambiguity does not exist in the list at all.
+    // Sibling of the existing "no two retired-doc entries share a basename" pin, one step weaker.
+    const bases = RETIRED_DOCS_NAMED_ON_PURPOSE.map((e) => retiredBasename(e.cited));
+    const shadowed = bases.flatMap(
+      (a) => bases.filter((b) => a !== b && b.startsWith(a)).map((b) => `${a} prefixes ${b}`),
+    );
+    expect(shadowed, 'a prefix pair makes the bare-name alternation order-dependent').toEqual([]);
+  });
+
+  it('bareNameMentions: two different bases on one line are both reported, in base order (#1046)', () => {
+    // The multi-base shape the #621 fixture never exercised (it uses a single base), and the one
+    // the rewrite could silently reorder or drop: one alternation pass finds matches in TEXT
+    // order, where the matcher-per-base loop grouped them by BASE.
+    //
+    // MUTATION CHECK: delete the `hits.sort(...)` and this goes red (line 1 reports b-doc before
+    // a-doc); replace `matchAll` with a single `exec` and it goes red for a dropped second hit.
+    const bases = new Set(['a-doc.md', 'b-doc.md']);
+    const doc = [
+      'cites b-doc.md and a-doc.md together',  // 1: text order b,a — base order must be a,b
+      'a-doc.md twice: a-doc.md',              // 2: same base twice, both positions kept
+    ];
+    expect(bareNameMentions(doc, bases)).toEqual([
+      { line: 1, base: 'a-doc.md' },
+      { line: 1, base: 'b-doc.md' },
+      { line: 2, base: 'a-doc.md' },
+      { line: 2, base: 'a-doc.md' },
+    ]);
+  });
+
+  it('bareNameMentions: no bases means no mentions, not every line (#1046)', () => {
+    // `ambiguousRetiredBasenames()` can in principle exclude every base. The matcher-per-base loop
+    // degenerated harmlessly to zero matchers; an alternation built from an empty list is
+    // `(?:^|[^…])()`, whose empty branch matches at nearly every position — so this guard would
+    // report the entire repo as citing "".
+    //
+    // MUTATION CHECK: remove the `if (bases.size === 0) return out;` early return and this test
+    // goes red with 5 phantom mentions of the empty string: 3 on line 1 (at offsets 0, 8 and 11 —
+    // NOT every position, because the `(?:^|[^A-Za-z0-9._/-])` prefix consumes a character between
+    // matches), and 1 each on lines 2 and 3.
+    expect(bareNameMentions(['anything at all', '', 'x'], new Set())).toEqual([]);
+  });
+
   it('the bare-name scan\'s ambiguity exclusion is exactly the known collision (#621)', (ctx) => {
     // docs/plans/ is stripped from the OSS snapshot, so docs/plans/profiler.md — the live file
     // that makes `profiler.md` ambiguous — is absent there, and this pin would fail for a reason
     // that has nothing to do with citations.
-    if (!hasFullDocsTree()) {
+    if (!hasPrivateDocs()) {
       ctx.skip();
       return;
     }
@@ -715,7 +1000,7 @@ describe('cited doc paths resolve (#194)', () => {
     // this file are for: if "the enumeration found the repo" above and the `bareNameMentions`
     // synthetic-fixture test are both green, the matcher and the enumeration are proven alive, and
     // a zero here is the healthy case — not a regression to chase.
-    if (!hasFullDocsTree() || !hasInternalGames()) {
+    if (!hasPrivateDocs() || !hasInternalGames()) {
       ctx.skip();
       return;
     }
@@ -764,11 +1049,11 @@ describe('cited doc paths resolve (#194)', () => {
     // grep list in a shell script, in another language, that nobody here would think to check
     // before editing. (The first draft omitted this and its commit message claimed otherwise; the
     // staged-snapshot check could not tell, because the snapshot fails both predicates at once.)
-    if (!hasFullDocsTree() || !hasInternalGames()) {
+    if (!hasPrivateDocs() || !hasInternalGames()) {
       ctx.skip();
       return;
     }
-    const wouldFlag = scanDocPathCitations(new Set());
+    const wouldFlag = scanDocPathCitationsUnfiltered();
     const bareFlag = scanBareNameCitations();
     const inert = RETIRED_DOCS_NAMED_ON_PURPOSE
       .filter((e) => sitesNamingEntry(wouldFlag, bareFlag, e.cited).size === 0)
@@ -822,7 +1107,7 @@ describe('cited doc paths resolve (#194)', () => {
     // of file; distinguishing a NEW prose pointer from an old one in an already-citing file would
     // still mean guessing at prose, which is the approach measured and rejected in that rule's
     // comment.
-    if (!hasFullDocsTree() || !hasInternalGames()) {
+    if (!hasPrivateDocs() || !hasInternalGames()) {
       ctx.skip();
       return;
     }
@@ -831,7 +1116,7 @@ describe('cited doc paths resolve (#194)', () => {
     // `verify:publish` names). Ungated, every one of those would report there as "no longer cites
     // it" — the same trap the absorbedByPaths test fell into. No count is quoted on purpose: three
     // rounds of review on this file have now found a stale one, and the argument never needed it.
-    const wouldFlag = scanDocPathCitations(new Set());
+    const wouldFlag = scanDocPathCitationsUnfiltered();
     const bareFlag = scanBareNameCitations();
     const drift: string[] = [];
     for (const e of RETIRED_DOCS_NAMED_ON_PURPOSE) {
@@ -908,7 +1193,7 @@ describe('cited doc paths resolve (#194)', () => {
     // "three rounds of review on this file have now found a stale one" on the citedBy test above):
     // running `scanBareNameCitations()` is how you get the current number, not reading one here —
     // this very paragraph used to quote one, and it was stale on arrival.
-    if (!hasFullDocsTree() || !hasInternalGames()) {
+    if (!hasPrivateDocs() || !hasInternalGames()) {
       ctx.skip();
       return;
     }
@@ -921,11 +1206,12 @@ describe('cited doc paths resolve (#194)', () => {
     // reader follows them into a 404 — but that belongs to the publish scanner, not here.
     const offenders: string[] = [];
     let checked = 0;
-    // DOC_CITATION_EXEMPT applies here for the reason each of its entries already states: a file
-    // that must QUOTE broken citations to explain them. This rule proved that immediately — the
+    // SELF_QUOTING applies here for the reason it states: a file that must QUOTE broken citations
+    // to explain them. ⚠️ It is this file ONLY — the old blanket list also pardoned
+    // `scanPublishSafety.test.ts` here, and measurement showed that pardoned nothing (#1123). This rule proved that immediately — the
     // paragraph below explaining why `oss/**` is excluded quotes `](CLA.md)`, and the guard
     // reported its own explanation as a defect.
-    const exempt = new Set(DOC_CITATION_EXEMPT.map((e) => e.file));
+    const exempt = new Set(SELF_QUOTING);
     for (const file of repoFiles()) {
       const relFile = rel(file);
       if (exempt.has(relFile) || isNonCitingSource(relFile)) continue;
@@ -942,17 +1228,9 @@ describe('cited doc paths resolve (#194)', () => {
       // PUBLIC repo, so `](CLA.md)` in a workflow there resolves beside the file it becomes, not
       // beside the file it is. That is a different tree, and this repo cannot answer for it.
       if (relFile.startsWith('oss/')) continue;
-      const lines = fs.readFileSync(file, 'utf8').split(/\r?\n/);
-      for (const { line: lineNo, target } of documentLinkTargets(lines)) {
-        checked += 1;
-        const resolved = path.relative(
-          repoRoot, path.resolve(path.dirname(file), target),
-        );
-        // A target escaping the repo is wrong for the same reason a missing one is: nothing a
-        // reader can follow. Reported rather than skipped, so `../../../../etc/x.md` cannot hide.
-        if (!resolved.startsWith('..') && exists(resolved)) continue;
-        offenders.push(`${relFile}:${lineNo} → ${target}`);
-      }
+      const found = unresolvedLinksInFile(file);
+      checked += found.checked;
+      offenders.push(...found.offenders);
     }
     // Vacuity floor, like every other rule in this file. `offenders` is only ever appended from
     // inside the `markdownLinkTargets` loop, so breaking the MATCHER makes this check zero targets
@@ -988,10 +1266,10 @@ describe('cited doc paths resolve (#194)', () => {
     // docs/todo.md, docs/engine-oss-publishing.md) — all trimmed from the public OSS snapshot by
     // publish-engine-oss.sh, same as the OTHER GATED test in this block (the one above this reads
     // only `e.cited`, asserting ABSENCE — which the snapshot satisfies just as well, gated or not).
-    // Gate on BOTH here: the targets span the private docs tree AND games/, and hasFullDocsTree()
+    // Gate on BOTH here: the targets span the private docs tree AND games/, and hasPrivateDocs()
     // alone would still fail on a snapshot-shaped checkout (no games/) while it happens to keep the
     // full docs/ tree.
-    if (!hasFullDocsTree() || !hasInternalGames()) {
+    if (!hasPrivateDocs() || !hasInternalGames()) {
       ctx.skip();
       return;
     }
@@ -1050,38 +1328,109 @@ function projectRoots(): string[] {
 /** Citations that intentionally name a file that does not exist. Every entry states why —
  *  without the reason this list becomes the place stale pointers go to hide.
  *
- *  `in` scopes an entry to ONE citing file. Use it whenever the exemption is a property of the
- *  sentence rather than of the path: a doc that names `runtime/setup.ts` to say the project
- *  *has no such file* is asserting its ABSENCE, which is both true and useful — but exempting
- *  that path repo-wide would green-light a genuinely stale pointer to it in some other doc. */
-const SOURCE_CITATION_EXEMPT: ReadonlyArray<{ cited: string; reason: string; in?: string }> = [
+ *  ⚠️ **Keyed `citingFile::cited` and SPENT (#1140).** This was a `.some()` match on the cited
+ *  path with an OPTIONAL `in` scope, so three of its five rows pardoned that path in every doc in
+ *  the repo — a plan naming its unbuilt file also excused a genuinely stale pointer to the same
+ *  path written into any other doc, which is the case the old `in` field's own docblock warned
+ *  about and then left optional. One row per (citing doc, path), matching rule 1's grain: the path
+ *  is the identity, so two mentions of one absent file in one doc are one fact. The ledger's
+ *  over-blessed arm replaces both old meta-tests — a row whose citation was edited away and a row
+ *  whose file came back each leave it blessing a (doc, path) the scan no longer reports. */
+const SOURCE_CITATION_EXEMPT: ReadonlyArray<{ item: string; reason: string }> = [
   // --- Named to assert the file is ABSENT. The claim is true; there is nothing to repoint.
   {
-    cited: 'runtime/setup.ts',
-    in: 'demos/2d-physics-demo/CLAUDE.md',
+    item: 'demos/2d-physics-demo/CLAUDE.md::runtime/setup.ts',
     reason: '"No runtime/setup.ts, systems.ts, traits.ts, or ui/" — the demo is stock engine traits '
       + 'only, and saying so is the point of the line',
   },
 
   // --- Deleted ON PURPOSE, and the doc's subject IS the deletion.
   {
-    cited: 'scripts/sync-agent-configs.mjs',
-    in: 'docs/todo.md',
+    item: 'docs/todo.md::scripts/sync-agent-configs.mjs',
     reason: 'deleted with the multi-CLI support it generated (#793). The declined-decision record '
       + 'names it to say what existed — a doc describing its own subject\'s deletion, which is '
       + 'the case this list\'s own failure message calls out',
   },
 
+  {
+    item: 'engine/electron/PHASE0_RESULTS.md::electron/main.cjs',
+    reason: 'the Phase 0 spike report (2026-06-11) names its throwaway CommonJS host, and records that it '
+      + 'was superseded in Phase 2 — a dated result describing what it tested',
+  },
+  {
+    item: 'engine/electron/PHASE0_RESULTS.md::electron/preload.cjs',
+    reason: 'the same throwaway spike host\'s preload, named by the same dated report',
+  },
+  {
+    item: 'games/court/audio.md::runtime/music.ts',
+    reason: '"Court had its own runtime/music.ts for half a day; it is gone, and AudioSource.playlist '
+      + 'replaced it" — the doc records the deletion and what replaced it',
+  },
+
+  // --- In ANOTHER repo. The path is right; it just is not this repo's.
+  {
+    item: '.agent-memory/a-readiness-check-must-list-what-is-ready.md::scripts/ensure-firestore-indexes.mjs',
+    reason: 'names `modoki-testboard/scripts/ensure-firestore-indexes.mjs` — a file in the separate '
+      + 'modoki-testboard repo, which rule 2\'s regex keys from its `scripts/` segment',
+  },
+
+  // --- A harness README naming where its file is DROPPED. Re-applied uncommitted while it runs.
+  {
+    item: 'tools-scratch/weave-leak-harness/README.md::runtime/bisect.ts',
+    reason: '"drop into games/wordweave/runtime/bisect.ts" — the harness file is copied in for a run, '
+      + 'never committed',
+  },
+  {
+    item: 'tools-scratch/webkit-gpu-leak/RUN-IN-FLIGHT.md::runtime/bisect.ts',
+    reason: 'the same harness file, named as re-applied and uncommitted while the measurement runs',
+  },
+
   // --- Not built yet. A plan naming its future file is the plan doing its job.
-  { cited: 'editor/inspectorRegistry.ts', reason: 'custom-editor-windows-inspectors plan: proposed, unbuilt' },
-  { cited: 'tests/sling-trait-hygiene.test.ts', reason: 'entity-id-guard plan: proposed, unbuilt' },
+  { item: 'docs/plans/custom-editor-windows-inspectors-plan.md::editor/inspectorRegistry.ts',
+    reason: 'custom-editor-windows-inspectors plan: proposed, unbuilt' },
+  { item: 'docs/plans/entity-id-guard-game-traits-plan.md::tests/sling-trait-hygiene.test.ts',
+    reason: 'entity-id-guard plan: proposed, unbuilt' },
 
   // --- A worked example, not a pointer.
-  { cited: 'scripts/stage-foo.cjs', reason: 'bundle-new-tools.md: placeholder name in a how-to template' },
+  { item: 'docs/bundle-new-tools.md::scripts/stage-foo.cjs',
+    reason: 'bundle-new-tools.md: placeholder name in a how-to template' },
 ];
 
-/** Every `.md` whose source-path citations must resolve: the engine docs, plus every `CLAUDE.md`
- *  (#195).
+/** Does an exclusion-ledger `path` cover `relFile`? Three shapes, and nothing else: an exact path; a
+ *  directory prefix ending in `/`; or a glob with `*` (within one segment) and a `**` segment (any depth) — the glob
+ *  exists so a row can say what ANOTHER gate derives (`qa/*.md` is the qa gate's `suiteDocs()`)
+ *  instead of hand-copying today's members, which is the defect #1124 is about. */
+function ledgerPathCovers(rowPath: string, relFile: string): boolean {
+  if (rowPath.includes('*')) {
+    const segment = (part: string) => part.replace(/[.+?^${}()|[\]\\]/g, '\\$&').replace(/\*/g, '[^/]*');
+    const re = new RegExp(`^${rowPath.split('**/').map(segment).join('(?:[^/]+/)*')}$`);
+    return re.test(relFile);
+  }
+  return rowPath.endsWith('/') ? relFile.startsWith(rowPath) : relFile === rowPath;
+}
+
+/** What rule 2's corpus does NOT read. A trailing `/` makes a row a directory prefix; every row
+ *  must still match a tracked `.md` (`SOURCE_PATH_CORPUS_EXCLUDED is load-bearing`). */
+const SOURCE_PATH_CORPUS_EXCLUDED: ReadonlyArray<{ path: string; reason: string }> = [
+  {
+    path: 'qa/cases/',
+    reason: 'OWNED by `qaCaseReferences.test.ts`, which resolves a case\'s paths itself and knows what a '
+      + 'case `creates:` — a probe file a case writes and deletes is absent from the tree by design',
+  },
+  {
+    path: 'qa/*.md',
+    reason: 'OWNED by `qaCaseReferences.test.ts` — every top-level suite doc, the set its `suiteDocs()` derives '
+      + '(README included: it is that suite\'s spec). The qa gate resolves `qa/tools/…` paths in full; this '
+      + 'rule\'s segment-anchored regex reads only the tail (`tools/cdp-shot.mjs`) and reports it missing',
+  },
+];
+
+/** Every `.md` whose source-path citations must resolve: every tracked `.md` (#1124), minus
+ *  `isNonCitingSource` and `SOURCE_PATH_CORPUS_EXCLUDED`.
+ *
+ *  It was `docs/**`, `games|demos/<id>/docs/**` and every `CLAUDE.md` — a hand-declared scope,
+ *  so a project's top-level doc (`games/court/audio.md`) was never read, and
+ *  measured on widening it held four paths that had moved or gone (#1124).
  *
  *  `CLAUDE.md` earns the stricter treatment, not the looser one: it is loaded into an agent's
  *  context AUTOMATICALLY at session start, so a wrong path there is believed by default rather
@@ -1089,13 +1438,10 @@ const SOURCE_CITATION_EXEMPT: ReadonlyArray<{ cited: string; reason: string; in?
  *  `runtime/core/traits/Time.ts` by the layering reorg — precisely because the #194 rule stopped
  *  at `docs/**`. */
 function citingMarkdownFiles(): string[] {
-  return repoFiles().filter((f) => {
+  return repoMarkdownFiles().map((r) => path.join(repoRoot, r)).filter((f) => {
     const r = rel(f);
-    if (!r.endsWith('.md')) return false;
     if (isNonCitingSource(r)) return false;
-    if (r.startsWith('docs/')) return true;
-    if (/^(?:games|demos)\/[^/]+\/docs\//.test(r)) return true;
-    return r === 'CLAUDE.md' || r.endsWith('/CLAUDE.md');
+    return !SOURCE_PATH_CORPUS_EXCLUDED.some((row) => ledgerPathCovers(row.path, r));
   });
 }
 
@@ -1113,10 +1459,6 @@ function rootsFor(relFile: string): string[] {
   return [...SOURCE_ROOTS, ...projectRoots()];
 }
 
-const isExemptBySourceList = (cited: string, citingFile: string) => SOURCE_CITATION_EXEMPT.some(
-  (e) => e.cited === cited && (e.in === undefined || e.in === citingFile),
-);
-
 /** Rule 2's scan, factored out for the same reason as `scanDocPathCitations` above: the
  *  "is this exemption still load-bearing" check (#578, close-out sweep) has to ask rule 2's OWN
  *  matcher, not a lookalike.
@@ -1130,11 +1472,10 @@ const isExemptBySourceList = (cited: string, citingFile: string) => SOURCE_CITAT
  *  structural rather than lucky, since a divergence would be silent in the worse direction —
  *  reporting an exemption inert while rule 2 is still using it, and inviting its deletion.
  *
- *  `isExempt` is a parameter so the load-bearing check can pass a predicate that exempts nothing.
+ *  It applies NO exemption: `SOURCE_CITATION_EXEMPT` is spent against its output (#1140), which is
+ *  what lets one scan answer both "unexcused" and "pardons nothing any more".
  *  Returns cited-path → the `file:line` sites that named it. */
-function scanSourcePathCitations(
-  isExempt: (cited: string, citingFile: string) => boolean,
-): Map<string, Set<string>> {
+function scanSourcePathCitations(): Map<string, Set<string>> {
   const offenders = new Map<string, Set<string>>();
   // Anchored at a known top-level segment so ordinary prose ("the .ts file") cannot match.
   // `tsx` precedes `ts` and the trailing look-ahead is load-bearing: `ts|tsx` would match the
@@ -1149,7 +1490,6 @@ function scanSourcePathCitations(
     lines.forEach((line, i) => {
       for (const m of line.match(RE) ?? []) {
         const cited = m.replace(/[.,)]+$/, '');
-        if (isExempt(cited, relFile)) continue;
         if (roots.some((r) => exists(r ? `${r}/${cited}` : cited))) continue;
         if (!offenders.has(cited)) offenders.set(cited, new Set());
         offenders.get(cited)!.add(`${relFile}:${i + 1}`);
@@ -1164,22 +1504,89 @@ describe('docs cite by SYMBOL, never by line number (#686)', () => {
    * The `qa/` half of this rule lives in `qaCaseReferences.test.ts`; both import the same detectors
    * from `helpers/lineCitations.ts`, because a duplicated detector is one that drifts.
    *
-   * ⚠️ **Scope is top-level `docs/*.md` ONLY, and the two exclusions are deliberate, not laziness:**
+   * ⚠️ **Scope is EVERY tracked `*.md`, minus `LINE_CITATION_CORPUS_EXCLUDED` (#1124, owner
+   * ruling).** It used to be top-level `docs/*.md`, read with a `readdirSync` of that one
+   * directory — so the rule held in `docs/` and refilled everywhere else: ~95 line citations had
+   * accumulated in the projects' own docs, 55 of them in `games/court/daily.md`. A corpus that
+   * names its directories excludes the next one by default; this one is derived from git, so a new
+   * doc directory is covered without anyone remembering to add it, and every exclusion is a
+   * counted, reasoned, load-bearing row instead.
    *
-   * - `docs/reviews/**` is **immutable** by `docs/doc-conventions.md` — "a dated point-in-time
-   *   audit… never updated, only superseded by a newer one". A guard that demands edits to a doc
-   *   the conventions forbid editing is a guard that gets deleted. Those citations stay.
-   * - `docs/plans/**` are in-flight trackers, written and rewritten daily by other clones. Their
-   *   citations rot like any other, but a tracker is folded into its feature doc and DELETED when
-   *   it lands, so the cost of policing them recurs while the benefit does not.
-   *
-   * That leaves the durable feature docs, which is the set this guards. ⚠️ No counts are frozen
-   * into this comment — a measurement of a corpus five clones edit goes stale and then reads as
-   * fact, which is the hazard this file's own finding-10 fix deleted two numbers for. The reasoning
-   * matters because #686 originally claimed the opposite — that half the surface was landed plans
-   * ripe for deletion. Nothing in `plans/` was landed; acting on that would have deleted another
-   * clone's authoritative tracker.
+   * ⚠️ No counts are frozen into this comment beyond that historical one — a measurement of a
+   * corpus five clones edit goes stale and then reads as fact. #686 originally claimed that half
+   * the `docs/` surface was landed plans ripe for deletion; nothing in `plans/` was landed, and
+   * acting on it would have deleted another clone's authoritative tracker.
    */
+  /**
+   * What the line-citation rule does NOT read, and why. A trailing `/` makes a row a directory
+   * prefix. Every row must still earn its place (`every exclusion is load-bearing`), in the sense its
+   * reason names: a `hits` row exists to pardon citations, so it must still cover one; a `files` row
+   * is a standing convention (a tree another gate owns, or one the conventions exempt), so it must
+   * still cover a file.
+   */
+  const LINE_CITATION_CORPUS_EXCLUDED: ReadonlyArray<{ path: string; bearing: 'hits' | 'files'; reason: string }> = [
+    {
+      path: 'docs/doc-conventions.md',
+      bearing: 'hits',
+      reason: 'SPEC — the rule itself, which has to quote every shape it forbids.',
+    },
+    {
+      path: 'qa/README.md',
+      bearing: 'hits',
+      reason: 'SPEC — the QA suite\'s format spec, which quotes the forbidden shapes; the qa gate reads it as '
+        + 'prose for other rules and deliberately not for this one.',
+    },
+    {
+      path: '.claude/skills/summary/SKILL.md',
+      bearing: 'hits',
+      reason: 'SPEC for CHAT output — it prescribes `file.ts:120` as a status-report evidence anchor. '
+        + 'A report is read once, in the turn it is written, so the line cannot drift under it.',
+    },
+    {
+      path: 'qa/cases/',
+      bearing: 'files',
+      reason: 'OWNED by `qaCaseReferences.test.ts`, which runs these same detectors over every case with its '
+        + 'own counted ledger (scanning them here would report every hit twice). NOT `qa/` whole: the qa '
+        + 'gate reads the cases and the top-level suite docs, so `qa/tools/**` stays in this corpus.',
+    },
+    {
+      path: 'qa/*.md',
+      bearing: 'files',
+      reason: 'OWNED by `qaCaseReferences.test.ts` — every top-level suite doc, the set its `suiteDocs()` derives, '
+        + 'read with the same detectors. A glob, not `qa/knowledge.md`: the qa gate itself stopped '
+        + 'hard-coding that one name because a new suite doc was scanned by nothing.',
+    },
+    {
+      path: 'docs/reviews/',
+      bearing: 'files',
+      reason: 'IMMUTABLE by doc-conventions — a dated point-in-time audit is never updated, only '
+        + 'superseded. A guard that demands edits to a doc the conventions forbid editing gets deleted.',
+    },
+    {
+      path: 'docs/plans/',
+      bearing: 'files',
+      reason: 'IN-FLIGHT trackers, rewritten daily by other clones and DELETED when they land (their '
+        + 'rationale folds into a feature doc, which IS guarded). The cost of policing recurs; the '
+        + 'benefit does not.',
+    },
+    {
+      path: 'tools-scratch/**/*-DRAFT.md',
+      bearing: 'hits',
+      reason: 'THIRD-PARTY drafts — upstream issue reports citing three.js/pixi source at a pinned '
+        + 'version, which cannot drift, and which is how an upstream report is conventionally '
+        + 'written (owner ruling on #1124).',
+    },
+  ];
+
+  const isExcludedBy = (row: { path: string }, relFile: string) => ledgerPathCovers(row.path, relFile);
+
+  /** Pure, so the filter is testable on synthetic paths: the rule reads every `.md` it is handed
+   *  except what a ledger row excludes — nothing is included by NAMING a directory. */
+  function lineCitationCorpusFilter(relFiles: readonly string[]): string[] {
+    return relFiles
+      .filter((f) => f.endsWith('.md') && !LINE_CITATION_CORPUS_EXCLUDED.some((row) => isExcludedBy(row, f)))
+      .sort();
+  }
   /**
    * Bare spans that are NOT line numbers, keyed file+token so the exemption cannot widen.
    *
@@ -1187,58 +1594,121 @@ describe('docs cite by SYMBOL, never by line number (#686)', () => {
    * enough to have a line 8100 exists in this repo too. Allowlisting is the narrow instrument;
    * mangling the value to satisfy the tool is the outcome this whole convention exists to avoid.
    */
-  const BARE_ALLOWED: ReadonlyArray<{ file: string; token: string }> = [
-    { file: 'docs/trusted-device-input.md', token: ':8100' },
+  const BARE_ALLOWED: ReadonlyArray<{ file: string; token: string; count: number; reason: string }> = [
+    {
+      file: 'docs/trusted-device-input.md',
+      token: ':8100',
+      // Measured 2026-09-13 (#1128). It was `.some()`-matched, so a FIFTH `:8100` added here was
+      // green (proven by addition on work-qa, #1134) — as would a real `:8100` line citation have
+      // been, under a reason about a port.
+      count: 4,
+      reason: "WebDriverAgent's HTTP port, named in four places the doc explains WDA provisioning and "
+        + 'reaching it — a port, never a line number',
+    },
   ];
 
-  /**
-   * Exceptions for the token and prose forms. Empty today, and present anyway.
-   *
-   * Without them the only way to excuse one legitimate citation in one doc is to widen a detector
-   * in `helpers/lineCitations.ts` — which is SHARED with the `qa/` gate, so a `docs/` exception
-   * would silently punch a hole in the rule covering every QA case. An allowlist keyed file+token
-   * is the narrow instrument; the detector is not.
+  /*
+   * ⚠️ **No TOKEN / PROSE / MARKER allowlists — deleted, not left empty (#1128).** They were empty
+   * `{file, token}` lists consulted with `.some()`, so their first row would have MATCHED — pardoning
+   * every repeat of that token in that doc. The reason they existed still holds: never excuse a doc
+   * by widening a detector in `helpers/lineCitations.ts`, which the `qa/` gate shares. So if one of
+   * those forms ever needs an exception, add a counted ledger shaped like `BARE_ALLOWED` below —
+   * not a matched list. The detectors themselves are pinned on synthetic input by
+   * `lineCitationsGuard.test.ts`.
    */
-  const TOKEN_ALLOWED: ReadonlyArray<{ file: string; token: string }> = [];
-  const PROSE_ALLOWED: ReadonlyArray<{ file: string; token: string }> = [];
-  const MARKER_ALLOWED: ReadonlyArray<{ file: string; token: string }> = [];
 
-  function featureDocs(): Array<{ rel: string; body: string }> {
-    const dir = path.join(repoRoot, 'docs');
-    if (!fs.existsSync(dir)) return [];
-    return fs
-      .readdirSync(dir)
-      // `doc-conventions.md` is the SPEC for this rule and has to quote every shape it forbids —
-      // the same reason `qa/README.md` sits outside the qa gate, and the same reason the path
-      // check next door skips README (it documents `creates:` by example). A spec that cannot
-      // state its own rule is worse than an unguarded spec.
-      .filter((f) => f.endsWith('.md') && f !== 'doc-conventions.md')
-      .sort()
-      .map((f) => ({ rel: `docs/${f}`, body: fs.readFileSync(path.join(dir, f), 'utf8') }));
+  /** The line-citation corpus: every `.md` git knows about (tracked + untracked-not-ignored, via the
+   *  shared producer — #771), minus the ledger. */
+  function lineCitationCorpus(): Array<{ rel: string; body: string }> {
+    return lineCitationCorpusFilter(repoMarkdownFiles())
+      .map((f) => ({ rel: f, body: readScannedSource(path.join(repoRoot, f), DOC_AS_PROSE).raw }));
   }
 
   it('the enumeration found the docs — a vacuous pass is a failure', () => {
     // Collection, not assertion. A perfect assertion over an empty collection is green and
-    // worthless, and `featureDocs` reads ONE directory by name.
+    // worthless.
     //
-    // ⚠️ This used to gate on `hasFullDocsTree()`, which requires `docs/plans` — a directory the
-    // OSS snapshot deliberately EXCLUDES. So on the public runner both of these tests returned
-    // early and passed vacuously, over exactly the durable docs that DO ship there. Gate on what
-    // the rule actually needs: some docs to read.
-    expect(featureDocs().length).toBeGreaterThan(0);
-    // The full private tree carries far more; only a broken collection trips this.
-    if (hasFullDocsTree()) expect(featureDocs().length).toBeGreaterThan(20);
+    // ⚠️ This used to gate on a private-docs probe (`docs/plans` — a directory the OSS snapshot
+    // deliberately EXCLUDES). So on the public runner both of these tests returned early and
+    // passed vacuously, over exactly the durable docs that DO ship there. Gate on what the rule
+    // actually needs: some docs to read.
+    const corpus = lineCitationCorpus().map((d) => d.rel);
+    expect(corpus.length).toBeGreaterThan(0);
+    // Each layout's own anchors, so a collection that silently fell back to one root trips here:
+    // the feature docs ship in both layouts, and the projects' docs (#1124) are the population
+    // the old `docs/`-only walker never reached.
+    expect(corpus.some((f) => f.startsWith('docs/'))).toBe(true);
+    if (hasPrivateDocs()) expect(corpus.length).toBeGreaterThan(20);
+    if (hasInternalGames()) expect(corpus).toContain('games/court/daily.md');
+    // A directory merely NAMED like build output is not build output (close-out finding 1): these two
+    // were silently dropped while the corpus borrowed repoFiles()' segment-matched SKIP_DIRS.
+    if (hasPrivateDocs()) expect(corpus.some((f) => f.startsWith('.agent-memory/')), '.agent-memory/ is read').toBe(true);
+    if (hasInternalGames()) expect(corpus.some((f) => /\/ios\//.test(f)), 'a .md under an ios/ directory is read').toBe(true);
+  });
+
+  it('the corpus is DERIVED — a doc in a directory nobody named is read, an excluded one is not (#1124)', () => {
+    const filtered = lineCitationCorpusFilter([
+      'zz-new-root/notes.md', // no row names this directory — the case a readdirSync of named roots misses
+      'games/court/daily.md',
+      'demos/forest-camp/CLAUDE.md',
+      'README.md',
+      'docs/plans/some-tracker.md',
+      'docs/reviews/2026-01-01-audit.md',
+      'docs/doc-conventions.md',
+      'docs/doc-conventions.md.old.md', // an exact-path row is NOT a prefix — and this still ends in .md
+      'qa/cases/x/case.md',
+      'qa/tools/NOTES.md', // qa/ is NOT excluded whole — the qa gate never reads this
+      'qa/playbook.md', // …but EVERY top-level suite doc is, not just today's knowledge.md
+      'tools-scratch/webkit-gpu-leak/pixijs-upstream-issue-DRAFT.md',
+      'tools-scratch/boot-stall/README.md', // a harness README is not a third-party draft
+      'tools-scratch/a/b/deep-DRAFT.md', // `**` spans more than one directory
+      'engine/app/thing.ts',
+    ]);
+    expect(filtered).toEqual([
+      'README.md',
+      'demos/forest-camp/CLAUDE.md',
+      'docs/doc-conventions.md.old.md',
+      'games/court/daily.md',
+      'qa/tools/NOTES.md',
+      'tools-scratch/boot-stall/README.md',
+      'zz-new-root/notes.md',
+    ]);
+  });
+
+  it('every exclusion is load-bearing — a row that excludes nothing has outlived its reason (#1124)', (ctx) => {
+    // The OSS snapshot ships a curated subset (no plans, no tools-scratch, no .claude), so there a
+    // row's target is legitimately absent; the private tree is where every row must bite.
+    if (!hasPrivateDocs()) { ctx.skip(); return; }
+    const relFiles = repoMarkdownFiles();
+    const dead: string[] = [];
+    const quotesALine = (rel: string): boolean => {
+      const body = readScannedSource(path.join(repoRoot, rel), DOC_AS_PROSE).raw;
+      return codeTokens(body).some(citesALine)
+        || nonCodeText(body).split(/\s+/).some(citesALine)
+        || citesALineInProse(body).length > 0
+        || citesALineByMarker(body).length > 0
+        || codeSpans(body).some(isBareLineSpan);
+    };
+    for (const row of LINE_CITATION_CORPUS_EXCLUDED) {
+      const covered = relFiles.filter((f) => isExcludedBy(row, f));
+      if (covered.length === 0) { dead.push(`${row.path}: matches no tracked .md`); continue; }
+      // A `hits` row's whole reason is the citations it pardons, so it must still pardon one.
+      if (row.bearing === 'hits' && !covered.some(quotesALine)) dead.push(`${row.path}: pardons no line citation any more`);
+    }
+    // The `qa/cases/` row is wider than what the qa gate reads in exactly one way: `loadCases()` skips a
+    // `README.md`. None exists today; if one appears it is read by NEITHER gate, so say so here.
+    // `endsWith('README.md')`, NOT `'/README.md'` — `loadCases()`' own test, so `SETUP-README.md` counts too.
+    const caseReadmes = relFiles.filter((f) => f.startsWith('qa/cases/') && f.endsWith('README.md'));
+    expect(caseReadmes, 'a README under qa/cases/ is read by neither gate — narrow the qa/cases/ row').toEqual([]);
+    expect(dead, 'Delete the LINE_CITATION_CORPUS_EXCLUDED row — its reason no longer holds').toEqual([]);
   });
 
   it('no doc cites a source location by line', () => {
-    const docs = featureDocs();
-    if (docs.length === 0) return; // no docs shipped in this tree at all
+    const docs = lineCitationCorpus();
+    // Asserted, not returned on (#1071): a bare return here reported PASS over no docs at all.
+    expect(docs.length, 'no feature docs found — the enumeration broke').toBeGreaterThan(0);
     const offenders: string[] = [];
-    const allowed = (
-      list: ReadonlyArray<{ file: string; token: string }>,
-      rel: string,
-      tok: string,
-    ) => list.some((a) => a.file === rel && a.token === tok.trim());
+    const bareSpans: Array<{ item: string; site: string }> = [];
     for (const { rel, body } of docs) {
       // `codeTokens`, NOT a whitespace split. `citesALine`'s contract is a code-span token, and
       // feeding it raw whitespace tokens broke it in both directions:
@@ -1250,9 +1720,7 @@ describe('docs cite by SYMBOL, never by line number (#686)', () => {
       //             (`` `ok:true`/`changed:1` ``), hitting the path shortcut. `codeTokens` splits
       //             INSIDE each span, so this false positive exists only for the split.
       for (const token of codeTokens(body)) {
-        if (citesALine(token) && !allowed(TOKEN_ALLOWED, rel, token)) {
-          offenders.push(`${rel}: "${token}"`);
-        }
+        if (citesALine(token)) offenders.push(`${rel}: "${token}"`);
       }
       // …and the PROSE, because `codeTokens` reads only spans and fences. Switching to it fixed a
       // false positive but silently narrowed the gate: an UNBACKTICKED `saveSync.ts:1745` in a
@@ -1260,39 +1728,63 @@ describe('docs cite by SYMBOL, never by line number (#686)', () => {
       // `nonCodeText` blanks the spans first, so this recovers those without re-fusing adjacent
       // spans into one slash-bearing token.
       for (const token of nonCodeText(body).split(/\s+/)) {
-        if (citesALine(token) && !allowed(TOKEN_ALLOWED, rel, token)) {
-          offenders.push(`${rel}: "${token}"`);
-        }
+        if (citesALine(token)) offenders.push(`${rel}: "${token}"`);
       }
       for (const span of codeSpans(body)) {
-        if (isBareLineSpan(span) && !allowed(BARE_ALLOWED, rel, span)) {
-          offenders.push(`${rel}: "${span}"`);
-        }
+        if (isBareLineSpan(span)) bareSpans.push({ item: `${rel}::${span.trim()}`, site: `${rel}: "${span.trim()}"` });
       }
-      for (const m of citesALineInProse(body)) {
-        if (!allowed(PROSE_ALLOWED, rel, m)) offenders.push(`${rel}: "${m}"`);
-      }
+      for (const m of citesALineInProse(body)) offenders.push(`${rel}: "${m}"`);
       // The `~L202` marker — invisible to both detectors above (no filename attached after a
       // whitespace split, and no literal "line" for the prose rule).
-      for (const m of citesALineByMarker(body)) {
-        if (!allowed(MARKER_ALLOWED, rel, m)) offenders.push(`${rel}: "${m}"`);
-      }
+      for (const m of citesALineByMarker(body)) offenders.push(`${rel}: "${m}"`);
     }
     expect(
       offenders,
       'Cite the SYMBOL, not the line (#686) — name the function, export, action id or route ' +
         'instead of a line number, which rots silently and no test can check. If a hit is ' +
-        'legitimate, add it to this file\'s TOKEN_ALLOWED / BARE_ALLOWED / PROSE_ALLOWED / ' +
-        'MARKER_ALLOWED with a reason; do NOT loosen helpers/lineCitations.ts, which another gate ' +
-        'shares. (Rationale lives in docs/doc-conventions.md, which is not in the OSS snapshot.)',
+        'legitimate, add a COUNTED ledger row with a reason (see BARE_ALLOWED); do NOT loosen ' +
+        'helpers/lineCitations.ts, which another gate shares. (Rationale lives in ' +
+        'docs/doc-conventions.md, which is not in the OSS snapshot.)',
     ).toEqual([]);
+    // Spent, not matched (#1128). A row whose doc this checkout does not ship is left out — the
+    // snapshot publishes a curated subset of docs/ — and with none left the bare spans must be
+    // empty outright, because the ledger's `floor >= 1` cannot hold over a population of 0.
+    // ⚠️ The cost of that filter, stated: it cannot tell "not shipped here" from "deleted", so a row
+    // for a DELETED doc goes silently dead rather than over-blessed (close-out review). This ledger
+    // never had a staleness check before #1128, so that is not a regression — but it is a hole.
+    const present = new Set(docs.map((d) => d.rel));
+    const live = BARE_ALLOWED.filter((r) => present.has(r.file));
+    if (live.length === 0) {
+      expect(bareSpans.map((b) => b.site), 'a bare span that is a line number — cite the symbol (#686)').toEqual([]);
+    } else {
+      assertExemptionLedger({
+        label: 'BARE_ALLOWED in docCitations',
+        population: bareSpans,
+        exempt: live.map((r) => ({ item: `${r.file}::${r.token}`, count: r.count, reason: r.reason })),
+        floor: 1,
+        fix: 'Cite the SYMBOL, not the line (#686). A bare span that is genuinely not a line number (a '
+          + 'port) gets a counted BARE_ALLOWED row, with a reason that covers every occurrence.',
+      });
+    }
   });
 });
 
 describe('source paths cited in docs and CLAUDE.md resolve (#194, second face; #195)', () => {
-  it('every runtime/editor/engine source path cited in docs/** or a CLAUDE.md exists', (ctx) => {
+  it('SOURCE_PATH_CORPUS_EXCLUDED is load-bearing, and the corpus reaches a project\'s top-level doc (#1124)', (ctx) => {
+    if (!hasInternalGames()) { ctx.skip(); return; }
+    const mds = repoMarkdownFiles();
+    for (const row of SOURCE_PATH_CORPUS_EXCLUDED) {
+      expect(mds.some((f) => ledgerPathCovers(row.path, f)), `${row.path} excludes nothing`).toBe(true);
+    }
+    const corpus = citingMarkdownFiles().map(rel);
+    // Not a `docs/` file nor a `CLAUDE.md` — the two shapes the old hand-declared scope named.
+    expect(corpus).toContain('games/court/audio.md');
+    expect(corpus.some((f) => f.startsWith('qa/cases/'))).toBe(false);
+  });
+
+  it('every runtime/editor/engine source path cited in any tracked doc exists', (ctx) => {
     // An engine doc legitimately cites a GAME's file by its project-relative path —
-    // `runtime/services/CapacitorLLMService.ts` (llm-test), `runtime/shaders/planet.ts`
+    // `runtime/shaders/planet.ts`
     // (space-console), `tests/haptics.test.ts`. Those resolve on a real clone and CANNOT in the
     // OSS snapshot, which ships no `games/`. Running the rule there asks a question whose answer
     // depends on the checkout rather than on whether the doc is right: measured, the snapshot
@@ -1306,64 +1798,31 @@ describe('source paths cited in docs and CLAUDE.md resolve (#194, second face; #
       ctx.skip();
       return;
     }
-    const offenders = scanSourcePathCitations(isExemptBySourceList);
+    const offenders = scanSourcePathCitations();
 
-    const report = [...offenders.entries()]
-      .sort()
-      .map(([p, sites]) => `${p}\n    cited by: ${[...sites].sort().join(', ')}`);
+    // One population entry per (citing doc, cited path) — rule 1's grain; `site` keeps every line.
+    const byDocAndPath = new Map<string, { item: string; site: string }>();
+    for (const [cited, sites] of [...offenders.entries()].sort()) {
+      for (const site of [...sites].sort()) {
+        const item = `${site.replace(/:\d+$/, '')}::${cited}`;
+        const seen = byDocAndPath.get(item);
+        if (seen) seen.site += `, ${site}`;
+        else byDocAndPath.set(item, { item, site: `${cited}\n    cited by: ${site}` });
+      }
+    }
 
-    expect(
-      report,
-      'these docs point at source files that have moved or gone. Repoint them to the real path '
+    assertExemptionLedger({
+      label: 'SOURCE_CITATION_EXEMPT in docCitations (rule 2)',
+      population: [...byDocAndPath.values()].sort((x, y) => x.item.localeCompare(y.item)),
+      exempt: SOURCE_CITATION_EXEMPT,
+      // The rest of the population is exactly the pardons on a clean tree; the detector-alive proof
+      // is "the enumeration found the repo" above, and this only stops the ledger meeting nothing.
+      floor: 1,
+      fix: 'these docs point at source files that have moved or gone. Repoint them to the real path '
         + '(the layering reorg moved much of runtime/* under runtime/core/*), or — if the file '
         + 'is absent on purpose (a plan naming an unbuilt file, a doc describing its own '
-        + 'deletion) — add it to SOURCE_CITATION_EXEMPT above WITH a reason.',
-    ).toEqual([]);
-  });
-
-  it('every exemption is still LOAD-BEARING (#578 sweep)', (ctx) => {
-    // The #578 defect, one list down. The sibling test below asks whether the exempted path is
-    // still absent; nothing asked whether anything still CITES it. Measured when this landed:
-    // 10 of 14 entries exempted nothing — worse than the 9-of-22 in RETIRED_DOCS_NAMED_ON_PURPOSE
-    // that #578 was filed about, and for a traceable reason. Six named files that the retired
-    // `docs/plans/cloud-teardown-and-migration-plan.md` listed as deleted; when that plan was
-    // itself deleted the citations went with it, and the exemptions stayed. Nothing could see it,
-    // because "the file is still absent" stays true forever once a file is gone.
-    //
-    // Same gate as the rule it mirrors — an entry can only be seen as load-bearing where the
-    // citing docs and projects it is exempted in are actually present.
-    if (!hasInternalGames()) {
-      ctx.skip();
-      return;
-    }
-    const wouldFlag = scanSourcePathCitations(() => false);
-    const inert = SOURCE_CITATION_EXEMPT
-      .filter((e) => {
-        const sites = wouldFlag.get(e.cited);
-        if (!sites) return true;
-        if (e.in === undefined) return false;
-        // A scoped entry is load-bearing only where IT is scoped, not wherever the path is named.
-        return ![...sites].some((s) => s.replace(/:\d+$/, '') === e.in);
-      })
-      .map((e) => `${e.cited}${e.in ? ` (scoped to ${e.in})` : ''} — nothing cites it; drop this exemption (${e.reason})`);
-    expect(
-      inert,
-      'SOURCE_CITATION_EXEMPT has entries that exempt no citation — the doc that named the absent '
-        + 'path was itself edited or deleted, so the entry is bookkeeping that reads as '
-        + 'enforcement. Delete it; git holds the history.',
-    ).toEqual([]);
-  });
-
-  it('every exemption names a path that is still absent', () => {
-    // An exemption whose file came back is dead weight that silently stops guarding. Fail so the
-    // list stays honest rather than accumulating entries nobody dares delete.
-    // Resolve each entry the way the rule above would resolve it — a file-scoped entry against
-    // ITS citing file's roots. Checking a scoped entry against the wide root list would call
-    // `runtime/setup.ts` "back" the moment any project has one, which most do.
-    const stale = SOURCE_CITATION_EXEMPT
-      .filter((e) => rootsFor(e.in ?? '').some((r) => exists(r ? `${r}/${e.cited}` : e.cited)))
-      .map((e) => `${e.cited}${e.in ? ` (in ${e.in})` : ''} — now exists; drop this exemption (${e.reason})`);
-    expect(stale, 'exemption list has entries that are no longer needed').toEqual([]);
+        + 'deletion) — add a `citingDoc::path` row to SOURCE_CITATION_EXEMPT above WITH a reason.',
+    });
   });
 });
 
@@ -1394,17 +1853,8 @@ describe('source paths cited in docs and CLAUDE.md resolve (#194, second face; #
  *    real and is stated in the report rather than hidden: a dangling `§` in an UNNUMBERED doc
  *    is not caught here.
  */
-const SECTION_CITE = /([A-Za-z0-9_./-]+\.md)\)?[^\n§]{0,60}§\s*([0-9]+[a-z]*(?:-bis)?)(?![.\d])/g;
-
-/** Heading ids a markdown doc actually defines: `## 6. …`, `### 8a-bis. …`, `## ⚠️ 0. …`. */
-function headingIds(absDoc: string): Set<string> {
-  const ids = new Set<string>();
-  for (const line of fs.readFileSync(absDoc, 'utf8').split('\n')) {
-    const m = /^#{2,4}\s+(?:[^\w\s]+\s+)*([0-9]+[a-z]*(?:-bis)?)\./.exec(line);
-    if (m) ids.add(m[1]);
-  }
-  return ids;
-}
+// SECTION_CITE + headingIds moved to ../helpers/docSections (#1095 review): `qaCaseReferences`
+// asks the same syntax question about QA frontmatter and had written its own, narrower, copy.
 
 /** Rule 4: a `<doc>.md § "Quoted Title"` citation names a heading that doc really defines.
  *
@@ -1443,40 +1893,20 @@ function headingTitles(absDoc: string): string[] {
   return out;
 }
 
-/** Titled section citations that dangle TODAY, ratcheted so no NEW one can land (#328).
- *
- *  ⚠️ **EMPTY, and it must stay that way — the burn-down is done (#329).** All eleven original
- *  entries were repointed rather than deleted, per `docs/doc-conventions.md`: "if the citation
- *  reads as a live pointer, repoint it instead, because that is the defect and not the exception."
- *
- *  What #329 found, which is worth knowing before adding an entry here: **the sections had NOT
- *  been "renamed substantially or folded away" — nine of the eleven pointed at material that was
- *  right there**, written as a **bold lead-in** rather than as a `#### heading`. This guard only
- *  reads headings, so an accurate citation of a bold-styled section dangles. Those were repointed
- *  to the enclosing real heading with the specific phrase kept in prose
- *  (`§ "How it works" (the "A stranded synthetic press" note)`) — the house style already used by
- *  the ABSORBED_BY table above. The other two were not citation defects at all: one was a line
- *  naming TWO docs before the `§` (the regex attributes it to the first, a human reads the
- *  second), and one was a code comment QUOTING a known-bad citation as a historical example,
- *  which rule 4 cannot tell from a live one.
- *
- *  So before ratcheting anything: check whether the target exists as non-heading text, and whether
- *  the citing line names more than one `.md`. Adding an entry to get a rename past the gate is
- *  explicitly forbidden by `docs/doc-conventions.md`; this list only ever shrinks, and the
- *  meta-test below fails if an entry stops dangling.
- */
-const KNOWN_DANGLING_TITLES: ReadonlyArray<{ doc: string; title: string }> = [];
-
-function isKnownDangling(citedDocRel: string, rawTitle: string): boolean {
-  const want = normHeading(rawTitle);
-  return KNOWN_DANGLING_TITLES.some(
-    (e) => citedDocRel.endsWith(e.doc) && normHeading(e.title) === want,
-  );
-}
+/* ⚠️ **`KNOWN_DANGLING_TITLES` is DELETED (#1140), not migrated.** It was the #328 ratchet of
+ *  eleven titled citations that dangled when rule 4 landed, burned down to EMPTY in #329 — and an
+ *  empty ledger has nothing to spend, while its first row would have pardoned a (doc, title) pair
+ *  however many files cited it. So a dangling titled citation now has no pardon at all; repoint it
+ *  (`docs/doc-conventions.md`). What #329 learned before that list emptied is worth keeping: nine
+ *  of the eleven cited material that was right there as a **bold lead-in** rather than a heading,
+ *  and this rule reads headings only — so check for non-heading text, and whether the citing line
+ *  names more than one `.md`, before concluding a section was renamed away. */
 
 describe('cited doc SECTION TITLES resolve (#328)', () => {
-  it('every `<doc>.md § "Title"` names a heading that doc defines', () => {
-    if (!hasFullDocsTree()) return; // OSS snapshot trims docs/plans + games.
+  // A SKIP, not the bare `return` these three used to have (#1071): a return reports PASS for a
+  // check that never ran, and a skip is at least counted.
+  it('every `<doc>.md § "Title"` names a heading that doc defines', (ctx) => {
+    if (!hasPrivateDocs()) { ctx.skip(); return; } // OSS snapshot trims docs/plans + games.
 
     const offenders: string[] = [];
     let checked = 0;
@@ -1484,7 +1914,6 @@ describe('cited doc SECTION TITLES resolve (#328)', () => {
     for (const abs of repoFiles()) {
       const relFile = rel(abs);
       if (isNonCitingSource(relFile)) continue;
-      if (relFile === 'engine/tests/architecture/docCitations.test.ts') continue; // this file
       const text = fs.readFileSync(abs, 'utf8');
 
       for (const m of text.matchAll(TITLE_CITE)) {
@@ -1498,7 +1927,6 @@ describe('cited doc SECTION TITLES resolve (#328)', () => {
         const want = normHeading(rawTitle);
         if (want.length < 4) continue;
         checked++;
-        if (isKnownDangling(rel(target), rawTitle)) continue;
         if (!headingTitles(target).some((h) => h.includes(want))) {
           const line = text.slice(0, m.index).split('\n').length;
           offenders.push(`${relFile}:${line} cites ${rel(target)} § "${rawTitle}" — no such heading`);
@@ -1514,25 +1942,11 @@ describe('cited doc SECTION TITLES resolve (#328)', () => {
         + 'docs/doc-conventions.md.',
     ).toEqual([]);
   });
-
-  it('every KNOWN_DANGLING_TITLES entry still dangles — fixed ones must be removed', () => {
-    if (!hasFullDocsTree()) return;
-    const stale: string[] = [];
-    for (const e of KNOWN_DANGLING_TITLES) {
-      const abs = path.join(repoRoot, e.doc);
-      if (!fs.existsSync(abs)) continue; // rule 1 owns missing docs.
-      const want = normHeading(e.title);
-      if (headingTitles(abs).some((h) => h.includes(want))) {
-        stale.push(`${e.doc} § "${e.title}" resolves now — drop it from KNOWN_DANGLING_TITLES`);
-      }
-    }
-    expect(stale.sort(), 'the ratchet only goes one way').toEqual([]);
-  });
 });
 
 describe('cited doc SECTIONS resolve', () => {
-  it('every `<doc>.md § N` names a heading that doc defines', () => {
-    if (!hasFullDocsTree()) return; // OSS snapshot trims docs/plans + games; nothing to check.
+  it('every `<doc>.md § N` names a heading that doc defines', (ctx) => {
+    if (!hasPrivateDocs()) { ctx.skip(); return; } // OSS snapshot trims docs/plans + games.
 
     const offenders: string[] = [];
     let checked = 0;
@@ -1540,7 +1954,6 @@ describe('cited doc SECTIONS resolve', () => {
     for (const abs of repoFiles()) {
       const relFile = rel(abs);
       if (isNonCitingSource(relFile)) continue;
-      if (relFile === 'engine/tests/architecture/docCitations.test.ts') continue; // this file
       const text = fs.readFileSync(abs, 'utf8');
 
       for (const m of text.matchAll(SECTION_CITE)) {
@@ -1553,7 +1966,7 @@ describe('cited doc SECTIONS resolve', () => {
         ];
         const target = candidates.find((c) => fs.existsSync(c) && c.endsWith('.md'));
         if (!target) continue; // rule 1 owns unresolvable paths; don't double-report them.
-        const ids = headingIds(target);
+        const ids = headingIds(fs.readFileSync(target, 'utf8'));
         if (ids.size === 0) continue; // doc does not number its headings — see the scope note.
         checked++;
         if (!ids.has(section)) {

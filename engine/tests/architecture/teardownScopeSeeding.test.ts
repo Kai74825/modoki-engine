@@ -20,6 +20,7 @@
  */
 
 import { describe, it, expect } from 'vitest';
+import { found } from '@modoki/engine/testing/inOrder';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { readScannedSource } from '@modoki/engine/testing';
@@ -45,8 +46,15 @@ const sites: { label: string; rel: string; seed: string; acquisitions: string[];
     label: 'SceneView viewport effect',
     rel: 'engine/packages/modoki/src/editor/panels/SceneView.tsx',
     seed: 'cleanup = scope.dispose;',
+    // ⚠️ The GPU device lease (`acquireRenderer(`) is NOT ordered against this seed, deliberately, since
+    // #1052. It is taken in `createRenderer`, BEFORE `install` exists, and that is correct: a renderer
+    // that never reaches `install` (the panel unmounted, or a newer bring-up superseded it) is given
+    // back by `viewportBringUp`'s `discard`, not by this scope — so its release path is reachable the
+    // moment it is taken without the seed coming first. What pins it now is the `discard` release in
+    // `releases` below, plus `viewportBringUpWired.test.ts`. A rejected acquire needs neither:
+    // `rendererLease.ts` deletes its own entry. (The window between `setActiveRenderer` resolving and
+    // the lease's `scope.add` below predates #1052 and is unchanged by it.)
     acquisitions: [
-      'acquireRenderer(',                          // the GPU device lease
       'attachRendererLossHandling(',
       'setEditorViewportCamera(camera)',           // the five module-level slots
       '_pickBillboardInUI = (clientX',
@@ -63,6 +71,9 @@ const sites: { label: string; rel: string; seed: string; acquisitions: string[];
     ],
     releases: [
       'scope.add(() => releaseRenderer(container))',
+      // The lease's release for a renderer that never reached `install` (#1052) — see the note above
+      // `acquisitions`. Dropping it leaks a GPU device per StrictMode double-mount or unmount-mid-boot.
+      "if (reason === 'disposed') releaseRenderer(container);",
       'scope.add(detachUncapturedError)',
       'scope.add(detachRendererLoss)',
       'scope.add(() => setEditorViewportCamera(null))',
@@ -166,7 +177,7 @@ describe('the release path is seeded before the first acquisition (#858)', () =>
       // Exactly once, so a rename or a duplicated bring-up fails loudly here rather than letting
       // `indexOf` silently answer about the wrong occurrence.
       expect(code.split(seed).length - 1, `${rel}: expected exactly one \`${seed}\``).toBe(1);
-      const seedAt = code.indexOf(seed);
+      const seedAt = found(code.indexOf(seed), `${rel}: \`${seed}\``);
 
       for (const acq of acquisitions) {
         const at = code.indexOf(acq);

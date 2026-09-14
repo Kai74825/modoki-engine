@@ -20,7 +20,7 @@ import { createTeardownScope } from '../../runtime/core/teardownScope';
 import { makePreviewLossPolicy } from './previewLossPolicy';
 import { canApplyParticleDef, handleParticleLossTeardown } from './particle/particlePreviewLoss';
 import { particleBackend } from '../../runtime/particles/particleBackend';
-import { defaultParticleEffect, resolveTrailSegments, type ParticleEffectDef, type ParticleHandle, type EmitterShapeType, type BlendMode, type ForceField, type MeshPrimitive, type SpriteMode, type SubEmitter, type CollisionConfig, type ColliderShape } from '../../runtime/particles/types';
+import { defaultParticleEffect, resolveTrailSegments, type ParticleEffectDef, type ParticleHandle, type EmitterShapeType, type BlendMode, type ForceField, type MeshPrimitive, type SpriteMode, type SubEmitter, type CollisionConfig, type ColliderShape, COLLIDER_SHAPES, COLLISION_MODES } from '../../runtime/particles/types';
 import { normalizeParticleDef } from '../../runtime/loaders/particleCache';
 import { newGuid, registerAsset } from '../../runtime/loaders/assetManifest';
 import { parseAssetJson } from '../../runtime/loaders/assetFetch';
@@ -34,7 +34,8 @@ import { SectionIdContext, particleFieldSlug, useFieldId } from './particle/fiel
 import { pendingAssetDoc, adoptParkedDoc } from './pendingAssetDoc';
 import { ParkAdoptedBanner } from './AssetLoadRefusedBanner';
 import { assetWrittenToDisk } from '../scene/dirtyAssets';
-import { pushAction, peekUndo, isExecutingUndoRedo, undo as gUndo, redo as gRedo, type UndoAction } from '../undo/undoManager';
+import { pushAction, peekUndo, isExecutingUndoRedo, type UndoAction } from '../undo/undoManager';
+import { runUndoCommand } from '../undo/undoCommand';
 import CurveEditor from './particle/CurveEditor';
 import { loadParticleEditorShowFloor, saveParticleEditorShowFloor } from './particleEditorPrefs';
 import { DEFAULT_CURVE_POINTS, withCurvePoints, withCurveScale } from './particle/curveMath';
@@ -523,8 +524,8 @@ export default function ParticleEditor() {
           <div style={{ position: 'absolute', left: 8, right: 8, bottom: 8, display: 'flex', alignItems: 'center', gap: 8, background: 'rgba(0,0,0,0.55)', border: '1px solid #333', borderRadius: 4, padding: '6px 8px' }}>
             <button data-ui-id="particle.transport.play" data-ui-kind="button" data-ui-label="play/pause" data-ui-state={playing ? 'playing' : 'paused'} onClick={togglePlay} style={btn}>{playing ? '⏸' : '▶'}</button>
             <button data-ui-id="particle.transport.restart" data-ui-kind="button" data-ui-label="restart" onClick={restart} style={btn}>⟲</button>
-            <button data-ui-id="particle.transport.undo" data-ui-kind="button" data-ui-label="undo" onClick={() => gUndo()} title="Undo (⌘Z) — shared global undo" style={btn}>↶</button>
-            <button data-ui-id="particle.transport.redo" data-ui-kind="button" data-ui-label="redo" onClick={() => gRedo()} title="Redo (⇧⌘Z) — shared global undo" style={btn}>↷</button>
+            <button data-ui-id="particle.transport.undo" data-ui-kind="button" data-ui-label="undo" onClick={() => runUndoCommand('undo')} title="Undo (⌘Z) — shared global undo" style={btn}>↶</button>
+            <button data-ui-id="particle.transport.redo" data-ui-kind="button" data-ui-label="redo" onClick={() => runUndoCommand('redo')} title="Redo (⇧⌘Z) — shared global undo" style={btn}>↷</button>
             <button data-ui-id="particle.transport.floor" data-ui-kind="toggle" data-ui-label="ground plane" data-ui-state={showFloor ? 'on' : 'off'} onClick={() => setShowFloor((v) => !v)} title="Toggle opaque ground plane (occludes particles behind it; use for soft particles / ground reference)" style={{ ...btn, background: showFloor ? '#2d6cdf' : '#2a2a40' }}>▦</button>
             <input data-ui-id="particle.transport.scrub" data-ui-kind="field" data-ui-label="scrub" type="range" min={0} max={def.duration} step={0.01} value={displayElapsed(elapsed, def.duration, def.looping)} onChange={(e) => scrub(+e.target.value)} style={{ flex: 1 }} />
             <span style={{ width: 56, textAlign: 'right', color: '#888' }}>{displayElapsed(elapsed, def.duration, def.looping).toFixed(2)}s</span>
@@ -675,10 +676,10 @@ export default function ParticleEditor() {
           </Section>
 
           <Section title="Collision" hint="Solid collider particles hit — a plane, sphere, or box. Coordinates are in the emitter's simulation space (emitter-local unless World space is enabled).">
-            <Enum label="Mode" hint="None = pass through. Kill = particle dies on contact. Bounce = reflect off the surface." v={def.collision?.mode ?? 'none'} options={['none', 'kill', 'bounce']} on={(v) => updColl({ mode: v as CollisionConfig['mode'] })} />
+            <Enum label="Mode" hint="None = pass through. Kill = particle dies on contact. Bounce = reflect off the surface." v={def.collision?.mode ?? 'none'} options={[...COLLISION_MODES]} on={(v) => updColl({ mode: v as CollisionConfig['mode'] })} />
             {def.collision && def.collision.mode !== 'none' && (
               <>
-                <Enum label="Shape" hint="Plane = infinite half-space (normal + a point). Sphere = solid ball. Box = solid axis-aligned box. Cylinder = solid column (axis + radius + length)." v={def.collision.shape ?? 'plane'} options={['plane', 'sphere', 'box', 'cylinder']} on={(v) => updColl({ shape: v as ColliderShape })} />
+                <Enum label="Shape" hint="Plane = infinite half-space (normal + a point). Sphere = solid ball. Box = solid axis-aligned box. Cylinder = solid column (axis + radius + length)." v={def.collision.shape ?? 'plane'} options={[...COLLIDER_SHAPES]} on={(v) => updColl({ shape: v as ColliderShape })} />
                 <Check label="Container" hint="Off = solid collider (keep particles OUT — they hit when entering). On = container (keep particles IN — they hit when leaving). Use a container sphere/box to trap an effect inside a volume and cull strays." v={def.collision.invert ?? false} on={(v) => updColl({ invert: v })} />
                 {def.collision.mode === 'bounce' && <Num label="Bounce" hint="Fraction of velocity retained on bounce: 0 = stop dead, 1 = perfectly elastic." v={def.collision.bounce} min={0} max={1} step={0.05} on={(v) => updColl({ bounce: v })} />}
                 {(def.collision.shape ?? 'plane') === 'plane' && (

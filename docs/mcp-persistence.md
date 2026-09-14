@@ -54,6 +54,17 @@ three were rare under `auto` and are routine now:
 - **`modoki_build` REFUSES** while unsaved — it reads the FILE, so the artifact would miss the work.
 - **A file-direct `mutate_scene` 409s** while unsaved — its write hot-reloads the scene and would
   destroy live-only work.
+- **`mutate_scene` 409s inside a scrub/preview ENVELOPE** (`code: 'PREVIEW_ENVELOPE'`, #1122) — for
+  the same reason `save_all` refuses the scene half there, and it did not until 2026-09-13. The
+  route gated on the 3-value `playState` compat shim, in which `scrub` and `preview` both collapse
+  to `'stopped'`, so an agent write mid-preview was ALLOWED: it applied, read back correctly, and
+  evaporated when the human left the envelope, with no 409 and nothing in the reply to hint at it.
+  ⚠️ **`playState` is the wrong field for any AUTHORING decision** — read `runMode`, which
+  `editor-state` has reported since the preview-mode refactor. `canEdit()` (`runMode === 'stopped'`)
+  is the predicate, and its docblock names `mutate` by name; it just had no caller on this route.
+  The refusal names the exit that actually works, which depends on `modeOwner`: an ANIMATION-owned
+  envelope is ended by `modoki_exit_pose_envelope`, and a TIMELINE-owned one is not — that op
+  deliberately refuses it, so there the reply asks for the human's ⏹ Exit Preview instead.
 - **A game-code (`.ts`) edit force-reloads the editor and DISCARDS unsaved scene edits** after a 5s
   countdown (CLAUDE.md). This is the sharpest one: accumulated unsaved work is more exposed than it
   was under `auto`.
@@ -569,17 +580,18 @@ unsaved-work refusal, unlike `/api/scene-mutate` above). Two things worth knowin
   renderer, and reports `source: 'parked' | 'disk'`; with no renderer it falls back to disk and says
   `editorConnected:false` rather than passing a pre-edit file off as the answer.
 
-  The write half is **one gate on three routes**, `metaParkGate` in `editorBackendRouter.ts`, asking
-  the new `resolve-meta-park` op. The rule it generalises is worth more than the three fixes:
-  **a registry that lives in the RENDERER is invisible to a NODE route, and consulting it is a
-  round trip nobody makes unless a specific bug forces them to** — which is why this arrived one
-  route at a time, each site individually correct.
+  The write half was **one gate on three routes** (`metaParkGate`, #872/#882). It is now **one probe
+  for every route**, `unsavedGate` asking `resolve-unsaved` (#889) — see
+  § "Disk is not the source of truth while an editor is open" below for why the narrow version was
+  the wrong shape, and what replaced it.
 
-  | Route | What a parked edit costs it | §8 consequence → hatch |
+  | Route | What unsaved work costs it | §8 consequence → hatch |
   |---|---|---|
   | `/api/write-meta` | replaces the sidecar wholesale; the park then flushes back over the write | **DESTROYED** → `discardUnsaved` |
   | `/api/reimport` | every handler reads the sidecar off DISK, so the bake uses the PRE-EDIT values | **un-included** → `force` |
-  | `/api/duplicate-asset` | seeds the copy's sidecar from the source's FILE | **un-included** → `force` |
+  | `/api/duplicate-asset` | seeds the copy from the source's FILE — the sidecar AND the document | **un-included** → `force` |
+  | `/api/unused-assets` | the orphan list is computed from the pre-edit graph, and it feeds a DELETE | **stale read** → disclosed |
+  | `/api/find-references` | a "0 references" verdict computed from the pre-edit graph | **stale read** → disclosed |
 
   Four things a reader should not have to re-derive:
 
@@ -596,7 +608,9 @@ unsaved-work refusal, unlike `/api/scene-mutate` above). Two things worth knowin
     class with a quieter symptom — it flushes the source's park first (the click is consent, as
     `assetViews/reimport.ts` already does) rather than being refused with the reason discarded.
   - ⚠️ **`unknown agent op` does NOT mean "no renderer" over this transport.** `ws.send`
-    BROADCASTS to every HMR client and `createBrowserRequestRegistry` is first-reply-wins;
+    BROADCASTS to every HMR client and `createBrowserRequestRegistry` WAS first-reply-wins (⚠️ since
+    #1030 it settles on the first AUTHORITATIVE reply — a decline is counted, not obeyed — so the
+    race below is closed; the guard is kept because it must not depend on the transport);
     `initAgentBridge()` runs on any editor-flagged page but `registerEditorAgentOps()` only from
     `editor/setup.ts`. So a second tab on the dev server's runtime route answers *"unknown agent
     op"* instantly and beats the editor tab that actually holds the park — and reading that as
@@ -613,9 +627,14 @@ unsaved-work refusal, unlike `/api/scene-mutate` above). Two things worth knowin
     park is filed under the canonical form, so the check missed and the write destroyed the park it
     had just looked for.
   - ⚠️ **The gate must not fail OPEN, and that is the hard part.** `requestBrowser` rejects on a
-    timeout, and *"the renderer did not answer"* is not *"there is no park"* (§5). It reuses
-    `applyMovesInRenderer`'s classifier rather than a second copy — `isRelayTransportFailure` minus
-    `isRelayTimeout`. A definitively-absent renderer PROCEEDS (a park is renderer-only state, so
+    timeout, and *"the renderer did not answer"* is not *"there is no park"* (§5). It asks
+    **`relayProvesNoRenderer`** — the GUARD question ("can I prove nothing is at risk"), which is
+    `isRelayTransportFailure` minus `isRelayTimeout` **plus an `unknown agent op` guard**.
+    ⚠️ This used to say it "reuses `applyMovesInRenderer`'s classifier rather than a second copy",
+    and that consolidation is exactly what must not happen: `applyMovesInRenderer` is a REPAIR path
+    where an absent op means nothing to repair, so `absent` is ITS safe answer and the opposite of
+    a guard's. Copying only the pair is what let `/api/scene-mutate` skip its unsaved-work probe and
+    rewrite a scene file over live edits. A definitively-absent renderer PROCEEDS (a park is renderer-only state, so
     with no renderer there is none) and says `editorConnected:false`; a **silent** one REFUSES with
     `NO_RENDERER`. Reading a timeout as "clear" would be #872 rebuilt inside its own fix, and every
     test that stubs a working renderer passes either way.
@@ -631,7 +650,7 @@ unsaved-work refusal, unlike `/api/scene-mutate` above). Two things worth knowin
 
   - ⚠️ **The gate cannot see the EDITOR'S OWN save, and no flag makes it — `flushPendingMeta`
     takes the batch out and `pending.clear()`s it BEFORE issuing any request**. By the time
-    `/api/write-meta` asks `resolve-meta-park`, the registry is empty for every path in that flush,
+    `/api/write-meta` asks `resolve-unsaved`, the registry is empty for every path in that flush,
     so the probe honestly answers `clear` and the write proceeds. The clear-first ordering is
     correct for its own reason (a `flushPendingMetaFor` landing mid-flush must not see a document
     this flush is about to overwrite), and `rendererWrite:true` is not what is doing the work here
@@ -857,8 +876,15 @@ message is now built from `unsavedChangeCauses()` and lists `getDirtyAssetPaths(
 `modoki_add_native_target`, `modoki_ota_publish`) both used to build their refusal from the same
 flat `unsavedChanges` boolean the `guardUnsaved` fix above replaced — so both still blamed
 `create_entity`/`duplicate_entity`/`prefab` even when the actual cause was a dirty asset (a
-Material slider drag parks one the same way, since #831). Both now read the same
+Material slider drag parks one the same way, since #831). Both were then rebuilt on the
 `unsavedCauses`/`unsavedChangeCauses()` shape and name the dirty asset paths.
+
+⚠️ **And that rebuild is itself the cautionary half.** `/api/scene-mutate`'s copy was a SECOND
+hand-enumeration of the cause list, and it drifted twice more after this fix — `pendingBaseScenes`
+and `pendingImportSettings` both arrived on the wire and went unnamed, reproducing the exact defect
+#844 closed. Reading "the same shape" is not the same as reading the same LIST. #889 phase 3
+collapsed that route onto `unsavedGate`, whose list is derived under a type-level exhaustiveness
+check; the MCP-side `unsavedChangesWarning()` is still a hand copy and is tracked as **#972**.
 
 **The durable lesson, which is the point of this section and not the instance list: a refusal
 message derived from a collapsed boolean names whatever cause existed when the message was
@@ -876,6 +902,266 @@ so they carry the same generic wording regardless of which kind of unsaved work 
 Because that seam is a boolean-returning callback rather than a call site that can simply be
 swapped for a richer one, fixing it means widening the `DirtyProbe` seam itself, not just
 changing what a caller passes.
+
+## Disk is not the source of truth while an editor is open (#889)
+
+> **While an editor is open, disk is not the source of truth for asset content — the renderer is.
+> Any Node-side decision that treats a file's bytes as current is wrong for exactly as long as the
+> renderer holds a newer copy, and the Node process has no way to notice.**
+
+That is the mechanism `metaParkGate` (#872/#882) fixed three instances of. Stating it at the
+`.meta.json` level is what made it look like three bugs: the same defect reaches asset DOCUMENTS,
+scene files, and — worst — routes that merely READ, one of which feeds a delete.
+
+### ⚠️ There are FIVE sources of unsaved state, and one of them is not a registry
+
+The obvious list is the four modules under `editor/scene/` — `dirtyAssets`, `pendingMeta`,
+`pendingBaseScene`, `sceneDirty`. **It is missing the most commonly edited thing in the editor.**
+
+`sceneDirty.ts` tracks **base scenes only** (its own header says so, and explains why: `saveAll`
+always attempts the primary anyway). The **primary** scene's unsaved live-world state is
+`getEditVersion() !== _savedAtEditVersion` — a bare, pathless boolean in `serialize.ts`, in no
+registry module at all.
+
+⚠️ **A name collision is what hides it.** The *cause* called `sceneDirty` is the PRIMARY scene; the
+*module* called `sceneDirty.ts` supplies the cause called `dirtyScenes`, which is the loaded BASES.
+A probe assembled by enumerating registry modules is therefore **vacuous for the open scene**, and
+nothing goes red.
+
+So the probe does not enumerate modules. **`unsavedChangeCauses()` (`serialize.ts`) is the
+single-source-of-truth total**, and `resolve-unsaved` derives its registry list from it. A
+hand-written list here would be `CLAUDE.md`'s "hand-maintained list of fields we read", and it would
+already have been wrong by one.
+
+| Registry name (the wire vocabulary) | Cause it answers for | Keyed by | Written by |
+|---|---|---|---|
+| `dirtyAsset` | `dirtyAssetPaths` | asset-root URL (`path`) | flush, **before** the scene write |
+| `pendingMeta` | `pendingImportSettings` | asset-root URL (`path`) | flush, **before** the scene write |
+| `pendingBaseScene` | `pendingBaseScenes` | asset-root URL (`path`) | flush, **after** the scene write |
+| `liveScene` | `sceneDirty` (the PRIMARY — a boolean) **and** `dirtyScenes` (the BASES — guids) | resolved renderer-side (`none` / `guid`) | the scene write itself |
+
+### The cause table is the SCHEMA, not just the value (#972)
+
+`unsavedChangeCauses()` used to publish a **value** and no **schema**. Consumers that must act
+*per cause* — test it, gate on it, name it, flush it, remap it across a rename — had nowhere to ask
+*"what are the causes, and what is each one like"*, so **ten sites re-stated the population by
+hand**, and TypeScript checked none of them: a hand-written subset of a wider object is a legal
+structural subtype. Three of the ten were already under-reporting when this was found, one of them
+losing a human's edit on Cmd+S.
+
+**`CAUSE_SPECS` (`serialize.ts`) is now the root, and the cause TYPE is derived from it** — the
+inversion is the point. Each cause declares a cheap `has`, a reporting `read`, a `keying`
+(`'none' | 'guid' | 'path'`), a `writtenBy`, and a human `label`. Three subsets are derived from it
+and must never be re-listed:
+
+| Derived from | Consumed by | What a missing member costs |
+|---|---|---|
+| `keying: 'path'` → `PathKeyedCause` | the move repair (`PARKED_MOVE_REPAIRS`) | a rename strands the edit on a dead path; it never flushes |
+| `writtenBy: {flush}` → `flushParked(phase)` | all three save sites | Cmd+S reports success and never writes it |
+| `writtenBy: 'scene-write'` → `sceneNeedsWriting()` | the preview-envelope decision | a preview is cycled for nothing, or not cycled when it should be |
+
+⚠️ **`hasUnsavedChanges()` is DERIVED, not merely guarded**, and that distinction is load-bearing:
+every refusal in the repo gates on that boolean, so a cause it cannot see is not unsaved work
+*anywhere*, whatever the consumers do. `has` stays a first-class field so the derivation is still
+allocation-free — it is called on hot paths and from a 1 Hz poll.
+
+⚠️ **Never widen `UnsavedCauses` to `Record<string, …>`.** Every `satisfies Record<keyof
+UnsavedCauses, …>` in the repo silently stops checking anything the moment `keyof` stops being a
+finite union. Guarded by a type-level assertion in `tests/editor/unsavedCauseTable.test.ts`.
+
+#### Which failure mode a consumer gets, and why it is not one rule
+
+> **Inside the module boundary → exhaustive derivation (fail to COMPILE).
+> Across a zone or wire boundary → structural enumeration (fail READABLY).**
+
+Across a wire, a *newer* renderer sending a sixth cause is exactly as likely as an older one sending
+four, and a hand-written type drops the new one **silently**. That is a runtime problem no compiler
+on the receiving side can see, so only structural enumeration survives it. `app/debug/hmrStaleness.ts`
+and `engine/tools/modoki-mcp/src/context.ts` are the two CORRECT instances — both type the causes
+loosely and humanize an unknown key. **Do not "tidy" either into a table.**
+
+Measured, adding a sixth cause to `CAUSE_SPECS` and to nothing else: **9 compile errors across 9
+sites**, 2 runtime test failures (the backstop for vitest, which erases types), and the two
+degrading consumers stay green and NAME the new cause. That both halves behave differently is the
+check — not that everything goes red.
+
+⚠️ **A `.tsx` dialog showing an unsaved-work caveat renders the route's `staleInputsNote`; it does
+not re-derive the causes.** The server's note comes from the same probe that computed the result, so
+it cannot disagree with it, and that probe carries the exhaustiveness check. A boolean
+`hasUnsavedChanges()` poll for drift *after* the scan is fine and is a different question. Guarded by
+`tests/architecture/staleDisclosureIsServerDerived.test.ts`.
+
+#### The accepted residue
+
+`SaveResult`'s three flush fields (`assets`, `importSettings`, `baseScenes`) are still named by hand:
+they carry deliberately different shapes and collapsing them is a wire change. So a sixth *flushing*
+cause can no longer be **forgotten** — it reaches disk — but it can be left **unnamed in the report**,
+i.e. the work is saved and the toast does not mention it. Stated rather than pretended away.
+
+#### Why `/api/move-file` and `/api/delete-asset` are EXEMPT rather than gated
+
+Gating them would refuse a rename *because* the file being renamed has unsaved edits — precisely the
+case the repair exists to carry across. A file must stay renameable while it is being edited. They
+instead repair every path-keyed registry, **by derivation**, and the exemption in
+`tests/architecture/unsavedGateCoverage.test.ts` is void if that stops being true. "It repairs them"
+was true of the hand-written version too, right up until it was two of three and nothing said so.
+
+#### Incident: Cmd+S under a timeline preview flushed 2 of 3 (#972 P12)
+
+`runSaveAllOnce`'s preview fast path called `flushDirtyAssets` + `flushPendingMeta` and stopped, and
+its gate `sceneNeedsWriting()` was typed against a two-field structural subtype of the causes object
+— so it could not see a pending base-scene ref at all. With a preview live and *only* such a ref
+parked, Cmd+S took the fast path, returned `{target:'assets'}` reporting success, and the edit was
+never written. No refusal, no toast, no error. The flush set was spelled by hand at three save sites
+and one of the three was short.
+
+**The guid/path mismatch is reconciled in the RENDERER, and that is not an implementation detail.**
+Node holds the manifest and *could* map path→guid — but only the renderer knows which scenes are
+loaded and which is primary, and the primary's term is a boolean Node cannot compute at any key.
+Answering there lets Node keep paths end to end (what every route already holds) and avoids a second
+path→guid implementation beside `SceneManager`'s. Both scene cases report as one `liveScene` row,
+because *"does this file back a scene with unsaved live edits?"* is one question to a caller.
+
+⚠️ **`liveScene` is probe-only.** Dropping live-world edits means RELOADING the scene, which is
+`load_scene {discardUnsaved}`'s job; a second way to do it does not belong in a probe. Encoded as
+`DiscardableRegistry = Exclude<UnsavedRegistry, 'liveScene'>` rather than as prose.
+
+### The caller declares a CONSEQUENCE; the policy follows from it
+
+`metaParkGate` failed closed. `/api/scene-mutate` used to fail **open** with a warning,
+deliberately and with a written rationale. That divergence is **gone as of phase 3** (owner,
+2026-09-09): the two are now one policy applied to three different consequences, with no exception
+left standing. Why it could be closed is in § "Phase 3" below — the rationale rested on a busy
+renderer being indistinguishable from an absent one, and phase 1's classifier had already made
+them distinguishable.
+
+| `consequence` | Proceeding means | `held` | `unknown` | Hatch |
+|---|---|---|---|---|
+| `destroys` | the unsaved work is lost irrecoverably | 409 `REQUIRES_SAVE` | 503 `NO_RENDERER` | `discardUnsaved` |
+| `stale-write` | bytes written from stale input; the human's copy survives | 409 `REQUIRES_SAVE` | 503 `NO_RENDERER` | `force` |
+| `stale-read` | an answer REPORTED from stale input; nothing written | 200 + `staleInputs` | 200 + `staleInputsUnknown` | — |
+
+**Why this is not the whack-a-mole it replaces.** The author declares *what their route does with
+the bytes* — a fact about their own code they cannot get wrong by inattention — not *what the gate
+should do*, which is the judgement that kept being re-litigated per route. The mapping lives in one
+function; a new route picks one of three words and cannot invent a fourth. And a declared word is
+**machine-checkable**, which a hand-rolled `if (probeFailed) warnings.push(…)` is not.
+
+⚠️ **A read that refuses is worse than a read that caveats**, and §8 licenses the softer half in as
+many words: it refuses when work would be *"lost or **omitted**"*, and a read omits nothing if it
+says what it could not see. Every `stale-read` route is also called by the editor's own panels, so
+refusing them is #872's Sprite-Editor regression one route over. But answering *silently* is §5's
+cardinal sin, so the disclosure is **mandatory and typed** rather than a `warnings.push` no guard
+can check for. The sibling rule §5 gains:
+
+> **"I looked at a stale copy" is not "this is current"** — the read half of *"could not look is
+> never reported as nothing is there."*
+
+⚠️ **The disclosure is ABSENT when clean, never `staleInputs: []`.** A field present on every call
+is one readers learn to skip, and then the call that matters is skipped with it.
+
+### `covers` — the skew guard, and why it needed its own test
+
+The reply carries a mandatory `covers` list, and Node treats a reply that omits a registry the
+caller asked about as `unknown`, not as clear. Without it, a renderer running an older build answers
+`holds: []` **truthfully for the registries it knows** and is indistinguishable from a clean editor.
+`unknown agent op` covers the fully-old renderer; `covers` covers the half-old one.
+
+⚠️ **Deleting that comparison left all 44 tests green** when it was written — nothing exercised a
+renderer that answers *without covering what was asked*, so the field called the skew guard was
+defended by its own docblock and no assertion. It is pinned now
+(`plugins/metaParkGate.test.ts` § "a SKEWED renderer is `unknown`"), and the episode is the general
+lesson: **a three-link chain tested only at its end is a mechanism that can be deleted in silence.**
+
+### Phase 2 and phase 3 — what closed, and the two things that did not
+
+Phase 1 covered `/api/duplicate-asset` (both branches), `/api/unused-assets` and
+`/api/find-references`. **Phases 2 and 3 (2026-09-09) closed the rest of the filed list:**
+
+| Route | Shape | Note |
+|---|---|---|
+| `/api/validate-scene` | `stale-read`, **global**, scoped to `pendingMeta` + `liveScene` | see the scope note below — this took two attempts to get right |
+| `/api/validate-prefab` | `stale-read`, **path-scoped** | `validatePrefabData` consults no resolver, so nothing else can |
+| `/api/scene-mutate` | `destroys` | plus the §8 convergence below |
+| `/api/asset-write` | `destroys`, scoped to `dirtyAsset` | `selfWrite` is what made it gateable |
+
+⚠️ **`/api/validate-scene`'s scope was wrong twice, in both directions, and the question that
+settles it is not the obvious one.** It first declared all four registries, on the reading that
+"its resolvers read prefabs and assets". They do not: `makeAssetResolver` is a membership test over
+manifest GUIDs and `validateSceneData` takes only `getPrefab` + `assetExists`, so a parked material
+could not move a warning — and the route caveated a provably correct answer every time a human
+touched a Material slider, sending an agent to `save_all` for a byte-identical result. The
+correction then over-swung and dropped `pendingMeta`, which is an UNDER-disclosure: the dangerous
+direction.
+
+The right question is **not** *"which pass reads that file?"* but *"can that park change what these
+resolvers ANSWER?"*:
+
+| Registry | In? | Why |
+|---|---|---|
+| `pendingMeta` | **yes** | through the MANIFEST, not the pass — `vite-asset-scanner` resolves a texture's `textureType` from the sidecar and emits the auto whole-image `sprite` sub-entry only for `2d`/`ui`, so a parked Type change deletes a guid the scene references |
+| `liveScene` | **yes** | `makePrefabResolver` reads prefab documents, and prefab-edit is the only registry state that holds an unsaved prefab |
+| `pendingBaseScene` | no | `sceneValidation.ts` contains the string `baseScene` zero times |
+| `dirtyAsset` | no | a parked asset document changes no manifest entry `assetExists` tests |
+
+⚠️ **The corpus guard cannot catch this class.** Its registry check is a SUPERSET test — declared ⊇
+needed — so narrowing `HELPER_REGISTRIES` and the route together is invisible to it by
+construction, and so is widening both. Only a behavioural test on each direction pins it, which is
+why `editorActionRouter.test.ts` now carries one per registry rather than one per route.
+
+**`/api/scene-mutate` — the §8 convergence.** The old code caught every probe rejection into one
+`probeFailed` boolean and wrote the file anyway. Its rationale was honest: a genuinely headless edit
+is this route's normal case, and refusing would break it. It rested on the premise that the two
+failures were *"genuinely indistinguishable here"* — which stopped being true when phase 1 landed
+`isRelayTransportFailure` + `isRelayTimeout`. ⚠️ **That pair alone is not the rule, and stating it
+as one caused a data-loss regression** — `unknown agent op` is a transport-classified failure that
+does NOT mean no renderer exists (the ops are unregistered; the window may be up holding unsaved
+work). The rule is `relayProvesNoRenderer`: a non-timeout transport failure that is not
+`unknown agent op` means no renderer exists; anything else means one may be attached and did not
+answer. So the route refuses
+503 on the second and proceeds on the first, and the headless path now says *why* it skipped the
+guards instead of implying they passed.
+
+It also stopped keeping its own copy of the cause list. That copy had drifted **twice** — its own
+comment said so, and ended *"worth collapsing if a third appears"*. It is collapsed onto
+`unsavedGate` now, whose list is derived under a type-level exhaustiveness check.
+
+**`/api/asset-write` — why it was the hard one.** `flushDirtyAssets` POSTs here; this route is the
+only path from a parked document to disk. A gate that refuses when `dirtyAsset` holds the path
+refuses the editor's own save and wedges the registry shut — #872's Sprite-Editor regression with
+every parked document in the blast radius. `selfWrite` already existed and already meant the right
+thing: an assertion about the CALLING PROCESS, not the document. A write issued from the renderer is
+never blind to the registry, because it **is** the flush. Same shape as `rendererWrite` on
+`/api/write-meta`.
+
+⚠️ **A sixth source of unsaved state, found while scoping `/api/validate-prefab`.** The probe's
+`sceneDirty` row read `causes.sceneDirty && primaryScenePath ? [row] : []` — and two production
+states hold a dirty live world with **no scene path**: prefab-edit (`serialize.ts` nulls
+`_currentScenePath` on purpose, so an ordinary save cannot target the prefab world) and a scene
+never yet written. In both, the op replied `holds: []` with `covers` naming all four registries: a
+**false clear**, not an `unknown` — so every phase-1 gate read it as clean and proceeded. Measured
+before the fix, with a control alongside: the same dirty world *with* a path reported one
+`liveScene` row, *without* one reported nothing. `dirtyWorldTarget()` now resolves the world to a
+path once per call, using the prefab's own asset-root path in prefab-edit (which is what makes a
+path-scoped ask from `/api/validate-prefab` match) and a marker for a genuinely pathless world.
+
+### What is still NOT fixed
+
+- ⚠️ **`/api/move-file` and `/api/delete-asset` repair the park for `dirtyAsset` and `pendingMeta`
+  and NOT `pendingBaseScene`** — `assetEditorBindings.ts` does not reference that registry at all.
+  A moved or deleted `.scene.json` strands its parked baseScene edit on a dead path and it never
+  flushes: edit a baseScene ref, rename the scene, and the edit is silently gone at the next
+  `save_all`. Tracked as **#972**, not #889, because the mechanism is #972's — a consumer
+  hand-enumerating the registries instead of deriving them. ⚠️ **Gating these routes would be the
+  WRONG fix**: it would refuse a rename *because* the file being renamed has unsaved edits, which
+  is the case the repair exists to carry across. The fix is to finish the repair.
+- These three used to be **prose here and invisible to the guard** — they matched none of
+  `CONTENT_CALLS`' trigger symbols, so `unsavedGateCoverage` classified them as nothing and this
+  list read as a ledger the guard keeps when for them it was not. Closed in phase 3 by adding
+  `moveToTrash`, `moveAssetFile` and `writeFileSync` as triggers. `/api/write-file` came out
+  **exempt**: it has no `contracts.ts` entry, so no agent tool reaches it, and it fingerprints every
+  write through `markEditorWrite` — the same assertion `selfWrite` makes. ⚠️ Void the day it gains
+  an MCP contract.
 
 ## 6. Prior fix this generalizes
 

@@ -141,6 +141,21 @@ describe('ensureSpriteMaterial', () => {
     expect(onReady).not.toHaveBeenCalled();
   });
 
+  // #1055. A JavaScriptCore stack (iOS) is frames only, so `stack || message` warned with a frame and
+  // no message. Fabricated in the shape an iPad produced, since these run on V8.
+  it('a rejection whose stack is frames only (JavaScriptCore) still warns with its MESSAGE (#1055)', async () => {
+    paths.set('g1', 'mat.shader.json');
+    const err = new Error('shader parse failed');
+    Object.defineProperty(err, 'stack', { value: 'buildPixiShaderProgram@capacitor://localhost/assets/index.js:3:7' });
+    build.mockRejectedValue(err);
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+
+    cache.ensureSpriteMaterial('g1');
+    await flush();
+
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining('Error: shader parse failed'));
+  });
+
   it('marks an unresolved GUID as failed without calling build', () => {
     // no path seeded → resolveRef returns undefined
     expect(cache.ensureSpriteMaterial('missing')).toBeUndefined();
@@ -292,6 +307,20 @@ describe('ensureSpriteMaterial', () => {
     expect(onReady).toHaveBeenCalledTimes(1);
     expect(onReady2).toHaveBeenCalledTimes(1);
   });
+
+  it('clearSpriteMaterialCache: a waiter that throws does not starve the waiters after it (#953)', () => {
+    paths.set('g1', 'mat.shader.json');
+    build.mockReturnValue(new Promise(() => {})); // in flight forever, so both waiters stay parked
+    const errSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const second = vi.fn();
+    cache.ensureSpriteMaterial('g1', () => { throw new Error('bad wake'); });
+    cache.ensureSpriteMaterial('g1', second);
+
+    expect(() => cache.clearSpriteMaterialCache()).not.toThrow();
+
+    expect(second, 'every map is already cleared, so a starved wake is never fired again').toHaveBeenCalledTimes(1);
+    expect(errSpy).toHaveBeenCalled();
+  });
 });
 
 // #852: `invalidateShader` used to be a thin wrapper around the wholesale `clearSpriteMaterialCache`
@@ -336,6 +365,25 @@ describe('invalidateShader (#852 per-key)', () => {
     expect(cache.getSpriteMaterialProgram(GUID_A)).toBe(programA);
     expect(build).toHaveBeenCalledTimes(3); // A, B, A again
     expect(invalidateProgram).toHaveBeenCalledWith(PATH_A); // the pixiShaderBuilder optimisation still runs
+  });
+
+  it('a waiter that throws skips neither the waiters after it nor the pixiShaderBuilder eviction (#953)', async () => {
+    // Pre-#953 the per-key wake was a bare loop, so a throw escaped `invalidateShader` BEFORE its
+    // last statement, `invalidatePixiShaderProgram(manifestPath)`: the edit silently did not take.
+    const { registerAsset } = await import('../../src/runtime/loaders/assetManifest');
+    paths.set(GUID_A, PATH_A);
+    registerAsset(GUID_A, PATH_A, 'shader');
+    build.mockReturnValue(new Promise(() => {})); // in flight forever, so both waiters stay parked
+    const errSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const second = vi.fn();
+    cache.ensureSpriteMaterial(GUID_A, () => { throw new Error('bad wake'); });
+    cache.ensureSpriteMaterial(GUID_A, second);
+
+    expect(() => cache.invalidateShader(PATH_A)).not.toThrow();
+
+    expect(second).toHaveBeenCalledTimes(1);
+    expect(invalidateProgram).toHaveBeenCalledWith(PATH_A);
+    expect(errSpy).toHaveBeenCalled();
   });
 
   it('resolves a WATCHER-shaped path (a leading-slash asset URL, not a bare relative path invented by a test)', async () => {

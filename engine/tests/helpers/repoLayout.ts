@@ -85,6 +85,57 @@ export function hasAgentDefinitions(): boolean {
   return fs.existsSync(path.join(REPO_ROOT, '.claude', 'agents'));
 }
 
+/** True when this checkout carries the PRIVATE top-level docs — the ones
+ *  `scripts/publish-engine-oss.sh` drops from the snapshot (its `grep -vE '^docs/(…)\.md$'` chain is
+ *  the authoritative list, and `publishExclusions.test.ts` asserts it).
+ *
+ *  ⚠️ **Reads `docs/task-claiming.md`, which neither consumer gates on** — deliberately, the
+ *  `hasScratchTooling()` lesson again. `projectDocs.test.ts` needs `docs/projects.md` and
+ *  `docCitations.test.ts` needs `docs/todo.md` + `docs/plans/`; a predicate keyed on either would let
+ *  a rename of that file switch its own guard off, where reading a different excluded doc lands the
+ *  rename as a RED read instead.
+ *
+ *  Replaces two hand-rolled probes (#1071): `projectDocs`' `existsSync('docs/projects.md')`, and
+ *  `docCitations`' local `hasFullDocsTree()`, which the layout ledger could not see because it
+ *  wrapped the probe in a function. */
+export function hasPrivateDocs(): boolean {
+  return fs.existsSync(path.join(REPO_ROOT, 'docs', 'task-claiming.md'));
+}
+
+/** True when this checkout carries the QA suite (`qa/**`).
+ *
+ *  ⚠️ **`qa/` is absent from the snapshot by a DIFFERENT mechanism from the private docs, which is
+ *  why `hasPrivateDocs()` is the wrong proxy for it.** Those are dropped by an explicit exclusion;
+ *  `qa/` is simply not among the roots `scripts/publish-engine-oss.sh` stages (`git ls-files --
+ *  engine build docs` plus named root files and `demos/<id>`), so it is not excluded from the
+ *  manifest — it was never in it. Nothing would catch a change to one exclusion list silently
+ *  altering the other, because they are not the same list.
+ *
+ *  ⚠️ **Reads `qa/README.md`, which no consumer gates on** — the `hasPrivateDocs()` rule directly
+ *  above, for the same reason: `editorPorts.test.ts` needs `qa/knowledge.md`, so a predicate keyed
+ *  on that file would let a rename switch off the very guard that should have gone red. Added for
+ *  #1102, replacing a hand-rolled `existsSync` that `layoutConditionalTestLedger.test.ts` caught. */
+export function hasQaSuite(): boolean {
+  return fs.existsSync(path.join(REPO_ROOT, 'qa', 'README.md'));
+}
+
+/** True when this checkout carries the committed Claude Code project settings,
+ *  `.claude/settings.json` — where the PreToolUse hooks are registered. The snapshot ships no
+ *  `.claude/` at all.
+ *
+ *  ⚠️ **Reads the settings FILE, not the `.claude/` directory** — the opposite call from
+ *  `hasScratchTooling()`, because the directory is NOT a reliable marker. Measured #1071: a local
+ *  dry run of `scripts/publish-engine-oss.sh` left an EMPTY `.claude/` in the staged snapshot even
+ *  though the manifest excludes it (what creates it was not traced) — so a directory probe reads
+ *  true in exactly the checkout it must read false in. The rename hazard that trades
+ *  away is `repoLayoutGuard.test.ts`'s to catch: this reading false in a private clone turns it red.
+ *
+ *  Replaces a raw `existsSync` in `contextCostGuard.test.ts` that the layout ledger had allowlisted
+ *  as "no predicate exists" (#1071). */
+export function hasAgentSettings(): boolean {
+  return fs.existsSync(path.join(REPO_ROOT, '.claude', 'settings.json'));
+}
+
 /** True when the `oss/` publish overlay (the workflows rewritten onto the public repo by
  *  `scripts/publish-engine-oss.sh`) is present in this checkout. */
 export function hasOssOverlay(): boolean {

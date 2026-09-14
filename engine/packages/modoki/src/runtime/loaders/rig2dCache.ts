@@ -12,9 +12,11 @@
 import { isGuid, registerAsset } from './assetManifest';
 import { resolveRefWarnOnce } from './modelGlbUrl';
 import { assetUrl } from './assetUrl';
+import { awaitLazyLoad } from './awaitLazyLoad';
 import { normalizeRig2D, type Rig2DFile, type ParsedRig2D } from '../skinning/rig2dTypes';
-import { parseAssetJson } from './assetFetch';
+import { ASSET_FETCH_INIT, parseAssetJson } from './assetFetch';
 import { createTeardownToken } from '../core/liveness';
+import { fireDirtyListeners } from '../core/renderDirty';
 
 export {
   type Rig2DBone, type Rig2DPart, type Rig2DFile, type ParsedRig2DPart, type ParsedRig2D,
@@ -35,8 +37,11 @@ const cache = new Map<string, ParsedRig2D>();
  *  THE COST, stated rather than discovered: this retains the parsed JSON for every loaded rig, on
  *  the same lifetime as the parsed form (both are dropped together by `invalidateRig2D` /
  *  `clearRig2DCache`), in a shipped game as well as the editor. Bounded by the rig files
- *  themselves — 11 KB for `bar.rig2d.json`, 208 KB for `zombie.rig2d.json`, and a scene's rigs are
- *  released at the swap. Accepted over gating it on `__MODOKI_EDITOR__`: no `runtime/**` module
+ *  themselves — 11 KB for `bar.rig2d.json`, 208 KB for `zombie.rig2d.json`. ⚠️ **It is bounded by
+ *  every rig the SESSION has loaded, not by one scene's**: a scene swap does NOT clear this cache
+ *  (#1171 — no def cache is cleared at a swap, because #1162 preloads the next scene's defs BEFORE
+ *  it; see `SceneManager.acquireResourceInner`'s `rig2d` case). This once said "a scene's rigs are
+ *  released at the swap", which nothing did. Accepted over gating it on `__MODOKI_EDITOR__`: no `runtime/**` module
  *  references that global, and it resolves TRUE under vitest AND a plain `npm run dev`, so the
  *  gate would be wrong exactly where a developer runs their own game (the reasoning
  *  `tierCalibration.setTierFrameCapEnabled` records for the same trap). If rig memory ever
@@ -79,7 +84,7 @@ export function getRig2D(ref: string, opts?: { load?: boolean }): ParsedRig2D | 
   if (opts?.load === false) return null;
   if (!loading.has(path)) {
     const stillLive = liveness.capture(path);
-    const p = fetch(assetUrl(path))
+    const p = fetch(assetUrl(path), ASSET_FETCH_INIT)
       .then((r) => {
         return parseAssetJson(r, path);
       })
@@ -88,8 +93,7 @@ export function getRig2D(ref: string, opts?: { load?: boolean }): ParsedRig2D | 
         if (cache.has(path)) return;          // editor live-preview seeded it
         const id = (json as Rig2DFile)?.id;
         if (id && isGuid(id)) registerAsset(id, path, 'rig2d');
-        sourceCache.set(path, json as Rig2DFile);
-        cache.set(path, normalizeRig2D(json as Rig2DFile));
+        storeRig(path, json as Rig2DFile);
       })
       .catch((e) => {
         if (stillLive()) failed.add(path);
@@ -99,6 +103,19 @@ export function getRig2D(ref: string, opts?: { load?: boolean }): ParsedRig2D | 
     loading.set(path, p);
   }
   return null;
+}
+
+/** Resolve a rig ref, AWAITING its load — the scene acquire's preload (#1162). `skin2DSystem`
+ *  builds no skin buffer while the rig is null, and a `SkinnedSprite2D` has no `Renderable2D` to
+ *  fall back on, so a rig still in flight at the swap leaves the entity INVISIBLE (measured: 1-2
+ *  frames cold on a local dev server). Contract: {@link awaitLazyLoad}. The part textures stay
+ *  lazy, like every 2D texture. */
+export function loadRig2DNow(ref: string): Promise<ParsedRig2D | null> {
+  return awaitLazyLoad(
+    () => getRig2D(ref),
+    () => { const path = rig2dCacheKey(ref); return path ? loading.get(path) : undefined; },
+    () => getRig2D(ref, { load: false }),
+  );
 }
 
 /** The AUTHORED rig doc behind a cached rig — the file's own JSON (or the editor's live,
@@ -116,9 +133,23 @@ export function getRig2DSource(refOrPath: string): Rig2DFile | null {
 export function setRig2D(refOrPath: string, def: Rig2DFile): void {
   const path = rig2dCacheKey(refOrPath);
   if (!path) return;
+  storeRig(path, def);
+  failed.delete(path);
+}
+
+/** The ONE write into the cache, and it wakes the render loops (#1141).
+ *
+ *  A rig is not an ECS trait, so writing one fires nothing on its own. `skin2DSystem` still
+ *  rebuilds the mesh (it runs while stopped), but both Scene2D renderers skip every idle frame
+ *  that nothing marked dirty, so a Skin-editor weight edit or its undo stayed invisible in the
+ *  Game view and the SceneView until a bone moved. The wake lives HERE rather than at the
+ *  editor call site because every writer needs it: paint strokes, undo closures, `loadSkinDef`,
+ *  the bone list, and a load that resolves while the editor is stopped. Same channel
+ *  `registerAsset` uses. */
+function storeRig(path: string, def: Rig2DFile): void {
   sourceCache.set(path, def);
   cache.set(path, normalizeRig2D(def));
-  failed.delete(path);
+  fireDirtyListeners();
 }
 
 /** Drop a cached rig so the next access re-fetches (e.g. after an external edit). */
@@ -137,7 +168,8 @@ export function invalidateRig2D(refOrPath: string): void {
   loading.delete(path);
 }
 
-/** Drop ALL cached rigs (scene swap / full resource disposal / test teardown). */
+/** Drop ALL cached rigs (`disposeAllCachedResources`'s full teardown / test teardown) — NOT called at a
+ *  scene swap, which would wipe the rigs the next scene just preloaded (#1171). */
 export function clearRig2DCache(): void {
   liveness.invalidateAll();
   cache.clear();

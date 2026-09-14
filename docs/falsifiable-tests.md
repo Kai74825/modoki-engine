@@ -48,6 +48,8 @@ asking the subject. See **The wrong-subject shape** below.
 | `engine/packages/modoki/tests/runtime/envPmremOwnership.test.ts` | Reference for the two-instance discriminant test |
 | `engine/packages/modoki/tests/video/videoTextureSync2D.test.ts` | The compact model of the same, in `gives each surface its own texture over the SAME element` |
 | `engine/tests/tools/readAssetDefServed.ts` | Reference for the **wrong-subject** shape — probes the op instead of inferring what it serves |
+| `engine/packages/modoki/tests/helpers/inOrder.ts` | `expectInOrder` / `found` — ordering checks that fail on an absent subject, shape **(H)** |
+| `engine/tests/architecture/indexOrderingAssertions.test.ts` | The shape (H) guard: no raw `indexOf`-family position on the vacuous side of an ordering matcher |
 
 ## How it works
 
@@ -114,6 +116,44 @@ and assert three things — the third is the one people forget:
 1. the derived outputs are `not.toBe` each other;
 2. the underlying build counter incremented **once per instance**, not once in total;
 3. touching instance B does **not** disturb a cache hit already established for instance A.
+
+### The FROZEN-PARAMETER shape: a sweep that varies one axis and pins the other (#984, #979)
+
+A test over a *sampled* process has more than one free parameter, and freezing the wrong one makes
+the assertion collapse into something that cannot fail. Both games that hit-test a swept pointer
+stroke shipped this, in two different generations, and the second was written as the FIX for the
+first:
+
+| Generation | Swept | Frozen | What it degenerated into |
+|---|---|---|---|
+| original | the row OFFSET | the x-PHASE, at cell centre → cell centre | "is the offset inside the radius" — a substep lands on every cell's exact centre, so no step size can straddle a chord |
+| its replacement | the x-PHASE | the OFFSET, at 0.35 pitch — outside the band where the failure lives | passed, and declared impossible the defect filed against it days later |
+
+**The rule: sweep every free parameter, and compare against a near-continuous REFERENCE run of the
+same input rather than a literal expected output.** The property is *"the shipped step finds what a
+finer one finds"*; a hardcoded `[6,7,8,9]` cannot express it, because a start phase inside the first
+cell's circle legitimately seeds it and yields `[7,8,9]`, which is not a failure.
+
+Four details that each cost a green-but-empty test:
+
+- **An ABSOLUTE anchor is mandatory.** Both sides call the same sampler, so any mutation that makes
+  the sampler match *nothing* — a radius of zero — collapses them to `[] === []` and the entire
+  sweep passes. Assert the reference itself found a plausible number of hits.
+- **The phase count must be COPRIME with the stride divisor.** `shift = pitch * p / PHASES` against
+  a stride of `pitch/4` gives only `PHASES / gcd` distinct alignments: 16 phases was really FOUR,
+  and the losing phases hid in the aliased set. Use a prime.
+- **The segment must not be a whole number of pitches.** An exact multiple keeps the sample grid
+  commensurate with the cell grid, so a miss becomes all-or-nothing rather than phase-dependent.
+- ⚠️ **Deriving the sweep's BOUNDS from production makes the sweep blind to production's formula.**
+  Court's blind-band edge is computed from the shipped stride. Take that stride from the production
+  function (right — a mirrored copy drifts) and the band moves with it, so a changed formula is
+  still "consistent with itself" and the sweep stays green. That is not a reason to re-mirror it:
+  it means the FORMULA needs its own test, asserting the shipped value and the relationship
+  directly. Measured — with the stride reverted to its pre-fix form, the sweep passed and only the
+  formula test went red.
+
+Worked examples: `games/wordweave/tests/screen.test.ts` (the reference implementation) and
+`games/court/tests/memo.test.ts` § "a swept stroke finds what a near-continuous walk finds".
 
 ### The wrong-subject shape: a guard that interrogates a sibling constant (#855)
 
@@ -276,6 +316,420 @@ test *does* build two worlds and register the same guid in both, but asserts onl
 world resolves correctly. Under a shared map the second registration simply overwrites the first and
 that assertion still passes. **Two instances is necessary, not sufficient — the assertion has to
 interrogate the STALE one.**
+
+### The World axis (#851) — and what running the census actually showed
+
+The third axis of shape (A)/(B): **a per-`World` cache's discriminant is unfalsifiable because no
+test holds two live `World`s while exercising that cache's read/write path in the same assertion.**
+The fixture is `engine/packages/modoki/tests/helpers/twoWorlds.ts`; copy it rather than deriving a
+fourth shape.
+
+⚠️ **The ordering is the whole mechanism: write A, write B, then read A BACK.** "Two worlds exist"
+is necessary and NOT sufficient. `guidIndex.test.ts` built two worlds, registered the same guid in
+both, and asserted only that the CURRENT world resolved correctly — which is exactly what a shared
+map produces under last-write-wins. Never assert on the world you wrote last.
+
+⚠️ **Honest scope.** Two koota `World`s coexist only transiently, during the two-world atomic scene
+swap, unlike #828's renderer axis where SceneView and GameView coexist permanently. This is a cover
+gap first and only possibly a live defect; a row count is not severity.
+
+⚠️ **A hand-traced census is a hypothesis. Running it moved a row.** #851 was filed READ-ONLY with
+the verdicts reached by reading each declaration and hand-tracing the suites. Executed, the
+`zoneEventBus` row was **wrong**: collapsing its `WeakMap` reddens 29 of 39 existing zone tests —
+not through any isolation assertion, but incidentally, because the module-level singleton then
+leaks subscribers between tests. `physicsEventBus` (32 tests) and `timelineEventBus` were confirmed
+blind, as filed. Two lessons: **incidental cross-test contamination is not coverage** (reorder the
+file and it may stop failing, which is why the deliberate assertion still earns its place), and a
+census that has not been run belongs in the issue as a hypothesis, not as a count.
+
+⚠️ **Mutate the way a careless FIX would, not by deleting the declaration.** Removing
+`subsByWorld` outright also breaks `__clear`'s reference to it, so the suite fails to compile and
+39 tests go red — which reads exactly like detection and is not. The valid mutation KEEPS the map
+and ignores the key (`get(ONE)`/`set(ONE, …)`): it compiles, it preserves every other behaviour,
+and it isolates the one property under test.
+
+⚠️ **Two live instances is not enough if the TEST supplies both key and value.** A case that does
+`registry.worlds.set(a, …)` then `registry.worlds.get(a)` asserts `Map.prototype`, not any
+production keying — it cannot fail under the prescribed mutation, because the mutation changes code
+the test never calls. Ask where the keying actually happens: for the physics registry it is at the
+CONSUMERS (`physics2DSystem` / `physics3DSystem` take `registry.worlds` and do their own
+`get(world)`/`set(world, st)`), so no test in the registry's own file can reach it. Test the thing
+the module itself decides — for that registry, WHICH world each teardown path frees.
+
+`physicsWorldRegistry` was flagged in the issue for escalation on the grounds that two koota
+`World`s sharing one Rapier instance might be prevented somewhere. It is not: `worlds` is a
+`Map<World, S>` whose `disposeAll` iterates it, and `onWorldSwap((next, old) => dispose(old))`
+frees the old world's WASM while the new one is already live. **Two entries coexisting is a
+designed state during the swap**, so a test is the right artifact — not an assertion at a
+prevention point that does not exist.
+
+### Shape (C): the test drives the WRONG COPY of the code
+
+The two shapes above are about how many INSTANCES a suite builds. This one is about which **copy**
+it runs. A file is a SOURCE that gets copied, bundled, staged or vendored into the place it
+actually executes — and the verification reads the source, or rebuilds its own private copy, so a
+stale or wrong SHIPPED artifact cannot fail it.
+
+Closed instances, which are the same sentence with different nouns: **#909** (a git hook is copied
+into the hooks dir, git runs the copy, the test spawned the source), **#685** (a re-vendored plugin
+tarball is never EXTRACTED — `npm install` says "up to date" and the native build ships the old
+plugin), **#215** (`bootstrap-game-deps` skips a project whose `node_modules` is stale, so "already
+installed" is true and wrong), and **#945** across the Electron packaging pipeline.
+
+**The rule: the test drives the artifact the shipping path produces.** Not a faithful rebuild of
+it — the rebuild is a second implementation, and it drifts.
+
+⚠️ **A rebuild does not merely fail to catch staleness; it drifts on its own.** `mcpBundle.test.ts`
+re-ran esbuild with options its own comment said "mirror `build-electron.mjs`", and by the time
+#945 was written the two had already diverged in two fields while staying green. The fix is a
+**declaration-only** module both sides import (`scripts/mcpBuildOpts.mjs`) — declaration-only
+because the builder runs `await esbuild.build(...)` at top level, so importing *it* for the options
+would run a build as an import side effect.
+
+⚠️ **Two claims, not one — do not collapse them.** "The shipped artifact runs" and "the bundle is
+self-contained" need different setups: the first spawns `dist/index.js` where it actually lives,
+the second builds into an isolated dir holding nothing else. The shipped file sits beside its own
+`node_modules` and cannot make the second claim. Keep both cases; the mutation check that proves
+they are different is *break the shipped file and watch only one go red*.
+
+⚠️ **Where the check already exists, look at whether its VERDICT survives.** The sharpest form of
+this class is not "nothing verifies it" but "something verifies it and throws the answer away".
+Both toolchain stagers already ran their staged binary (`toktx --version`; `msdf-atlas-gen`, which
+exits non-zero when dyld cannot resolve the dylibs the stager just relocated) and then
+`console.warn`ed the failure and continued — so a binary that could not run was staged, signed and
+shipped. Distinguish a **missing** optional tool (a legitimate graceful skip, `before-pack.cjs`'s
+documented contract) from a **staged-but-broken** one (a bad artifact that must stop the pack).
+
+The reference implementations of the right shape, for copying rather than re-deriving:
+`vendorPluginsIntegration.test.ts` (a real `npm pack`, then `verifyInstalledMatchesTarball`
+through the unmocked path), `packagedViteConfig.test.ts` (including its stale-leftover case), and the publish scanners, which run over `$STAGE` rather than the working tree.
+
+⚠️ **A staleness check keyed on MTIME is the wrong instrument twice over.** The first version of
+the MCP guard compared `dist/index.js`'s mtime against `src/index.ts`'s. The bundle inlines 22
+source files plus `node_modules`, so touching any of the other 21 left it green with a genuinely
+stale artifact — and an mtime comparison against a TRACKED file goes red after any
+`git merge`/`checkout` that rewrites that file's mtime without changing what it produces, i.e. a
+false red on the worker-merges-main flow, on a step `verify` does not even run. **Compare CONTENT**:
+rebuild with the shared options into a tmpdir and diff the bytes. Any change to any input changes
+the output and nothing else does. That rebuild is an *oracle for currency*, not a substitute for
+the artifact — the shipped file is still the thing that gets spawned.
+
+⚠️ **A byte comparison also tells you when a mutation was INVALID, and this matters for the bar.**
+Two obvious-looking mutations of that guard left it green and were both correct to: a comment-only
+edit, and adding an unused export (tree-shaken). Neither changes the artifact, so the bundle really
+was current. Only a *reachable semantic* change reddens it. "The test stayed green" is a finding
+about your mutation before it is a finding about the test.
+
+⚠️ **A currency guard on a gitignored artifact taxes every clone, so say so where they read it.**
+This one reddens `verify` on any clone that has ever packaged, whenever the MCP source changes —
+including a change that arrives via `git merge` rather than one the session made. That was accepted
+deliberately (owner, 2026-09-09) because the failure it prevents is silent and reaches real users,
+and it is announced in `CLAUDE.md` § Tests rather than left to be discovered as a mystery red. The
+fix is always `npm run build:electron`. If you add a guard of this shape, budget for the same
+announcement — a gate that fails for reasons the reader cannot place gets disabled, not obeyed.
+
+⚠️ **Know which runs your guard is actually live on.** `dist/` is gitignored and CI never runs
+`build:electron`, so both shipped-artifact cases skip on every CI run — they are a
+developer-machine guard, not a CI gate. Say that in the suite rather than letting the coverage be
+overread; what actually stops a stale bundle shipping is that every packaging path re-runs the
+builder.
+
+⚠️ **What a text scan of a build script CANNOT tell you** is whether the artifact works — only that
+the code says it will check. Where a hook is context-driven (`copy-three-addons`'s `appOutDir` /
+`projectDir`) drive the real hook against a staged tree in a tmpdir. Where it writes to a fixed
+repo path (the stagers' module-level `BIN_DIR`), a unit test would write into the checkout, so the
+end-to-end claim belongs to `verify:packaged` and stays open until a pack fixture exists. Say which
+half you covered.
+
+#### (C1) The MUTATION CHECK drives the wrong copy — a worktree's symlinked `node_modules`
+
+Every instance above is a *test* running the wrong copy. This one is worse, because it corrupts the
+thing that validates every other entry in this file: **a mutation check run from a git worktree can
+report a false green.**
+
+A worktree created by `Agent(isolation: "worktree")` gets its `node_modules` as a symlink, so
+`node_modules/@modoki/engine -> ../../engine/packages/modoki` resolves **back into the parent
+clone**. Mutate `engine/packages/modoki/tests/helpers/<x>.ts` inside the worktree, run a suite that
+imports it through the `@modoki/engine/...` specifier, and the suite loads the PARENT's unmutated
+file. The mutation is real, the run is real, and the green is meaningless.
+
+⚠️ **It fails in the safe-looking direction, which is why it is dangerous.** A false RED would be
+investigated. A false green reads as "the mechanism is pinned" and retires the question.
+
+Found 2026-09-12, reviewing #1119's label budget: a reviewer's first pass at mutating
+`tests/helpers/authoredTextBudget.ts` appeared not to reach the wordweave suite at all, and every
+helper-level finding had to be re-derived after rebuilding the link inside the worktree.
+
+**So: before trusting any mutation check of a file imported through a package specifier, establish
+which copy the suite loaded** — point the worktree's link inside itself, or run the check in the
+clone. Two shapes are affected and one is not: a change under `engine/packages/modoki/**` imported
+as `@modoki/engine/...` is exposed, a change to a test file the suite loads by relative path is not.
+This is also the one case where "I ran the mutation and it stayed green" should make you check the
+setup before concluding the test is vacuous — the usual inference runs the other way.
+
+### Shape (D): the STUB or FAKE is more capable than the thing it stands in for
+
+Shapes (A)-(C) are about how many instances a suite builds, and which copy it runs. This one is
+about the **boundary** it replaces: a double that accepts inputs production rejects, or performs
+behaviour the real dependency lacks, lets the test explore a region **production cannot reach** —
+and everything asserted about that region is about the double.
+
+Two surfaces, one mechanism, and they are easy to read as unrelated:
+
+- **A stub that ACCEPTS more.** `editorActionRouter.test.ts` stubbed `resolveAssetPath` as the
+  identity function. Production resolves only paths under an asset root's `urlPrefix`, so a native
+  absolute path 404s and never reaches the staleness gate; through the identity stub it sailed
+  through. The fixtures duly built paths with `path.join(os.tmpdir(), …)` — a shape production never
+  produces — and the case was green on macOS (`/var/folders/…` survives the route's
+  `startsWith('/') ? p : '/' + p`) and red on Windows (`E:\…` becomes `/E:\…` and matches nothing).
+- **A fake that DOES more.** The mirror image, already in this repo's practice: a fake modelling
+  behaviour the real dependency does not have makes the guard defend the bug.
+
+⚠️ **The tempting fix is to widen PRODUCTION so the test's input works**, and it is wrong. Here that
+was one line — teach the normaliser about `path.isAbsolute` — measured as a **no-op on POSIX**, so
+it would have passed every check either platform could run and looked entirely safe. It would have
+widened production to serve a path production cannot produce. **Fix the double, not the subject.**
+
+**The rule: a double must be no more permissive, and no more capable, than what it replaces.** When
+one is, the honest question is not "why does this fail on platform X" but "what is this test
+actually exercising".
+
+⚠️ Windows merely EXPOSED this one, because that is where the two path spellings differ. Do not
+read it as a Windows lesson — `docs/windows.md` § Paths carries the platform instance and links
+here for the general shape.
+
+⚠️ **Not the same as Shape (E) below, and the remedies do not transfer.** (D) is a double that can
+DO more than production; (E) is two sides of a comparison that MOVE together. A test can have both,
+and making a double faithful does nothing for a dependent comparison.
+
+### Shape (E): the two sides of the comparison SHARE A SOURCE
+
+Shape (D) is about a double that can DO more than production. This one is narrower and commoner:
+both sides of an assertion derive from the same thing, so **a fault in that thing moves both and the
+comparison cannot express it**. Neither side need be unfaithful; they need only be dependent.
+
+**Trigger — apply this when the EXPECTATION is COMPUTED rather than WRITTEN.** A literal expectation
+cannot share a source with the subject; a computed one might, and that is the whole population. The
+test is mechanical and cheap, and it selects every instance below while excluding almost everything
+else in a suite. Do not run the procedure on every assertion — a bar people skip is worse than no
+bar, because the next reviewer assumes it was applied.
+
+Three instances, one mechanism (all 2026-09-09, all in one session, which is how the family was
+noticed):
+
+| instance | the shared source |
+|---|---|
+| `linkFixtureGuard`'s `${realTmp}-alias` | fixture and expectation built off the same base, so an unanchored `startsWith` passed under the very mutation the case existed to catch |
+| `cleanPackagedCacheLinkGuard`'s exemption case | script and fixture both call `appSupportRoot()`, so a WRONG platform rule moves both and the case stays green |
+| an `appSupportRoot` assertion authored through a bash heredoc | argument and expectation mangled identically by the transport (`'C:\\U…'` → `'C:\U…'`), so the case passed on a corrupted value |
+
+⚠️ **The mutation bar INVERTS here, and this is the useful part.** For an ordinary mechanism, mutate
+it and expect RED; a green is a test gap. For a shared source, **GREEN is the diagnostic** — it says
+the two sides moved together, so the comparison is blind to a fault in that source. The procedure:
+
+```
+0. confirm the mutation actually MOVES the shared value   <- else the green means nothing
+1. mutate the shared source
+2. RED   -> the two sides are independent; done
+   GREEN -> Shape (E): the comparison cannot see that source
+3. demand an INDEPENDENT pin elsewhere
+4. no such pin exists -> that is the gap
+```
+
+⚠️ **Step 0 is not optional, and the platform case makes it easy to skip.** A green also results when
+the mutation never changed the value the test uses — mutate `appSupportRoot`'s **darwin** branch while
+running on Windows and you get a worthless green, then go hunting for a pin against a source the test
+never consumes. It is this file's own positive-control rule aimed at the mutation. **The cheap form
+for a platform rule: mutate the branch you are standing on.** (Measured: mutating the *win32* branch
+on Windows, with `APPDATA` set by the fixture's sandbox, is a real green and real evidence.)
+
+**Step 3's independent pin, and where it must NOT come from.** Three forms that work — a literal that
+IS the specification (`packagedAppPaths.test.ts`'s per-platform `appSupportRoot` cases; legitimate
+for the same reason a golden file is), an anchor off a *different* base (the `path.sep`-anchored
+`startsWith`), or a **read-back** that observes what actually landed (author via argv, then read the
+file). ⚠️ It must not come from **the same generator**: a literal typed by the script that wrote the
+value, or a read-back through the same mangling transport, is the shared source with an extra step —
+and that is how a Shape (E) fix quietly becomes another Shape (E).
+
+**A fourth instance, and the purest — because nothing was TRANSFORMED.** A gate log showed
+`[FAIL]` on both lanes and `REAL_EXIT=0` beneath it, which reads exactly like a runner lying about
+its status. Two runs were writing to one file: an earlier run, killed for memory, whose children
+were still alive, and the real one. Both lines were **correct about their own run**; they were false
+only when read as one document. The other three instances each involved a mangled value —
+truncated, wrapped, collapsed — and can be dismissed as "be careful with pipes". This one has no
+transformation at all, which is why it is the version to cite.
+
+Its remedy is also the most reusable: **assert the artifact has exactly ONE summary.** That works
+because it does not check the values at all — it checks that **the reading has one source**, which
+is the property actually in question, and it generalises to any accumulating artifact two producers
+can reach. (A timestamp check is the tempting alternative and a worse one: it compares values that
+both producers can legitimately write.) Name each run's artifact uniquely and stamp the identity
+INSIDE it — `verify-<sha>-<time>.log`, with the sha written into the file — so a shared file is
+detectable rather than silently plausible.
+
+**The fix for Shape (E) is to make one side a written literal; the trigger for Shape (E) is that
+neither side is.**
+
+⚠️ Related to Shape (D) but **not** foldable into it: (D)'s remedy is *make the double faithful*,
+which does nothing here, where both sides may be perfectly faithful and merely dependent. A shape
+whose remedy applies to half its instances is worse than two shapes.
+
+### Shape (F): the EXEMPTION is keyed coarser than the ban it pardons (#1123)
+
+A guard bans a per-occurrence pattern and pardons per FILE, so the row's scope is every occurrence
+that file will ever contain rather than the one its `reason` argues for. The guard then cannot fail on
+the thing it was written to catch, and no green run can show it — the mutation check is the only
+instrument that sees it, and **the mutation has to ADD a second occurrence to an exempt file**, not
+delete the only one. Deleting exercises the staleness arm instead, which is why this survived 16
+guards.
+
+Measured across 16 guards; 9 already had an exempt file holding more than its reason covered. The rule,
+the shared helper (`assertExemptionLedger`) and the four arms it enforces live in
+[verify-and-ci.md](verify-and-ci.md) § "Exemption GRAIN" — not restated here, because this page owns
+the FALSIFIABILITY framing and that one owns the guard conventions.
+
+⚠️ Related but distinct, and bending one fix across both serves neither: a guard with no non-vacuity
+FLOOR (Shape G, below) has a fine population and greens on zero inputs, and a guard whose SCOPE is
+narrower than its claim (#830, #1124) never reaches the population at all.
+
+### Shape (G): the scan asserts no offences, and never that its MATCHER found anything (#1105)
+
+A corpus scan collects offences and ends in `expect(offences).toEqual([])`. A regex that stops
+matching produces the same empty list as a clean repo. A `repoFiles({ floor })` or a
+`toContain(file)` check does not close this: those prove the FILES were enumerated, not that the
+matcher yielded anything inside them. The first census found fifteen scans across ten files in this
+shape. Its close-out sweep found eight more inside larger test files that already had a floor
+somewhere, because a floor on one `it` covers nothing in the next. So census per `it`, not per file.
+Which fix applies depends on whether a clean corpus has any positive yield:
+
+- **The matcher has a legitimate yield** (citations, command blocks, `pkill` patterns, temp paths).
+  Count what the matcher returned and floor that count inline:
+  `expect(n, '<what> found — fix the matcher, do not delete this assertion').toBeGreaterThan(N)`.
+  Count AFTER any `continue` that sits between the match and the check, so a skip that eats
+  everything is caught too. Size `N` under the **public snapshot** wherever the scan runs there.
+  The snapshot has no `.claude/skills` or `games/`, and ships no demos or a two-demo subset (see
+  [verify-and-ci.md](verify-and-ci.md) on sizing floors to the snapshot). `cliToolchainRecipes`
+  counts 458 shell blocks on a clone but roughly 120 in the snapshot's markdown, so its floor is 50.
+- **A clean corpus yields ZERO** (a banned pattern: `BANNED`, the basename-reap rule, the
+  Windows `-like` predicate, a chained geometry destroy). A floor here is impossible, because a
+  correct run yields zero too. Put the matcher in ONE constant or function, and pin it with an
+  accept/reject self-test built from the shipped defect string. `uiLengthFallback` already had
+  this shape. `winProcessPredicates` only looked like it: its detection test carried its OWN copy
+  of the regex, so an edit to the sweep's copy left the test pinning a regex nothing ran.
+- **A completeness check skips the real instances before testing them.**
+  `packagedLaunchIsolation` skipped every listed launcher and then asked the detector about the
+  rest, so the detector never ran on a real launch. The positive control is the skipped set
+  itself: every listed launcher must read as a launch.
+- **An unparsed input is skipped instead of counted.** `buildTargetFloor`'s `if (m && …)` and
+  `deviceAppIdentity`'s bare `catch {}` both skipped input they failed to read. Report the
+  failure as an offence, and swallow only the absence the comment actually names. Converting the
+  parse failure is NOT enough on its own. `buildTargetFloor` skipped on `existsSync` BEFORE the
+  parse, so renaming the `CapApp-SPM` path segment still skipped every project and passed. The
+  review caught it by mutation, and the file now floors the count of files it parsed too.
+- **The yield is real but tiny.** Don't floor a population of one. The skills carry exactly ONE
+  `§`-heading citation, so a floor there goes red when a skill is edited, and its message blames
+  the matcher for it. Pin the regex with a self-test instead. Where a small floor is kept
+  deliberately (`reapScoping`'s 2 and 1, all in one script), its message names the other way it
+  can go red.
+- **A `> 0` floor only catches a TOTAL wipe-out.** A second review broke part of each matcher
+  and both floors stayed green. Deleting the array branch of `assetRefIntegrity`'s `stringValues`
+  cut 27,600 strings to about 2,400, blinding the scan to every entity's trait refs, and `> 0` passed.
+  In `sceneGuidUniqueness`, breaking the dominant `EntityAttributes.guid` read left 29 guids from the
+  top-level fallback, enough to hold a combined total above zero. Size the floor to the corpus, gated on
+  the private tree where it lives. When a read has a fallback, floor each path separately.
+
+The mutation bar applies to the floor itself. The #1105 pass broke each of the fifteen matchers
+once, then the eight from the close-out sweep and the three review fixes. Each time, exactly the
+intended test went red. The one exception was the geometry anchor mutation, which also reddened
+the corpus sweep that runs the same matcher.
+
+⚠️ **Check that a real-corpus control finds something before relying on it.** The first idea for
+`geometryRelease` was to count the helper's own sanctioned `destroy(true)` as a real-corpus
+instance. It counted **0**: the helper's parameter is named `g`, which the name-based matcher
+deliberately ignores, so the `inHelper` exemption exempts nothing today. Assuming the control
+matched would have added a floor that could never pass.
+
+### Shape (H): an ABSENT subject reads as a position (#1181)
+
+`expect(s.indexOf(a)).toBeLessThan(s.indexOf(b))` looks like it checks that `a` comes before `b`.
+But `indexOf` returns `-1` for a missing needle, and `-1` is less than every real position. So the
+assertion also passes when `a` never appeared. `userDataDir.test.ts` did exactly this: its guard for
+#1036 compared a formatter-wrapped `app.setPath(`, the left side read `-1`, and the check passed with
+its subject gone. The hole sits on whichever side should be SMALLER:
+
+- the actual of `toBeLessThan[OrEqual]`, and the expected of `toBeGreaterThan[OrEqual]`;
+- `.not` swaps the two sides;
+- binding the position first (`const at = src.indexOf(x)`) carries the `-1` into every later
+  comparison;
+- a constant bound is no protection: `expect(banner.indexOf(X)).toBeLessThan(8)` passes on `-1`.
+
+The same holds for `lastIndexOf`, `findIndex`, `findLastIndex` and `search`, and for the boolean
+spelling `expect(a < b).toBe(true)`.
+
+**The census was 114 comparisons in 54 files, not the 21 the issue was filed with** — 102 converted,
+and 12 in the four files `IN_FLIGHT_1179` pardons (below). A regex count
+missed the mirror form, the variable-bound form (the majority), and every `expect(` a formatter had
+wrapped across lines. The guard's first cut missed two more: it read only the ordering matchers, and
+it prefiltered files by those matcher names. So `geometryRelease`'s boolean
+`expect(body.indexOf('.unload(') < body.indexOf('.destroy(')).toBe(true)` was never parsed — and
+that one was live. Its presence checks were whitespace-tolerant regexes, so a
+`g.destroy(true); g.unload ();` order left it green 8/8 (close-out review, by mutation). A re-review
+then found six more: comparisons inside `&&`/`!` (`renderFrameFlushOrdering`'s inline
+`idx >= 0 && idx < other` pins, and `iapParkedCallRelease`'s `lineOf` conjunct), and a same-file
+`const idx = (p) => list.findIndex(p)` helper (`chromeLetterbox`, live: a missing Canvas2D entity
+passed). About half the sites already carried a
+separate presence pin (`toBeGreaterThan(-1)`, `toContain(needle)`), so they were not vacuous today.
+
+⚠️ **The position's pattern must match at least as broadly as the presence check — and as broadly as
+the ORDERING question.** `geometryRelease` proved presence with `/\.unload\s*\(\s*\)/` and ordered
+with `indexOf('.unload(')`, which disagree on a single space. The first repair then ordered against
+`/\.destroy\s*\(\s*true\s*\)/` because that was the presence pattern — and a bare `destroy()` placed
+ahead of `unload()` passed, where the old `indexOf('.destroy(')` had caught it (re-review, by
+mutation). Presence asks "is `destroy(true)` there?"; the order asks "does ANY destroy come first?",
+so the position comes from `/\.destroy\s*\(/`.
+
+**The fix is where the index is PRODUCED, not a pin beside the comparison.** Import from
+`@modoki/engine/testing/inOrder` (package tests: `../helpers/inOrder`):
+
+- `expectInOrder(haystack, [a, b, c], label)`. Every needle must be present, and a missing one is
+  reported by name before any position is compared. Then their first occurrences must strictly
+  increase. Use it for needles searched from the start of a string or list.
+- `found(index, what)`. It throws naming `what` for any negative or non-integer index, and otherwise
+  returns the index. Use it for a position computed any other way: a `from` offset, `lastIndexOf`,
+  a predicate `findIndex`, a regex `search`. For example,
+  `const at = found(src.indexOf('x(', start), 'x( after start')`.
+
+⚠️ **A presence pin does NOT satisfy the guard, on purpose** (owner, 2026-09-14). "Does the
+`toBeGreaterThan(-1)` three lines up pin THIS operand?" is an adjunct question. A pin on a re-bound
+variable, or on the same needle in a different haystack, reads identically, and an adjunct pardon is
+the kind that fails open ([verify-and-ci.md](verify-and-ci.md) § Exemption GRAIN). So every site
+migrated, including the already-pinned half, and the separate pin lines were deleted.
+
+`engine/tests/architecture/indexOrderingAssertions.test.ts` enforces this over every test file,
+on the AST: the four ordering matchers, and a relational comparison under
+`toBe`/`toEqual`/`toStrictEqual(true|false)`, `toBeTruthy` or `toBeFalsy`. It parses every test
+file with no content prefilter, because a prefilter that skips too much is invisible once the tree
+is clean. It does **not** cover:
+
+- ordering outside an `expect` (`if (a < b)`, `assert(a < b)`, a detector's own arithmetic);
+- a position returned by an IMPORTED helper, or by a same-file helper whose body is anything but a
+  concise expression or exactly one `return` statement (`{ const i = s.indexOf(n); return i; }` is
+  not followed) — a same-file `const idx = (p) => list.findIndex(p)` IS followed (`chromeLetterbox`);
+- a position that travels through anything but a plain `const`/`let` initialiser: destructuring
+  (`const [a, b] = [s.indexOf(x), s.indexOf(y)]`), an element of a `.map(n => s.indexOf(n))` array, a
+  later reassignment (`let r = 0; r = s.indexOf(x)`), an object property or method (`o.at`,
+  `h.idx(x)`), a pass-through call (`wrap(s.indexOf(x))`, `Math.min(s.indexOf(x), 9)`). A full
+  tracing probe over the real tree found no live site of any of these (re-review, 2026-09-14);
+- a comparison inside a disjunction asserted true, or a conjunction asserted false — neither asserts
+  any single comparison. A conjunct asserted true (`idx >= 0 && idx < other`), a disjunct asserted
+  false, and `!` are followed, which is what caught `renderFrameFlushOrdering`'s inline pins;
+- arithmetic on a raw index (`src.indexOf(x) + 1` reads `0` when absent).
+
+⚠️ **An ABSENCE check is refused too if it is spelled as an ordering** — `expect(s.indexOf(x)).toBeLessThan(0)`
+reads exactly like the vacuous shape. Spell absence as `expect(s.indexOf(x)).toBe(-1)` or
+`expect(s).not.toContain(x)`; `found()` is for positions that must exist.
+
+Its `IN_FLIGHT_1179` rows pardon four files that #1179 was rewriting on another branch at the time.
 
 ## Gotchas
 

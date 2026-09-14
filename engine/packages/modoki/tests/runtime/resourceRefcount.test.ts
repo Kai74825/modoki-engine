@@ -96,6 +96,12 @@ const GUIDS: Record<string, { guid: string; type: 'material' | 'mesh' | 'model' 
   '/entry-percent.prefab.json': { guid: '10000000-0000-4000-8000-000000000033', type: 'prefab' },
   '/entry-nounit.prefab.json': { guid: '10000000-0000-4000-8000-000000000034', type: 'prefab' },
   '/entry-px.prefab.json': { guid: '10000000-0000-4000-8000-000000000035', type: 'prefab' },
+  '/entry-notraits.prefab.json': { guid: '10000000-0000-4000-8000-000000000036', type: 'prefab' },
+  '/entry-child.prefab.json': { guid: '10000000-0000-4000-8000-000000000037', type: 'prefab' },
+  '/entry-nested.prefab.json': { guid: '10000000-0000-4000-8000-000000000038', type: 'prefab' },
+  '/entry-nested2.prefab.json': { guid: '10000000-0000-4000-8000-000000000039', type: 'prefab' },
+  '/entry-vh.prefab.json': { guid: '10000000-0000-4000-8000-00000000003a', type: 'prefab' },
+  '/entry-vh0.prefab.json': { guid: '10000000-0000-4000-8000-00000000003b', type: 'prefab' },
   '/env/sky.hdr':      { guid: '10000000-0000-4000-8000-000000000040', type: 'environment' },
 };
 const G = (path: string) => GUIDS[path].guid;
@@ -125,6 +131,27 @@ const fetchResponses: Record<string, any> = {
     entities: [{ localId: 1, name: 'Root', traits: { UIElement: { width: 50, height: 80 } } }] },
   '/entry-px.prefab.json': { version: 1, name: 'entry-px', rootLocalId: 1,
     entities: [{ localId: 1, name: 'Root', traits: { UIElement: { width: 120, widthUnit: 'px', height: 240, heightUnit: 'px' } } }] },
+  // A cached prefab whose root row carries NO traits at all — the case that separates "not cached"
+  // from "cached with nothing on it" (#1026 review F5).
+  '/entry-notraits.prefab.json': { version: 1, name: 'entry-notraits', rootLocalId: 1,
+    entities: [{ localId: 1, name: 'Root' }] },
+  // #1031 fixtures — an entry prefab whose ROOT row is a nested-instance reference. The child's root
+  // authors the size; the reference row overrides one axis. `entry-nested2` nests THAT prefab again
+  // and overrides the same field, so the outer layer has to win. Refs are GUIDs, as on disk.
+  '/entry-child.prefab.json': { version: 2, name: 'entry-child', rootLocalId: 1,
+    entities: [{ localId: 1, name: 'Root', traits: { UIElement: { width: 30, widthUnit: '%', height: 10, heightUnit: 'px' } } }] },
+  '/entry-nested.prefab.json': { version: 2, name: 'entry-nested', rootLocalId: 1,
+    entities: [{ localId: 1, name: 'Ref', prefab: '10000000-0000-4000-8000-000000000037',
+      traits: { EntityAttributes: { name: 'Ref', parentId: 0 } }, overrides: { 1: { UIElement: { height: 50 } } } }] },
+  '/entry-nested2.prefab.json': { version: 2, name: 'entry-nested2', rootLocalId: 1,
+    entities: [{ localId: 1, name: 'Ref2', prefab: '10000000-0000-4000-8000-000000000038',
+      traits: { EntityAttributes: { name: 'Ref2', parentId: 0 } }, overrides: { 1: { UIElement: { height: 70 } } } }] },
+  // #840 fixture — a root sized in a VIEWPORT unit on one axis, which the pool refuses (owner decision).
+  '/entry-vh.prefab.json': { version: 2, name: 'entry-vh', rootLocalId: 1,
+    entities: [{ localId: 1, name: 'Root', traits: { UIElement: { width: 100, widthUnit: '%', height: 50, heightUnit: 'vh' } } }] },
+  // ...and its zero twin: a viewport unit picked while the size is 0, which a save leaves as a bare unit key.
+  '/entry-vh0.prefab.json': { version: 2, name: 'entry-vh0', rootLocalId: 1,
+    entities: [{ localId: 1, name: 'Root', traits: { UIElement: { heightUnit: 'vh' } } }] },
   '/unknown.mat.json': { type: 'totally-bogus-material-type', color: 0x123456 },
   // '/bad.mat.json' intentionally absent → fetch returns ok:false (404 path).
 };
@@ -433,6 +460,128 @@ describe('refcount cache — prefab', () => {
       expect(entryPrefabProvider.rootSize(G('/entry-px.prefab.json')))
         .toEqual({ width: 120, widthUnit: 'px', height: 240, heightUnit: 'px' });
     });
+
+    /** #1026 — `rootAuthoredUI` against the REAL cache, for the same reason its sibling above
+     *  exists: this is the operand every pooled-row authoring warning now compares against, and a
+     *  fake provider cannot tell whether it reads the prefab root or something else entirely. The
+     *  two must resolve the SAME root (they share `rootTraits`), so a divergence here means the
+     *  size and the authoring answers have started describing different entities. */
+    it('returns the prefab root UIElement VERBATIM — units kept, nothing normalised (#1026)', async () => {
+      const { acquirePrefab } = await getCache();
+      const { entryPrefabProvider } = await import('../../src/runtime/loaders/entryPrefabProvider');
+      await acquirePrefab(1, G('/entry-percent.prefab.json'));
+      // ⚠️ Verbatim, NOT `rootSize`-shaped: the caller resolves an absent field against the
+      // TRAIT's schema default, so normalising here would hide which fields were authored at all.
+      expect(entryPrefabProvider.rootAuthoredUI(G('/entry-percent.prefab.json')))
+        .toEqual({ width: 50, widthUnit: '%', height: 80, heightUnit: '%' });
+    });
+
+    it('leaves an ABSENT unit key absent rather than defaulting it — that is the caller\'s job (#1026)', async () => {
+      const { acquirePrefab } = await getCache();
+      const { entryPrefabProvider } = await import('../../src/runtime/loaders/entryPrefabProvider');
+      await acquirePrefab(1, G('/entry-nounit.prefab.json'));
+      const ui = entryPrefabProvider.rootAuthoredUI(G('/entry-nounit.prefab.json'));
+      expect(ui).toEqual({ width: 50, height: 80 });
+      expect(ui).not.toHaveProperty('widthUnit');
+    });
+
+    it('is undefined for a prefab that is not cached — nothing pooled, nothing to warn about (#1026)', async () => {
+      const { entryPrefabProvider } = await import('../../src/runtime/loaders/entryPrefabProvider');
+      expect(entryPrefabProvider.rootAuthoredUI(G('/entry-px.prefab.json'))).toBeUndefined();
+    });
+
+    /** ⚠️ `rootTraits` returns `null` ONLY for the uncached case, and `{}` for a cached root with
+     *  no traits. Its docblock calls that load-bearing — `rootSize`'s two branches key on it — but
+     *  nothing held it: changing `root.traits ?? {}` to `?? null` left the whole suite green
+     *  (measured, #1026 review F5). These two cases are the difference, and they are the ONLY
+     *  observable one, so without them the invariant is prose. */
+    it('tells "not cached" apart from "cached with no traits" — px vs % on the empty root (#1026)', async () => {
+      const { acquirePrefab } = await getCache();
+      const { entryPrefabProvider } = await import('../../src/runtime/loaders/entryPrefabProvider');
+      // Not cached: no authored unit exists to report, so `px` is the honest label.
+      expect(entryPrefabProvider.rootSize(G('/entry-notraits.prefab.json')))
+        .toEqual({ width: 0, widthUnit: 'px', height: 0, heightUnit: 'px' });
+
+      await acquirePrefab(1, G('/entry-notraits.prefab.json'));
+      // Cached with an empty root: there IS a root, and an absent unit key means `%` (the
+      // UIElement default a save strips) — the same rule `rootUnit` applies everywhere else.
+      expect(entryPrefabProvider.rootSize(G('/entry-notraits.prefab.json')))
+        .toEqual({ width: 0, widthUnit: '%', height: 0, heightUnit: '%' });
+      expect(entryPrefabProvider.rootAuthoredUI(G('/entry-notraits.prefab.json'))).toBeUndefined();
+    });
+
+    /** #1031 — a NESTED-INSTANCE root, through the REAL cache. The root row carries only
+     *  `EntityAttributes`; the size lives in the child prefab's root plus the row's override. Reading
+     *  the row's own traits (the pre-#1031 resolution) answered a 0 size and no authored record.
+     *
+     *  ⚠️ The registry is populated here on purpose. The override filter is the SPAWNER's
+     *  (`isPersistentTraitField` via the registry), and this suite otherwise registers no trait at
+     *  all — so without it every override is refused, which is the conservative answer but not the
+     *  production one. */
+    const registerUIElement = async () => {
+      const { registerTrait } = await import('../../src/runtime/core/ecs/traitRegistry');
+      const { UIElement } = await import('../../src/runtime/traits/UIElement');
+      registerTrait({ name: 'UIElement', trait: UIElement, category: 'component', fields: {} });
+    };
+
+    it('a NESTED-INSTANCE root reads the child root plus the reference row\'s override (#1031)', async () => {
+      await registerUIElement();
+      const { acquirePrefab } = await getCache();
+      const { entryPrefabProvider } = await import('../../src/runtime/loaders/entryPrefabProvider');
+      await acquirePrefab(1, G('/entry-child.prefab.json'));
+      await acquirePrefab(1, G('/entry-nested.prefab.json'));
+      expect(entryPrefabProvider.rootSize(G('/entry-nested.prefab.json')))
+        .toEqual({ width: 30, widthUnit: '%', height: 50, heightUnit: 'px' });
+      expect(entryPrefabProvider.rootAuthoredUI(G('/entry-nested.prefab.json')))
+        .toEqual({ width: 30, widthUnit: '%', height: 50, heightUnit: 'px' });
+      expect(entryPrefabProvider.isCached(G('/entry-nested.prefab.json'))).toBe(true);
+    });
+
+    it('two nested levels: the OUTER reference row\'s override wins (#1031)', async () => {
+      await registerUIElement();
+      const { acquirePrefab } = await getCache();
+      const { entryPrefabProvider } = await import('../../src/runtime/loaders/entryPrefabProvider');
+      await acquirePrefab(1, G('/entry-child.prefab.json'));
+      await acquirePrefab(1, G('/entry-nested.prefab.json'));
+      await acquirePrefab(1, G('/entry-nested2.prefab.json'));
+      expect(entryPrefabProvider.rootSize(G('/entry-nested2.prefab.json')))
+        .toEqual({ width: 30, widthUnit: '%', height: 70, heightUnit: 'px' });
+    });
+
+    it('a nested root whose CHILD is not cached is not cached itself — spawnInstance would return 0 (#1031)', async () => {
+      const { acquirePrefab } = await getCache();
+      const { entryPrefabProvider } = await import('../../src/runtime/loaders/entryPrefabProvider');
+      await acquirePrefab(1, G('/entry-nested.prefab.json'));
+      expect(entryPrefabProvider.isCached(G('/entry-nested.prefab.json')), 'the parent file alone cannot spawn a root').toBe(false);
+      expect(entryPrefabProvider.rootSize(G('/entry-nested.prefab.json')))
+        .toEqual({ width: 0, widthUnit: 'px', height: 0, heightUnit: 'px' });
+      expect(entryPrefabProvider.rootAuthoredUI(G('/entry-nested.prefab.json'))).toBeUndefined();
+
+      await acquirePrefab(1, G('/entry-child.prefab.json'));
+      expect(entryPrefabProvider.isCached(G('/entry-nested.prefab.json')), 'and becomes spawnable once the child arrives').toBe(true);
+    });
+
+    /** #840 (owner decision: refuse) — a pooled row resolves the prefab root's size against the SCROLL
+     *  VIEW, so a viewport unit has no honest answer. It used to be folded into `%` (`50vh` became 50%
+     *  of the view); now that axis reads 0 and the refused unit is named, while the other axis is
+     *  untouched. */
+    it('REFUSES a viewport-unit axis — 0, with the unit named — and leaves the other axis alone (#840)', async () => {
+      const { acquirePrefab } = await getCache();
+      const { entryPrefabProvider } = await import('../../src/runtime/loaders/entryPrefabProvider');
+      await acquirePrefab(1, G('/entry-vh.prefab.json'));
+      const size = entryPrefabProvider.rootSize(G('/entry-vh.prefab.json'));
+      expect(size).toEqual({ width: 100, widthUnit: '%', height: 0, heightUnit: 'px', refusedHeightUnit: 'vh' });
+      expect(size, 'a supported axis carries no refusal').not.toHaveProperty('refusedWidthUnit');
+    });
+
+    it('does NOT refuse a ZERO authored in a viewport unit - 0 is no size in any unit, and the validator is silent on it (#840)', async () => {
+      const { acquirePrefab } = await getCache();
+      const { entryPrefabProvider } = await import('../../src/runtime/loaders/entryPrefabProvider');
+      await acquirePrefab(1, G('/entry-vh0.prefab.json'));
+      const size = entryPrefabProvider.rootSize(G('/entry-vh0.prefab.json'));
+      expect(size, 'no refusal to warn about').not.toHaveProperty('refusedHeightUnit');
+      expect(size).toEqual({ width: 0, widthUnit: '%', height: 0, heightUnit: 'px' });
+    });
   });
 });
 
@@ -731,7 +880,7 @@ describe('re-import-mid-scene transitive snapshot (Missing Test #3)', () => {
     expect(stats.materials['/m1.mat.json']).toBe(1);
 
     // Simulate a mid-scene re-import: invalidateModel evicts the mesh-asset cache
-    // entry that references the model (meshTemplateCache.ts:372-376). The owner
+    // entry that references the model (`invalidateModel`'s meshAssetCache loop). The owner
     // refcounts are untouched — only the cached data is dropped.
     invalidateModel('/island.glb');
 

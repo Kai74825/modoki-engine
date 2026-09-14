@@ -1,6 +1,8 @@
 /** Prefab system — save, load, and instantiate prefab entity trees. */
 
+import { useEditorStore } from '../store/editorStore';
 import { getCurrentWorld, spawnEntity, findEntityByGuid, indexEntityGuid } from '../../runtime/core/ecs/world';
+import { hasDocKey, putOwn } from '../../runtime/core/docKeys';
 import { validatePrefabData, REF_FIELDS_BY_TRAIT } from '../../runtime/loaders/sceneValidation';
 import { postWriteFile, jsonFileBody } from '../backend/editorBackend';
 import { getAllTraits, getTraitByName, type TraitMeta } from '../../runtime/core/ecs/traitRegistry';
@@ -425,7 +427,11 @@ export function mergeRiggedPrefab(fresh: PrefabFile, existing: PrefabFile): Pref
     if (match) {
       // Preserve user-added traits the import doesn't emit (Animator, BoneAttachment…).
       for (const [tname, tdata] of Object.entries(match.traits)) {
-        if (!(tname in traits)) traits[tname] = tdata;
+        // ⚠️ `hasDocKey`/`putOwn` (#986). `tname` is a trait name from the EXISTING prefab JSON and
+        // `traits` is a spread of the fresh one, so a trait named after an Object.prototype member
+        // read as already-present and the user's preserved trait was DROPPED on re-import — a
+        // silent data loss, which is what this loop exists to prevent.
+        if (!hasDocKey(traits, tname)) putOwn(traits, tname, tdata);
       }
     }
     return { ...pe, localId: freshRemap.get(pe.localId)!, traits };
@@ -618,7 +624,8 @@ export function instantiatePrefab(
     }
 
     const entity = spawnEntity(getCurrentWorld(), ...traitArgs);
-    clearOverrideMarks(entity.id()); // fresh member — drop stale marks on a reused id
+    // Still needed with the packed key: the 8-bit generation wraps (overrideMarks.ts).
+    clearOverrideMarks(entity);
     localToEcs.set(pe.localId, entity.id());
     ownMemberIds.push(entity.id());
   }
@@ -694,13 +701,21 @@ const prefabCache = new Map<string, PrefabFile>();
  *  the original ref so guid + path callers don't fetch twice. */
 export async function getPrefabSource(source: string): Promise<PrefabFile | null> {
   if (prefabCache.has(source)) return prefabCache.get(source)!;
+  const prefab = await fetchPrefabSource(source);
+  if (prefab) prefabCache.set(source, prefab);
+  return prefab;
+}
+
+/** Read a prefab file from disk, uncached — `getPrefabSource`'s fetch half, shared with
+ *  `refreshPrefabSourceForPath`. */
+async function fetchPrefabSource(source: string, init?: RequestInit): Promise<PrefabFile | null> {
   // Normally a GUID (resolve via manifest). A freshly-instantiated instance can
   // still carry a path before its owning scene is saved + normalized; resolveRef
   // rejects internal asset paths loudly, so fetch a path ref directly instead.
   const url = isGuid(source) ? resolveRef(source) : assetUrl(source);
   if (!url) return null;
   try {
-    const res = await fetch(url);
+    const res = await fetch(url, init);
     if (!res.ok) return null;
     const prefab: PrefabFile = await res.json();
     // Prefabs carry no migration chain at all — PREFAB_FORMAT_VERSION is a writer-only stamp
@@ -711,10 +726,43 @@ export async function getPrefabSource(source: string): Promise<PrefabFile | null
     // nestedOverrides paths too (including this prefab FILE's own nested rows), not just
     // entry.traits.
     for (const entry of prefab.entities) migrateUIAnchorZIndexStructured(entry);
-    prefabCache.set(source, prefab);
     if (prefab.id) registerAsset(prefab.id, url, 'prefab');
     return prefab;
   } catch { return null; }
+}
+
+/** Re-read the cached copy of a prefab whose FILE changed on disk from outside the editor (#1169).
+ *  `setPrefabCache` covers the editor's own writes; this covers a hand edit or a `git checkout`,
+ *  which reach the editor only as a watcher event (`agentBridge.ts` `handleSceneChanged`). Without
+ *  it the reload rebuilds instances from the new file while override capture keeps diffing them
+ *  against this stale copy, and a trait or entity the new prefab added is saved as an override.
+ *
+ *  ⚠️ REFRESH, never delete (close-out review). This cache has SYNC readers that treat a miss as "not
+ *  a prefab": `serializePrefab` flattens a nested instance it cannot find, and a prefab-edit save
+ *  refuses once the edited prefab is gone from it. In prefab-edit mode no reload follows to fill a
+ *  hole, so a delete made the next save inline a nested prefab and report success. So the new file is
+ *  fetched FIRST and swapped in, and an unreadable file (a half-typed hand edit, a deletion) keeps the
+ *  old entry — dropping it would also make the NEXT event skip the key as cold, so the fixed file
+ *  would never be read. A key nobody has read is left cold rather than warmed.
+ *
+ *  Swapped only if nobody replaced the entry during the fetch: an Apply-to-Prefab landing then has
+ *  already put the newer content in (its own write never reaches the watcher), and two external
+ *  writes can race their refreshes. And the prefab OPEN in prefab-edit mode keeps its copy: the edit
+ *  world still holds the old content, so the save it diffs against must stay the one it opened —
+ *  refreshing it changes what that save does without the world ever showing the external version.
+ *
+ *  Keyed by whatever ref the caller used, a GUID normally and a path for a not-yet-normalized
+ *  instance, so both keys are refreshed. Does NOT touch the runtime cache: the watcher path evicts
+ *  that itself. */
+export async function refreshPrefabSourceForPath(path: string): Promise<void> {
+  const guid = getGuidForPath(path);
+  const editing = useEditorStore.getState().editingPrefab?.guid;
+  for (const key of guid ? [guid, path] : [path]) {
+    const before = prefabCache.get(key);
+    if (before === undefined || key === editing) continue;
+    const fresh = await fetchPrefabSource(key, { cache: 'no-store' });
+    if (fresh && prefabCache.get(key) === before) prefabCache.set(key, fresh);
+  }
 }
 
 /** Synchronous cache lookup — returns the prefab if already loaded, else null.
@@ -983,7 +1031,7 @@ export function captureInstanceOverrides(
     const currentTraits = collectComparableTraits(entity.id(), allTraits);
 
     const diffs = getOverrideValues(localId, currentTraits, prefab);
-    const markSet = getOverrideMarkSet(entity.id());
+    const markSet = getOverrideMarkSet(entity);
 
     // Mark-gate prefab-DEFINED field diffs. getOverrideValues reports every field
     // whose live value differs from the prefab base — but a divergence alone is NOT
@@ -1058,6 +1106,8 @@ export function applyOverridesByRootInstance(
       console.debug(`[Prefab] override skipped: no entity for localId ${localId} in instance ${rootInstanceId}`);
       continue;
     }
+    const member = findEntity(ecsId);
+    if (!member) continue;
     for (const [traitName, fields] of Object.entries(traitMap)) {
       const meta = getTraitByName(traitName);
       if (!meta) {
@@ -1068,7 +1118,7 @@ export function applyOverridesByRootInstance(
         // Added-tag override: ensure the tag is present on the instance. writeTraitField
         // adds the tag for a truthy value (field name is ignored for tags).
         writeTraitField(ecsId, meta, '', true);
-        markOverride(ecsId, traitName, '');
+        markOverride(member, traitName, '');
         continue;
       }
       // Accept any field the trait PERSISTS (its koota schema), so a re-apply keeps
@@ -1084,12 +1134,11 @@ export function applyOverridesByRootInstance(
         }
         known[field] = value;
       }
-      const entity = findEntity(ecsId);
-      if (!entity) continue;
+      const entity = member;
       if (!entity.has(meta.trait)) {
         // Added-trait override (root or child): the instance carries a trait the
         // prefab lacks at this localId. Add it whole so prefab refresh preserves it.
-        entity.add((meta.trait as (d: Record<string, unknown>) => unknown)(known));
+        entity.add(meta.trait(known));
       } else {
         for (const [field, value] of Object.entries(known)) {
           writeTraitField(ecsId, meta, field, value);
@@ -1097,7 +1146,7 @@ export function applyOverridesByRootInstance(
       }
       // Seed explicit marks from the override map so these fields survive a later
       // serialize even if the prefab base is edited to coincide with them.
-      for (const field of Object.keys(known)) markOverride(ecsId, traitName, field);
+      for (const field of Object.keys(known)) markOverride(member, traitName, field);
     }
   }
 }

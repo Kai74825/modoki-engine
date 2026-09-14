@@ -16,9 +16,9 @@ specifically, see [managers-and-systems.md](./managers-and-systems.md).
 | **Component** (Trait) | pure data on an entity | — | typed fields | `Transform`, `UIElement` |
 | **World** | the container of entities | — | all entities + their traits | the active scene's world |
 | **System** | per-frame `update(world)` | **yes** | nothing (transforms ECS) | `animationSystem`, `shipShakeSystem` |
-| **Projection** | mirrors a store into ECS | on change (or a tick) | nothing | `chessChatProjection` |
-| **Manager** | event-driven logic owner | **no** | long-lived state + methods | `SceneManager`, `ChessManager` |
-| **Store** | reactive state container | — | the data the UI renders | `useChessStore` |
+| **Projection** | mirrors a store into ECS | on change (or a tick) | nothing | `uiTreeProjection` |
+| **Manager** | event-driven logic owner | **no** | long-lived state + methods | `SceneManager`, `CameraManager` |
+| **Store** | reactive state container | — | the data the UI renders | `useGameStore` |
 | **Service** | SDK / platform wrapper | — | a connection/handle | `ads`, `audio` |
 | **Utility** | pure function | — | nothing | `anchorLayout`, `render2DUtils` |
 
@@ -47,18 +47,55 @@ rebuilt from a query every call and (b) **trusts an `entity.id()` lookup as "sti
 entity"** will hand a new entity the dead one's state. A `seen`-set sweep at the end of a pass is
 not a defence: a despawn+respawn landing BETWEEN two passes never gets one.
 
-Two sanctioned fixes, and the choice is about who else holds the id:
-- **Key by the packed entity** (`entity.valueOf()` — generation included) when the map is private
-  to the module. Used by `zones/zoneTriggerCore.ts` (QA-ZONE-0003).
-- **Keep the id key and store the generation alongside it**, rebuilding on a mismatch, when the id
-  is also a public *addressing* contract other modules call you with. Used by
-  `physics/physics2DSystem.ts`+`physics3DSystem.ts` (`BodyRec.entityGen`, see
-  [physics-2d.md](physics-2d.md)), by `video/videoSystem.ts` (its `owner` map — #336; its ids reach
-  it from the texture surfaces, `UIVideoMount` and the `video.*` actions), by
-  `rendering/materialInstanceSystem.ts`'s `_defaultBaseCache` (#336 — a cache deliberately held
-  "forever" so re-reading `mesh.material` can't thrash the clone, which is exactly what makes it
-  outlive its entity), and by `rendering/sprite2DMaterialBroker.ts` (#848 — both its registered
-  `entityShaders` maps and its per-frame dirty map).
+**Three sanctioned shapes (#868)**, and the choice is about who else holds the id:
+- **`PackedEntity`** — key a map private to its module by `packedOf(entity)` (`entity.valueOf()`,
+  generation included). The brand makes `map.set(entity.id(), …)` a type error. Used by
+  `zones/zoneTriggerCore.ts` (QA-ZONE-0003).
+- **`EntityTable<T>`** — keeps the id key and stores the generation in the same record as the
+  payload, when the id is also an *addressing* contract other modules call you with, or when entries
+  own something to release. Reads are generation-checked; every write takes an `Entity`, stamps it,
+  and disposes a dead entity's entry at that index first — so the half-shape failure below cannot be
+  written. The 8-bit generation wrap and the world-swap caveat are documented there, once.
+- **Despawn eviction** (`core/ecs/despawnEviction.ts`) — for a **frame-derived cache** filled by one
+  pass and read by id at later priorities or out of band, often by readers that hold only an id (a
+  SceneView gizmo, a parent lookup), so a generation check at the read has nothing to check. The owner
+  binds `world.onRemove(trait)` to the world it is filling from, and the entry is deleted inside
+  `destroy()` before any spawn can reclaim the index. ⚠️ An owner with a change-detection
+  short-circuit must also recompute after an eviction: a respawn with the dead entity's exact values
+  compares unchanged, and its evicted entry would never be rebuilt. Used by
+  `transformPropagationSystem`'s `worldTransforms`/`deactivatedEntities` (which are also cleared on a
+  world swap), `skin2DBuffers` and `deform2DBuffers`.
+
+⚠️ **A packed value is not unique forever, whichever shape holds it** (#868 close-out, measured on
+koota 0.6.6). The generation is 8 bits, so after 256 reuses of one index the next spawn has a dead
+entity's exact `valueOf()` — and koota reuses a destroyed World's id, so two scene swaps later an
+entity in a new world can too. So a packed-keyed map that nothing sweeps before the scene swap still
+clears on spawn (`loaders/overrideMarks.ts`, which a prefab rebuild loop drives past 256), and a
+world-swap reset stays load-bearing under a packed key (`games/space-console/runtime/setup.ts`).
+
+**UI state held across user time** — a dialog's subject, the row being renamed, a debug-tree selection —
+pins its entity with `core/ecs/entityPin.ts`, which records the World object as well as the packed
+value, and drops the pin on a world swap where nothing else re-checks it. A React list keyed by
+entity keys by `uiNodeKey` (`id:generation`, `runtime/ui/uiNodeKey.ts`), or a respawn keeps the dead
+entity's DOM and hook state.
+
+**An out-of-band reader that walks a renderer cache BY ID** — the screen-bounds providers and the SceneView
+picker, which run between the pass that fills the cache and the pass that sweeps it — checks a packed owner
+stamped on each entry at every visit, and refuses a dead one: [enact.md](enact.md), the scene-entity row of the aim table (#1197).
+
+**A generation-free `Map<number, …>` / `Set<number>` in `runtime/**` needs a ledger row saying why** —
+`engine/tests/architecture/entityKeyedMaps.test.ts` flags every one at module scope, as a class field
+or as an interface field, with a tagged reason (`not-entity:`, `scratch:`, `revalidated:`, …).
+
+Sites that predate the type and carry the second shape by hand, ledgered as `gen-in-value:` and
+deliberately not converted (each is tested, and converting risks iteration order or purge semantics):
+`physics/physics2DSystem.ts`+`physics3DSystem.ts` (`BodyRec.entityGen`, see
+[physics-2d.md](physics-2d.md) — iteration order feeds Rapier), `video/videoSystem.ts` (its `owner`
+map — #336; its ids reach it from the texture surfaces, `UIVideoMount` and the `video.*` actions),
+`rendering/materialInstanceSystem.ts`'s `_defaultBaseCache` (#336 — a cache deliberately held
+"forever" so re-reading `mesh.material` can't thrash the clone, which is exactly what makes it outlive
+its entity), and `rendering/sprite2DMaterialBroker.ts` (#848 — both its registered `entityShaders`
+maps and its per-frame dirty map).
 
 ⚠️ **A per-frame rebuild is not automatically the "revalidated" exemption below.** The broker's
 dirty map is cleared and refilled every frame and was still wrong, because the mark and the read sit
@@ -122,11 +159,22 @@ the same space as its `slots`/`activeIds`/`last*Render` maps, which one shared s
 together — re-keying one of them to `entity.valueOf()` would silently desync that sweep. Ask who
 else *keys* the map, not just who calls you.
 
-Neither is needed for a cache whose every entry is **revalidated against a value recomputed this
+**State MIRRORED onto a kept object is not the hazard — state ACCUMULATED in it is (#868).** Most of
+the renderer's id-keyed caches (`scene3DSync`'s `ecsObjects`/`ecsMaterials`/…, `Scene2D`'s
+`last*Render` snapshots, `canvas2DPool`) hold a copy of what was last applied to a Three/Pixi object
+and re-compare every input each frame, so a same-id respawn is indistinguishable from a live edit of
+one entity — an identical respawn skipping its redraw is correct, the pixels already match. What
+leaks is state that is **time-accumulated** (an `AnimationMixer` clock, a particle emitter's elapsed
+time), **build-seeded** (#873's uniforms), **closure-captured** (a mixer listener holding the dead
+entity), or **a once-flag** (`autoplayed`). Ask which of those an entry holds before calling it safe.
+
+None of the three is needed for a cache whose every entry is **revalidated against a value recomputed this
 frame** — that is why `skinning/skin2DSystem.ts` is safe despite looking identical, and
 `tests/runtime/skin2DIdReuse.test.ts` pins it so a future trust-based entry there is caught.
-Likewise a per-frame-rebuilt index (`entityIndex.ts`, `transformPropagationSystem.ts`) never holds
-a value across a despawn and does not share the hazard.
+A per-frame-rebuilt index is exempt only when every read takes its id from a live entity in the SAME
+pass that rebuilt it (`entityIndex.ts`). One rebuilt at one priority and read at a later one is not
+— that is the broker's straddle above — and it takes despawn eviction (`worldTransforms`,
+`deactivatedEntities`, `skin2DBuffers`, `deform2DBuffers`).
 
 **In serialized data and event payloads, use the GUID, never the id** — runtime ids are reassigned
 on every scene hot-reload.
@@ -186,6 +234,23 @@ GUID now, with a separate `systemFont` field for a typeface no asset can express
 guarded by `tests/assets/assetRefIntegrity.test.ts`.
 See [textures.md](./textures.md) and [scene-loading.md](./scene-loading.md).
 
+⚠️ **Copying an asset WITH its `.meta.json` into another project was observed to give it a NEW
+GUID in the destination** — for both a model and an audio clip from one copy (the model's
+`.processed.glb` was regenerated too). The mechanism was seen, not traced, and there are two
+candidates. Under a monorepo `npm run dev` (no `MODOKI_PROJECT`) the scanner walks every project,
+so the copy IS a GUID collision and `buildManifest`'s dev heal keeps the id on the path that sorts
+first and re-keys the other — which may be the ORIGINAL. The Electron editor roots at the one open
+project, so there a copy only collides with engine assets; `duplicateAssetFile`
+(`engine/plugins/asset-fs-ops.ts`), which mints a fresh GUID and drops the generated list, fits the
+observation but was not shown to be the route. So do not author refs from the GUID you copied, or from a `modoki_list_assets` read taken
+before the import settled. A stale ref may work once and die on the next reload — a model logs
+`[RiggedCache] Unknown asset guid` and draws nothing while a sibling primitive still draws; an
+audio cue logs `[AudioCache] Unknown asset guid` and plays nothing while its `@cue` journal event
+still fires, so data-only verification looks fine. After copying, let the import settle, re-read
+`modoki_list_assets` in the destination (and in the source, under monorepo dev), repoint every holder (trait field, scene `resources`,
+timeline cue), and verify with `modoki_diagnose` (`refs.issues: []`), a real `modoki_render_scene`
+and the console — not `get_scene_state` alone.
+
 ### World
 A **world** holds all entities and their traits. modoki uses **two-world
 isolation** for scene swaps: the next scene is built in a staging world, then
@@ -230,13 +295,13 @@ infrastructure that lives the whole session, e.g. Time/Navigation). Registered v
 `registerManager`, symmetric to `registerSystem`.
 
 ```ts
-class ChessManager implements ManagerDef {
-  // Scene-scoped: the LLM download in init() is expensive, so it waits for the
-  // chess scene to load rather than firing the moment the manager is registered
-  // (the editor registers every game's managers up front).
-  name = 'chess.controller'; scope = 'scene' as const; scenes = ['chess'];
-  actions = { 'chess.newGame': () => this.newGame() };
-  init() { /* start a new game + LLM download */ }
+// abridged from games/3d-test/runtime/PlaybackManager.ts
+class PlaybackManager implements ManagerDef {
+  // Scene-scoped: active only while the animation-preview scene is loaded, and
+  // disposed (its action unregistered) on swap away — the editor registers every
+  // game's managers up front, so scope is what keeps it from running elsewhere.
+  name = 'playback'; scope = 'scene' as const; scenes = ['2D Animation'];
+  actions = { 'playback.toggle': ({ world }) => { /* flip every authored rig's `playing` */ } };
 }
 ```
 
@@ -249,13 +314,13 @@ on entities the renderer draws). Two forms:
 
 - **Event-driven** (`registerProjection`) — subscribes to the store and runs at
   `PROJECTION` priority only on the first frame after the store changes or the
-  scene swaps. Use for **pure store→ECS mirrors** (`chessStateProjection`,
-  `llmStateProjection`).
+  scene swaps. Use for **pure store→ECS mirrors**. (No game registers one today —
+  the last ones left with `chess` and `llm-test` in #1191.)
 - **System** (`registerSystem`) — sync that *can't* be a pure mirror because it
   does genuine per-frame work the dirty flag would starve. Such code is a System
   and is **named `*System`, not `*Projection`** — the two reasons it shows up:
-  - it must poll for something no store change signals — `chessBoardSystem`
-    re-attaches a click handler whenever the PixiJS canvas remounts; or
+  - it must poll for something no store change signals — e.g. re-attaching a click
+    handler whenever a PixiJS canvas remounts; or
   - it runs the *reverse* direction (**ECS → store readback**), so there's no
     source store to subscribe to — 3d-test's `gameStatsSystem` reads GamePhase /
     entity count / FPS off ECS and writes the HUD store.
@@ -271,9 +336,10 @@ container** — pure data + setters, no logic, no tick. Its job is to be the
 *writes* the store; React components and Projections *read* it.
 
 The split inside a feature is sharp: **internal plumbing → Manager fields;
-reactive, displayed state → Store.** In `LLMManager` the `llmService` handle is a
-private field (never shown), while `messages`/`status`/`loadProgress` live in
-`useLLMStore` (rendered by the chat UI + projected to ECS).
+reactive, displayed state → Store.** In space-console, `CameraManager` owns the
+`spaceConsole.setCameraDistance` action and the store-hook registration (plumbing,
+never shown), while `cameraDistance`/`cameraDistanceText`/`cameraLodLabel` live in
+`useDebugStore` (rendered by the slider and its label).
 
 ### Service & Utility
 - **Service** — a stateful wrapper around a platform/SDK: `ads` (AppLovin MAX),
@@ -301,7 +367,7 @@ module with `register*`/`unregister*` + a lookup.
 The **write side / read side** pair is the symmetry that lets Managers/Systems
 expose a surface to declarative UI without coupling:
 
-- **Write:** a button's `UIAction` binding `{kind:'call', action:'chess.newGame'}`
+- **Write:** a button's `UIAction` binding `{kind:'call', action:'playback.toggle'}`
   dispatches a named action a Manager/System registered.
 - **Read:** a label's text `Time: {timeSinceGameStart}` resolves through the
   read-source registry to a Manager getter — no per-frame projection needed.
@@ -337,11 +403,12 @@ user clicks a button
   → UINode onClick → applyBindings(bindings,'click')        (gated by isSimRunning)
       ├─ kind:'set'  → write a trait field directly          e.g. UIElement.isVisible
       └─ kind:'call' → dispatchUIAction(name,…)
-           → a Manager/System handler runs                   e.g. ChessManager.newGame()
-               → writes a Store                               useChessStore.newGame()
-                   → Projection re-runs (store changed)       chessStateProjection
-                       → writes ECS entities                  status text, highlights
-                           → render sync paints it            Scene2D
+           → a Manager/System handler runs                   e.g. CameraManager's setCameraDistance (a slider)
+               → writes a Store                               useDebugStore.setCameraDistance()
+                   → EITHER a Projection re-runs              a registerProjection mirror
+                       → writes ECS entities → render sync paints them
+                   → OR the binding resolver reads the store  space-console's distance label
+                       (via its store hook) on the next UI render
 ```
 
 The reverse (a value flowing *to* a label) is the read side: the binding resolver
@@ -368,6 +435,76 @@ manifest (`registerSystems` + `registerManagers` + trait metadata).
 
 ---
 
+## Writing to an authored field you must also READ as authored (#1042)
+
+**The shape:** a system computes a value into the same trait field a human authored — a bar's
+`width`, a visual's scale, a config's `levelId` — and something later needs the value the *author*
+wrote. After the first write, a naive re-read returns the system's own previous output. The field
+is now two things at once, and nothing in the type system says so.
+
+⚠️ **It usually ships LATENT, in the way that hides it.** Of the four instances #1042 found with no
+recovery at all, **two** had a hardcoded value that *coincided* with the authored one — a puck scale
+of `1`, a gauge width of `220` — so nothing in the shipped data could distinguish "reads the authored
+value" from "ignores it". A third (court's `levelId`) only made a doc comment false. The fourth was
+**not** latent: `games/llm-test`'s bar was visibly wrong and nobody had measured it. Corollary for
+testing, which holds either way: **a test for this class must author a value that DIFFERS from the
+code's**; a test using the shipped values cannot fail.
+
+### The one question that picks the fix: where did the entity come from?
+
+|  | authored value still available? | reach for |
+|---|---|---|
+| **Instantiated from a PREFAB** | yes — the prefab doc is in the cache | read the prefab (`cachedPrefab`), or snapshot the instance's value at spawn |
+| **Authored in a SCENE** | no — nothing retains the loaded scene document at runtime | snapshot at first read, before anything writes |
+
+That asymmetry is why there is no single `authoredValue(entity, Trait, field)` primitive, and adding
+one was **declined** (owner, 2026-09-10): for a scene-authored entity it is not a helper but a change
+to scene loading (retaining every loaded document in memory), and the cheap cases already have an
+answer.
+
+### Four strategies, cheapest first — prefer the ones that delete the problem
+
+1. **Express the runtime value in a unit that needs no authored one.** A progress bar written as
+   `progress * 100` with `widthUnit: '%'` never has to know its track's width. This is the only row
+   that removes the dependency rather than recovering from it — reach for it first.
+   ⚠️ Only available when the element resolves against the thing it is a fraction OF. `forest-camp`'s
+   power gauge cannot use it: the fill's parent is the HUD, not the track it fills.
+2. **Use a DIFFERENT FIELD for the runtime state.** `audioSystem` (`autoplay` vs `playing`) and
+   `scrollApi` (`scrollBehavior` vs `scrollToBehavior`, #409). #409's comment says why it was
+   needed: one request *"permanently overwrote an author's `smooth`, and the next save baked the
+   overwrite into the scene as authored data."*
+3. **Snapshot the authored value** — from the prefab, or from the instance on the one frame before
+   the writing starts. Multiply by it rather than replacing it, so `k = 0` returns the base exactly.
+4. **Keep a last-write baseline** (`physics2DSystem`'s `rec.lastX/lastY/lastAng`) when the value
+   changes continuously and there is no stable "authored" moment.
+
+### Two things that make it worse
+
+⚠️ **A comment naming the coupling is not a fix.** `const GAUGE_MAX_PX = 220; // matches
+PowerGaugeTrack's authored width in the scene` documented its own staleness and still drifted — the
+root `CLAUDE.md`'s single-source-of-truth table forbids exactly this. Read the value; don't describe
+where it lives.
+
+⚠️ **Check the UNIT, not just the number.** `UIElement.widthUnit` defaults to `'%'`, so a px-intended
+number written into an unauthored width field silently means a percentage. `games/llm-test` shipped
+a progress bar running ~2.4x fast this way, reading full at 42%, for exactly as long as nobody
+measured it.
+
+### The save-time half
+
+`runtime/core/ecs/authoredWrites.ts` warns when a system writes an authored entity **while the
+simulation is stopped**, which is when such a write would be baked into the scene file by a save. It
+hooks `writeTraitField` and therefore cannot see koota's `entity.set`.
+
+⚠️ **That boundary IS reachable — `entriesSystem` runs above `TRANSFORM` and `set`s the authored
+scroll view — but nothing bakes, because every field written that way is `runtimeOnly` and the
+serializer skips it.** Extending the probe was declined on that basis (owner, 2026-09-10): it would
+report writes a save already cannot persist. What would make it live is an `entity.set` on a field
+that is *not* `runtimeOnly`. Read that file's header before proposing the extension again — the
+first version of this paragraph declined it for a reason that turned out to be false.
+
+---
+
 ## Where to read more
 
 - [managers-and-systems.md](./managers-and-systems.md) — Manager/System design,
@@ -377,7 +514,7 @@ manifest (`registerSystems` + `registerManagers` + trait metadata).
   game decoupling
 - [rendering.md](./rendering.md) — the three render layers, WebGPU, NPR post-process
 - [scene-loading.md](./scene-loading.md) — two-world swap, refcounting, persistence
-- [ui-system.md](./ui-system.md) — ECS UI traits, UIRenderer, custom React UI
+- [ui-system.md](./ui-system.md) — ECS UI traits, UIRenderer, store hooks
 - [prefabs.md](./prefabs.md) · [model-pipeline.md](./model-pipeline.md) ·
   [textures.md](./textures.md) · [editor.md](./editor.md) ·
   [native-and-sdks.md](./native-and-sdks.md)

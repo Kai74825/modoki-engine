@@ -101,6 +101,55 @@ persistent editor-only toggle: follow that convention (a small `load*`/`save*` p
 component, or an inline `localStorage.getItem`/`setItem` in a Zustand setter) rather than
 folding it into layout JSON — layout is FlexLayout's `Model`, not a general prefs bag.
 
+#### A View option that REMOVES content must announce itself (#1003)
+
+**The rule: of SceneView's view options, three families remove viewport content rather than adding an
+overlay — the 2D `colliders2DOnly` flag, the 3D `showColliders` flag, and the 3D/2D/UI layer chips.**
+Two surfaces carry that for the **two collider flags**:
+
+- **The `View ▾` badge NAMES what is on** — `View: Colliders`, not `View (1)` — via the pure
+  `viewBadgeLabel()` in `editor/panels/ViewOptionsMenu.tsx` (two names, then `+N`). The naming rule
+  is `namedBadgeLabel()` in `editor/panels/badgeLabel.ts`, which the Hierarchy/Assets **`Type ▾`**
+  filter uses too (#1021) — same mechanism, second site: a filter hides tree rows, and `Type (2)`
+  could not say which. That trigger names a selected type the menu has NO row for first (a persisted
+  Assets filter can carry one across projects), since it is the one filter with no checkbox to untick.
+  ⚠️ At the default 281px column a named `Type ▾` no longer fits beside the search field and drops to
+  the toolbar's second row while a filter is on — measured live and accepted by the owner over moving
+  the names to the footer.
+- **A corner notice in the viewport** while content is hidden, from `hiddenContentNotice()` in
+  `editor/scene/sceneViewMath.ts`. It is keyed to the SAME predicate the renderer gates on
+  (`shouldHideMeshesForColliderMode`) so it can never claim content is hidden when it is not, and it
+  names the shortcut, because that is what somebody staring at a blank viewport needs. When the scene
+  has no colliders at all it says so outright, and a warn TOAST fires on the OFF→ON transition — that
+  is the case where the viewport goes completely empty with nothing to inspect.
+
+⚠️ **The LAYER CHIPS are NOT covered by either surface, and this section previously implied they
+were.** `hiddenContentNotice` never fires for `show2D`/`show3D`/`showUI`, so turning the 2D layer off
+empties the viewport with only the chip's own colour as the signal. They are milder — each chip is
+individually labelled and lit, and none has a shortcut — but the gap is real and is stated here rather
+than papered over. Extending the notice to them is unclaimed work.
+
+⚠️ The badge names at most two options before collapsing to `+N`, so a `ViewOption` that removes
+content sets **`notable: true`** and is named FIRST. Without it the cap ran in items order and
+`colliders` is last in both menus — `View: FX, Focus +1` elided the one option the badge exists for.
+
+⚠️ **Why a count was not merely unhelpful but empty:** in 3D, `View (1)` is the DEFAULT resting state,
+because Grid is checked by default (`sceneViewPrefs.ts`). So the badge read identically whether the
+content-hiding Colliders mode was on or off. And Grid-only vs Colliders-only are both "one option
+active" — one viewport showing everything, one showing nothing, same string.
+
+⚠️ **Collider-only mode is one unmodified keypress away (`C`) and it PERSISTS**, and both are
+deliberate — the persistence is #399's, above. `C` is not gated on a scene HAVING colliders, on
+purpose: a key that silently does nothing is its own trap, and with the notice on screen the mode
+explains itself even in a scene with no colliders at all (the case where the viewport is completely
+empty). Note the binding is armed by PANEL focus, not viewport focus — clicking the Scene tab is
+enough (`input/keymap.ts`).
+
+**What this cost, which is why it is a rule and not a nicety:** an empty authoring viewport is
+indistinguishable from a broken one. It cost the owner a debugging session, and it cost the tracker a
+wrong issue — #1000 was filed with *"one `Scene2DRenderer` dies permanently"* as its headline, because
+the flag was on and nothing on screen said so.
+
 #### Remembering an ASSET PATH is not the same as remembering a toggle (#473)
 
 A toggle is a value. A remembered **path** is a reference into a project, and the editor's
@@ -339,6 +388,18 @@ projects:
   measurement showing the hazard its first draft cited does not currently exist.
   ⚠️ Consequence worth knowing: prune used to double as a scrubber of unrecognised
   top-level junk in the committed file, and no longer does — a stray key now survives Apply.
+  ⚠️ **A default-valued field the file never carried is ABSENT, so every raw-JSON reader must
+  resolve it** (the prune rule above keeps a default-valued key only when the file already had
+  it). A project that enables OTA and leaves the bundle name at `shell` gets an `ota` block with
+  no `bundleName` key — a valid config. A `.mjs` script cannot import `loadProjectConfig`, so it
+  must map absent → default itself and refuse only a present-but-wrong-typed value. Decide per
+  field by what the default MEANS: `bundleName`'s `'shell'` is a real value, while `publicKey`'s
+  `''` means "unset" and must still refuse. A default duplicated into `.mjs` is acceptable only
+  when a guard pins it to `DEFAULT_PROJECT_CONFIG` (`OTA_DEFAULT_BUNDLE_NAME`). And **build test
+  fixtures through `mergeProjectConfig`/`pruneProjectConfig`, never by hand** — #582 added an
+  absent-is-fatal check that passed review twice because every fixture hand-wrote the field, a
+  shape the writer never emits; it would have died in the spawned CLI after the build had run
+  (full incident: [ota-updates.md](./ota-updates.md) § "Gotchas").
 - **Reading COERCES a bad string-union value; writing ROUND-TRIPS it.** `mergeProjectConfig`
   falls an out-of-union value back to the default and warns, for EVERY string-union field in
   the config — not just `rendering.web.sizeMode` / the three/pixi `backend`s (#39) — so the
@@ -518,6 +579,61 @@ question the person in front of it was actually asking.
 ---
 
 ## Panels
+
+### Tab mounting LATCHES — "unselected" is not "unmounted" (#1015)
+
+**THE FACT, and everything else in the repo links here rather than restating it:** FlexLayout
+defers only a tab's **first** render. Once a tab has been rendered it keeps rendering after you
+switch away, so *"FlexLayout mounts only the SELECTED tab"* is true **only of a tab that has never
+been opened this session.**
+
+Verified in `flexlayout-react`'s `Layout` renderer (`dist/index.js`). ⚠️ **Two methods there each
+compute a local called `renderTab`, and only one of them governs MOUNTING** — `renderTabMoveables()`,
+the sole creator of the `SizeTracker` portal, and `SizeTracker` is in turn the sole caller of
+`layout.props.factory(node)`, which is what instantiates a panel:
+
+```js
+// renderTabMoveables() — the MOUNTING decision
+const visible = selected || !child.isEnableRenderOnDemand();
+const renderTab = child.isRendered() || visible && (rect.width > 0 && rect.height > 0);
+if (renderTab) { /* …createPortal(<SizeTracker …/>, element, key)… */ child.setRendered(renderTab); }
+```
+
+`setRendered` has exactly **one** call site, and it is that one, inside `if (renderTab)` — so
+`rendered` is only ever written `true`, and nothing anywhere resets it. The editor does not set
+`tabEnableRenderOnDemand`, so FlexLayout's default (`true`) applies.
+
+⚠️ **What latches is the tab NODE, not the tab's name.** `rendered` is initialised `false` in the
+`TabNode` constructor, and CLOSING a tab removes the node — so a tab closed and re-added is a
+*fresh* node that must be selected once again. "I opened it earlier this session" is therefore not
+by itself a reason to believe a panel is mounted; `panelMounted` is.
+
+⚠️ **Do not read the decision off `renderTabs()`.** Its `renderTab` is a *different* expression
+(`child.isRendered() || selected || !child.isEnableRenderOnDemand()`), it calls no `setRendered`,
+and what it renders is the `Tab` positioning element — not the panel.
+
+⚠️ **Selection is not sufficient either.** The mounting condition also requires
+`rect.width > 0 && rect.height > 0`, so a **selected tab in a zero-area tabset never mounts.**
+That case is **not** the one `panelCollapsed` reports — it is the opposite one. `panelCollapsed` is
+`panelMounted && <zero area>` (`describeGameView` in `engine/app/editor/agentEditorOps.ts`), so it
+describes a panel that latched first and was squeezed flat afterwards; a tab first selected INTO a
+zero-area tabset surfaces as `panelMounted: false` instead. Which is why "is it selected?" answers
+neither direction of the question.
+
+**So mountedness has exactly one source of truth: the panel publishes it from its own mount effect**
+(`gameViewMounted`, `animationPanelMounted`), read back as `panelMounted`. It is **not** derivable
+from `openPanels` — that is every tab NODE in the model with no selection test — and it is not
+derivable from selection. ⚠️ Do not "simplify" `panelMounted` into either; #367 shipped the
+`openPanels` version, which answered `mounted: true` for precisely the case the field exists to
+catch.
+
+**The practical advice everywhere is unchanged and still correct** — *open AND select the tab* —
+because selecting an unmounted tab does mount it. Only the stated *reason* was wrong.
+
+⚠️ **The scar is that this propagates.** #994's session read one of the unqualified copies, believed
+it, and wrote the claim into an agent-facing refusal string and two normative docs before measuring
+`gameView.panelMounted: false` alongside a live `game-3d` surface and having to retract. #1015 then
+found seven more copies. A fact restated at N sites is a fact that gets corrected at one.
 
 ### A panel's load/write DECISION goes in a plain `.ts` beside it, not in the `.tsx`
 
@@ -778,12 +894,22 @@ Two signature changes were needed and both are dependency injection, not redesig
 in, defeating the move), and `resetLayout` split into a testable `clearStoredLayout()` plus the
 `window.location.reload()` that stays in the component.
 
-**What genuinely remains untestable there is the other ~393 lines, and the reason is
+**What genuinely remains untestable there is the other ~390 lines, and the reason is
 structural**: they are one 650-line React component plus six modal components — 34 hooks, the
 menu tree built from live callbacks, the Electron OS-menu bridge, project open/close, HMR-epoch
-wiring. There is no decision in it that is separable from the hook that owns its state; every
-candidate is orchestration, which is the Phase-2 shape. That part needs an integration harness,
-and one e2e spec is the honest coverage for it — which the suite already has.
+wiring. Most of it is orchestration, which is the Phase-2 shape: it needs an integration
+harness, and one e2e spec is the honest coverage for it — which the suite already has.
+
+⚠️ **"There is no decision left in it" was this paragraph's claim until 2026-09-10, and it was
+wrong twice over** — once when written, and once as a rule of thumb. The `menu-action` relay
+looked like pure orchestration (an IPC handler reading a ref) and had a real decision buried in
+it: *what to do when the relayed id is not in the current action map*. It answered with a
+`console.warn` the user cannot see, so a menu click did nothing and said nothing (#1032's
+`family/refusal-not-surfaced` mechanism). Extracting `resolveMenuAction()` into `menuSpec.ts`
+made the decision testable and the toast possible; the hook kept only the dispatch. **So the
+lesson below generalises further than it was first stated: an orchestration site can still
+CONTAIN a decision, and the giveaway is a branch whose two arms differ in what the user is
+told.**
 
 **The transferable lesson**: before declaring a `.tsx` untestable, grep it for module-scope
 `function`/`const` declarations that take no hooks. "Most Electron-entangled panel in the
@@ -970,6 +1096,21 @@ of it. Read this before touching a measurement there.
 | Layout px | `clientWidth`/`offsetWidth`, `getComputedStyle` padding/border | **every** transform |
 | Frame-logical px | what `toLogicalDelta` produces | only the FRAME's transform is divided out |
 
+⚠️ **And a fourth trap that is not a transform at all: the GAME panel's device frame carries a
+1 px border, so its CLIENT box is 2 px narrower than the device it claims to preview** (found
+measuring #1119's label budget, 2026-09-12). At the iPhone SE preset the frame lays out at
+`offsetWidth: 375` with `box-sizing: border-box`, and every `%`-width UI root inside it therefore
+resolves against **373**, not 375. **SceneView's frame has no such border**, so the two panels
+measure the SAME entity about 0.5% apart — at scale `0.869333`, a full-width root reads `326.0`
+(375 x 0.869333, exact) in SceneView and `324.261` (373 x 0.869333) in the Game panel. Neither is
+wrong; they are previewing boxes of different widths.
+
+Two consequences. **A live measurement checked against an authored `%` is off by 0.5% unless you
+divide by the client width rather than the preset's name** — small enough to read as rounding, big
+enough to sink a budget check sitting on a few px of headroom. And **the error does not exist on a
+real device**, so a discrepancy this size between a panel measurement and a device one is expected
+rather than a defect to chase.
+
 Two separate transforms stack between the frame and an element. `SceneView` lays the preview
 frame out at the logical device size and applies `transform: scale(uiScale)`; **and**
 `applyRotationStyle` (`runtime/ui/anchorCss.ts`) emits a second `transform: scale(s)` on any node
@@ -1151,9 +1292,50 @@ group math is a single pure module, `editor/scene/multiTransform.ts` (headless-u
   entity to the selection (plain left-drag still orbits/pans; orbit is suppressed only for the
   shift-drag). Both viewports. Shift/Ctrl-click also add/toggle, mirroring the Hierarchy panel.
 - **Undo** — one group drag is a single batched step (`buildGroupTransformUndoAction`) covering
-  every member. Because undo/redo write traits via a direct `entity.set` (no dirty broadcast), the
-  2D overlay AND the Pixi content are both explicitly re-woken on undo (`subscribeUndo` →
-  `mark2DDirty` + `editorMarkScene2DDirty`), else a reverted 2D transform shows stale until refocus.
+  every member. Undo/redo write traits via a direct `entity.set`, so the transform action's apply
+  (`editor/scene/gizmoUndo.ts`) fires `fireDirtyListeners()` itself — without it the Game view kept
+  the pre-undo position (#1141). The SceneView's 2D overlay and Pixi content are ALSO woken
+  explicitly on any undo (`subscribeUndo` → `mark2DDirty` + `editorMarkScene2DDirty`), which covers
+  undo entries that are not transform actions. The live drag follows the same rule: every direct
+  write in `installScene2DInteraction` calls both `mark2DDirty()` and `fireDirtyListeners()`.
+- **Undo labels name an entity through `entityDisplayName(id)`** (`entityUtils.ts`), which resolves
+  the name exactly as the Hierarchy row does. An unnamed entity falls back to its GUID rather than a
+  runtime id a hot-reload reassigns — the id only when there is no GUID or no live entity. Never read `.name` off a `findEntity` result: the name lives on the
+  `EntityAttributes` trait, and `findEntity` infers `any`, so the read compiles and is always
+  `undefined`. Every gizmo, 2D-drag and UI move/resize label read `Entity <id>` that way (#1138).
+- **A canvas drag must CAPTURE the pointer, because it ends in its element's `pointerup`** (#1161, #1176).
+  The single gizmo, group and Collider2D-vertex drags all listen on the Canvas2D's chrome canvas,
+  and all three push their undo entry (with the unsaved flag, and for a gizmo or group drag a
+  `!transform`; a vertex drag's is `Edit Collider2D.points`) only in that canvas's `pointerup`. Without capture, a release past the canvas edge, over the toolbar or over
+  another panel goes to whatever is under the cursor: the entity has moved, nothing can undo it,
+  and the drag ref stays live, so a later hover with NO button held keeps dragging.
+  `bindDragPointerCapture` (`editor/panels/dragPointerCapture.ts`) captures on a press that claimed
+  a drag, as the 3D gizmo always has. A lost capture for that same pointer while the drag is
+  still live counts as the release. Per the spec that is the touch/pen `pointercancel` path, and it
+  has not been observed live. A second pointer can neither steal the capture nor end the first
+  drag. The UI-mode right-button pan binds it too: it commits nothing, but it stayed live the
+  same way. ⚠️ Any new drag state added to `installScene2DInteraction` must join its `isDragging`
+  predicate, or that drag is uncaptured again. The routing is jsdom-unreachable. The automated check is
+  the e2e `editor-scene-multiselect.spec.ts` (a single gizmo drag released past the canvas edge), and
+  QA-SVIEW-0011 covers all three drag kinds live.
+  The Sprite and Nine-Slice slicer canvases bind the same helper through `useDragPointerCapture`
+  (#1176). They used to END a drag on `onMouseLeave` instead, which does commit, but at the last
+  in-canvas point, so an edge could never be overshot onto the sheet boundary. ⚠️ **Do not
+  "restore" a leave handler as a safety net.** Under capture a leave cannot end a live drag anyway:
+  measured on Electron, the sequence is `pointerup`, `lostpointercapture`, then
+  `pointerout`/`pointerleave`. That is also why `SkinCanvas` and sling's editors, which capture on
+  press, are unaffected by their own `onPointerLeave={onPointerUp}`. A press on a scroll viewport's
+  own scrollbar still reaches its `pointerdown`, so the slicers skip it with `pressIsOnScrollbar`
+  rather than capturing a scrollbar drag as an edit.
+  **The game's `pointerSource` no longer shadows a panel's capture (#1182).** It listens on `window`.
+  Until the editor installed a pointer ingestion scope, it captured the TARGET of any press that no
+  handler had stopped, so the slicer's canvas held capture instead of the viewport. An outside
+  release still worked with the Sprite Editor's `captureDrag` deleted (measured 2026-09-14), which made
+  outcome-only checks of a panel's capture unfalsifiable. Now only a press inside the Game panel's
+  play area reaches the game's sources ([editor-input.md](editor-input.md) § "The pointer ingestion
+  scope"). QA-ASSET-0025 step 5c used to stub the canvas's `setPointerCapture` to work around this.
+  The stub is gone (#1192): without it the step goes red when `captureDrag` is deleted (measured
+  2026-09-14).
 - **Selection state was already array-based** (`selectedEntityIds` + primary `selectedEntityId`) —
   this feature was purely SceneView-viewport wiring; the store, Inspector, Hierarchy, and selection
   undo already supported multi-select.
@@ -1180,7 +1362,32 @@ passes plain values in):
   (or candidates lacking an order) falling back to closest box-center.
 
 UI mode picking is DOM-native — the `UIRenderer` reports the clicked element's entity via
-`onSelectEntity`.
+`onSelectEntity`. Two things about that are load-bearing and were each a shipped bug:
+
+- **A click on a 2D canvas is decided on `pointerdown`, but can be UNDONE by the `click` that
+  follows it** (#999/#1001). `installScene2DInteraction` selects the 2D entity on `pointerdown` and
+  stops that event — but the browser dispatches a separate `click` for the same gesture, and a
+  Canvas2D host is a LEAF in the UI tree, so `UINode` gives it neither an `onClick` nor pointer
+  events. That click therefore bubbles PAST the host to the nearest ancestor UI node that does have
+  a handler — in practice the UI root — which re-selects itself. Nothing logs, so the symptom reads
+  as "2D is unpickable" rather than "picked, then overwritten". `UIEditorOverlay`'s arbiter arms its
+  existing click-swallow (`overrodeClickRef`/`swallowGenRef`) on every pick-canvas `pointerdown` to
+  shield the canvas's own selection; the canvas handler still owns the selection itself.
+  ⚠️ The winner's own OPACITY is irrelevant to this path — it is simply the nearest ancestor with a
+  handler. Reproduced in three games whose winners disagreed on opacity (wordweave's and court's
+  painted nothing, chess's was opaque), which is why `isPaintOpaque` was a red herring in all three.
+- **A genuine 2D miss is bounded by the canvas host.** `pickUnderlyingUIEntity` looks through the
+  2D surfaces for a UI element beneath, and without a bound it escaped upward to the root the same
+  way. `resolveHostBoundedPick` + `hostRelationOf` (`uiPreviewPick.ts`, pure + DOM adapter, so the
+  rule is unit-testable — this is the § Panels rule about a `.tsx`'s decisions living in a `.ts`)
+  substitute the host when the fall-through landed on an ANCESTOR of it. Owner ruling 2026-09-09: an
+  empty-canvas click selects the canvas host. A descendant of the host — a UI child showing through
+  a transparent canvas — and an unrelated subtree both keep their own answer, which is what leaves
+  the Three.js and deselect fall-throughs intact.
+  ⚠️ `hostRelationOf` asks whether the PICKED element contains the host, scoped to its own subtree,
+  rather than looking the host up document-wide: the editor mounts the same UI host in BOTH the
+  SceneView preview and the Game panel, so a document-wide lookup can answer with the other panel's
+  copy.
 
 ### 3D collider outline overlay + collider-only mode
 
@@ -1241,10 +1448,16 @@ Six things about that surface are load-bearing:
   so every `resolve*` helper and every GameView consumer handles it unbranched. `logicalW: 0` is
   reserved by `FREE_PRESET` for "fill the panel", so a zero dimension is refused rather than
   silently becoming Free.
-- **A custom size reports `safeAreaBasis: 'custom-none'`.** There is no device to look insets up
-  from, so its zeros are zeros *by construction* — and four bare zeros are indistinguishable from a
-  measured "this screen has no notch", which is the mis-authoring `devicePresets.ts` warns about.
-  A catalog preset reports `'preset'`, where a zero is a statement.
+- **Every inset quartet says where it came from — `safeAreaBasis`, per orientation (#786).**
+  `'measured'` (a real device reported it), `'published'` (a vendor's per-model table),
+  `'inferred'` (reasoned, or generalised from another device) or `'no-device'` (zeros by
+  construction: `Custom`, `Free` and the aspect presets). Four bare zeros are indistinguishable from
+  a measured "this screen has no notch", which is the mis-authoring `devicePresets.ts` warns about.
+  It is DATA authored beside the numbers in `SafeAreaSet.basis`, not derived from the preset's name:
+  the old name check reported every catalog row as `'preset'` — a reasoned Android-tablet zero and
+  the iPhone SE's measured one alike — and missed that a `16:9` row has no device behind it either.
+  ⚠️ The landscape half of every measured row is `'inferred'`: the apps that measured them are
+  portrait-locked, so nothing rotated to check.
 - **A `dpr` that cannot round-trip is refused, not rounded.** `physical` is stored as
   `round(logical × dpr)` and the read-back recovers dpr as `physical / logical`, so `{1, 1, dpr: 0.5}`
   used to be accepted and answer `dpr: 1` — a wrong answer stated authoritatively. The combination is
@@ -1269,6 +1482,37 @@ Six things about that surface are load-bearing:
 Not persisted to localStorage, unlike `sceneViewMode`: this reset to `Free` on every mount before it
 moved to the store, and a custom resolution silently restored days later is a measurement taken at a
 size nobody chose.
+
+### ⚠️ The preview is ~0.4% NARROWER than the preset it names — so it confirms a mechanism, never a sub-1% margin
+
+**Measured 2026-09-10** (Court, #969's close-out), driving the editor at the `Galaxy S22` preset:
+the Game panel's host box computed **358.468 x 778.472** for a preset that reports **360 x 780**.
+That is **0.43% short on width** and 0.20% on height. The engine resolves viewport units against
+that host box — it does not use CSS `vmin`/`vh`, it computes them and writes px — so **every
+`vmin`/`vw`/`vh`-authored length in the preview is short by the same fraction.**
+
+**The rule that follows, and it applies to every project, not just the one that found it:**
+
+> An editor pass can confirm a **mechanism** — that a tap zone renders, that a row wraps where you
+> think, that a value is read rather than ignored. It cannot confirm a **margin thinner than ~0.5%**,
+> because the instrument's own error is that size. A measurement inside its own error bar is not
+> evidence, however precise the number looks.
+
+What this cost when it was not written down: #969 shipped two tap-target fixes whose margins were
+0.24dp and 0.23pt — both well inside this error — and an editor pass would have appeared to confirm
+or refute them at random. The margins were settled by arithmetic on the AUTHORED values instead, and
+the live pass was used only for what it can actually decide: the pad renders, and three markers fit
+per row. A margin that genuinely needs settling needs a real device (#973's `elementsFromPoint`
+probe on hardware), not this panel.
+
+⚠️ **The CAUSE is not diagnosed** — plausibly the host's fractional-zoom rounding (the editor window
+runs a non-integer `zoomFactor`, and authored `px` lengths do come back divided by it), but that was
+not confirmed, so do not repeat it as fact. The *size* of the discrepancy is measured; the *reason*
+is open. If it is ever fixed, this rule relaxes rather than disappearing — re-measure before
+trusting a tighter bound.
+
+The measurement's own home, with the full numbers and the layout they were taken against, is
+`games/court/tests/tapZoneClearance.test.ts`.
 
 ---
 
@@ -1333,6 +1577,42 @@ Animation panel's live preview as a side effect of closing an idle tab — and t
 before anyone noticed the session, because every one of them reasoned about the flag. The store's
 `closeTimelineEditor`/`closeAnimationEditor` are the same shape again: ownership decisions wearing a
 store action's clothes.
+
+**A pose opens a session, or it poses nothing (#1167).** `beginTimelinePreviewSession()` resolves
+`true` only when a session is held, and every caller acts on `false` by posing nothing, starting no
+▶ loop, and handing back the run mode it claimed. It resolves `false` in two cases:
+
+- **A restore is still landing.** The ending session has already cleared its snapshot, so a begin
+  there would serialize the still-posed world as the new "authored" snapshot, and the next Exit
+  would restore a pose. The owner chose **refuse** over **wait** (2026-09-13). Waiting would have
+  kept a drag's last position, but the pose that followed would aim at entity ids resolved before
+  the swap. Refusing matches #1148, which already refuses every undo/redo for the same window. A
+  scrub drag poses again on its next move once the restore has landed. One chain has its own
+  restore: grabbing the playhead while ▶ plays reverts the forward run and then reopens a scrub
+  session. That chain goes through `reopenPreviewAfterRestore`, which re-claims scrub, because a drag
+  move refused during its restore handed the mode back and the reopen then posed under `stopped`. It
+  poses at the latest playhead, and it reopens only while the gesture is live: ⏹ Exit, an asset
+  switch, unmount and toolbar Stop cancel it (`cancelPreviewGestures`). An Exit during that restore
+  used to be silently undone by the reopen.
+- **The restore window reaches the other authored writers too.** Exit clears the session and sets
+  `stopped` before the swap lands, so anything that only checks those would act on the posed world.
+  Cmd+S waits for the restore (`whenPreviewRestoresLanded`) instead of writing the pose, and Play
+  treats a landing restore as a world swap (`aSceneSwapIsHappening`). A Stop pressed during that
+  window waits for the restore and then returns to stopped. The exception is a Stop pressed while
+  Play is starting up: it still goes to #470's queue, because Play's own preview restore produces
+  the same state.
+- **An Exit intervened** while the snapshot was serializing. A begin made after that Exit does not
+  join the cancelled begin still serializing. It opens its own session, and the cancelled caller then
+  also reads `true` ("a session is held"), because `false` would hand back the same owner's mode over
+  the later claim.
+
+Callers used to pose unconditionally after the begin. The one pose that asserts a session
+(`applyPose`/`applyPoseAtTime`) only logged, while `poseAt` and the Timeline ▶ loop posed and fired
+signals with nothing to revert. A thrown snapshot was an unhandled rejection with the mode pinned at
+`scrub`. The Timeline's pose sites now go through `openPreviewSessionThen(owner, pose)`
+(`editor/scene/openPreviewSession.ts`, unit-tested), and `poseClipAtTime` reports `refused`, which
+the `pose-clip` agent op turns into a `REFUSED_BY_OP` "the preview is closing" instead of "applied 0
+channels". Both ▶ loops start only after the session is held.
 
 **Test it by the OWNER, not by the playhead.** With a timeline doc loaded the Timeline's own loop
 advances `playheadTime` too, so "the playhead moved" passes under both the correct and the broken
@@ -1555,6 +1835,47 @@ so it is hardening, not a replacement for the ownership machinery.
 `hierarchyCollapse.test.ts` pins the decisions; `e2e/editor-hierarchy-collapse.spec.ts` pins the
 wiring, including the Save-As case and the Create Scene case (reverting either turns it red). The
 mechanism class is written up in [async-lifetime.md](./async-lifetime.md).
+
+### Revealing the selected row — a reveal is a REQUEST, not a changed value (#1156, #1143)
+
+Both tree panels un-collapse whatever hides the selected row and scroll it into view when a
+selection asks to be shown: a new lead from any source, or an explicit request. **Neither may
+key that reveal on the selected VALUE alone.** Re-selecting the entity or asset that is already
+selected changes no value, so an agent asking to reveal a row that a human has collapsed since
+would get nothing back. That was measured on both panels: the same select again showed 0 rows;
+clearing the selection first and then selecting showed 1.
+
+- **Hierarchy** reveals on a changed lead, a collapse restore (`collapseEpoch`), or an explicit
+  request: the store's `entityRevealRequest` counter, bumped by `requestEntityReveal()`. Only the
+  writers that MEAN "select this" call it: the agent `set-selection` op (`agentEditorOps.ts`), a
+  plain or Shift viewport pick (`applyPickSelection`, decided by `pickRequestsReveal` in
+  `scene/pickSelection.ts`), a UI-preview pick and a Bone2D handle pick (both in `SceneView.tsx`).
+  Undo/redo, a Cmd/Ctrl-click toggle, the delete folds and a hand collapse do not request, so
+  **while the lead stays the same** they leave the tree as the user set it. Any write that MOVES
+  the lead still reveals, whatever its source: undoing back to an entity under a collapsed parent
+  re-opens it. The decision is `isRevealRequest` (`editor/panels/hierarchyFolders.ts`), and the
+  scroll effect follows a reveal tick rather than every selection write.
+
+  ⚠️ **The request cannot be inferred from the selection diff — two attempts proved it.** Keying on
+  the `selectedEntityIds` array identity revealed on a Cmd-click that trimmed the set. A refinement
+  ("a new array that drops no member is a request") revealed on UNDOING that trim, because undo
+  restores the superset, and it never revealed a plain viewport click on the lead of a
+  multi-selection, because `[4,3] → [3]` with lead 3 is exactly what a trim publishes. Both were
+  found by the close-out reviews. A new selection writer that should reveal must call
+  `requestEntityReveal()`; one that should not must leave it alone.
+- **Assets** keys on the `selectedAsset` OBJECT identity through `createStoreSelectionTracker`
+  (`editor/panels/assetReveal.ts`). The agent op creates a new object per call, so it reads as a
+  request. The panel needs own-marks because its effect also re-syncs a LOCAL multi-select that
+  its own publishes must not collapse. ⚠️ Because any new `selectedAsset` object is a request there,
+  a writer that republished it on a timer or a structure refresh would undo a human's collapse; none
+  does today.
+
+`hierarchyFolders.test.ts` pins the decision. `hierarchyReveal.test.tsx` pins the wiring on both
+sides: a same-id re-select with the request reveals and scrolls, and so does a pick on the lead of a
+multi-selection. A Cmd-click trim, and the undo of one, neither re-open a manual collapse nor
+scroll. The writers' side is pinned by `engine/tests/editor/setSelectionRevealRequest.test.ts` (the
+agent op, through `runAgentOp`) and `pickSelection.test.ts` (`pickRequestsReveal`). The UI-preview
+and bone-pick calls are one-liners in `SceneView.tsx` with no test.
 
 
 ## Asset editors
@@ -1881,8 +2202,11 @@ load-bearing:
   fetches the baked `.glb` over HTTP, so even a re-run effect would replay the browser's cached
   copy of an unchanged URL. `cacheBustReimport(url, epoch)` appends `?reimport=<n>` — with the
   `blob:`/`data:` carve-out `withCacheBust` makes for the same reason (a blob URL is matched by
-  UUID, so a query suffix 404s the model). The engine's own `withCacheBust` cannot serve here:
-  it is PROD-and-content-hash only, and the editor is neither.
+  UUID, so a query suffix 404s the model). The engine's own `withCacheBust` still cannot serve
+  here, but the reason narrowed in #1022: it keys on the manifest CONTENT HASH, and a re-bake of
+  an unchanged source leaves that hash alone. (It used to be "PROD-and-content-hash only"; the
+  PROD half is gone, so the bust now applies in the editor too — just not on the axis this needs.)
+  `reimport=<n>` moves per re-import, which is exactly the axis that does.
 - **The epoch coalesces on a trailing 250 ms timer, and that is not cosmetic.** ONE Import click
   fires `invalidateModel` for the same model **three** times — measured on `games/sling`'s
   `ramp_wedge`, 2 ms apart then 32 ms later (it invalidates before re-deriving templates, again
@@ -2284,6 +2608,28 @@ run of them coalesces into that one step via `panels/coalescedEdit.ts` — opene
 change and closed by an idle timer or by anything else that touches the history, **never by a
 focus event**, which does not fire in an unfocused window (#244; the class, and how to test it,
 is in [editor input](./editor-input.md)). See [Materials & Textures](./textures.md).
+
+**A resize moves each edge the grabbed handle OWNS by the pointer's travel since the press, clamped
+to the sheet** (`resizeSliceRect` in `panels/sliceDrag.ts`; the Nine-Slice guides use
+`dragNineSliceGuide` beside it) (#1176). It used to set the rect from the pointer's ABSOLUTE
+position against the opposite handle's point, which failed twice on an edge-to-edge sheet
+(`catvader_1`, 252×392, measured):
+- a side handle drove the axis it does not own: `e`'s opposite point is the mid-left edge, so a
+  horizontal `e` drag gave `{y: 195, h: 1}`;
+- a corner snapped to wherever the press landed, and every error pointed up-left. A far-edge
+  handle is published 0.72 CSS px inside its canvas (`clampHandleToOwner`), `MouseEvent.clientY`
+  is an integer, and Enact rounded its intermediate moves. So a purely horizontal `se` drag
+  shaved a bottom-row slice's height, `392 → 389`.
+Travel makes all of that irrelevant, because a drag that did not move on an axis cannot change it.
+The clamp is widened to include where the value started (`clampFrom`). A slice already partly
+outside the sheet (after a texture is re-imported smaller, or a W typed past it, since the rect
+fields do not clamp) or Nine-Slice insets loaded unclamped from a meta that no longer fits therefore
+move inward by the pointer's travel, and a drag outward leaves them where they started. A plain clamp snapped them inside on the first
+jitter: a nudged `{x:1100, w:8}` became `{x:1008, w:100}`. The body's move drag (`moveSliceRect`)
+follows the same rule.
+The canvases read POINTER events (fractional) and keep the drag alive past the canvas (the capture
+bullet under SceneView above). The `move` drag always carried its grab offset. Live coverage:
+QA-ASSET-0025 steps 5 and 5b.
 
 > **A `.meta.json` write REPLACES the file — every writer must read-modify-write.**
 > `/api/write-meta` → `writeMetaSidecar` → `writeJsonAtomic(sidecarPath, committed)`: no merge with
@@ -2688,6 +3034,11 @@ Two things that look like they should stop an editor and do not (#129):
   `devServer.ts` passes, skips it, and says so. (Guarded by
   `engine/tests/architecture/devStopEditorCarveOut.test.ts`, because that flag exists for a
   packaging reason and nothing else would notice if it went away.)
+  **The tell, when an editor looks broken:** read `modoki_get_console_logs` FIRST, before
+  reproducing a game-logic theory. `[vite] server connection lost. Polling for restart...` with a
+  live backend but a dead Vite port means the tooling was stopped, not that the game broke — confirm
+  with `curl 127.0.0.1:<vitePort>`. (The incident: the owner was *playing* with nothing unsaved when
+  the dev server died, so `unsavedChanges: false` does not mean nobody is using the editor.)
 - **`POST <backend>/api/exit`** 404s. `/api/exit` is a *Vite dev-server* route, so it answers on
   the Vite port (5175), not on the backend port that `MODOKI_BACKEND` and the launch banner
   advertise — aiming it at the port you were told to use cannot work.
@@ -2698,7 +3049,9 @@ App-wide UI zoom via Electron `webContents` zoom (`engine/electron/zoom.ts`) —
 anywhere in the editor, Cmd/Ctrl+`=`/`-`/`0`, and native **View → Zoom In/Out/Actual Size** menu
 items (`projects.ts`'s `viewRoleTail`), all routed through one controller so wheel/menu/accelerator
 stay in sync. `factor = 1.2^level`, step 0.5, clamped to level ∈ [−3, +4] (matches VS Code). The
-level persists per editor identity (`userData/ui-prefs.json`) and restores on `did-finish-load`. A
+level persists per editor identity (`ui-prefs.json`, at the editor-identity dir — ⚠️ **NOT under
+`userData`**, which since #1036 is keyed on the PROJECT; see `setUiPrefsDir` and
+[connect-claude-code.md](connect-claude-code.md)) and restores on `did-finish-load`. A
 capture-phase Ctrl/Cmd+wheel forwarder in `EditorApp.tsx` (`editor/input/zoomWheel.ts`) pre-empts
 panels that also consume modified wheel (SceneView camera dolly, the Animation Curve Editor's
 value-axis zoom) via a `data-modki-wheel-zoom` opt-out marker, so UI zoom and panel-local zoom don't
@@ -2744,6 +3097,71 @@ that pressing undo walks back through exactly the steps the user took, including
 selected at each one.
 
 The undo stack is capped at 200 entries (oldest dropped, warned once per session).
+
+### Undo outside `stopped`: Play refuses, a preview reads the entry on top (#1148)
+
+`undoStep(direction)` (`editor/undo/undoManager.ts`) returns `{ did, refused }`; `undo()`/`redo()`
+are its boolean form. It refuses, **without popping**, whenever `undoRefusedReason(direction)` is
+non-null:
+
+| Run mode | Refused | Why |
+|---|---|---|
+| `stopped` | nothing | the live world IS the authored scene |
+| `playing` (incl. paused) | **every** entry | Stop reverts the world and truncates the during-Play entries (`truncateUndoTo`) |
+| `scrub` / `preview` | a **scene edit from before the preview session** | Exit restores the snapshot. An asset-document edit (`_isFileDirect`) and a selection step are never touched by that restore, and a scene edit made *during* the session belongs to the posed world |
+
+**Exit drops the session's own scene edits from the history.** The undo manager marks each entry with
+the preview session held when it was pushed. `timelinePreview.ts` calls `setPreviewUndoSession` at
+begin, before the snapshot await, and clears it at end. Right after a restore,
+`endTimelinePreviewSession` calls `dropPreviewSceneEdits`. The restore already discarded those edits.
+Undoing one afterwards would write a posed value into the authored scene: a recorded field edit's
+`before` becomes the scene value, or a delete respawns an entity the restore already brought back,
+duplicating its guid. Asset and selection entries stay.
+
+- An end **without** a restore keeps the entries, because the world still holds those edits.
+- **For the length of a restore, every undo/redo is refused** (`beginPreviewRestore` …
+  `finishPreviewRestore`, decided when the step runs). The restore then awaits `whenUndoIdle()`,
+  which by then only waits for a step that was already running. A step pops its entry and then
+  awaits its closure (a prefab re-instantiate respawns asynchronously). Without both halves, an
+  entry could be off both stacks during the drop. The step then pushed it back and applied its edit
+  to the restored world, whether it was running when Exit was pressed or queued a keystroke later.
+- The scene path is re-checked **after** that wait, so a scene opened meanwhile never has the old
+  snapshot loaded over it.
+- The mark stays on **until after the drop**, and a second end during the restore does not clear it.
+  An edit pushed while `loadScene` is awaiting lands in the world the swap discards, so it has to be
+  dropped too.
+  A *pose* during the restore used to begin a new session over the still-posed world, and its mark
+  then replaced the first one's. That begin is now refused (#1167; see § Play / Stop / Pause, "A pose opens a session, or it poses nothing"), so nothing seats a
+  second session mid-restore. The restoring set still holds more than one session, as a backstop.
+- A coalescing chain never crosses the session boundary.
+
+The marks are keyed to the SESSION, not the run mode, for two reasons. The Timeline ▶ begins its
+session *before* entering `preview`. And the mode can reach `stopped` on either side of the restore.
+
+The mode and the entry are read **when the step runs**, not when it was called. A step queued behind
+another can be refused by what that step did, so callers read `refused` from the result instead of
+pre-checking. A pre-check once reported such a refusal as `did:false`, i.e. "the stack was empty".
+
+- **Why the preview rule reads the entry.** The first ruling refused every undo inside the envelope.
+  But an Animation or Timeline clip undo **re-poses**, and a pose re-opens the envelope
+  (`poseClipAtTime` → `enterScrubMode`). So one ⏹ Exit bought exactly one undo, and every Exit
+  reverted the pose. #709's live run had measured the re-entry ("exit → `'stopped'`; first undo →
+  `'scrub'` again"). The owner re-ruled with that known (2026-09-13).
+- **The gate lives in the manager, not at the call sites.** Undo has five entry points: the
+  Cmd+Z / Shift+Cmd+Z chords, Edit ▸ Undo/Redo, the ↶/↷ buttons in the Animation, SpriteAnim,
+  Particle and Skin panels, and the agent `undo`/`redo` ops. Before #1148 only the first two were
+  gated, and both read `getPlayState()`, which calls a preview `'stopped'`. The panels and the agent
+  reached `undo()` directly, and the agent ops were ungated even during Play.
+- **Human paths go through `runUndoCommand`** (`editor/undo/undoCommand.ts`), which toasts
+  `refused`. The Edit menu greys each item on `undoRefusedReason('undo' | 'redo')`, recomputed on
+  `onRunModeChange` and on every stack change. `onPlayStateChange` does not fire when a preview
+  starts.
+- **The agent ops answer `REFUSED_BY_OP`** with the same reason.
+- **Tests that call `undo()` must set `setRunMode('stopped')`.** The runtime defaults to `playing`
+  so a shipped game runs with no setup, which means a bare test is refused.
+- `engine/tests/architecture/playStateIsNotAnAuthoringGate.test.ts` bans comparing `playState` to
+  `'stopped'` in editor code outside a reasoned allowlist, because that comparison is the defect's
+  shape. It shipped three times: #1122, then twice in #1148.
 
 ### Asset delete IS undoable — it is snapshot-backed, not a filesystem one-way door
 

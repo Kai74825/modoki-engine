@@ -45,19 +45,14 @@ const REPO = path.resolve(__dirname, '../../..');
 const PKG_DIR = 'engine/packages/modoki';
 const AUTHORED = path.join(REPO, 'engine/scripts/courtAuthored.mjs');
 const SWEEP_GATE = path.join(REPO, 'games/court/tests/sweepGate.ts');
+const CHANGED_LEVELS = path.join(REPO, 'games/court/tests/changedLevels.ts');
 
-/** Barrels whose lack of `WATCHED` coverage is deliberate, each with the reason it is safe.
- *  A ledger, not an off-switch: every entry must still be a barrel Court actually imports (asserted
- *  below), so a stale row fails rather than rotting. */
-const COVERAGE_EXEMPT: ReadonlyArray<{ barrel: string; reason: string }> = [
-  {
-    barrel: '@modoki/engine/testing',
-    reason: 'Test INFRASTRUCTURE (tests/helpers/sourceScanner.ts), not engine behaviour Court '
-      + 'measures. A change there breaks Court\'s suite LOUDLY — a scanner that stops stripping '
-      + 'fails its own assertions — rather than silently shifting a measured value, and silent '
-      + 'shifting is the only failure this gate exists to catch.',
-  },
-];
+/* ⚠️ **No COVERAGE_EXEMPT ledger (#1140).** It held one row, `@modoki/engine/testing` ("test
+ *  INFRASTRUCTURE, not engine behaviour Court measures"), and that barrel HAS watched coverage — so
+ *  the row pardoned nothing. Its staleness check asked only that Court still imported the barrel,
+ *  which stays true for an exemption that is no longer needed. Found when the row was put on the
+ *  spending ledger (#1140). A barrel that genuinely cannot shift a measured value takes a counted
+ *  `assertExemptionLedger` row with that reason. */
 
 /** `const WATCHED = [...]` as written in a file. Both copies are plain source, read through the
  *  shared scanner so a commented-out entry cannot be mistaken for a live one. */
@@ -107,28 +102,86 @@ describe.skipIf(!hasInternalGames())('Court sweep scope (#787)', () => {
     expect(watchedIn(SWEEP_GATE)).toEqual(watchedIn(AUTHORED));
   });
 
+  it('every #826 site binds the SAME reason to the SAME arm', () => {
+    // ⚠️ **This asserts ARM -> REASON, not the SET of reasons, and the difference is the guard.**
+    // A first version collected every `return '<literal>'` in the body and compared the set; that
+    // passes with the two literals SWAPPED — attach `'git-failed'` to the degenerate arm and
+    // `'no-own-commits'` to the dirty-tree failure and #826 is restored verbatim, with every one of
+    // Court's own suites green (they exercise reason -> sentence, never arm -> reason).
+    //
+    // ⚠️ **THREE files, not two.** A second version read only the two `courtTouched` copies — and
+    // `changedLevels.ts` is the site that actually RENDERS the sentence, the one the release-version
+    // skill now quotes. Swapping its literals restored #826 in the one place a human reads, with
+    // this guard green. That is the same defect this whole family is about: a guard whose scope
+    // claim is wider than its reach. `typecheck-projects.mjs` is the fourth site and is covered
+    // end-to-end by `typecheckProjectsSelection.test.ts`, which drives the real CLI against a temp
+    // repo that genuinely produces `origin/main === HEAD` — a stronger test than this one, so it is
+    // deliberately not duplicated here.
+    //
+    // Read as SOURCE rather than by calling anything: these functions shell out to git against
+    // whatever repo the suite runs in, so their ANSWER is a fact about this checkout, not the code.
+    // `readScannedSource` blanks comment CONTENT while preserving structure, so a prose copy of a
+    // literal cannot satisfy a match, and `\n\s*` still spans an interleaved comment.
+    const DEGENERATE = /if \(base\.trim\(\) === git\('rev-parse', 'HEAD'\)\?\.trim\(\)\) return '([^']+)';/g;
+    const DIRTY_FAILED = /const dirty = git\('status'[^\n]*\n\s*if \(dirty === null\) return '([^']+)';/g;
+    const BASE_FAILED = /const base = git\('merge-base', 'HEAD', 'origin\/main'\);\n\s*if \(base === null\) return '([^']+)';/g;
+    // The FOURTH arm, which the first version of this guard missed even though the same commit's
+    // test-cost.md edit newly enumerated it. Different shape per file: a `??` fallback in the two
+    // `courtTouched` copies, an `if` on the diff in `changedLevels`.
+    const AUTHORED_FALLBACK = /return authoredInRange\(git, base\.trim\(\)\) \?\? '([^']+)';/g;
+    const COMMITTED_FAILED = /const committed = git\('diff'[^\n]*\n\s*if \(committed === null\) return '([^']+)';/g;
+
+    const SITES = [
+      { file: SWEEP_GATE, fourth: AUTHORED_FALLBACK, fourthName: 'authoredInRange fallback' },
+      { file: AUTHORED, fourth: AUTHORED_FALLBACK, fourthName: 'authoredInRange fallback' },
+      { file: CHANGED_LEVELS, fourth: COMMITTED_FAILED, fourthName: 'failed git diff' },
+    ];
+
+    for (const { file, fourth, fourthName } of SITES) {
+      const code = readScannedSource(file).code;
+      const rel = path.relative(REPO, file);
+      const arm = (re: RegExp, what: string): string => {
+        const all = [...code.matchAll(re)];
+        // ⚠️ Exactly one, not "the first" — two functions in one file each carrying this arm would
+        // make a `.exec` silently vouch for whichever came first and ignore the other.
+        expect(all.length, `${rel}: expected exactly ONE ${what} arm, found ${all.length}. Renamed, `
+          + 'reshaped, or duplicated? This guard cannot vouch for an arm it cannot read, and a '
+          + 'silently unreadable arm is how #826 survived in the first place.').toBe(1);
+        return all[0][1];
+      };
+
+      expect(arm(DEGENERATE, 'degenerate merge-base === HEAD'),
+        `${rel}: the degenerate range is NOT a failure — git answered, HEAD merely has no commits `
+        + 'of its own. Reporting it as one is #826, and it is the message the hub prints after every '
+        + 'push and a worker after every fast-forward merge.').toBe('no-own-commits');
+      expect(arm(DIRTY_FAILED, 'failed git status'),
+        `${rel}: a failed git status IS a real failure`).toBe('git-failed');
+      expect(arm(BASE_FAILED, 'failed merge-base'),
+        `${rel}: a failed merge-base IS a real failure`).toBe('git-failed');
+      expect(arm(fourth, fourthName),
+        `${rel}: the ${fourthName} arm is a real failure, not the degenerate range`).toBe('git-failed');
+    }
+  });
+
   it('every engine barrel Court\'s tests import has SOME watched coverage', () => {
     const watched = watchedIn(AUTHORED);
-    const exempt = new Map(COVERAGE_EXEMPT.map((e) => [e.barrel, e.reason]));
     const barrels = courtImportedBarrels();
 
     // Non-vacuity: Court imports engine barrels in quantity; an empty read means the scan broke.
     expect(barrels.length, 'no @modoki/engine imports found under games/court/tests — the scan has '
       + 'broken, and every assertion below would pass having examined nothing').toBeGreaterThan(1);
 
-    const uncovered: string[] = [];
+    const uncovered: Array<{ site: string }> = [];
     for (const barrel of barrels) {
-      if (exempt.has(barrel)) continue;
       const dir = barrelSourceDir(barrel);
       if (dir === null) {
-        uncovered.push(`${barrel}  (not in @modoki/engine's exports map — cannot resolve)`);
+        uncovered.push({ site: `${barrel}  (not in @modoki/engine's exports map — cannot resolve)` });
         continue;
       }
-      const covered = watched.some((w) => w === dir || w.startsWith(`${dir}/`));
-      if (!covered) uncovered.push(`${barrel}  ->  ${dir}`);
+      if (!watched.some((w) => w === dir || w.startsWith(`${dir}/`))) uncovered.push({ site: `${barrel}  ->  ${dir}` });
     }
 
-    expect(uncovered, [
+    expect(uncovered.map((u) => u.site), [
       "Court's tests import these engine barrels, and NO `WATCHED` entry in",
       'engine/scripts/courtAuthored.mjs covers any part of them. A clone that changes one of these',
       'surfaces and touches nothing under games/court skips the Court suite entirely — and Court',
@@ -136,20 +189,7 @@ describe.skipIf(!hasInternalGames())('Court sweep scope (#787)', () => {
       '',
       'Fix by adding the specific subdirectory Court depends on to WATCHED in BOTH copies —',
       'NOT the whole barrel: widening WATCHED to `engine/` makes the gate a no-op, which is the',
-      'cost it exists to avoid. If the dependency genuinely cannot shift a measured value, add a',
-      'COVERAGE_EXEMPT row saying why.',
-      '',
-      ...uncovered,
+      'cost it exists to avoid.',
     ].join('\n')).toEqual([]);
-  });
-
-  it('every COVERAGE_EXEMPT row is still a barrel Court imports', () => {
-    // Keeps the ledger load-bearing: an exemption for a barrel nobody imports any more is vouching
-    // for nothing, and would quietly excuse that name if a future test started importing it.
-    const barrels = new Set(courtImportedBarrels());
-    const stale = COVERAGE_EXEMPT.map((e) => e.barrel).filter((b) => !barrels.has(b));
-    expect(stale, 'These COVERAGE_EXEMPT rows name barrels games/court/tests no longer imports. '
-      + 'Delete them — a stale exemption is an unexamined hole waiting for the name to come back.')
-      .toEqual([]);
   });
 });

@@ -64,6 +64,15 @@ export interface HandlesDumpResult {
 /** A greyed-out control — present but inert. `meta.disabled` is the convention. */
 const isDisabled = (h: InteractionHandle) => h.meta?.disabled === true;
 
+/** Cap a label for the REPORT. A panel's text can be arbitrarily long, and a chrome element's
+ *  label is its whole `textContent`. Capped here, at serialization, rather than in the provider:
+ *  the `label` filter and aim match the FULL string (#1153), so a provider-side cap would make any
+ *  long label unmatchable by its own text. */
+const LABEL_CAP = 60;
+export function capLabel(label: string): string {
+  return label.length > LABEL_CAP ? label.slice(0, LABEL_CAP - 3) + '…' : label;
+}
+
 const isElement = (v: unknown): v is Element =>
   typeof Element !== 'undefined' && v instanceof Element;
 
@@ -80,12 +89,23 @@ export function computeHandles(params: HandlesDumpParams = {}): HandlesDumpResul
     // the chrome provider. Being un-clickable because something covers you is a property
     // of anything addressed by coordinate, which is what a handle IS. `owner` is a live
     // DOM node, so it must never reach the JSON that crosses the agent bridge.
-    const { owner, ...rest } = h;
-    const occludedBy = isElement(owner) ? occlusionAt(owner, h.x, h.y) : undefined;
+    const { owner, label, ...rest } = h;
+    // `'press'` — not click-shaped, so the tap-zone redirect is not consulted (#1016). Stated as a
+    // choice rather than inherited from a default.
+    //
+    // ⚠️ The reason is NOT "these are canvas handles" — an earlier version said that and it is
+    // wrong: `computeHandles` also carries `chromeHandles`' DOM `[data-ui-id]` handles. The
+    // conclusion survives on a narrower fact, checked rather than assumed: the chrome handles are
+    // editor toolbar/panel controls that paint ABOVE the game viewport, and a game's `minTapSize`
+    // expander is inside it, so no zone can cover one. ⚠️ `/api/input/tap-handle` refuses on this
+    // very field and IS click-shaped, so if a chrome handle ever moves under game UI this line is
+    // where a stale refusal would come from.
+    const occludedBy = isElement(owner) ? occlusionAt(owner, h.x, h.y, 'press') : undefined;
     const inWindow = h.x >= 0 && h.y >= 0 && h.x <= vw && h.y <= vh;
     const clipped = inWindow && isElement(owner) && !withinClip(owner, h.x, h.y, clipCache);
     return {
       ...rest,
+      ...(label !== undefined ? { label: capLabel(label) } : {}),
       ...(occludedBy ? { occludedBy } : {}),
       onScreen: inWindow && !clipped,
       ...(clipped ? { clipped: true as const } : {}),

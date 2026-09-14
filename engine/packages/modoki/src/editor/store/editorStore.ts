@@ -1,5 +1,6 @@
 /** Editor state — separate from game state. Tracks selection, mode, etc. */
 
+import type { EntityPin } from '../../runtime/core/ecs/entityPin';
 import { create } from 'zustand';
 import { pushSelectionChange, isExecutingUndoRedo } from '../undo/undoManager';
 import { entityRef, buildGuidIndex, resolveWith, type EntityRef } from '../undo/entityRef';
@@ -87,6 +88,10 @@ interface EditorState {
   /** Full multi-selection set. [] when nothing selected, [id] for a single
    *  selection. The Inspector renders common traits across all of these. */
   selectedEntityIds: number[];
+  /** Bumped by `requestEntityReveal` — "show the lead entity's row", from a writer whose intent
+   *  a selection DIFF cannot express (#1156). The Hierarchy reveals on a lead change anyway;
+   *  this is for the writes that leave the lead where it was. Not persisted, not undoable. */
+  entityRevealRequest: number;
   /** Primary (lead) selected asset — drives the single-asset Inspector detail. */
   selectedAsset: SelectedAsset | null;
   /** Full multi-selection set of assets. [] when none, [asset] for a single
@@ -239,10 +244,11 @@ interface EditorState {
   sceneLoadStatus: { active: boolean; loaded: number; total: number };
   /** Transient toast notice (e.g. save succeeded / blocked). Auto-clears. */
   toast: { id: number; message: string; kind: 'info' | 'warn' | 'success' } | null;
-  /** Selective Apply-to-Prefab dialog state */
-  applyPrefabDialog: { active: boolean; rootInstanceId: number | null };
+  /** Selective Apply-to-Prefab dialog state. `subject` pins the instance root it was opened for
+   *  (#868 — see prefabDialogSubject.ts). */
+  applyPrefabDialog: { active: boolean; subject: EntityPin | null };
   /** Selective Revert-to-Prefab dialog state */
-  revertPrefabDialog: { active: boolean; rootInstanceId: number | null };
+  revertPrefabDialog: { active: boolean; subject: EntityPin | null };
   /** Project Settings window open state */
   projectSettingsOpen: boolean;
   /** "Clean Up Unused Assets" dialog open state */
@@ -369,6 +375,11 @@ interface EditorState {
   previewOwner: 'timeline' | 'animation' | null;
 
   selectEntity: (id: number | null) => void;
+  /** Ask the Hierarchy to reveal the lead entity's row even if the lead did not change (#1156).
+   *  Called by writers that MEAN "select this": an agent's set-selection and a viewport or
+   *  UI-preview pick. Deliberately NOT by undo/redo, a Cmd/Ctrl-click toggle or a delete fold,
+   *  which would re-open a row the user collapsed even when the lead did not move. See docs/editor.md § Revealing the selected row. */
+  requestEntityReveal: () => void;
   /** Replace the whole selection set. `primary` becomes the anchor (defaults to
    *  the last id). Used by Shift-range selection. */
   setSelectedEntities: (ids: number[], primary?: number | null) => void;
@@ -379,9 +390,9 @@ interface EditorState {
   /** Replace the whole asset selection set (Cmd/Shift multi-select in the Assets
    *  panel). `primary` becomes the lead (defaults to the last). Clears entities. */
   setSelectedAssets: (assets: SelectedAsset[], primary?: SelectedAsset | null) => void;
-  openApplyPrefabDialog: (rootInstanceId: number) => void;
+  openApplyPrefabDialog: (subject: EntityPin) => void;
   closeApplyPrefabDialog: () => void;
-  openRevertPrefabDialog: (rootInstanceId: number) => void;
+  openRevertPrefabDialog: (subject: EntityPin) => void;
   closeRevertPrefabDialog: () => void;
   openProjectSettings: () => void;
   closeProjectSettings: () => void;
@@ -611,6 +622,7 @@ export const useEditorStore = create<EditorState>((set, get) => {
   return {
   selectedEntityId: null,
   selectedEntityIds: [],
+  entityRevealRequest: 0,
   selectedAsset: null,
   selectedAssets: [],
   gizmoMode: lsEnum('editor:gizmoMode', ['translate', 'rotate', 'scale'] as const, 'translate'),
@@ -638,8 +650,8 @@ export const useEditorStore = create<EditorState>((set, get) => {
   buildStatus: { active: false, message: '', step: 0, totalSteps: 5, failed: false },
   sceneLoadStatus: { active: false, loaded: 0, total: 0 },
   toast: null,
-  applyPrefabDialog: { active: false, rootInstanceId: null },
-  revertPrefabDialog: { active: false, rootInstanceId: null },
+  applyPrefabDialog: { active: false, subject: null },
+  revertPrefabDialog: { active: false, subject: null },
   projectSettingsOpen: false,
   cleanupAssetsOpen: false,
   findReferencesTarget: null,
@@ -691,6 +703,8 @@ export const useEditorStore = create<EditorState>((set, get) => {
       selectedAssets: [],
     });
   },
+
+  requestEntityReveal: () => set((s) => ({ entityRevealRequest: s.entityRevealRequest + 1 })),
 
   setSelectedEntities: (ids, primary) => {
     const unique = Array.from(new Set(ids));
@@ -881,10 +895,10 @@ export const useEditorStore = create<EditorState>((set, get) => {
       if (get().toast?.id === id) set({ toast: null });
     }, 3500);
   },
-  openApplyPrefabDialog: (rootInstanceId) => set({ applyPrefabDialog: { active: true, rootInstanceId } }),
-  closeApplyPrefabDialog: () => set({ applyPrefabDialog: { active: false, rootInstanceId: null } }),
-  openRevertPrefabDialog: (rootInstanceId) => set({ revertPrefabDialog: { active: true, rootInstanceId } }),
-  closeRevertPrefabDialog: () => set({ revertPrefabDialog: { active: false, rootInstanceId: null } }),
+  openApplyPrefabDialog: (subject) => set({ applyPrefabDialog: { active: true, subject } }),
+  closeApplyPrefabDialog: () => set({ applyPrefabDialog: { active: false, subject: null } }),
+  openRevertPrefabDialog: (subject) => set({ revertPrefabDialog: { active: true, subject } }),
+  closeRevertPrefabDialog: () => set({ revertPrefabDialog: { active: false, subject: null } }),
   openProjectSettings: () => set({ projectSettingsOpen: true }),
   closeProjectSettings: () => set({ projectSettingsOpen: false }),
   openCleanupAssets: () => set({ cleanupAssetsOpen: true }),
@@ -942,11 +956,9 @@ export const useEditorStore = create<EditorState>((set, get) => {
     set({ editingSkinDef: def });
   },
   applySkinDef: (path, def) => {
+    // setRig2D wakes every render loop itself (#1141), including the SceneView overlay's
+    // heatmap — ensureCanvas2DListeners subscribes mark2DDirty to that same channel.
     setRig2D(path, def);
-    // Redraw the SceneView: weight edits (auto-weight/paint) change the heatmap even when
-    // the bind-pose mesh positions don't, so nothing else would trigger a repaint until the
-    // next pointer event. Cheap flag set (no React re-render), safe to call per paint move.
-    mark2DDirty();
     set((s) => (s.editingSkinAsset?.path === path ? { editingSkinDef: def } : {}));
   },
   setSkinWeightView: (on) => set({ skinWeightView: on }),

@@ -35,7 +35,7 @@
 
 import { emit } from '../core/journal';
 import { peekCurrentWorld } from '../core/ecs/worldRegistry';
-import { NoopStoreBackend, type StoreBackend } from './storeBackend';
+import { NoopStoreBackend, isStoreCancelled, type StoreBackend, type StoreCancelled } from './storeBackend';
 import { IapLedger, type IapLedgerStore } from './ledger';
 import { LocalVerifier, type PurchaseVerifier } from './verifier';
 import type { IapGrant, IapProduct, IapProductInfo, PurchaseResult, StoreTransaction } from './types';
@@ -305,8 +305,8 @@ async function settle(tx: StoreTransaction, source: 'purchase' | 'recovery'): Pr
  * ⚠️ A settle spans awaits that can last minutes — the platform sheet, Face ID, a parent approving
  * Ask-to-Buy. `resetIap()` can run in that window — a live in-process game swap: an OTA sub-game
  * switch, or hash navigation between two baked games. Both re-enter `GameShell`'s `[gameId]` boot
- * effect, which calls `unregisterGameSystems()` (→ `resetIap()`) at `App.tsx:301` and re-inits
- * PlayerPrefs at `:290`. ⚠️ NOT the editor's File → Open Project, which this comment used to cite:
+ * effect, which calls `unregisterGameSystems()` (→ `resetIap()`) in `App.tsx`'s `GameShell` `[gameId]` effect and re-inits
+ * PlayerPrefs in that same effect. ⚠️ NOT the editor's File → Open Project, which this comment used to cite:
  * Electron's `setProject` ends in `webContents.reloadIgnoringCache()` and the web-served editor has
  * no in-process project switch at all, so neither editor surface reaches this window (#421).
  * `settleInner` holds the OLD config in a closure. Its ledger store
@@ -542,7 +542,7 @@ export async function purchase(productId: string): Promise<PurchaseResult> {
   if (!c) return { outcome: 'failed', productId, error: 'iap not configured' };
   journal('iap.purchase.started', { productId });
 
-  let tx: StoreTransaction | null;
+  let tx: StoreTransaction | StoreCancelled | null;
   try {
     tx = await c.backend.purchase(productId);
   } catch (e) {
@@ -554,10 +554,30 @@ export async function purchase(productId: string): Promise<PurchaseResult> {
     return { outcome: 'failed', productId, error: d.code ? `${d.message} [${d.code}]` : d.message };
   }
 
-  if (!tx) {
+  if (!tx || isStoreCancelled(tx)) {
     // Dismissed the sheet. Not an error, and must never surface as one.
-    journal('iap.purchase.cancelled', { productId });
-    return { outcome: 'cancelled', productId };
+    //
+    // ⚠️ **`null` and a named cancel are ONE outcome** (#946). The reason rides along when the
+    // backend had one and is simply absent when it did not — a plugin build predating the field
+    // still resolves `null`, and nothing here may start behaving differently because a string
+    // arrived. The journal entry gains a field; the outcome, the wording and the analytics event
+    // are untouched. Before this, the iOS side's own `classify(error)` was computed and then
+    // discarded on the cancel arm, so a purchase the player CONFIRMED came back `cancelled` with
+    // no record able to say whether Apple cancelled it or a fault was misclassified as one.
+    // ⚠️ `detail` as well as `reason`, and the omission was the SAME failure-to-generalise this
+    // change accuses #499 of, one layer up. The native side computes `errorDetail(error)` — the
+    // `{domain, code, description, failureReason, underlying}` chain #499 added precisely BECAUSE a
+    // top-level domain/code does not separate an ASD fault from an AMS one — resolves it, and it
+    // arrived here and was dropped one line before the journal. The reject arm three lines up has
+    // always carried it. Both fields are documented "log-only"; without this there was no log.
+    const reason = tx === null ? undefined : tx.reason;
+    const detail = tx === null ? undefined : tx.detail;
+    journal('iap.purchase.cancelled', reason === undefined
+      ? { productId }
+      : detail === undefined ? { productId, reason } : { productId, reason, detail });
+    return reason === undefined
+      ? { outcome: 'cancelled', productId }
+      : { outcome: 'cancelled', productId, cancelReason: reason };
   }
 
   return settle(tx, 'purchase');

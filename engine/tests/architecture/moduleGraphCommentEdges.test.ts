@@ -13,17 +13,17 @@
  * whole job is to be trustworthy. A guard that pushes the fix the wrong way needs the reason
  * recorded next to it.
  *
- * Two runtime files already hold an import inside prose (`ui/storeHooks.ts:11`,
- * `storage/playerPrefs.ts:25`). Both happen to use the bare `@modoki/engine/runtime`, so today's
+ * Two runtime files already hold an import inside prose (the module docblocks of `ui/storeHooks.ts`,
+ * `storage/playerPrefs.ts`). Both happen to use the bare `@modoki/engine/runtime`, so today's
  * graph is correct by luck rather than by construction. This is what replaces the luck.
  */
 
 import * as fs from 'node:fs';
-import * as os from 'node:os';
 import * as path from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { readScannedSource } from '@modoki/engine/testing';
 import { parseFromStatements, REPO_ROOT } from './moduleGraph';
+import { makeScratchDir } from '@modoki/engine/testing/scratchDir';
 
 /** A file whose PROSE shows a relative import — the shape that injects a phantom cross-folder edge. */
 const SRC = [
@@ -47,7 +47,7 @@ describe('the module graph is built from code, not from prose (#812)', () => {
   });
 
   it('the same source read through readScannedSource yields only the REAL import', () => {
-    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'modgraph-'));
+    const dir = makeScratchDir('modgraph-');
     try {
       const file = path.join(dir, 'storeHooks.ts');
       fs.writeFileSync(file, SRC, 'utf8');

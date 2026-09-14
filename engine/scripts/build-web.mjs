@@ -10,16 +10,16 @@
  *
  *  Full cross-game coverage still lives in `npm run typecheck` (tsc -b engine). */
 
-import { execSync } from 'node:child_process';
+import { execSync, spawnSync } from 'node:child_process';
 import { writeFileSync, existsSync } from 'node:fs';
 import path from 'node:path';
 import { isProjectDir } from './projectRoots.mjs';
-import { parseBuildTarget } from './buildTarget.mjs';
+import { parseBuildTarget, nativeHealPlatforms } from './buildTarget.mjs';
 import { scopedTsconfigContent } from './scopedTsconfig.mjs';
 import { chooseViteConfig } from './viteConfigChoice.mjs';
-import { loadEnginePluginModule, loadEnginePluginModuleResult } from './loadVendorPlugins.mjs';
+import { loadEnginePluginModuleResult } from './loadVendorPlugins.mjs';
 import { acquireBuildClaim } from './buildClaimsStore.mjs';
-import { describeUnreadablePackageJsonWarning } from './staleNodeModulesWarning.mjs';
+import { readGitProvenance, readHeadCommit, settleBuildStamp, writeBuildStamp, BUILD_STAMP_FILENAME } from './ota/buildStamp.mjs';
 
 // --target parsing lives in buildTarget.mjs (pure, unit-tested) — see its header comment for
 // WHY there is no default in either direction (#40).
@@ -111,22 +111,16 @@ if (proj) {
   }
 }
 
-/** The SAME two-part project-config check the editor's `/api/build` route runs — for every
- *  target alike (`vite-asset-scanner.ts`'s `/api/build` handler runs it once, before the platform
- *  branch, so it covers web/playable/ios/android identically; this mirrors that, not a
- *  native-only gate). Sibling of #589, where the CLI scaffolder (`add-native-targets.mjs`) reached
- *  the identical scaffold path with none: this script is what `npm run build` actually runs, and
- *  what `docs/build.md` tells a human to run by hand for a device build, and until now it healed a
- *  native project (`healNativeProject`, below) straight from a config nothing had validated.
- *
- *  The union pass is SEPARATE from `validateBuildConfig` because `validateBuildConfig` sees the
- *  already-RESOLVED config, where a bad value has been coerced to its default and is no longer
- *  there to complain about (#39) — the failure this closes: a `capacitor.orientation` typo like
- *  `"potrait"` is silently coerced to the default orientation and ships with rotation UNLOCKED to
- *  the store, invisible to `validateBuildConfig` alone. What this guards is artifact IDENTITY/
- *  behaviour (`app.appId`, `build.appleTeamId`, `capacitor.orientation` and friends), not HTTP
- *  hygiene — which is why a CLI needs it exactly as much as a route does. No `--force` bypass:
- *  that is an owner call.
+/** The SAME project-config check the editor's `/api/build` route runs — `projectBuildConfigErrors`,
+ *  the one function every build entry point calls (#827) — for every target alike (the route runs
+ *  it once, before the platform branch, so it covers web/playable/ios/android identically; this
+ *  mirrors that, not a native-only gate). Sibling of #589, where the CLI scaffolder
+ *  (`add-native-targets.mjs`) reached the identical scaffold path with none: this script is what
+ *  `npm run build` actually runs, and what `docs/build.md` tells a human to run by hand for a device
+ *  build, and until then it healed a native project straight from a config nothing had validated.
+ *  What this guards is artifact IDENTITY/behaviour (`app.appId`, `build.appleTeamId`,
+ *  `capacitor.orientation` and friends), not HTTP hygiene — which is why a CLI needs it exactly as
+ *  much as a route does. No `--force` bypass: that is an owner call.
  *
  *  Gated on `proj`: that's the only case with a `project.config.json` to check (a bare
  *  `npm run build:editor` never reaches this script at all). Degrades to a no-op like the heals
@@ -156,204 +150,145 @@ async function validateProjectConfig() {
     );
     return;
   }
-  const { loadProjectConfig, loadProjectUserConfig, validateBuildConfig, projectConfigUnionErrors } = cfgMod;
-  const projectRoot = path.resolve(repoRoot, proj);
-  const cfg = loadProjectConfig(projectRoot);
-  const cfgErrors = [...projectConfigUnionErrors(projectRoot), ...validateBuildConfig(cfg, loadProjectUserConfig(projectRoot))];
+  const cfgErrors = cfgMod.projectBuildConfigErrors(path.resolve(repoRoot, proj));
   if (cfgErrors.length) {
     console.error(`[build-web] invalid project settings — not building:\n${cfgErrors.map((e) => `  • ${e}`).join('\n')}`);
     process.exit(1);
   }
 }
 
-/** Heal the native project before building it — the CLI half of #90/#148/#150/#685.
+/** Generate app icons + splash art for a native build — the CLI half of #1011 facet A.
  *
- *  `--target native` ONLY: every heal below is a native-artifact concern, so a web/playable
- *  build has nothing to keep fresh and must not pay for it (nor mutate the project).
+ *  ⚠️ Before this, icon generation ran from EXACTLY ONE place: `iconStep` in
+ *  `engine/plugins/vite-asset-scanner.ts`, i.e. the editor's Build menu. So the CLI native recipe that
+ *  CLAUDE.md documents — `npm run build -- --target native`, then `cap sync`, then
+ *  xcodebuild/gradle — regenerated NOTHING, and a project whose art or `iconSource` had changed
+ *  shipped the previously committed icons with every gate green. There was no guard either: the
+ *  freshness stamp lives under a gitignored `.cache/`, so nothing committed records what the shipped
+ *  artifacts were built from, and it is a per-MACHINE fact.
  *
- *  Why it lives here. The editor's `/api/build` runs THREE in-process heals before the shell
- *  steps of a native build (`vite-asset-scanner.ts`, "Re-heal the native config"):
- *  `healNativeConfig` → `ensureCapacitorDeps` → `vendorEnginePlugins`. `docs/build.md` presents
- *  this CLI recipe as the manual EQUIVALENT of Build → iOS/Android Device, but until #148 it ran
- *  NONE of them, and #148 only added the third — so the documented CLI recipe could produce an
- *  IPA/APK signed with a stale team, missing a newly-required Capacitor plugin, or containing the
- *  PREVIOUS native code, with every signal reporting success. `npm run build -- --target native`
- *  is what the recipe actually runs, so this is the seam where the two paths become equivalent.
- *  This is not a new class of side effect: `build-web.mjs` already mutates the project (re-packs
- *  tarballs, rewrites the `capacitor-game-debug` dep spec, runs `npm install` in the project dir)
- *  since #148, and the CLI path exists precisely for headless/CI use where "go open the editor
- *  once" isn't available.
+ *  ⚠️ Deliberately NOT part of `healNativeProject`: a heal repairs machine/identity config, and burying
+ *  a required step inside an optional one is the failure `electron/main.ts`'s `healProjectOnOpen` docblock argues against and
+ *  #150 actually shipped. It is its own call, in the main flow, where a reader can see it.
  *
- *  ORDER IS LOAD-BEARING — copies the editor's exact sequence, do not reorder:
- *   1. `healNativeConfig` — machine/identity settings (iOS DEVELOPMENT_TEAM, Android
- *      local.properties) that must land before anything shells out to xcodebuild/gradle.
- *   2. `ensureCapacitorDeps` — adds any Capacitor dep the engine now requires. When it adds
- *      `capacitor-game-debug`, it writes a PLACEHOLDER spec (`'*'`).
- *   3. `vendorEnginePlugins` — rewrites that placeholder to the real
- *      `file:plugins/<name>-<ver>.tgz`. Running this BEFORE step 2 would mean step 2's
- *      placeholder never gets rewritten — a project stuck depending on a spec npm can't
- *      install. Vendoring is also re-run UNCONDITIONALLY (not just when deps changed): it's
- *      idempotent + content-addressed, so an unchanged plugin re-packs nothing, but a plugin
- *      whose CONTENT changed needs a fresh tarball even when no dep was newly added.
- *   4. `npm install`, gated on EITHER heal having changed something (`depHeal.changed ||
- *      v.needsInstall`) — a tarball or a new dep spec is inert until installed, and gating on
- *      only one of the two conditions would silently skip the other's install.
- *   5. `verifyInstalledMatchesTarballResult` (#731's Result variant — see the call site below for
- *      why the plain `verifyInstalledMatchesTarball` isn't enough here) — runs UNCONDITIONALLY,
- *      whether or not step 4 installed anything (#685). Every signal step 4's gate trusts (the dep
- *      spec, the lockfiles, the install marker) can agree "nothing to do" while
- *      `node_modules/<plugin>` on disk still holds a PREVIOUS tarball's bytes — that IS the #685
- *      failure, and it is exactly the case a
- *      gate keyed to "something changed" cannot see. So step 5 is a separate, unconditional read
- *      of what's actually on disk, not part of step 4's `if`. On a mismatch it throws — no
- *      auto-repair (see the call site's own comment for why).
- *
- *  `ensureCapacitorDeps` needs a PLATFORM, but `--target native` covers both iOS and Android with
- *  no platform of its own — so this heals whichever of `ios/`/`android/` the project already has
- *  on disk. A project with NEITHER folder yet skips the deps heal: that case is the editor's
- *  scaffold-then-build path (`addNativeTarget` scaffolds an empty native folder as part of adding
- *  the target), which this CLI script has no equivalent entry point for.
- *
- *  Each heal degrades to a no-op (not a crash) when its module can't be loaded — in the packaged
- *  editor that's because esbuild is pruned as a devDependency, NOT because engine sources are
- *  missing (measured, #714: `engine/plugins/*.ts` IS present there). Either way `main.ts` already
- *  healed/vendored on project open, and the packaged app can't rebuild a plugin's `dist/` anyway
- *  (`canBuild:false`).
- *
- *  NOT defended, deliberately: a HALF-present engine checkout (`addNativeTarget.ts` loadable but
- *  `vendorPlugins.ts` not) would let step 2 write the placeholder `capacitor-game-debug: '*'` spec
- *  and then install it, resolving against the public registry instead of the local tarball. There
- *  is no operational path into that state — both loads go through the same esbuild-gated seam
- *  (`loadEnginePluginModule`), so esbuild's presence gates both identically, and a source checkout
- *  has both `.ts` files, so the two modules still appear and disappear together — and guarding it
- *  would mean gating the install on which module loaded, which is exactly the coupling step 4
- *  exists to avoid. Recorded because it was raised and dismissed on reasoning, not because it was
- *  never considered.
- *
- *  ⚠️ npm ships `README.md` regardless of the `files` field, so editing a plugin's DOCS re-hashes
- *  its tarball too. Nothing to do differently here — just don't be surprised by a re-vendor after
- *  a docs-only plugin edit. */
-async function healNativeProject() {
+ *  Every input comes from `project.config.json` now, so this passes only the project and the platform —
+ *  the script owns resolution AND the freshness check, which is what keeps this from being a second
+ *  copy of `iconStep`'s fourteen-flag command line. A non-zero exit FAILS the build: the script only
+ *  exits non-zero when something asked for an icon that cannot be read, which is a broken config rather
+ *  than an absent one, and shipping stale art over it is the defect this closes. Verified against every
+ *  project in the repo: none has an `iconSource` pointing at a missing file. */
+async function generateNativeIcons() {
   if (target !== 'native' || !proj) return;
+  // ⚠️ The EDITOR's native plan runs this script as its first step and then runs its OWN `iconStep`,
+  // so without this the editor build generates every icon twice — two `@capacitor/assets` runs, two
+  // sharp splash passes, two collateral snapshots of both native trees, and two windows in which the
+  // restore can fail. It is not merely waste: this function does BOTH platforms whenever both dirs
+  // exist, so an iOS-only editor build would also rewrite tracked Android art, which is #162/#236's
+  // complaint by name. `iconStep` is per-platform, so the editor's copy wins and this one stands
+  // down. Set only by that plan's own build-web step — a plain CLI build never carries it.
+  // ⚠️ That reason used to read "`iconStep` is the more capable of the two (it falls back to the
+  // bundled icon for a project that authors none…)". #1027 removed the difference — both callers
+  // now read the default from `scripts/iconAssets.mjs` — so per-platform is the whole of it now.
+  if (process.env.MODOKI_ICONS_HANDLED === '1') {
+    console.log('[build-web] icon generation left to the caller (MODOKI_ICONS_HANDLED=1).');
+    return;
+  }
   const projectRoot = path.resolve(repoRoot, proj);
-
-  // 1. Machine/identity config — DEVELOPMENT_TEAM, local.properties.
-  const healMod = await loadEnginePluginModule(repoRoot, path.join('plugins', 'healNativeConfig.ts'));
-  if (healMod) {
-    for (const n of healMod.healNativeConfig(projectRoot).notes) console.log(`[build-web][heal] ${n}`);
-  }
-
-  // 2. Engine-required Capacitor deps, per platform actually present on disk.
-  let depsChanged = false;
   const platforms = ['ios', 'android'].filter((p) => existsSync(path.join(projectRoot, p)));
-  if (platforms.length) {
-    const addMod = await loadEnginePluginModule(repoRoot, path.join('plugins', 'addNativeTarget.ts'));
-    if (addMod) {
-      for (const platform of platforms) {
-        const depHeal = addMod.ensureCapacitorDeps(projectRoot, platform, repoRoot);
-        for (const n of depHeal.notes) console.log(`[build-web][heal] ${n}`);
-        depsChanged = depsChanged || depHeal.changed;
-      }
+  if (!platforms.length) return;
+
+  const script = path.join(repoRoot, 'engine', 'scripts', 'generate-icons.mjs');
+  for (const platform of platforms) {
+    // ⚠️ `--strict true` (#1028). Without it this function's own promise below — "not building;
+    // building on would ship the previously committed art" — covered exactly ONE of the five ways
+    // generation can fail, because #1011 facet C made only an unreadable icon SOURCE exit non-zero.
+    // The other four exited 0: a non-zero `npx @capacitor/assets` (a NETWORK fetch, and much the
+    // likeliest of the five), an unreadable splash source, collateral the wrapper could not
+    // restore, and a post-processing throw. So the rare failure aborted the build and the common
+    // one did not, which is precisely backwards.
+    const res = spawnSync(process.execPath, [script, '--project', projectRoot, '--platform', platform, '--strict', 'true'], {
+      cwd: repoRoot,
+      stdio: 'inherit',
+    });
+    // ⚠️ Two different failures, and telling the operator the wrong one costs them the hunt. A
+    // non-zero STATUS is the script's own verdict — it named the bad path already. A NULL status is
+    // the child never running or dying on a signal (no node on PATH, OOM, an abort), where "fix the
+    // icon source" points at a file that is perfectly fine.
+    if (res.error || res.status === null) {
+      console.error(`[build-web] could not RUN icon generation for ${platform} — not building. `
+        + `${res.error?.message ?? `killed by ${res.signal ?? 'an unknown signal'}`}. `
+        + 'This is the generator failing to start, not a problem with the icon source.');
+      process.exit(1);
     }
-  }
-
-  // 3. Vendor engine plugins — MUST run after step 2 (see ordering note above).
-  const vendorLoad = await loadEnginePluginModuleResult(repoRoot, path.join('plugins', 'vendorPlugins.ts'));
-  const vendorMod = vendorLoad.module;
-  const v = vendorMod ? vendorMod.vendorEnginePlugins(projectRoot, repoRoot) : null;
-  if (v?.vendored.length) console.log(`[build-web][heal] vendored engine plugin(s): ${v.vendored.join(', ')}`);
-
-  // 4. Install iff either heal actually changed something.
-  //
-  // Deliberately NOT short-circuited on a missing vendor module: step 2 may have written new deps
-  // into package.json, and those are inert until installed. Bailing out here because step 3 was
-  // unavailable would leave the project claiming a dependency that is not on disk — the same
-  // shape as the #148/#150 silent-success bug, one step further along. So the install is gated on
-  // what CHANGED, never on which module happened to load.
-  //
-  // ⚠️ This is an `if`, not an early `return` — step 5 below must run on EVERY call, install or
-  // not. An early return here used to end the function; see step 5's own comment for why that
-  // shape is exactly the bug it exists to catch.
-  if (depsChanged || v?.needsInstall) {
-    const why = depsChanged ? 'healed Capacitor plugins' : 'engine plugin changed';
-    console.log(`[build-web] ${why} — installing it into the project…`);
-    execSync('npm install', { stdio: 'inherit', cwd: projectRoot, env: runEnv });
-    // The marker records the vendored spec set, so it is only meaningful when step 3 actually ran.
-    if (vendorMod && v) vendorMod.writeVendorMarker(projectRoot, v.expectedVendor);
-  }
-
-  // 5. Verify node_modules actually matches the tarball it's supposed to be installed from —
-  //    UNCONDITIONALLY, after step 4, never behind its `if` (#685).
-  //
-  //    The whole failure mode this defends against is node_modules holding a PREVIOUS tarball's
-  //    bytes while every OTHER signal — package.json's `file:` spec, package-lock.json,
-  //    node_modules/.package-lock.json, the install marker step 4 just wrote or left alone —
-  //    agrees the current one is installed. In that state `depsChanged` is false and
-  //    `v.needsInstall` is false too (the marker matches), so step 4 does nothing: `npm install`
-  //    reports "up to date" and never re-extracts. A check gated on step 4 having changed
-  //    something could therefore never fire in the one case it exists for — the exact
-  //    unreachable-mechanism shape #148/#150 already burned this file on once. So this runs
-  //    every single call, install-or-not, and reads what's actually on disk rather than trusting
-  //    the signals that said "nothing to do".
-  //
-  //    Deliberately NOT auto-repaired, and the reason is NOT "a build must not write a tracked
-  //    lockfile" — vendorEnginePlugins already does exactly that (invalidateLockfileEntry) a few
-  //    lines above. The difference is KNOWLEDGE of which side is right: the vendorer just packed
-  //    the tarball, so it knows the tarball is correct and node_modules is what must move. This
-  //    check knows only that the two DISAGREE. Its reachable causes include a mis-resolved `.tgz`
-  //    binary merge conflict, where the committed tarball is the WRONG generation — auto-extracting
-  //    it would install wrong bytes confidently and erase the only signal that the committed state
-  //    is inconsistent. Fail loud instead, with the exact manual remedy, and let a human decide
-  //    which side is authoritative.
-  // ⚠️ `loadEnginePluginModuleResult` degrades SILENTLY (as far as its return value goes) when the
-  //    TS sources are absent or esbuild is not installed. Say so out loud rather than skipping in
-  //    silence — a guard that quietly does not run is the same unreachable-mechanism shape this
-  //    step exists to catch, one level up — and say WHICH cause it was (#714): the two mean
-  //    different things to a developer, and a single "cannot load" warning couldn't tell them
-  //    apart. Not fatal either way — vendoring itself already degrades here, and failing the build
-  //    would take the packaged editor's native build with it.
-  if (!vendorMod) {
-    const why = vendorLoad.reason === 'no-esbuild'
-      ? 'esbuild is not installed, so vendorPlugins.ts could not be loaded (expected inside a '
-        + 'packaged editor, which ships no devDependencies; on a source checkout it means the '
-        + 'install is incomplete — run `npm install` at the repo root)'
-      : 'there is no engine/plugins/vendorPlugins.ts here — this is not a source checkout, so '
-        + 'there is nothing to check';
-    console.warn(
-      `[build-web] ⚠️ ${why}. The #685 stale-node_modules check did NOT run, so a native build `
-        + 'here could ship the wrong plugin bytes undetected.',
-    );
-  }
-  if (vendorMod) {
-    // ⚠️ `verifyInstalledMatchesTarballResult` (#731) — same shape as `loadEnginePluginModuleResult`
-    // above: this project's OWN `package.json` may be unreadable (truncated, merge-conflicted), and
-    // that must not read as "verified clean" any more than a missing engine checkout should. Warn,
-    // don't throw — the throw below diagnoses "node_modules is STALE", which would be the wrong
-    // message for a `package.json` this check could not even read.
-    const { problems, reason: verifyReason } = vendorMod.verifyInstalledMatchesTarballResult(projectRoot);
-    if (verifyReason === 'unreadable-package-json') {
-      console.warn(`[build-web] ${describeUnreadablePackageJsonWarning(projectRoot)}`);
-    }
-    if (problems.length) {
-      throw new Error(
-        `[build-web] node_modules is STALE for ${problems.length} vendored plugin(s) — a native build `
-          + `would silently ship the WRONG native code (#685):\n${problems.map((p) => `  • ${p}`).join('\n')}\n\n`
-          + `⚠️ Do NOT reach for \`npm install --package-lock-only\` — measured (#685): it is what CREATES `
-          + `this state, writing the new resolved+integrity into both lockfiles without extracting, and a tree `
-          + `left there is unrecoverable by any plain install. A bare \`npm install\` or \`--force\` also will `
-          + `not fix it. Repair, in order:\n`
-          + `  1. delete the plugin's entry from ${projectRoot}/package-lock.json ("node_modules/<plugin>" under "packages")\n`
-          + `  2. (cd ${projectRoot} && npm install)   # a PLAIN install — it now re-resolves AND extracts\n`
-          + `  3. ONLY if step 2 reported "up to date" and this check still fires — then node_modules/.package-lock.json `
-          + `is ahead of the disk and nothing will re-extract:\n`
-          + `     (cd ${projectRoot} && rm -rf node_modules/<plugin> && npm install)`,
-      );
+    if (res.status !== 0) {
+      console.error(`[build-web] icon generation failed for ${platform} — not building. `
+        + 'Fix the icon/splash source it named above (or clear the field in Project Settings); '
+        + 'building on would ship the previously committed art.');
+      process.exit(1);
     }
   }
 }
 
+/** Heal the native project before building it — `healNativeProject` (`engine/plugins/healNativeProject.ts`),
+ *  the ONE heal sequence every native-build entry point calls (#827). Which steps run, in what order,
+ *  and why that order is load-bearing live there, not here: this function supplies only the I/O.
+ *
+ *  `--target native` ONLY: every heal is a native-artifact concern, so a web/playable build has
+ *  nothing to keep fresh and must not pay for it (nor mutate the project). `ensureCapacitorDeps`
+ *  needs a PLATFORM, but `--target native` has none of its own — so this heals whichever of
+ *  `ios/`/`android/` the project already has on disk.
+ *
+ *  Degrades with a warning (never a crash, never silently) when the module cannot be loaded — in a
+ *  packaged editor that is esbuild pruned as a devDependency, not missing sources (#714), and there
+ *  the `/api/build` route that spawned this script already ran the identical sequence in-process.
+ *  On a source checkout the same warning means the install is incomplete. */
+async function healNativeProject() {
+  if (target !== 'native' || !proj) return;
+  const projectRoot = path.resolve(repoRoot, proj);
+  const { module: healMod, reason } = await loadEnginePluginModuleResult(repoRoot, path.join('plugins', 'healNativeProject.ts'));
+  if (!healMod) {
+    const why = reason === 'no-esbuild'
+      ? 'esbuild is not installed, so healNativeProject.ts could not be loaded (expected inside a '
+        + 'packaged editor, which ships no devDependencies; on a source checkout it means the '
+        + 'install is incomplete — run `npm install` at the repo root)'
+      : 'there is no engine/plugins/healNativeProject.ts here — this is not a source checkout, so '
+        + 'there is nothing to heal';
+    console.warn(
+      `[build-web] ⚠️ ${why}. The native-project heals and the #685 stale-node_modules check did NOT `
+        + 'run, so a native build here could ship a stale team, a missing plugin or the wrong plugin bytes undetected.',
+    );
+    return;
+  }
+  // The editor's per-platform build names its platform; a hand-run build covers the folders present (#1062).
+  const platforms = nativeHealPlatforms(process.env, (p) => existsSync(path.join(projectRoot, p)));
+  const result = await healMod.healNativeProject(projectRoot, repoRoot, platforms, {
+    log: (line) => console.log(`[build-web]${line.startsWith('[') ? '' : ' '}${line}`),
+    warn: (line) => console.warn(`[build-web] ${line}`),
+    install: async (why) => {
+      console.log(`[build-web] ${why} — installing it into the project…`);
+      try {
+        execSync('npm install', { stdio: 'inherit', cwd: projectRoot, env: runEnv });
+        return true;
+      } catch {
+        return false;
+      }
+    },
+  });
+  if (result.ok) return;
+  // No `[build-web]` prefix on these: the top-level `catch` adds it to every in-process throw.
+  if (result.reason === 'stale-node-modules') throw new Error(result.lines.join('\n'));
+  if (result.reason === 'facebook-sdk-manifest') throw new Error(result.lines.join('\n'));
+  if (result.reason === 'install-failed') throw new Error(`npm install (${result.why}) failed in ${projectRoot} — not building.`);
+  throw new Error(result.message);
+}
+
 const tscBin = path.join(repoRoot, 'node_modules', 'typescript', 'bin', 'tsc');
 const viteBin = path.join(repoRoot, 'node_modules', 'vite', 'bin', 'vite.js');
+// #906: a native dist is what an OTA publish uploads, so it records which tree built it. Read NOW,
+// before the heals and icon generation rewrite tracked native files — those are this build's own
+// output, not uncommitted source. Web and playable builds are never OTA-published and get no stamp
+// (it would otherwise put a private-repo commit id into a public web deploy). See buildStamp.mjs.
+const stampStart = target === 'native' && proj ? readGitProvenance(path.resolve(repoRoot, proj)) : null;
 try {
   // FIRST of all — before the heal touches a single native file, let alone the typecheck or the
   // build itself. See validateProjectConfig's own comment for why.
@@ -361,6 +296,10 @@ try {
   // Before the typecheck, which resolves the plugin's TS types out of the project's node_modules.
   // A heal that lands after it would be typechecked against the old copy.
   await healNativeProject();
+  // AFTER the heal: `ensureCapacitorDeps` may have just created the platform directory this writes
+  // into, and the icon step is a native-artifact concern like every heal above it. Before the web
+  // build, so a failure costs nothing already built.
+  await generateNativeIcons();
   // Typecheck gate — DEV only. typescript is a devDependency, so the packaged editor
   // doesn't ship it; there the typecheck is also redundant (the engine ships pre-built,
   // and an EXTERNAL project's game code isn't in the tsc scope anyway — see `include`
@@ -410,6 +349,12 @@ try {
   // to hand Vite a CJS config, whose loader branch compiles in memory. Which config, and why the
   // choice is by file existence, is `viteConfigChoice.mjs` — not restated here.
   run(`${q(node)} ${q(viteBin)} build --config ${chooseViteConfig(engineDir)}`);
+  if (stampStart) {
+    const projectRoot = path.resolve(repoRoot, proj);
+    const stamp = settleBuildStamp(stampStart, readHeadCommit(projectRoot));
+    writeBuildStamp(path.join(projectRoot, 'dist'), stamp);
+    console.log(`[build-web] ${BUILD_STAMP_FILENAME}: commit ${stamp.commit ?? 'unknown'}, dirty ${stamp.dirty ?? 'unknown'}.`);
+  }
 } catch (e) {
   // A failing CHILD already printed its diagnostics via inherited stdio, so re-printing would
   // duplicate them — that is what the bare `catch` here was for, and it stays right for `run()`.

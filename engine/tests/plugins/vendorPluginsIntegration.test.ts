@@ -2,20 +2,27 @@
  * Integration guards for the vendored-plugin identity hash + the manual re-vendor
  * CLI. These use the REAL git/node/esbuild + the REAL committed engine plugins, so
  * they live apart from vendorPlugins.test.ts (which mocks child_process — that mock
- * would swallow the git/node spawns here). They skip cleanly where those tools or
- * the games/engine layout are absent (e.g. a packaged/external checkout).
+ * would swallow the git/node spawns here). They skip cleanly where those TOOLS are
+ * absent (e.g. a packaged/external checkout).
+ *
+ * ⚠️ They do NOT skip on the plugins being absent (#1071). `engine/packages/capacitor-*` is
+ * git-tracked and ships in the public snapshot too (publish-engine-oss.sh includes all of
+ * `engine/`), so there is no checkout where their absence is legitimate: it can only mean a
+ * move or a rename, and the presence gates this file used to carry would have answered that
+ * by skipping every check here and reporting green.
  */
 import { describe, it, expect, afterAll } from 'vitest';
+import { expectInOrder } from '@modoki/engine/testing/inOrder';
 import { execFileSync, spawnSync } from 'node:child_process';
 import { createRequire } from 'node:module';
 import fs from 'node:fs';
-import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import * as tar from 'tar';
 import { pluginHashInputs, compareTarballToSource, stampPluginBuild, vendorEnginePlugins, pluginContentHash, readPackedVersion, verifyInstalledMatchesTarball, verifyInstalledMatchesTarballResult } from '../../plugins/vendorPlugins';
 import { buildPluginsWorkspaces, plannedStampDirs } from '../../scripts/stamp-plugin-builds.mjs';
 import { repoFiles } from '../../scripts/repoCorpus.mjs';
+import { makeScratchDir } from '@modoki/engine/testing/scratchDir';
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..', '..');
 const enginePkgs = path.join(repoRoot, 'engine', 'packages');
@@ -31,9 +38,7 @@ function esbuildOk(): boolean {
 }
 /** The real engine capacitor plugins (the ones vendorEnginePlugins packs). */
 function enginePluginDirs(): string[] {
-  let names: string[];
-  try { names = fs.readdirSync(enginePkgs); } catch { return []; }
-  return names
+  return fs.readdirSync(enginePkgs)
     .filter((n) => n.startsWith('capacitor-'))
     .map((n) => path.join(enginePkgs, n))
     .filter((d) => fs.existsSync(path.join(d, 'package.json')));
@@ -46,9 +51,14 @@ function enginePluginDirs(): string[] {
 // the hash MUST be git-tracked. Catches a future plugin whose build tool emits to
 // a dir name not in BUILD_OUTPUT_DIRS (out/, lib/, .kotlin/, …) far better than
 // the hand-listed synthetic cases in vendorPlugins.test.ts.
-describe.skipIf(!(gitOk() && enginePluginDirs().length > 0))(
+describe.skipIf(!gitOk())(
   'plugin identity hash is reproducible — hashed set is exactly committed source',
   () => {
+    // The loop below makes one test per plugin, so an empty list would make NO tests — green.
+    it('finds the engine capacitor plugins to check', () => {
+      expect(enginePluginDirs().length).toBeGreaterThan(0);
+    });
+
     for (const dir of enginePluginDirs()) {
       const name = path.basename(dir);
       it(`${name}: every hashed input is git-tracked (no untracked/ignored litter leaks in)`, () => {
@@ -87,25 +97,30 @@ describe.skipIf(!(gitOk() && enginePluginDirs().length > 0))(
 // churn this scoping fixed), while its shipped native + src build inputs MUST. Reverting
 // pluginHashInputs to "all non-dist inputs" fails this; over-narrowing (dropping src or
 // native) fails it too.
-describe.skipIf(!(gitOk() && enginePluginDirs().some((d) => path.basename(d) === 'capacitor-game-debug')))(
+describe.skipIf(!gitOk())(
   'plugin identity hash EXCLUDES non-shipped dev files, INCLUDES shipped + build inputs (real plugin)',
   () => {
-    const dir = enginePluginDirs().find((d) => path.basename(d) === 'capacitor-game-debug')!;
-    const inputs = new Set(pluginHashInputs(dir));
+    const dir = enginePluginDirs().find((d) => path.basename(d) === 'capacitor-game-debug');
+    const inputs = new Set(dir ? pluginHashInputs(dir) : []);
     const under = (prefix: string) => [...inputs].filter((p) => p === prefix || p.startsWith(prefix + '/'));
-    const onDisk = (rel: string) => fs.existsSync(path.join(dir, rel));
 
-    // Non-shipped, non-build-input dev files → must be EXCLUDED (only assert for the ones
-    // that actually exist, so a future plugin reshuffle can't falsely pass/fail).
+    it('the real capacitor-game-debug plugin is present', () => {
+      expect(dir, 'engine/packages/capacitor-game-debug is gone — repoint this partition test').toBeDefined();
+    });
+
+    // Non-shipped, non-build-input dev files → must be EXCLUDED. Each one is asserted to EXIST
+    // first: an exclusion check over a directory that is not there passes by having nothing in
+    // it, so a plugin reshuffle must turn this red and update the list, not quietly stop checking.
     for (const excluded of ['android/src/test', 'ios/Tests', 'test-vectors']) {
-      it.skipIf(!onDisk(excluded))(`excludes ${excluded}/** (not shipped, not a dist input)`, () => {
+      it(`excludes ${excluded}/** (not shipped, not a dist input)`, () => {
+        expect(fs.existsSync(path.join(dir!, excluded)), `${excluded}/ moved — update this list`).toBe(true);
         expect(under(excluded), `${excluded}/** must not feed the identity hash`).toEqual([]);
       });
     }
 
     // Shipped native + src build inputs → must be INCLUDED (guards against over-narrowing).
     for (const included of ['src', 'android/src/main', 'ios/Sources']) {
-      it.skipIf(!onDisk(included))(`includes ${included}/** (shipped and/or a dist build input)`, () => {
+      it(`includes ${included}/** (shipped and/or a dist build input)`, () => {
         expect(under(included).length, `${included}/** must feed the identity hash`).toBeGreaterThan(0);
       });
     }
@@ -119,14 +134,14 @@ describe.skipIf(!(gitOk() && enginePluginDirs().some((d) => path.basename(d) ===
 // esbuild first. This locks that: a regression to a direct .ts import would exit
 // non-zero here. Vendors into a THROWAWAY temp project — never mutates the repo.
 describe.skipIf(!esbuildOk())('vendor-plugins.mjs CLI runs (esbuild-bundled, no dir-import crash)', () => {
-  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-vendor-cli-'));
+  const tmp = makeScratchDir('modoki-vendor-cli-');
   afterAll(() => fs.rmSync(tmp, { recursive: true, force: true }));
 
   it('bundles + vendors an engine plugin into a temp project, exit 0', () => {
     const plugin = enginePluginDirs().find((d) => path.basename(d) === 'capacitor-game-debug')
       ?? enginePluginDirs()[0];
-    if (!plugin) { expect(true).toBe(true); return; } // no engine plugins → nothing to vendor
-    const pluginName = JSON.parse(fs.readFileSync(path.join(plugin, 'package.json'), 'utf8')).name as string;
+    expect(plugin, 'no engine capacitor plugin to vendor — they are tracked, so this is a move').toBeDefined();
+    const pluginName = JSON.parse(fs.readFileSync(path.join(plugin!, 'package.json'), 'utf8')).name as string;
 
     fs.writeFileSync(path.join(tmp, 'package.json'), JSON.stringify({
       name: 'vendor-cli-smoke', version: '0.0.0', dependencies: { [pluginName]: '*' },
@@ -155,7 +170,7 @@ describe.skipIf(!esbuildOk())('vendor-plugins.mjs CLI runs (esbuild-bundled, no 
 // deliberately drifted tarballs and asserts each kind of drift is actually reported. Real tar, real
 // gzip, a throwaway plugin dir — never the repo's own.
 describe('compareTarballToSource detects a tarball whose NAME is fine and whose BYTES are not', () => {
-  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-tgz-drift-'));
+  const tmp = makeScratchDir('modoki-tgz-drift-');
   afterAll(() => fs.rmSync(tmp, { recursive: true, force: true }));
 
   const pluginDir = path.join(tmp, 'plugin');
@@ -178,7 +193,7 @@ describe('compareTarballToSource detects a tarball whose NAME is fine and whose 
 
   /** Pack the plugin's shipped set the way npm pack lays it out: everything under `package/`. */
   function pack() {
-    const stage = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-tgz-stage-'));
+    const stage = makeScratchDir('modoki-tgz-stage-');
     fs.cpSync(pluginDir, path.join(stage, 'package'), { recursive: true });
     fs.rmSync(path.join(stage, 'package', 'ios', 'Tests'), { recursive: true, force: true });
     tar.create({ file: tarball, sync: true, gzip: true, cwd: stage }, ['package']);
@@ -268,7 +283,7 @@ describe('compareTarballToSource detects a tarball whose NAME is fine and whose 
 // simulate the poisoned state — never the tarball, only the installed copy, since that is exactly
 // what #685 found: the tarball and every book-keeping signal were already correct.
 describe('verifyInstalledMatchesTarball detects node_modules holding stale bytes (#685)', () => {
-  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-installed-drift-'));
+  const tmp = makeScratchDir('modoki-installed-drift-');
   afterAll(() => fs.rmSync(tmp, { recursive: true, force: true }));
 
   const PLUGIN = 'capacitor-installed-fixture';
@@ -277,7 +292,7 @@ describe('verifyInstalledMatchesTarball detects node_modules holding stale bytes
   /** A throwaway project dir depending on PLUGIN via the exact `file:plugins/...` spec shape
    *  vendorEnginePlugins writes — the one verifyInstalledMatchesTarball recognizes. */
   function freshProjectRoot(): string {
-    const dir = fs.mkdtempSync(path.join(tmp, 'proj-'));
+    const dir = makeScratchDir('proj-', { base: tmp });
     fs.writeFileSync(path.join(dir, 'package.json'), JSON.stringify({
       name: 'installed-drift-fixture',
       dependencies: { [PLUGIN]: `file:${REL_TGZ}`, 'not-a-vendored-plugin': '^1.0.0' },
@@ -288,7 +303,7 @@ describe('verifyInstalledMatchesTarball detects node_modules holding stale bytes
   /** Pack a real two-entry plugin (package.json + one native source file) to REL_TGZ, npm-pack
    *  layout (`package/...`), the same way the fixture above this block does. */
   function packTarball(projectRoot: string, nativeBody: string) {
-    const stage = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-installed-drift-stage-'));
+    const stage = makeScratchDir('modoki-installed-drift-stage-');
     fs.mkdirSync(path.join(stage, 'package', 'ios', 'Sources'), { recursive: true });
     fs.writeFileSync(path.join(stage, 'package', 'package.json'), JSON.stringify({ name: PLUGIN, version: '1.0.0' }, null, 2));
     fs.writeFileSync(path.join(stage, 'package', 'ios', 'Sources', 'Plugin.swift'), nativeBody);
@@ -348,7 +363,7 @@ describe('verifyInstalledMatchesTarball detects node_modules holding stale bytes
     // A project depending ONLY on a normal registry dep — no `PLUGIN`, no plugins/, no
     // node_modules/ at all. If the non-vendored dep were mis-recognized as a vendored plugin, it
     // would report a missing tarball for it (there is no `plugins/` dir to find one in).
-    const projectRoot = fs.mkdtempSync(path.join(tmp, 'proj-'));
+    const projectRoot = makeScratchDir('proj-', { base: tmp });
     fs.writeFileSync(path.join(projectRoot, 'package.json'), JSON.stringify({
       name: 'no-vendored-plugins-fixture',
       dependencies: { 'not-a-vendored-plugin': '^1.0.0' },
@@ -362,7 +377,7 @@ describe('verifyInstalledMatchesTarball detects node_modules holding stale bytes
   // merge-conflicted project package.json shipped stale plugin bytes with every signal green.
   describe('verifyInstalledMatchesTarballResult tells "could not check" apart from "verified clean" (#731)', () => {
     it('reports reason "unreadable-package-json" and NO problems when package.json does not parse', () => {
-      const projectRoot = fs.mkdtempSync(path.join(tmp, 'proj-'));
+      const projectRoot = makeScratchDir('proj-', { base: tmp });
       fs.writeFileSync(path.join(projectRoot, 'package.json'), '{ this is not valid json');
       const r = verifyInstalledMatchesTarballResult(projectRoot);
       expect(r.reason).toBe('unreadable-package-json');
@@ -382,7 +397,7 @@ describe('verifyInstalledMatchesTarball detects node_modules holding stale bytes
     // read/parse failure (→ reason: 'unreadable-package-json', the genuine unknown) — the same
     // absent-vs-unknown split `buildClaimsStore.mjs`'s `readClaimsResult` already makes.
     it('reports reason null (not "unreadable-package-json") when package.json is simply missing — ABSENT, not unknown', () => {
-      const projectRoot = fs.mkdtempSync(path.join(tmp, 'proj-'));
+      const projectRoot = makeScratchDir('proj-', { base: tmp });
       // No package.json written at all — fs.readFileSync throws ENOENT, which must NOT read as
       // "could not check": there is nothing here that could possibly vendor a stale plugin.
       const r = verifyInstalledMatchesTarballResult(projectRoot);
@@ -420,7 +435,7 @@ describe('verifyInstalledMatchesTarball detects node_modules holding stale bytes
 // hand-rolled real-tar fixture as the block above), and packInto's actual `npm pack` output must
 // really carry it (further below, via a real, unmocked vendorEnginePlugins). ───────────────────
 describe('compareTarballToSource tolerates the #685 packed-version suffix, nothing else', () => {
-  const tmp2 = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-tgz-verdrift-'));
+  const tmp2 = makeScratchDir('modoki-tgz-verdrift-');
   afterAll(() => fs.rmSync(tmp2, { recursive: true, force: true }));
 
   const pluginDir2 = path.join(tmp2, 'plugin');
@@ -446,7 +461,7 @@ describe('compareTarballToSource tolerates the #685 packed-version suffix, nothi
     pkg.version = `1.0.0-h${hash}`;
     fs.writeFileSync(pj, JSON.stringify(pkg, null, 2) + '\n');
     try {
-      const stage = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-tgz-stage2-'));
+      const stage = makeScratchDir('modoki-tgz-stage2-');
       fs.cpSync(pluginDir2, path.join(stage, 'package'), { recursive: true });
       tar.create({ file: tarball2, sync: true, gzip: true, cwd: stage }, ['package']);
       fs.rmSync(stage, { recursive: true, force: true });
@@ -486,8 +501,8 @@ describe('compareTarballToSource tolerates the #685 packed-version suffix, nothi
  *  vendorEnginePlugins — real `npm pack`, real gzip tarball, exactly what a clone runs. Shared
  *  by the two #685 describe blocks below. */
 function makeFixture685() {
-  const projectRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-vendor685-proj-'));
-  const engineRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-vendor685-eng-'));
+  const projectRoot = makeScratchDir('modoki-vendor685-proj-');
+  const engineRoot = makeScratchDir('modoki-vendor685-eng-');
   const pluginDir = path.join(engineRoot, 'engine', 'packages', 'capacitor-fixture685');
   fs.mkdirSync(path.join(pluginDir, 'dist'), { recursive: true });
   fs.writeFileSync(path.join(pluginDir, 'package.json'), JSON.stringify({
@@ -518,7 +533,7 @@ describe('packInto (#685): the REAL npm-packed tarball carries the hash-suffixed
       // runs and renames npm's own `<name>-1.0.0-h<hash>.tgz` output to the un-prefixed name.
       expect(tgzName).toBe(`capacitor-fixture685-1.0.0-${hash}.tgz`);
 
-      const extractDir = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-vendor685-extract-'));
+      const extractDir = makeScratchDir('modoki-vendor685-extract-');
       try {
         tar.extract({ file: path.join(pluginsDir, tgzName!), cwd: extractDir, sync: true });
         const packedPkg = JSON.parse(fs.readFileSync(path.join(extractDir, 'package', 'package.json'), 'utf8'));
@@ -570,7 +585,7 @@ describe('vendorEnginePlugins: the #685 packed-version staleness trigger', () =>
       // Hand-build the exact pre-migration state: the tarball's NAME is already current (this
       // IS the plugin's real content hash), but its packed package.json is a bare `1.0.0` — no
       // `npm pack` / packInto involved, so this in no way depends on the fix under test.
-      const stage = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-vendor685-bare-'));
+      const stage = makeScratchDir('modoki-vendor685-bare-');
       fs.mkdirSync(path.join(stage, 'package'), { recursive: true });
       fs.writeFileSync(path.join(stage, 'package', 'package.json'), JSON.stringify({
         name: 'capacitor-fixture685', version: '1.0.0', capacitor: { android: {}, ios: {} },
@@ -604,7 +619,7 @@ describe('vendorEnginePlugins: the #685 packed-version staleness trigger', () =>
 // the stamp trustworthy; a stamp that is merely PRESENT would "fix" the flake while vouching for
 // a stale dist, which is the quiet wrong build this must not become.
 describe('stampPluginBuild marks a built dist current (#395)', () => {
-  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-stamp-'));
+  const tmp = makeScratchDir('modoki-stamp-');
   afterAll(() => fs.rmSync(tmp, { recursive: true, force: true }));
 
   /** A plugin dir with sources and (optionally) a built dist. */
@@ -764,7 +779,7 @@ describe('stamp-plugin-builds derives its set from build:plugins, not from disco
     const postinstall: string = pkg.scripts.postinstall;
     expect(postinstall).toContain('stamp-plugin-builds.mjs');
     // Order is the correctness argument: a failed build must never reach the stamper.
-    expect(postinstall.indexOf('build:plugins')).toBeLessThan(postinstall.indexOf('stamp-plugin-builds.mjs'));
+    expectInOrder(postinstall, ['build:plugins', 'stamp-plugin-builds.mjs'], 'postinstall');
     expect(postinstall.slice(postinstall.indexOf('build:plugins'), postinstall.indexOf('stamp-plugin-builds.mjs'))).toContain('&&');
   });
 });

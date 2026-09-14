@@ -39,8 +39,21 @@ describe('goIosDevice — pickHostSidePlatform', () => {
     expect(String((got as { error: string }).error)).toMatch(/no device is attached/)
   })
 
-  it('ignores a junk `explicit` instead of trusting it', () => {
-    expect(pickHostSidePlatform({ explicit: 'windows-phone', leased: 'android', iphones: [], androids: ['S'] })).toBe('android')
+  // This used to assert the junk was IGNORED — falling through to the lease. Not trusting it was
+  // right; ignoring it was the same wrong-device answer this function exists to refuse: a caller who
+  // NAMED a platform (`'andriod'`) was answered about whatever the lease or the cable said instead,
+  // with no hint its ask had been dropped. #1072's close-out sweep found it; the curl API reaches it
+  // (the MCP tools enum-validate `platform`).
+  it('REFUSES a junk `explicit` — neither trusting it nor silently falling through to the lease', () => {
+    const got = pickHostSidePlatform({ explicit: 'windows-phone', leased: 'android', iphones: [], androids: ['S'] })
+    expect(got).toHaveProperty('error')
+    expect(String((got as { error: string }).error)).toContain('windows-phone')
+  })
+
+  it('an EMPTY or NULL explicit is "not given", not junk', () => {
+    expect(pickHostSidePlatform({ explicit: '', leased: 'android', iphones: [], androids: ['S'] })).toBe('android')
+    // A JSON body can carry `platform: null` — the curl API reaches this with it.
+    expect(pickHostSidePlatform({ explicit: null as unknown as string, leased: 'android', iphones: [], androids: ['S'] })).toBe('android')
   })
 })
 
@@ -169,6 +182,27 @@ describe('goIosDevice — pickGoIosDevice', () => {
 // filter its hardware by the lease's PLATFORM before handing it to `pickGoIosDevice` — an Android
 // lease's `deviceModel` (e.g. 'SM-S901B') can never match an attached iPhone's `ProductType`, so
 // it read as a genuine mismatch and refused about a device that was attached, just on Android.
+describe('goIosDevice — a USB lease names its device by UDID (#1065)', () => {
+  const devices: GoIosDevice[] = [
+    { udid: 'UDID-A', productType: 'iPhone10,1' },
+    { udid: 'UDID-B', productType: 'iPhone10,1' },
+  ]
+
+  it('picks the leased UDID outright — two phones of the same model are no longer ambiguous', () => {
+    expect(pickGoIosDevice({ devices, lease: { deviceModel: 'iPhone10,1', osVersion: null }, leaseUdid: 'UDID-B' }))
+      .toEqual({ device: devices[1] })
+  })
+
+  it('refuses when the leased UDID is not attached — never another phone', () => {
+    const r = pickGoIosDevice({ devices, leaseUdid: 'UDID-GONE' })
+    expect((r as { error: string }).error).toMatch(/USB lease's device UDID-GONE is not attached/)
+  })
+
+  it('an explicit MODOKI_IOS_DEVICE_UDID pin still wins, as it does over the lease model', () => {
+    expect(pickGoIosDevice({ pinned: 'UDID-A', devices, leaseUdid: 'UDID-B' })).toEqual({ device: devices[0] })
+  })
+})
+
 describe('goIosDevice — leaseForIosOps (#670 finding 3)', () => {
   const hardware = { deviceModel: 'iPhone14,5', osVersion: '17.0' }
 

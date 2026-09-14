@@ -16,6 +16,8 @@
  *  contract closes it — `{guid}`/`{name}` resolves to the entity's live screen rect INSIDE the
  *  same call that dispatches the click. See `docs/enact.md`. */
 
+import type { AimGesture } from './domPointContract';
+
 // Type-only, and DOM-free like the rest of this file — `mcpResult.ts` is dependency-free
 // (`docs/mcp-tool-conventions.md` §9), so pulling just the `ErrorCode` union in does not
 // smuggle any MCP/DOM/node surface into the main-process program that consumes this contract.
@@ -27,6 +29,12 @@ import type { ErrorCode } from '../../tools/shared/mcpResult';
  *  triggers one), so an id captured a moment ago can name a different entity by the time it is
  *  used — the same trap `docs/debug-tools-mcp.md` warns about for every other addressed tool. */
 export interface EntityPointSpec {
+  /** What the caller will do here — see `AimGesture` in `domPointContract.ts`. Only `'tap'` is
+   *  click-shaped, and only a click-shaped aim models #977's tap-zone redirect (#1016). **Absent is
+   *  read as NOT click-shaped** — the redirect only ever removes refusals, so an unknown intent
+   *  must not get it. See `isClickShaped`'s banner. */
+  gesture?: AimGesture;
+
   guid?: string;
   name?: string;
   id?: number;

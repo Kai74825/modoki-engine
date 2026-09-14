@@ -50,7 +50,7 @@ export function parseBuildTarget(argv, env) {
     return { ok: false, message: usage };
   }
 
-  // F1: mirrors vite.config.ts:226's authoritative check (`process.env.VITE_PLAYABLE === '1'`)
+  // F1: mirrors vite.config.ts's authoritative `isPlayable` check (`process.env.VITE_PLAYABLE === '1'`)
   // exactly — a truthy check here (the old bug) treated `VITE_PLAYABLE=0` as "on" and hard-failed
   // a legitimate `--target web` build even though vite itself reads `0` as off.
   if (env.VITE_PLAYABLE === '1' && target !== 'playable') {
@@ -64,4 +64,22 @@ export function parseBuildTarget(argv, env) {
   if (target === 'playable') childEnv.VITE_PLAYABLE = '1';
 
   return { ok: true, target, childEnv };
+}
+
+/** Which native platforms `build-web.mjs --target native` heals for.
+ *
+ *  A hand-run CLI build covers whichever of `ios/`/`android/` exist — it builds both, or whichever the
+ *  project has. But the editor's `/api/build` SPAWNS this script as a step of ONE platform's build, and
+ *  a folder listing cannot tell that apart: Court has both folders, so an Android build healed for iOS
+ *  too — and heal step 6 (the #1062 Facebook strip) can REFUSE on an iOS manifest, failing an Android
+ *  build and rewriting iOS files during it. So the route names its platform in `MODOKI_NATIVE_PLATFORM`,
+ *  and that wins. An unknown value is ignored (falls back to the folders) rather than healing nothing.
+ *
+ *  @param {Record<string, string | undefined>} env
+ *  @param {(platform: 'ios' | 'android') => boolean} exists  whether `<project>/<platform>` exists
+ *  @returns {Array<'ios' | 'android'>} */
+export function nativeHealPlatforms(env, exists) {
+  const named = env.MODOKI_NATIVE_PLATFORM;
+  if (named === 'ios' || named === 'android') return exists(named) ? [named] : [];
+  return /** @type {Array<'ios' | 'android'>} */ (['ios', 'android']).filter((p) => exists(p));
 }

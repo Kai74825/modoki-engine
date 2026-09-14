@@ -61,7 +61,38 @@ export interface EntryPrefabProvider {
    *  its OWN unit — a root authored `width: 50, widthUnit: '%'` must resolve against the
    *  viewport exactly like the view's own authored `entryWidth`, not get pinned to a raw px
    *  number (#765). */
-  rootSize(prefabGuid: string): { width: number; widthUnit: 'px' | '%'; height: number; heightUnit: 'px' | '%' };
+  rootSize(prefabGuid: string): {
+    width: number; widthUnit: 'px' | '%'; height: number; heightUnit: 'px' | '%';
+    /** Set when the root authors that axis in a unit a pooled row cannot resolve — a viewport unit
+     *  (`vw`/`vh`/`vmin`/`vmax`) or any other non-px/% string. The axis then reads 0: the owner's
+     *  decision on #840 was to REFUSE such a root, not to guess a size for it. See `warnRefusedRootUnit`. */
+    refusedWidthUnit?: string;
+    refusedHeightUnit?: string;
+  };
+  /** The prefab root's authored `UIElement` record verbatim (`undefined` when the prefab is not
+   *  cached or its root has no `UIElement`) — **the operand every "did an author write this?"
+   *  question must use** (#1026).
+   *
+   *  ⚠️ **The pooled-row pin OVERWRITES the entity's own `UIElement`, so the live trait cannot
+   *  answer that question about itself.** `applySlots` writes the resolved box back — `width`,
+   *  `height` and their UNITS included — and a guard reading the result back sees the pool's own
+   *  write wearing an author's clothes. Two fields were provably wrong that way: `width`/`height`,
+   *  because the pin forces `widthUnit`/`heightUnit` to `'px'` and that unit is exactly what
+   *  `pooledSizeNeedsWarning` reads to grant the documented `%` exemption (so the exemption died
+   *  on frame 1 for every pooled row, and Court's `DailyMonth` — authored `100%` — warned about
+   *  a px value nothing authored); and `isVisible`, whose pin VARIES with the slot's live state,
+   *  so a slot pinned parked (`false`) and later going live compares the pool's own `false`
+   *  against a pin of `true` and warns.
+   *
+   *  ⚠️ **Required, not optional, deliberately.** A fake provider that omitted it would make every
+   *  authoring warning silently unreachable — the #761 failure exactly — and an optional method
+   *  turns that into a green suite instead of a compile error. Adding it to a fake is one line;
+   *  losing the warnings again is not worth the convenience.
+   *
+   *  A field ABSENT from the record means "the author never touched it": a scene/prefab save
+   *  strips any field equal to its default, so the caller resolves an absent field against the
+   *  trait's own schema default rather than treating `undefined` as authored. */
+  rootAuthoredUI(prefabGuid: string): Record<string, unknown> | undefined;
   /** Spawn one instance under `parentId`. Returns the root ecs id, or 0 if it cannot yet (the
    *  prefab is not cached) — the caller then tries again next frame rather than guessing. */
   spawnInstance(world: World, prefabGuid: string, opts: { parentId: number; guidSeed: string }): number;
@@ -158,6 +189,16 @@ interface ViewState {
    *  same reason one step further on — a resize changes which ROW a slot belongs to. */
   lastEntryW: number;
   lastEntryH: number;
+  /** Last authored gap per axis. ⚠️ **In the invalidation test for the same reason the entry size
+   *  is, and it was missed** (#1010 close-out F1): the published `strideX/strideY` is
+   *  `entrySize + gap`, so an author changing ONLY the gap moves no window origin and resizes no
+   *  entry — `moved` and `resized` both stay false, the cheap early-out skips the re-drive, and
+   *  the stride stays published at its pre-edit value. `scrollByEntry` then divides by a stride
+   *  the system is no longer using, which is precisely the two-derivations bug publishing the
+   *  stride was meant to end. Measured by review: `gapY` 0 -> 10 left `strideY` reading 100
+   *  against a live 110, and a step armed entry 7 where 6 was correct. */
+  lastGapX: number;
+  lastGapY: number;
   /** Pooled counts per axis. BOTH are in the invalidation test, and the Y one is not symmetry
    *  for its own sake: at `scroll = 0` the origin is CLAMPED to 0, so a travel spike that
    *  raises the overscan and then decays changes `yw.pooled` while `first` never moves. With
@@ -172,7 +213,7 @@ interface ViewState {
   uncachedTicks: number;
 }
 const viewStates = new Map<string, ViewState>();
-onWorldSwap(() => { viewStates.clear(); warnedUncached.clear(); warnedOverridden.clear(); });
+onWorldSwap(() => { viewStates.clear(); warnedUncached.clear(); warnedOverridden.clear(); warnedRefusedUnit.clear(); });
 
 /** Views already warned about an AUTHORING mistake (see `diagnoseBlankView`), so a per-frame
  *  system does not spam the console.
@@ -204,6 +245,11 @@ const warnedUncached = new Set<string>();
  *  has different views, so every entry is dead weight that would otherwise grow forever. */
 const warnedOverridden = new Set<string>();
 
+/** View+axis pairs already warned about a prefab ROOT sized in a unit the pool cannot resolve (#840 —
+ *  see `warnRefusedRootUnit`). Cleared on a world swap like `warnedUncached`: a scene load changes the
+ *  views, and so the answer. */
+const warnedRefusedUnit = new Set<string>();
+
 /** How many consecutive pipeline ticks a prefab may stay uncached before the system says so.
  *  120 ticks is ~2s at 60fps, and matches the established `Canvas2DMount` precedent for exactly
  *  this shape of diagnostic ("canvas still 0x0 after 120 frames"). It is a WARN, not an error:
@@ -212,7 +258,7 @@ const UNCACHED_WARN_TICKS = 120;
 
 /** Reset module state — tests and teardown. */
 export function resetEntriesSystem(): void {
-  viewStates.clear(); warned.clear(); warnedUncached.clear(); warnedOverridden.clear();
+  viewStates.clear(); warned.clear(); warnedUncached.clear(); warnedOverridden.clear(); warnedRefusedUnit.clear();
 }
 
 /** Say WHY a pooled view is blank when the cause is the PREFAB rather than the authoring.
@@ -230,7 +276,7 @@ function tickUncachedPrefab(viewGuid: string, prefabGuid: string, isFrameTick: b
     // wrong: `fetchPrefab` (meshTemplateCache.ts) never inspects `version`, and the editor's own
     // serializer WRITES 2 for a prefab containing nested instances. That advice would have had
     // authors break a legitimate format marker while the real cause went unfound.
-    console.warn(`[UIEntries] view ${viewGuid}: entry prefab ${prefabGuid} is STILL not cached after ${UNCACHED_WARN_TICKS} frames, so the pool cannot spawn and the view stays blank. Check, in this order: is that GUID the one the prefab file actually declares as its 'id'; is the prefab reachable from the scene's 'resources' (directly, or through a prefab that is); and did its fetch fail (a 404 or an unparseable file logs '[MeshCache] Failed to load prefab').`);
+    console.warn(`[UIEntries] view ${viewGuid}: entry prefab ${prefabGuid} is STILL not cached after ${UNCACHED_WARN_TICKS} frames, so the pool cannot spawn and the view stays blank. Check, in this order: is that GUID the one the prefab file actually declares as its 'id'; is the prefab reachable from the scene's 'resources' (directly, or through a prefab that is) — and if its ROOT row nests another prefab, is THAT one cached too; does the file's 'rootLocalId' name a row that actually exists (the pool cannot size or spawn a root it cannot resolve); and did its fetch fail (a 404 or an unparseable file logs '[MeshCache] Failed to load prefab').`);
   }
   return ticks;
 }
@@ -263,8 +309,33 @@ function diagnoseBlankView(viewGuid: string, countX: number, countY: number, sou
 /** The entry prefab's own authored root size, for the `entryWidth/Height = 0` case ("read it
  *  from the prefab"). Returns 0 (px) when the prefab is not cached yet — the caller then has no
  *  size and renders nothing this frame rather than guessing one. */
-export function prefabRootSize(prefabGuid: string): { width: number; widthUnit: 'px' | '%'; height: number; heightUnit: 'px' | '%' } {
+export function prefabRootSize(prefabGuid: string): ReturnType<EntryPrefabProvider['rootSize']> {
   return provider?.rootSize(prefabGuid) ?? { width: 0, widthUnit: 'px', height: 0, heightUnit: 'px' };
+}
+
+/** Say why a delegated axis is 0 when the prefab ROOT authored it in a unit the pool refuses (#840).
+ *
+ *  A pooled row's size resolves against the SCROLL VIEW, and nothing on that path can see the device
+ *  viewport, so a root sized `50vh` has no honest px answer — it used to be read, silently, as 50% of
+ *  the view. The owner chose to REFUSE it: `rootSize` reports the axis as 0 and names the unit, and
+ *  this says so — once per view per axis, and only when the view DELEGATES that axis
+ *  (`entry{Width,Height} = 0`), the one case where the prefab's size is actually used. */
+function warnRefusedRootUnit(
+  viewGuid: string, prefabGuid: string, axis: 'width' | 'height', authored: number | undefined, refusedUnit: string | undefined,
+): void {
+  if (refusedUnit === undefined || (authored ?? 0) !== 0) return;
+  const key = `${viewGuid}:${axis}`;
+  if (warnedRefusedUnit.has(key)) return;
+  warnedRefusedUnit.add(key);
+  const field = axis === 'width' ? 'entryWidth' : 'entryHeight';
+  console.warn(`[UIEntries] view ${viewGuid}: entry prefab ${prefabGuid} sizes its root ${axis} in '${refusedUnit}', which a pooled row cannot use — the row is sized against the scroll view, so only px and % resolve. That axis is 0 until the prefab root authors px/% or the view authors a non-zero ${field}.`);
+}
+
+/** The entry prefab root's authored `UIElement`, for the pooled-row authoring warnings (#1026).
+ *  `undefined` with no provider installed — which is also the right answer, because without one
+ *  nothing spawned and there is no pooled row to warn about. See `EntryPrefabProvider`. */
+export function prefabRootAuthoredUI(prefabGuid: string): Record<string, unknown> | undefined {
+  return provider?.rootAuthoredUI(prefabGuid);
 }
 
 export function entriesSystem(world: World, opts?: { fromScroll?: boolean }): void {
@@ -385,6 +456,8 @@ function driveView(
   // Entry size. `0` means "read it from the prefab" — the single-source-of-truth rule, so a
   // fixed-size entry is not a second copy of what the prefab root already states.
   const fromPrefab = prefabRootSize(kinds[0].prefab);
+  warnRefusedRootUnit(viewGuid, kinds[0].prefab, 'width', en.entryWidth as number, fromPrefab.refusedWidthUnit);
+  warnRefusedRootUnit(viewGuid, kinds[0].prefab, 'height', en.entryHeight as number, fromPrefab.refusedHeightUnit);
   const entryW = resolveEntrySize(en.entryWidth as number, en.entryWidthUnit as 'px' | '%', sv.viewportWidth, fromPrefab.width, fromPrefab.widthUnit);
   const entryH = resolveEntrySize(en.entryHeight as number, en.entryHeightUnit as 'px' | '%', sv.viewportHeight, fromPrefab.height, fromPrefab.heightUnit);
 
@@ -396,7 +469,17 @@ function driveView(
   // if the window did not also move, nothing rebuilds the UI tree, `UINode`'s one-shot
   // `scrollTo` effect never re-runs, and the request sits on the trait forever. Found by wiring
   // the first real caller of `ui.scrollTo`: `scrollToY` read 480000 while `scrollY` stayed 0.
-  const requested = consumeEntryRequest(view, m, en, entryW, entryH);
+  // ⚠️ **The ONE place `entrySize + gap` is spelled.** It was written out inline four times —
+  // here, the travel measurement, the overscan cap and `consumeEntryRequest` — while the change
+  // that published it was arguing that a second derivation of one number is the defect
+  // (#1010 close-out F6). A fifth copy is how a redefinition of stride (say, a gap BETWEEN
+  // entries but not after the last) becomes a systematic disagreement instead of an edge case.
+  const gapX = (en.gapX as number) ?? 0;
+  const gapY = (en.gapY as number) ?? 0;
+  const strideXraw = entryW + gapX;
+  const strideYraw = entryH + gapY;
+
+  const requested = consumeEntryRequest(view, m, en, strideXraw, strideYraw);
 
   // ⚠️ **A JUMP builds this frame's window from the TARGET, not from the scroll we can still
   // observe — and that is the whole fix for "it lands on the wrong page".**
@@ -421,7 +504,7 @@ function driveView(
   const st = viewStates.get(viewGuid)
     ?? { seeded: false, lastFirstX: 0, lastFirstY: 0, lastEpoch: -1, lastCountX: -1, lastCountY: -1, travel: 0,
          frameScrollX: 0, frameScrollY: 0,
-         lastEntryW: -1, lastEntryH: -1, lastCols: -1, lastRows: -1, uncachedTicks: 0 };
+         lastEntryW: -1, lastEntryH: -1, lastGapX: -1, lastGapY: -1, lastCols: -1, lastRows: -1, uncachedTicks: 0 };
 
   // ⚠️ Runs BEFORE the early-outs below, and that placement is the whole point. A prefab that
   // never caches makes `rootSize` 0, so an authored `entryHeight: 0` ("read it from the prefab")
@@ -434,8 +517,9 @@ function driveView(
   // How far the SCROLL has moved since the last pipeline tick, in entries — see
   // ViewState.frameScrollX for why the baseline is per-FRAME and why it must not come from
   // `first`.
-  const strideXpx = Math.max(1, entryW + ((en.gapX as number) ?? 0));
-  const strideYpx = Math.max(1, entryH + ((en.gapY as number) ?? 0));
+  // Clamped ONLY so the division below cannot blow up — never published; see `writeWindowState`.
+  const strideXpx = Math.max(1, strideXraw);
+  const strideYpx = Math.max(1, strideYraw);
   // ⚠️ A jump needs no special case HERE, and one was tried and removed. On the frame a request
   // is converted the scroll has not moved yet, so this is already ~0; the thing that stops a
   // teleport being measured as travel is the BASELINE moving with it (see `frameScrollX` below),
@@ -465,16 +549,16 @@ function driveView(
   // five more entries per frame, and a 30-per-frame flick still blanked. Covering an unbounded
   // scroll speed with pool size is a losing game; this covers normal wheel and trackpad use.
   const VIEWPORTS_OF_RAISE = 3;
-  const capX = Math.max(1, VIEWPORTS_OF_RAISE * Math.ceil(sv.viewportWidth / Math.max(1, entryW + (en.gapX as number))));
-  const capY = Math.max(1, VIEWPORTS_OF_RAISE * Math.ceil(sv.viewportHeight / Math.max(1, entryH + (en.gapY as number))));
+  const capX = Math.max(1, VIEWPORTS_OF_RAISE * Math.ceil(sv.viewportWidth / strideXpx));
+  const capY = Math.max(1, VIEWPORTS_OF_RAISE * Math.ceil(sv.viewportHeight / strideYpx));
   const overscanX = effectiveOverscan(floor, travel, capX);
   const overscanY = effectiveOverscan(floor, travel, capY);
 
   const xw: AxisWindow = countX > 0
-    ? computeAxisWindow({ scroll: windowScrollX, viewport: sv.viewportWidth, entrySize: entryW, gap: en.gapX as number, count: countX, overscan: overscanX })
+    ? computeAxisWindow({ scroll: windowScrollX, viewport: sv.viewportWidth, entrySize: entryW, gap: gapX, count: countX, overscan: overscanX })
     : EMPTY_WINDOW;
   const yw: AxisWindow = countY > 0
-    ? computeAxisWindow({ scroll: windowScrollY, viewport: sv.viewportHeight, entrySize: entryH, gap: en.gapY as number, count: countY, overscan: overscanY })
+    ? computeAxisWindow({ scroll: windowScrollY, viewport: sv.viewportHeight, entrySize: entryH, gap: gapY, count: countY, overscan: overscanY })
     : EMPTY_WINDOW;
 
   const epoch = (en.epoch as number) ?? 0;
@@ -483,6 +567,7 @@ function driveView(
   // window origin, so `moved` stays false and the cheap early-out below would keep a stale
   // padding forever — see ViewState.lastEntryW.
   const resized = entryW !== st.lastEntryW || entryH !== st.lastEntryH
+    || gapX !== st.lastGapX || gapY !== st.lastGapY
     || xw.pooled !== st.lastCols || yw.pooled !== st.lastRows;
   const invalidated = epoch !== st.lastEpoch || countX !== st.lastCountX || countY !== st.lastCountY || resized;
 
@@ -497,7 +582,8 @@ function driveView(
     // the same wrong number, one frame later.
     frameScrollX: jumpX ?? (isFrameTick ? sv.scrollX : st.frameScrollX),
     frameScrollY: jumpY ?? (isFrameTick ? sv.scrollY : st.frameScrollY),
-    lastEntryW: entryW, lastEntryH: entryH, lastCols: xw.pooled, lastRows: yw.pooled,
+    lastEntryW: entryW, lastEntryH: entryH, lastGapX: gapX, lastGapY: gapY,
+    lastCols: xw.pooled, lastRows: yw.pooled,
     uncachedTicks,
   });
 
@@ -531,9 +617,14 @@ function driveView(
   const focusRef = captureFocusedEntry(world, pool.ids, m, childIndex, stepIdOf);
 
   writeLayout(content, rows, m, xw, yw, en);
-  writeWindowState(view, m, xw, yw, plan.length);
+  writeWindowState(view, m, xw, yw, plan.length, strideXraw, strideYraw);
   applySlots(world, plan, pool.ids, viewGuid, kinds[0].name, en.source as string, m, childIndex,
-    { rows, cols: Math.max(1, xw.pooled), entryW, entryH });
+    { rows, cols: Math.max(1, xw.pooled), entryW, entryH },
+    // ⚠️ The AUTHORED root traits, read fresh from the prefab — NOT the pooled entity's own
+    // `UIElement`, which `applySlots` has already overwritten with the pin (#1026). Same
+    // `kinds[0].prefab` the size above resolves from, so the two answers cannot disagree about
+    // which prefab is being pooled.
+    prefabRootAuthoredUI(kinds[0].prefab));
   // ⚠️ The SAME `childIndex` serves both halves, and it is not stale for either. `applySlots`
   // reparents the pooled ROOTS between rows, which changes only the rows' own child buckets —
   // both walks here start AT an entry root and go down, so neither can see that edit. Rebuilding
@@ -658,7 +749,7 @@ function retargetFocus(
  *  what knows how big one is), `UIScrollView` speaks pixels (it is what the DOM consumes). The
  *  hand-off happens once, here, rather than either side learning the other's units. */
 function consumeEntryRequest(
-  view: EntityLike, m: Metas, en: Record<string, unknown>, entryW: number, entryH: number,
+  view: EntityLike, m: Metas, en: Record<string, unknown>, strideX: number, strideY: number,
 ): { x?: number; y?: number } | null {
   const reqX = (en.scrollToEntryX as number) ?? -1;
   const reqY = (en.scrollToEntryY as number) ?? -1;
@@ -671,8 +762,6 @@ function consumeEntryRequest(
   // it early computed `index x 0 = 0`, scrolled to the TOP, and cleared the request, so the
   // view silently opened at the beginning and the ask was gone. That is Court's own use case,
   // which is what makes this worth a guard rather than a comment.
-  const strideX = entryW + ((en.gapX as number) ?? 0);
-  const strideY = entryH + ((en.gapY as number) ?? 0);
   const canX = reqX < 0 || strideX > 0;
   const canY = reqY < 0 || strideY > 0;
   if (!canX || !canY) return null;    // retry next frame, once the prefab is cached
@@ -939,12 +1028,24 @@ function writeLayout(
   }
 }
 
-/** Publish the window so game code, tests and Percept can verify BY DATA rather than pixels. */
-function writeWindowState(view: EntityLike, m: Metas, xw: AxisWindow, yw: AxisWindow, poolSize: number): void {
+/** Publish the window so game code, tests and Percept can verify BY DATA rather than pixels.
+ *
+ *  ⚠️ `strideX`/`strideY` are the RAW `entrySize + gap`, deliberately NOT the `Math.max(1, …)`
+ *  clamped pair `driveView` uses for its travel measurement. The clamp exists so a division
+ *  cannot blow up; publishing it would state a 1px stride for a view whose entry size is not
+ *  resolved yet, and `scrollApi` reads 0 as "no usable window" and refuses. A clamped 0 would
+ *  therefore turn a refusal into a request for entry 0 — the teleport-to-top that
+ *  `scrollByEntry`'s own banner exists to prevent. */
+function writeWindowState(
+  view: EntityLike, m: Metas, xw: AxisWindow, yw: AxisWindow, poolSize: number,
+  strideX: number, strideY: number,
+): void {
   const cur = view.get(m.enMeta.trait) as Record<string, unknown>;
-  const next = { ...cur, firstX: xw.first, firstY: yw.first, visibleX: xw.visible, visibleY: yw.visible, poolSize };
+  const next = { ...cur, firstX: xw.first, firstY: yw.first, visibleX: xw.visible, visibleY: yw.visible,
+    poolSize, strideX, strideY };
   if (cur.firstX === next.firstX && cur.firstY === next.firstY && cur.visibleX === next.visibleX
-    && cur.visibleY === next.visibleY && cur.poolSize === next.poolSize) return;
+    && cur.visibleY === next.visibleY && cur.poolSize === next.poolSize
+    && cur.strideX === next.strideX && cur.strideY === next.strideY) return;
   view.set(m.enMeta.trait, next);
 }
 
@@ -957,7 +1058,13 @@ function writeWindowState(view: EntityLike, m: Metas, xw: AxisWindow, yw: AxisWi
  *  `isVisible` defaults to `true` but pins to the slot's `live` state, so every freshly-spawned
  *  PARKED slot (`live === false`) would warn too. For the eight fields whose pin already equals
  *  their default (margin, min/max — all pinned and defaulted to 0) `pinned === def`, so this
- *  reduces to exactly the old `cur !== pinned` check — no behaviour change there. */
+ *  reduces to exactly the old `cur !== pinned` check — no behaviour change there.
+ *
+ *  ⚠️ **`cur` is the PREFAB-authored value, not the pooled entity's live one** (#1026). The rule
+ *  above is only sound while `cur` is something an author actually wrote: `isVisible` pins to the
+ *  slot's varying `live` state, so a slot pinned parked carries the pool's own `false` on its
+ *  trait, and reading that back on the tick it goes live gives `false !== true && false !== true`
+ *  — a warning about authoring that never happened. See `EntryPrefabProvider.rootAuthoredUI`. */
 function pooledFieldNeedsWarning(cur: unknown, pinned: unknown, def: unknown): boolean {
   return cur !== pinned && cur !== def;
 }
@@ -985,7 +1092,16 @@ function pooledFieldNeedsWarning(cur: unknown, pinned: unknown, def: unknown): b
  *  and returned it verbatim as px — so a root authored `width: 100, widthUnit: '%'` under a view
  *  with no `entryWidth` was silently pinned to 100px with nothing warning here. `rootSize` now
  *  carries its own unit and `resolveEntrySize` resolves it against the same viewport axis as the
- *  view's own authored value, so the rule above holds for this case too. */
+ *  view's own authored value, so the rule above holds for this case too.
+ *
+ *  ⚠️ **`curValue`/`curUnit` MUST come from the PREFAB, never from the pooled entity's live
+ *  `UIElement`** (#1026 — the exemption above was unreachable for ~every pooled row until then).
+ *  The pin writes `widthUnit: 'px'` into the trait, so a caller passing `ui.widthUnit` hands this
+ *  function the pin's own unit: the `!== 'px'` line then returns `false` for one frame and `true`
+ *  forever after, and the "%" contract this whole docblock describes is granted to nobody.
+ *  Observed live: Court's `DailyMonth` authors `100%` on disk and printed
+ *  `authored UIElement.width=308px` — both the value and the unit written by the pool. The caller
+ *  in `applySlots` reads `authoredOf(...)`; keep it that way. */
 function pooledSizeNeedsWarning(curValue: unknown, curUnit: unknown, wantPx: number, def: unknown): boolean {
   if (curUnit !== 'px') return false;
   return curValue !== wantPx && curValue !== def;
@@ -1022,6 +1138,7 @@ function applySlots(
   viewGuid: string, kindName: string, sourceName: string, m: Metas,
   childIndex: Map<number, { id: number; name: string }[]>,
   grid: { rows: EntityLike[]; cols: number; entryW: number; entryH: number },
+  authoredUI: Record<string, unknown> | undefined,
 ): void {
   const resolver = sourceName ? getEntrySource(sourceName) : undefined;
 
@@ -1106,26 +1223,54 @@ function applySlots(
       const defaults = (m.uiMeta.trait as { schema?: Record<string, unknown> }).schema ?? {};
       const pinned = buildPooledRowPin({ live, wantW, wantH });
 
+      // ⚠️ **Every warning below reads `authoredOf`, NEVER `ui`** (#1026). `ui` is the pooled
+      // entity's LIVE `UIElement`, and the `entity.set` at the bottom of this block has already
+      // overwritten it with `pinned` on some earlier frame — so asking `ui` "did an author write
+      // this?" asks the pin about its own handiwork. Two fields answered wrong:
+      //
+      //   - `width`/`height`: the pin forces `widthUnit`/`heightUnit` to `'px'`, and that unit is
+      //     the exact discriminator `pooledSizeNeedsWarning` reads to grant the `%` exemption its
+      //     own docblock promises. So the exemption died on frame 1 for every pooled row, and from
+      //     then on any re-resolve to a different px value (a fractional container width, a DPR
+      //     change, a panel resize) warned. Court's `DailyMonth` authors `100%` and printed
+      //     "authored UIElement.width=308px" — a value and a unit the pool wrote itself.
+      //   - `isVisible`: its pin VARIES with the slot's live state. A slot pinned parked leaves
+      //     `false` on the trait; when it scrolls into the window `live` becomes `true`, and
+      //     `false !== true && false !== true` warns about the pool's own write.
+      //
+      // The other 11 pinned fields were never exposed — their pin is a constant, so once written
+      // `cur === pinned` and the guard is silent — but they read `authoredOf` too, because the
+      // NEXT field added to `POOLED_ROW_PINNED_GROUPS` with a varying pin would otherwise
+      // reintroduce this silently, which is precisely how #761 happened.
+      //
+      // An ABSENT authored field resolves to the trait's own schema default: a scene/prefab save
+      // strips any field equal to its default, so `undefined` means "never touched", not "authored
+      // undefined". Without this every stripped field would differ from both pin and default and
+      // warn on every row. (`??` and not `||`: an authored `0` or `false` is authoring.)
+      const authoredOf = (field: string): unknown => authoredUI?.[field] ?? defaults[field];
+
       // The nine fields the generic equality guard covers — everything `POOLED_ROW_PINNED_FIELDS`
       // names EXCEPT `isVisible` and `width`/`height` (+ their units), which each need their own
       // comparison below (live-state and folded-unit respectively).
       for (const field of POOLED_ROW_GENERIC_WARN_FIELDS) {
-        if (pooledFieldNeedsWarning(ui[field], pinned[field], defaults[field])) {
-          warnAuthoredOverride(entity, attr, viewGuid, slot, field, ui[field], pinned[field]);
+        if (pooledFieldNeedsWarning(authoredOf(field), pinned[field], defaults[field])) {
+          warnAuthoredOverride(entity, attr, viewGuid, slot, field, authoredOf(field), pinned[field]);
         }
       }
-      if (pooledFieldNeedsWarning(ui.isVisible, live, defaults.isVisible)) {
-        warnAuthoredOverride(entity, attr, viewGuid, slot, 'isVisible', ui.isVisible, live);
+      if (pooledFieldNeedsWarning(authoredOf('isVisible'), live, defaults.isVisible)) {
+        warnAuthoredOverride(entity, attr, viewGuid, slot, 'isVisible', authoredOf('isVisible'), live);
       }
       // width/height fold their companion unit into ONE warning — an author authors an axis, not
       // two independent fields, and a `width`+`widthUnit` pair that BOTH differ from the pin would
       // otherwise print twice for the same mistake. A `%` (or `vw`/`vh`/`vmin`/`vmax`) authored
       // unit is the documented contract, not a trap — see `pooledSizeNeedsWarning`.
-      if (pooledSizeNeedsWarning(ui.width, ui.widthUnit, wantW, defaults.width)) {
-        warnAuthoredOverride(entity, attr, viewGuid, slot, 'width', ui.width, `${wantW}px`, 'width', `${ui.width}${ui.widthUnit}`);
+      const aWidth = authoredOf('width'), aWidthUnit = authoredOf('widthUnit');
+      const aHeight = authoredOf('height'), aHeightUnit = authoredOf('heightUnit');
+      if (pooledSizeNeedsWarning(aWidth, aWidthUnit, wantW, defaults.width)) {
+        warnAuthoredOverride(entity, attr, viewGuid, slot, 'width', aWidth, `${wantW}px`, 'width', `${aWidth}${aWidthUnit}`);
       }
-      if (pooledSizeNeedsWarning(ui.height, ui.heightUnit, wantH, defaults.height)) {
-        warnAuthoredOverride(entity, attr, viewGuid, slot, 'height', ui.height, `${wantH}px`, 'height', `${ui.height}${ui.heightUnit}`);
+      if (pooledSizeNeedsWarning(aHeight, aHeightUnit, wantH, defaults.height)) {
+        warnAuthoredOverride(entity, attr, viewGuid, slot, 'height', aHeight, `${wantH}px`, 'height', `${aHeight}${aHeightUnit}`);
       }
 
       if (POOLED_ROW_PINNED_FIELDS.some((field) => ui[field] !== pinned[field])) {

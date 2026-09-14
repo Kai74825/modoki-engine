@@ -28,20 +28,22 @@
  *  net) therefore runs ONLY on the primary renderer's swap/stop; non-primary renderers only release
  *  their own slots' refcounts. The trait cache + `deactivatedEntities` + skin buffers are global too. */
 
-import type { World } from 'koota';
+import type { Entity, World } from 'koota';
 import { Graphics, Sprite, Mesh, MeshGeometry, Texture, Rectangle, Matrix, Assets, Container, Buffer, BufferUsage, type Shader, type Geometry } from 'pixi.js';
 import { deactivatedEntities } from '../core/ecs/transformPropagationSystem';
 import { getCurrentWorld, onWorldSwap } from '../core/ecs/world';
+import { onAssetInvalidated } from '../core/assetInvalidation';
 import { getAllTraits } from '../core/ecs/traitRegistry';
 import { Transform, Renderable2D, Collider2D, SkinnedSprite2D, Billboard3D, FlatSprite3D, Text2D, TextAnimation, GroupAlpha, Mask2D } from '../traits';
 import { MaterialInstance } from '../traits/MaterialInstance';
-import { applyTextAnimation, isTextAnimating, isColorEffect, type TextAnimParams } from './text/textAnimate';
+import { applyTextAnimation, isTextAnimating, isColorEffect, textAnimElapsed, type TextAnimParams } from './text/textAnimate';
 import { getTime } from '../core/getTime';
 import { ensureFontLoaded, getLoadedFont } from '../loaders/fontAtlasLoader';
 import { getFontTexturePixi } from './text/fontTexturePixi';
 import { isPixiTextureLive, loadPixiTexture } from './pixiTextureLoad';
 import { makeMtsdfPixiShader, updateMtsdfPixiStyle, canReuseMtsdfPixiShader, updateMtsdfPixiMetrics } from './text/mtsdfPixiShader';
 import { layoutText } from './text/layoutText';
+import { textCodepoints } from './text/textCodepoints';
 import { buildTextGeometryByPage, buildTextPositionsByPage, buildTextColorsByPage, canWriteTextPositionsInPlace } from './text/textMesh';
 import type { TextQuad } from './text/layoutText';
 import { getTextDirtyVersion, onTextDirty } from './text/textDirty';
@@ -62,7 +64,7 @@ import { getSpriteEpoch } from '../loaders/assetManifest';
 import { ensureSpriteMaterial, clearSpriteMaterialCache } from '../loaders/spriteMaterialCache';
 import { makePixiShaderInstance, buildUniformValues, type PixiShaderProgram } from './pixiShaderBuilder';
 import { coerceParamValue } from '../loaders/shaderSchema';
-import { register2DMaterialShaderMap, isEntity2DMaterialDirty } from './sprite2DMaterialBroker';
+import { register2DMaterialShaderMap, isEntity2DMaterialDirty, hasAny2DMaterialDirty } from './sprite2DMaterialBroker';
 import type { Entity2DShaderEntry } from './sprite2DMaterialBroker';
 import { computePaintOrder } from './paintOrder';
 import { computeGroupAlpha } from './groupAlpha';
@@ -75,9 +77,10 @@ import {
   type ParticleSync2DState, type ParticleSync2DCtx,
 } from './particleSync2D';
 import { addDirtyListener, onStructureDirty, readTraitData } from '../core/ecs/entityUtils';
-import { isSimRunning, onPlayStateChange } from '../core/playState';
+import { getRunMode, isSimRunning, onPlayStateChange } from '../core/playState';
 import { Canvas2DPool, defaultPool, type Canvas2DSlot } from './canvas2DPool';
 import { registerBoundsProvider, type BoundsSurface, type EntityScreenBounds } from '../core/screenBounds';
+import { isPackedAlive } from '../core/ecs/entityTable';
 import { ensurePixiKtxTranscoder } from '../loaders/pixiKtxTranscoder';
 
 // ── Display object tracking ──
@@ -120,6 +123,8 @@ interface Slot { kind: DisplayKind; obj: Graphics | Sprite | Mesh | Container; s
   // on deactivation; `animStart` is the smoothedElapsed captured at (re)activation so
   // each Play restarts the effect from t=0.
   baseQuads?: TextQuad[]; pageNums?: number[]; wasMotion?: boolean; wasColored?: boolean; animStart?: number; animEffect?: string;
+  /** The packed entity the animation clock last ran for — see `textAnimElapsed` (#868). */
+  animOwner?: number;
   // Text slots only: consecutive failed rebuild attempts (see the `meshFrameKey` sentinel
   // comment below) — bounds the retry so a PERMANENT failure degrades to a quiet blank
   // instead of churning every frame forever.
@@ -183,6 +188,86 @@ const spriteTextureRefs = new Map<string, number>();
 // a genuine last release still frees the VRAM one tick later.
 const pendingTextureUnloads = new Map<string, ReturnType<typeof setTimeout>>();
 
+// Urls whose ALREADY-ARMED unload must retain rather than destroy (#1000; and since #1053, any
+// scene-slot release made during Play — see `releaseSpriteTexture`). `deferUnload` early-returns
+// when a url is already pending, so a swap teardown re-releasing a url that an ORDINARY mid-scene
+// release armed a moment earlier cannot re-arm it — and would silently keep that arm's destroy
+// semantics. MEASURED: `games/court` hits exactly this on every stop, because its board overlay
+// despawns/respawns during play (see `pendingTextureUnloads`' note above), so its textures are
+// typically already armed by the time the stop swap arrives. wordweave does not, which is why the
+// first cut of this fix appeared to work there and did nothing in Court.
+const pendingRetainUpgrade = new Set<string>();
+
+// The scene as of the PREVIOUS world swap, so a play/stop swap (same scene) can be told from a genuine
+// scene change. `onWorldSwap` fires AFTER the swap, so a handler already reads the INCOMING scene —
+// recording it per swap is the only way to see the outgoing one. `undefined` means "no swap seen yet".
+//
+// ⚠️ Uses `getCurrent()?.path`, NOT `getCurrentBaseScene()`. The first version of this guard used the
+// latter and was ALWAYS TRUE, so the sweep it gates never actually became conditional and the churn
+// survived three attempted fixes. MEASURED live in games/court: `getCurrentBaseScene()` is `undefined`
+// (it names a CHAIN's base scene, which an ordinary single-scene project never sets) while
+// `getCurrent()?.path` is populated and stable across a play/stop. Absent must not be read as
+// "different" — that is the fail-open shape this comment exists to stop coming back.
+let lastSwapScenePath: string | null | undefined;
+/** Did THIS swap change the scene? Answered once per swap: the first renderer's handler updates the
+ *  record, so later handlers in the same swap see "unchanged" — which is correct, because when the
+ *  scene DID change the first handler has already run the wholesale sweep.
+ *  A first-ever swap reports `false`; nothing is tracked yet, so the net it gates is a no-op anyway. */
+/** The scene-identity key both the swap guard and the park purge compare on (#1000).
+ *
+ *  ⚠️ Exists as ONE function on purpose. These were two call sites reading the scene two different
+ *  ways, and that is exactly how this bug shipped twice: the guard was fixed to `getCurrent()?.path`
+ *  while `parkRetainedSpriteTexture` was left on `getCurrentBaseScene()` — which is `undefined` for any
+ *  project that is not a scene CHAIN, so its purge condition (`retainedForScene !== undefined`) could
+ *  never be true and the parked set was never evicted by a scene change at all. Derive, do not
+ *  duplicate. Found by the close-out sweep, one function away from the fix it mirrors. */
+function currentSceneKey(): string | null {
+  return sceneManager.getCurrent()?.path ?? null;
+}
+
+function swapChangedScene(): boolean {
+  const path = currentSceneKey();
+  // ⚠️ No identifiable scene → report CHANGED, i.e. sweep, i.e. exactly today's behaviour. Retention
+  // is an optimisation and must never be the reason a texture outlives its scene, so the unknown case
+  // fails toward the old behaviour rather than toward keeping things alive. (This is also what keeps
+  // the two F3 clear-on-swap tests honest: they swap worlds with no scene loaded at all.)
+  if (path === null) { lastSwapScenePath = null; return true; }
+  const changed = lastSwapScenePath !== undefined && lastSwapScenePath !== path;
+  lastSwapScenePath = path;
+  return changed;
+}
+
+// ── RETAINED sprite textures — refcount 0 means EVICTABLE, not destroyed (#1000) ──
+// A refcount reaching 0 across a play/stop transition does NOT mean the texture is finished with.
+// MEASURED on `games/court` and `games/wordweave` (dev editor, WebGPU, pixi 8.20.1): every play/stop
+// cycle destroyed each runtime-spawned sprite's TextureSource and RE-DECODED it on the next play —
+// `king.png` uid 5 -> 11, `count-banner.png` 7 -> 12, wordweave's UASTC `cell-washi.ktx2` 13 -> 16
+// (a GPU transcode, not just an image decode). Each destroy also emitted ~2 `[BindGroup] … destroyed
+// while still bound` warnings PER LIVE RENDERER, because Pixi's process-global batch bind-group cache
+// (`getTextureBatchBindGroup`'s `cachedGroups`) is never evicted and offers no public API to evict.
+//
+// ⚠️ Why the DEFERRAL above cannot fix this, and a longer one is a false fix: `deferUnload` cancels on
+// a re-retain, but after `stop` the reverted world genuinely does NOT hold the board's textures — the
+// board is spawned at runtime, so nothing re-retains and any timeout expires. The gap being bridged is
+// "a human decides to press Play", which is unbounded. Only RETENTION closes it.
+//
+// So the per-slot release path parks the url here instead of unloading, and the real release happens at
+// the coarse boundary the rest of the engine already uses — a change of SCENE, or the last renderer
+// stopping (docs/scene-loading.md: "the scene is the unit of memory management"). That bounds the set by
+// one scene's working set, which is the same bound every other GPU resource already has; sprite textures
+// were the exception to that rule, which is why they alone churned.
+const retainedSpriteTextures = new Set<string>();
+// Which base scene `retainedSpriteTextures` belongs to, so a genuine scene change can be told from a
+// play/stop swap (both are world swaps). `undefined` until the first retention.
+let retainedForScene: string | null | undefined;
+// >0 while a world-swap teardown is releasing slots — one of the TWO releases that may retain; the
+// other is a scene-slot release during Play (#1053, `releaseSpriteTexture`).
+// ⚠️ Scoped on purpose: retaining on EVERY release also retained every AUTHORING one — an entity
+// deleted, a sprite ref repointed with Play stopped — so an editing session that cycled through
+// sprites would pin each one until the scene changed. The mid-scene tests in Scene2D.test.ts pin
+// that by releasing with Play stopped; a counter plus the run mode is what keeps both behaviours.
+let swapTeardownDepth = 0;
+
 // ── EDITOR-PANEL holds on a sprite url (#701) ──
 // Deliberately a SECOND map rather than more entries in `spriteTextureRefs`, because that one is
 // SCENE-scoped by design (F3: "no texture accounting survives a scene") and `unloadAllSpriteTextures`
@@ -197,6 +282,8 @@ export function retainPanelTexture(url: string): void {
   if (!url) return;
   const pending = pendingTextureUnloads.get(url);
   if (pending !== undefined) { clearTimeout(pending); pendingTextureUnloads.delete(url); }
+  retainedSpriteTextures.delete(url);   // live again (#1000) — same reason as retainSpriteTexture
+  pendingRetainUpgrade.delete(url);
   panelTextureRefs.set(url, (panelTextureRefs.get(url) ?? 0) + 1);
 }
 
@@ -217,11 +304,19 @@ export function releasePanelTexture(url: string): void {
  *  refcount trough on a shared url would otherwise destroy the source out from under the rebuild
  *  about to re-retain it. Cancels itself if EITHER a scene slot or a panel re-retains meanwhile. */
 function deferUnload(url: string): void {
+  // BEFORE the early return, deliberately — see `pendingRetainUpgrade`.
+  if (swapTeardownDepth > 0) pendingRetainUpgrade.add(url);
   if (pendingTextureUnloads.has(url)) return;
   const handle = setTimeout(() => {
     pendingTextureUnloads.delete(url);
+    // Consume-and-read: only a release performed BY a world-swap teardown, or by a scene slot during
+    // Play (#1053), may retain. An AUTHORING release — an entity removed, a sprite ref repointed with
+    // Play stopped — must still FREE the texture, or an editing session that cycles through sprites
+    // would pin every one it ever touched (the mid-scene tests in Scene2D.test.ts pin that).
+    const retain = pendingRetainUpgrade.delete(url);
     if ((spriteTextureRefs.get(url) ?? 0) > 0 || panelTextureRefs.has(url)) return;
-    unloadSpriteTextureNow(url);
+    if (retain) parkRetainedSpriteTexture(url);
+    else unloadSpriteTextureNow(url);
   }, 0);
   pendingTextureUnloads.set(url, handle);
 }
@@ -234,25 +329,99 @@ function unloadSpriteTextureNow(url: string) {
   if (Assets.cache.has(url)) Assets.unload(url).catch(() => { /* ignore */ });
 }
 
+/** Park an unreferenced url instead of destroying it (#1000). The texture stays in the Assets cache,
+ *  so a later `retainSpriteTexture` is FREE — no re-decode, no destroy, and hence no `[BindGroup]`
+ *  warning. This is the line that turns a play/stop cycle from destroy+re-decode into a no-op.
+ *
+ *  The scene check is here, at PARK time, rather than in the swap handler, for a sequencing reason:
+ *  `onWorldSwap` fires AFTER the world is swapped, so a release performed there already reads the
+ *  INCOMING scene — a swap-time comparison would see "unchanged" for every scene change and never
+ *  purge. Comparing at park time instead means the first park under a new scene is what evicts the
+ *  previous scene's set, which is both correct and self-healing.
+ *
+ *  ⚠️ Known, bounded overshoot: the textures released BY a scene change get parked under the incoming
+ *  scene's label, so they live until the NEXT scene change. That overshoot exists only where two or
+ *  more renderers are live — i.e. the EDITOR, which is exactly where retention is wanted. A shipped
+ *  game has one renderer, so `unloadAllSpriteTextures` runs on its every swap (see the `liveRenderers
+ *  <= 1` gate in the swap handler) and purges this set with it, preserving F3 exactly. */
+function parkRetainedSpriteTexture(url: string) {
+  const scene = currentSceneKey();
+  if (retainedForScene !== undefined && retainedForScene !== scene) releaseRetainedSpriteTextures();
+  retainedSpriteTextures.add(url);
+  retainedForScene = scene;
+}
+
+/** Actually free every parked texture. The real release point for the retention above — reached on a
+ *  scene change (via {@link parkRetainedSpriteTexture}) and from `unloadAllSpriteTextures`, which is
+ *  the swap/last-stop net. Routes through `unloadSpriteTextureNow`, so a panel hold still vetoes. */
+function releaseRetainedSpriteTextures() {
+  for (const url of retainedSpriteTextures) unloadSpriteTextureNow(url);
+  retainedSpriteTextures.clear();
+  retainedForScene = undefined;
+}
+
+// ⚠️ A re-imported texture must not keep being served from the PARKED set (#1000).
+// Before retention, a single-renderer play/stop ran `unloadAllSpriteTextures` and the next Play
+// re-fetched; parking removed that flush, so re-importing a sprite PNG and pressing Play would keep
+// showing the OLD bytes until a genuine scene change.
+//
+// Purges the WHOLE parked set rather than the one url, deliberately: everything parked is BY
+// DEFINITION unreferenced, so dropping all of it is free, and it avoids mapping an asset PATH back to
+// the resolved variant URL(s) the set is keyed by — a mapping that would be a second place to get the
+// texture-variant scheme wrong.
+//
+// ⚠️ **THIS LISTENER IS PARKED-SET-ONLY, and it is the only Pixi-side one.** A texture a LIVE sprite
+// still holds has `spriteTextureRefs >= 1`, so the guard in `deferUnload` keeps it out of
+// `retainedSpriteTextures` by construction and nothing here can reach it.
+//
+// ⚠️ **Two earlier claims in this comment were FALSE, and #1022 was filed off them.** It said
+// "nothing on the Pixi side listens for texture invalidation at all" — four lines above this
+// listener — and that "`withCacheBust` cannot save it" because it is a dev no-op. The first was
+// stale the moment this listener landed. The second described a real gate that has since been
+// REMOVED: `withCacheBust` now appends `?v=<hash>` in dev too, so a re-import moves the resolved
+// url, the live sprite's slot rebuilds against a url the Pixi `Assets` cache has never seen, and
+// the stale source is released on the ordinary path. That is what closes the live-sprite half —
+// not this listener. See `loaders/assetUrl.ts` and `docs/textures.md`.
+onAssetInvalidated((kind) => {
+  if (kind !== 'texture') return;
+  releaseRetainedSpriteTextures();
+});
+
 function retainSpriteTexture(url: string) {
   const pending = pendingTextureUnloads.get(url);
   if (pending !== undefined) { clearTimeout(pending); pendingTextureUnloads.delete(url); }
+  // Live again — drop the parked hold. This is the line that makes the retention PAY: the texture was
+  // never destroyed, so the respawned sprite binds the same loaded source (#1000).
+  retainedSpriteTextures.delete(url);
+  pendingRetainUpgrade.delete(url);
   spriteTextureRefs.set(url, (spriteTextureRefs.get(url) ?? 0) + 1);
 }
 function releaseSpriteTexture(url: string) {
   const n = (spriteTextureRefs.get(url) ?? 0) - 1;
   if (n <= 0) {
     spriteTextureRefs.delete(url);
+    // #1053 — a release DURING PLAY parks rather than destroys. A running game rebuilds content it
+    // is about to show again, and not always inside one task: Court despawns its board, AWAITS the
+    // next level's fetch, then respawns the same art — so the macrotask deferral below expired inside
+    // the fetch, and every level load destroyed and re-decoded the board (on WebGPU, ~2 `[BindGroup]`
+    // warnings per source per live renderer). Parked textures are freed on a scene change, a texture
+    // invalidation or the last renderer's stop — but the set is WIDER than #1000's one-swap working
+    // set: every url released during Play, for the life of the scene (docs/rendering.md). Two scoping calls:
+    //  - `getRunMode()`, NOT `isSimRunning()` — a PAUSED Play is still a play session.
+    //  - Here, NOT in `deferUnload` — a panel hold dropping is authoring, and while Play is stopped a
+    //    release still frees at once, or an authoring session would pin every sprite it touched.
+    if (getRunMode() === 'playing') pendingRetainUpgrade.add(url);
     deferUnload(url);
   } else {
     spriteTextureRefs.set(url, n);
   }
 }
 
-/** Unload every tracked sprite texture and clear the refcount map. Called on world
- *  swap + stop AFTER all slots are disposed, and ONLY by the PRIMARY renderer: a
- *  non-primary (editor) renderer stopping alone must NOT nuke textures GameView still
- *  shows. A balanced run leaves the map empty (each disposeSlot already released its
+/** Unload every tracked sprite texture and clear the refcount map. Called AFTER all slots are
+ *  disposed, from two places: the world-swap handler — gated on `liveRenderers <= 1` AND on the swap
+ *  having actually CHANGED SCENE (#1000) — and `stop()` when the last renderer goes. Neither clause is
+ *  "primary": the gate is a renderer COUNT, so a non-primary (editor) renderer stopping alone must NOT
+ *  nuke textures GameView still shows, and the last one out may. A balanced run leaves the map empty (each disposeSlot already released its
  *  texture), so this is a defensive net that also enforces the "no texture accounting
  *  survives a scene" invariant (F3) — without it any drift would pin VRAM across scenes. */
 function unloadAllSpriteTextures() {
@@ -264,6 +433,10 @@ function unloadAllSpriteTextures() {
   // keeps the "no texture accounting survives a scene" invariant (F3) exact.
   for (const [url, handle] of pendingTextureUnloads) { clearTimeout(handle); unloadSpriteTextureNow(url); }
   pendingTextureUnloads.clear();
+  pendingRetainUpgrade.clear();   // its timers are gone; a stale record would upgrade a future arm
+  // The parked set is scene-scoped accounting like the refcount above, so the F3 net must clear it too
+  // — otherwise retention (#1000) would pin a scene's VRAM past the swap that ends it.
+  releaseRetainedSpriteTextures();
 }
 
 /** SCANNED frames a visible 2D entity may go undrawn for want of a Canvas2D ancestor before the
@@ -644,11 +817,6 @@ function textStyle2D(t: any): MtsdfStyle {
     shadowOffsetX: t.shadowOffsetX, shadowOffsetY: t.shadowOffsetY, shadowSoftness: t.shadowSoftness,
   };
 }
-function textCodepoints(text: string): number[] {
-  const out: number[] = [];
-  for (const ch of text) out.push(ch.codePointAt(0)!);
-  return out;
-}
 
 const OUTLINE_STROKE = { width: 2, color: 0x2effa6, alpha: 0.9 } as const;
 // Collider-ONLY mode (sprites hidden) uses purple — matches the 3D SceneView's collider-only
@@ -717,7 +885,12 @@ export class Scene2DRenderer {
   // aren't resident yet — dedupes the load so the every-running-frame material pass
   // doesn't re-issue it. Cleared per-url on settle (then markDirty wakes the rebuild).
   private readonly _materialTexLoading = new Set<string>();
-  private readonly activeIds = new Set<number>();
+  // Entity id → the packed entity (`entity.valueOf()`) that claimed it THIS pass. Cleared at the top
+  // of the pass and consumed by the slot-disposal sweep at its end — and, between passes, by
+  // `bounds2DProvider`, which refuses a slot whose owner is no longer alive: koota hands a destroyed
+  // entity's index to the next spawn, so until the next pass sweeps the slot, an id-only read reports
+  // the dead entity's rect for the newcomer's id (#1197).
+  private readonly activeIds = new Map<number, number>();
   private readonly prevCanvasIds = new Set<number>();
   // Pooled per-frame canvas-id set; cleared on entry, mutated through the loop,
   // transferred into prevCanvasIds at the end. Avoids the per-frame `new Set`.
@@ -749,12 +922,12 @@ export class Scene2DRenderer {
   // can't stomp each other's scratch; renderers also run sequentially via frame callbacks).
   private readonly parentOfEntity = new Map<number, number>();   // entityId → parentId
   private readonly sortOrderOfEntity = new Map<number, number>(); // entityId → EntityAttributes.sortOrder
-  // Every entity id alive THIS frame (built from the same EntityAttributes query as
+  // Every entity alive THIS frame, PACKED (#868 — see `Orphan2DTracker`) (built from the same EntityAttributes query as
   // parentOfEntity, so it's effectively "every scene entity"). Feeds `orphan2D.prune` — see
   // there for why `activeIds` (canvas-routed entities only) is the WRONG set: an entity still
   // orphaned this frame is alive but never enters `activeIds`, and pruning against that set
   // would erase its in-progress warn-frame count every single frame.
-  private readonly liveEntityIds = new Set<number>();
+  private readonly liveEntities = new Set<number>();
   private paintOrderOf = new Map<number, number>();              // entityId → global paint index (sortOrder DFS)
   /** entityId → alpha inherited from GroupAlpha ancestors × its own (#211). SPARSE: only
    *  entities actually faded appear, so a scene with no GroupAlpha keeps an empty map and
@@ -893,8 +1066,9 @@ export class Scene2DRenderer {
 
   /** Count a frame in which `entityId` was visible, active, and drawn by nothing because no
    *  Canvas2D ancestor exists — and say so ONCE, after the grace window, at warn level. */
-  private noteOrphan2D(entityId: number): void {
-    const key = this.orphan2D.note(entityId, () => this.orphan2DKey(entityId), ORPHAN_2D_WARN_FRAMES);
+  private noteOrphan2D(entity: Entity): void {
+    const entityId = entity.id();
+    const key = this.orphan2D.note(entity.valueOf(), () => this.orphan2DKey(entityId), ORPHAN_2D_WARN_FRAMES);
     if (!key) return;
     const attrs = attrMeta ? readTraitData(entityId, attrMeta) : null;
     const name = (attrs?.name as string) || `entity ${entityId}`;
@@ -1387,7 +1561,9 @@ export class Scene2DRenderer {
 
     // (1) Idle whole-frame skip — while the sim is stopped/paused, 2D only changes
     // via paths that set _externalDirty, so idle + clean ⇒ no ECS scan, no render.
-    if (!isSimRunning() && !this._externalDirty && !previewing2D && !previewChanged2D) return;
+    // A material uniform the driver wrote this frame counts too: its per-entity read is inside the
+    // scan below, which this skip would otherwise make unreachable (#1141 sibling).
+    if (!isSimRunning() && !this._externalDirty && !previewing2D && !previewChanged2D && !hasAny2DMaterialDirty()) return;
     let forceAll = this._externalDirty; // external edit / load / resize / swap ⇒ redraw all
     this._externalDirty = false;
 
@@ -1400,15 +1576,15 @@ export class Scene2DRenderer {
     this.canvasCompensate.clear();
     this.currentCanvasIds.clear();
     this.dirtyCanvases.clear();
-    this.liveEntityIds.clear();
+    this.liveEntities.clear();
 
     // Step 1: Build parentId + sortOrder maps from all entities with EntityAttributes
     world.query(attrMeta.trait).updateEach(([attr]: any[], entity: any) => {
       this.parentOfEntity.set(entity.id(), attr.parentId || 0);
       this.sortOrderOfEntity.set(entity.id(), attr.sortOrder || 0);
-      this.liveEntityIds.add(entity.id());
+      this.liveEntities.add(entity.valueOf());
     });
-    // ⚠️ `liveEntityIds` must also cover every entity `noteOrphan2D` can reach, not just the ones
+    // ⚠️ `liveEntities` must also cover every entity `noteOrphan2D` can reach, not just the ones
     // with EntityAttributes: `orphan2DKey` already falls back to an `id:`-prefixed key when
     // EntityAttributes is absent or guid-less (see that method), and an entity missing
     // EntityAttributes entirely is exactly the one the query above skips. Without this, a LIVE
@@ -1422,12 +1598,12 @@ export class Scene2DRenderer {
     // `updateEach` deliberately NOT used: it opens the trait stores and runs koota's change
     // detection over every Transform in the scene, and all we want is the id set. A QueryResult IS
     // a readonly Entity[], so plain iteration reads nothing and marks nothing.
-    for (const entity of world.query(Transform)) this.liveEntityIds.add(entity.id());
+    for (const entity of world.query(Transform)) this.liveEntities.add(entity.valueOf());
     // Forget any orphan-warn bookkeeping for an id that no longer names a live entity — koota
     // recycles ids, so an entity that died while still orphaned must not leave a stale count for
     // its id's next occupant to inherit (see `Orphan2DTracker.prune`). Runs right after the live
     // set is fully built and before any pass below calls `note`/`clear` on it.
-    this.orphan2D.prune(this.liveEntityIds);
+    this.orphan2D.prune(this.liveEntities);
     // Explicit Order-in-Layer overrides (Renderable2D) → sprites can stack independent of
     // the entity tree (e.g. a cut-out character's parts parented to scattered bones).
     const orderInLayerOfEntity = new Map<number, number>();
@@ -1503,6 +1679,7 @@ export class Scene2DRenderer {
         const refH = c2d.referenceHeight || 1920;
         const mode = c2d.scaleMode || 'fitH';
         const maxRefW = c2d.maxReferenceWidth || 0;
+        const maxRefH = c2d.maxReferenceHeight || 0;
         // The container this scale/offset positions lives in the Pixi renderer's
         // logical `screen` space, NOT necessarily the canvas's backing-pixel size —
         // those diverge once a project pins `rendering.pixi.resolution` > 0 (which
@@ -1511,7 +1688,7 @@ export class Scene2DRenderer {
         const actualW = slot.app.renderer?.screen?.width || slot.canvas.width;
         const actualH = slot.app.renderer?.screen?.height || slot.canvas.height;
         const { scale, scaleX, scaleY, offsetX, offsetY, compensateX, compensateY } =
-          computeCanvasScale(refW, refH, actualW, actualH, mode, maxRefW);
+          computeCanvasScale(refW, refH, actualW, actualH, mode, maxRefW, maxRefH);
         slot.container.scale.set(scaleX, scaleY);
         slot.container.position.set(offsetX, offsetY);
         // `scale` (min(scaleX, scaleY)) rides along with the shape compensation (#752) — it's
@@ -1549,13 +1726,13 @@ export class Scene2DRenderer {
 
         // Find which Canvas2D this entity belongs to
         const canvasId = this.findCanvasAncestor(id);
-        if (canvasId === null) { this.noteOrphan2D(id); return; } // no Canvas2D ancestor — skip
-        this.orphan2D.clear(id, () => this.orphan2DKey(id));
+        if (canvasId === null) { this.noteOrphan2D(entity); return; } // no Canvas2D ancestor — skip
+        this.orphan2D.clear(entity.valueOf(), () => this.orphan2DKey(id));
 
         const canvasSlot = this.pool.getSlot(canvasId);
         if (!canvasSlot) return;
 
-        this.activeIds.add(id);
+        this.activeIds.set(id, entity.valueOf());
 
         // A video ref is a Sprite on screen but NOT an image asset — it skips the whole
         // still-image path (resolve/load/retain/atlas) and gets its texture from
@@ -1700,9 +1877,9 @@ export class Scene2DRenderer {
           // an editor trait write on ANY entity). Re-issuing the shape for a pure move is not
           // merely wasted tessellation: `gfx.clear()` emits GraphicsContext 'update' →
           // Graphics.onViewUpdate → RenderGroup.onChildViewUpdate → the VIEW list, where
-          // `validateRenderable` returns true for anything batchable (GraphicsPipe.js:34-42) →
+          // `validateRenderable` returns true for anything batchable (pixi's GraphicsPipe.validateRenderable) →
           // `structureDidChange` → `_buildInstructions` for the WHOLE render group
-          // (RenderGroupSystem.js:104-108). One drifting square re-batches every sibling around it.
+          // (RenderGroupSystem._updateRenderGroups). One drifting square re-batches every sibling around it.
           // PixiJS is right to do that with a view change — we were manufacturing the view change.
           // `geomSig` lives on the SLOT, so a rebuilt slot (undefined) always draws.
           const geomSig = `${colliderMode ? 'c' : rend.sprite}|${rend.width}|${rend.height}|${px}|${py}|${rend.color}|${colliderSig}`;
@@ -1774,7 +1951,7 @@ export class Scene2DRenderer {
         const canvasSlot = this.pool.getSlot(canvasId);
         if (!canvasSlot) return;
 
-        this.activeIds.add(id);
+        this.activeIds.set(id, entity.valueOf());
         materialIds.add(id);
 
         const px = rend.pivotX, py = rend.pivotY;
@@ -2071,8 +2248,8 @@ export class Scene2DRenderer {
         // more fundamental failure of the two, and a rig that never finishes loading would
         // otherwise swallow the report of it entirely (measured — the warning never fired).
         const canvasId = this.findCanvasAncestor(id);
-        if (canvasId === null) { this.noteOrphan2D(id); return; }
-        this.orphan2D.clear(id, () => this.orphan2DKey(id));
+        if (canvasId === null) { this.noteOrphan2D(entity); return; }
+        this.orphan2D.clear(entity.valueOf(), () => this.orphan2DKey(id));
         const buf = getSkin2DBuffer(id);
         if (!buf || !buf.parts.length) return; // rig not ready yet — skin2DSystem retries next frame
 
@@ -2097,7 +2274,7 @@ export class Scene2DRenderer {
         }
         if (!allLoaded) return;
 
-        this.activeIds.add(id);
+        this.activeIds.set(id, entity.valueOf());
 
         // Rebuild signature: part count + each part's url / atlas-frame / topology.
         const sig = buf.parts.map((p) => {
@@ -2202,8 +2379,8 @@ export class Scene2DRenderer {
         if (!t.isVisible || this._collidersOnly || deactivatedEntities.has(entity.id())) return;
         const id = entity.id();
         const canvasId = this.findCanvasAncestor(id);
-        if (canvasId === null) { this.noteOrphan2D(id); return; }
-        this.orphan2D.clear(id, () => this.orphan2DKey(id));
+        if (canvasId === null) { this.noteOrphan2D(entity); return; }
+        this.orphan2D.clear(entity.valueOf(), () => this.orphan2DKey(id));
         const canvasSlot = this.pool.getSlot(canvasId);
         if (!canvasSlot) return;
 
@@ -2221,7 +2398,7 @@ export class Scene2DRenderer {
         const gate = getFontTexturePixi(provider, 0, () => this.markDirty());
         if (!gate || gate.destroyed) return;
 
-        this.activeIds.add(id);
+        this.activeIds.set(id, entity.valueOf());
 
         const layoutHash = [t.font, t.text, t.fontSize, t.align, t.maxWidth, t.lineSpacing,
           t.letterSpacing, provider.atlasVersion, getTextDirtyVersion(t.font)].join('|');
@@ -2444,11 +2621,8 @@ export class Scene2DRenderer {
         const colored = animActive && isColorEffect(anim!.effect);
         if ((motion || colored || slot.wasMotion || slot.wasColored) && slot.baseQuads && slot.pageMeshes?.length) {
           const now = getTime(world)?.smoothedElapsed ?? 0;
-          // Restart at t=0 on (re)activation OR an effect switch (effect isn't in the
-          // layout hash, so a mid-Play switch keeps the stale start → intros would skip).
-          if (animActive && ((!slot.wasMotion && !slot.wasColored) || slot.animEffect !== anim!.effect)) slot.animStart = now;
-          slot.animEffect = animActive ? anim!.effect : undefined;
-          const tsec = animActive ? now - (slot.animStart ?? now) : 0;
+          // Restarts on (re)activation, an effect switch, or a different entity on this index (#868).
+          const tsec = textAnimElapsed(slot, animActive, anim?.effect, entity.valueOf(), now);
           const quads = animActive ? applyTextAnimation(slot.baseQuads, anim!, tsec, t.fontSize) : slot.baseQuads;
           // pageMeshes can SKIP not-ready pages, so match each page's buffer to its mesh
           // by PAGE NUMBER, not array index.
@@ -2510,7 +2684,7 @@ export class Scene2DRenderer {
         // rebuild key would resurrect #677's per-frame geometry teardown.
         //
         // Derivation of `effScale`: the canvas root container is scaled by (scaleX, scaleY)
-        // (~:1487 above) and this container by (wt.sx * comp.x, wt.sy * comp.y) (below). Since
+        // (renderFrame's canvas-root `slot.container.scale.set`) and this container by (wt.sx * comp.x, wt.sy * comp.y) (below). Since
         // `comp.x = comp.scale / scaleX` (canvas2DScaler.ts's `compensateX`), the per-axis product
         // is `comp.scale * wt.sx` — `comp.x`/`comp.y` and `scaleX`/`scaleY` cancel EXACTLY, so the
         // on-screen factor is the canvas's own uniform scale times the entity's WORLD scale. `comp`
@@ -2648,6 +2822,11 @@ export class Scene2DRenderer {
     const out: EntityScreenBounds[] = [];
     for (const [id, slot] of this.slots) {
       if (ids && !ids.has(id)) continue;
+      // A dead owner's slot awaiting the next sweep is not measured at all — its id may already
+      // name a newcomer, and the rect is where the DEAD entity was drawn (#1197). No stamp means
+      // this pass never claimed the slot, which the sweep is about to dispose.
+      const owner = this.activeIds.get(id);
+      if (owner === undefined || !isPackedAlive(owner)) continue;
       const canvasId = this.canvasOfEntity.get(id);
       const cSlot = canvasId != null ? this.pool.getSlot(canvasId) : null;
       if (!cSlot || !cSlot.canvas.isConnected) { out.push({ id, layer: '2d', surface, screen: null, onScreen: false, canvasId }); continue; }
@@ -2695,6 +2874,12 @@ export class Scene2DRenderer {
     this.unsub2DMat = register2DMaterialShaderMap(this.entityShaders);
 
     this.unsubSwap = onWorldSwap(() => {
+      // Mark this teardown as a SWAP teardown so the releases below retain rather than destroy
+      // (#1000). play/stop are world swaps that keep the same scene, so the textures the outgoing
+      // world held are overwhelmingly the ones the incoming world is about to ask for again.
+      // A counter (not a boolean) because every live renderer runs its own handler.
+      swapTeardownDepth++;
+      try {
       // Before the slots go: release() restores each Sprite's previous texture, and a
       // destroyed Sprite can't take one back.
       if (__MODOKI_MODULE_VIDEO__) disposeVideoTextures2D(this);
@@ -2755,8 +2940,26 @@ export class Scene2DRenderer {
       // (run in the disposeSlot loop above, in EVERY instance's swap handler) unloads a texture
       // correctly once BOTH viewports have released it — a blanket nuke here would destroy textures
       // the other viewport still shows (adversarial-review finding).
-      if (liveRenderers <= 1) unloadAllSpriteTextures();
+      // ⚠️ AND only when the swap actually CHANGED SCENE (#1000). A play/stop swap keeps the same
+      // scene, so this net's own invariant ("no texture accounting survives a SCENE") does not apply
+      // to it — yet it fired anyway and destroyed every tracked texture, defeating the per-slot
+      // retention entirely whenever only ONE renderer was live. MEASURED: that is a SceneView panel
+      // being closed, not a property of the game — games/court reproduced with 1 renderer while
+      // games/wordweave (SceneView mounted, 2 renderers) did not. Skipping it here is safe because
+      // this is a defensive net, as the comment on `unloadAllSpriteTextures` says: a balanced run has
+      // already released every texture through the per-slot path above.
+      // ⚠️ Evaluated BEFORE the `&&`, deliberately. `swapChangedScene()` is the ONLY writer of
+      // `lastSwapScenePath`, so short-circuiting it left the record un-maintained on every swap that
+      // happened while a second renderer was live — and `liveRenderers` flips between 1 and 2 on a
+      // SceneView mode-dropdown click. That produced both wrong answers: a spurious wholesale sweep on
+      // a same-scene swap (destroying and re-decoding every sprite texture — #1000's exact symptom,
+      // back for one cycle), and a MISSED net on a genuine scene change, because the first call after
+      // the gap sees `undefined` and reports "unchanged" while the refcount map is fully populated.
+      // The same blind spot as the getCurrentBaseScene() bug: a guard whose state updates on one branch.
+      const sceneChanged = swapChangedScene();
+      if (liveRenderers <= 1 && sceneChanged) unloadAllSpriteTextures();
       this._externalDirty = true;  // redraw the incoming scene
+      } finally { swapTeardownDepth = Math.max(0, swapTeardownDepth - 1); }
     });
 
     if (this.primary) sceneManager.registerBeforeSwap(prewarmHook);
@@ -2829,7 +3032,7 @@ export class Scene2DRenderer {
     // pool has no such caller — `editorCanvas2DPool` is a module singleton whose only teardown is
     // this method. Predicted (NOT observed on a running editor) end state: stuck slots accumulate
     // to `MAX_SLOTS` (6), after which `allocate` refuses and warns and the 2D viewport draws
-    // nothing. That consequence is derived from `canvas2DPool.ts:508`, not measured.
+    // nothing. That consequence is derived from `canvas2DPool.ts`'s `takeFreeSlot` `MAX_SLOTS` refusal, not measured.
     // Idempotent: it acts only on `boundBySim` slots and clears that flag, so the runtime's
     // existing stop-then-destroyPool sequence is unaffected.
     this.pool.releaseAll();

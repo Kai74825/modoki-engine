@@ -217,6 +217,37 @@ case, and the only defence is the convention, not the test.
 Both are the generation token doing its ordinary job — the continuation just is not spelled `await`.
 When you are looking for sites that need a token, grep for the deferral, not for the keyword.
 
+### A fifth shape: a deliberate PRE-await write, where no liveness token can be right (#887)
+
+Every token above assumes the writes happen *after* the deferral, so a loser can be told to bail
+before it touches anything. `editor/scene/serialize.ts`'s `newScene()` breaks that assumption on
+purpose, and the two halves of that one file are the clearest statement of the rule:
+
+| | writes the four editor globals | so its token is |
+|---|---|---|
+| `serialize.loadScene` | **after** its `await`, behind `stillLive()` | a supersession epoch — a newer open wins |
+| `serialize.newScene` | **before** its `await`, by design | a **lock**: the second call is refused |
+
+`newScene` sets `setCurrentScenePath` / `setCurrentBaseScene` first because `setCurrentWorld` fires
+`onWorldSwap` synchronously and the Hierarchy's restore reads `getCurrentScenePath()` a frame
+later — and `aSceneSwapIsHappening()` is false on that path, so nothing waits for the state to
+settle. Writing first removes an ordering dependency instead of racing it.
+
+That makes supersession **unusable**, not merely awkward: a loser bailing in its tail has already
+stomped the path and cannot roll it back, and moving the write after the `await` to make bailing
+possible reopens the exact race the pre-write closes. So the question the site actually asks is not
+*am I still live?* but *may I start at all?* — and the answer is a plain in-flight boolean plus a
+typed refusal, released in a `finally` so one rejected swap does not brick the operation for the
+session. `editor/scene/playMode.ts`'s `enterPlay` (#470) is the same shape and the precedent to
+copy.
+
+**The test to apply before reaching for an epoch: does this function write anything the caller can
+observe BEFORE its first deferral?** If yes, a liveness token is guarding the wrong half of it.
+
+⚠️ Neither guard sees this. `livenessTokenIsShared` looks for a counter, and there is none; nothing
+looks for "an async function with pre-await writes and no mutual exclusion" — that is the same
+statement-order analysis § Enforcement declines to build.
+
 ### A fourth shape the helper does NOT cover: capture, and let a THIRD PARTY consume it
 
 Every token above answers *am I still live?* from inside the continuation. `NavigationManager` (#808)
@@ -373,9 +404,31 @@ none of the operations we bound accepts an `AbortSignal`: a Pixi `Application.in
 whose late result you then THROW AWAY is strictly worse than not bounding it: a slow-but-alive
 bring-up that used to succeed at 8.5 s instead exhausts its retries and leaves a permanently black
 surface. Both sites therefore route the late arrival back into the same success path the on-time one
-takes — `initSlotApp`'s cure for 2D, `adoptRenderer` for 3D — with a supersession token deciding
-whether it is still wanted. **If you add a bound, say where the late result goes before you add
-it.**
+takes — `initSlotApp`'s cure for 2D, `adopt` in `rendering/viewportBringUp.ts` for 3D — with a
+supersession token deciding whether it is still wanted. **If you add a bound, say where the late
+result goes before you add it.**
+
+⚠️ **A fix that lives in a component closure is a fix nothing pins.** #819 and #820 landed inside
+`Scene3D.tsx`'s effect; deleting all three changes (the bound, the token, the retirement) left 18,116
+tests passing (#824). They were extracted to `viewportBringUp.ts` — `boot()`/`rebuild()`,
+`boundedCaptureReadback` — and `viewportBringUp.test.ts` now pins each, including a
+`rendererRecovery` run where every attempt hangs and the LAST late renderer is adopted.
+⚠️ **Extraction moves the gap one layer out, it does not close it on its own**: the module's tests
+cannot see how `Scene3D.tsx` wires it, and the close-out review measured `rebuild: bringUp.boot` and
+a no-op capture slot leaving 144 tests green. `tests/architecture/viewportBringUpWired.test.ts`
+source-scans that wiring; pair any future extraction with the same.
+⚠️ **The editor's `SceneView.tsx` had the same shape until #1052**: its context-loss rebuild re-ran
+the whole viewport setup with no bound, so a hung WebGPU init latched recovery exactly as #820 did.
+It now goes through the same module, renamed from `scene3DBringUp.ts` to `viewportBringUp.ts` for
+it. The editor needed three seams Scene3D does not use: `createRenderer(kind)`, an async
+`install(r, stillCurrent)`, and a lease-aware `discard(r, reason)`. The wiring guard scans both
+callers. **The late result's destination was, as above, the hard part.** A renderer that arrives
+after UNMOUNT must go back through SceneView's container lease, because a StrictMode remount may be
+re-acquiring it. A SUPERSEDED one's lease was already dropped by the rebuild that overtook it, so
+releasing it would decrement the successor's hold — which is why `adopt` decides superseded FIRST.
+⚠️ **A live trigger was attempted and could not be driven.** `GPUDevice.destroy()` reads as an
+orderly teardown to `makeViewportLossPolicy` (`reason: 'destroyed'` is filtered). The fix is
+therefore verified by the module's fake-timer tests and the wiring guard, not by a live before/after.
 
 ### The rule
 
@@ -391,7 +444,7 @@ Three answers, and you must write one down:
 |---|---|---|
 | `{ adopt: why }` | a late settlement is handled on its OWN path | `canvas2DPool` — `initSlotApp` cures whichever attempt wins |
 | `{ discard: why }` | the late value owns nothing reclaimable | `gpuClock`'s stale duration; `handleEval`'s uncancellable agent code |
-| `{ onSettled }` | it holds something that must be released | `Scene3D` disposing a late renderer; `msdfGenerate` disposing a late worker |
+| `{ onSettled }` | it holds something that must be released | `viewportBringUp` disposing a superseded late renderer; `msdfGenerate` disposing a late worker |
 
 `adopt` and `discard` are both runtime no-ops. The distinction is type-level and load-bearing **at the
 source line**: the string is a written justification the next author gets for free instead of
@@ -410,7 +463,8 @@ coverage — this is a real hole in the family, not a solved member.
 wait for the abandoned generation (that restores the wedge the timeout exists to remove) and cannot
 cancel it (`MSDF.dispose()` awaits a comlink round-trip *before* `terminate()`, so it queues behind
 the very call that is stuck). It retires the generator instead: the next call builds a fresh Worker,
-and the window is per-worker. `Scene3D` does the same with its pooled render target.
+and the window is per-worker. `Scene3D` does the same with its pooled render target
+(`boundedCaptureReadback` in `viewportBringUp.ts`).
 
 ### When a hand-rolled deadline is the RIGHT answer
 
@@ -477,7 +531,12 @@ Two places do not follow the rule, on purpose. Neither is a defect to re-file.
 - [managers-and-systems.md](./managers-and-systems.md) — why this app has no app-level teardown path,
   and why the `disposed`-boolean token is rarer here than it looks. Every end-of-lifetime at app scope
   is a realm death; scene scope is where teardown is real.
-- [scene-loading.md](./scene-loading.md) — the scene load/swap lifecycle these guards protect.
+- [scene-loading.md](./scene-loading.md) — the scene load/swap lifecycle these guards protect,
+  including § "The promote's notification cannot abort the promoter" (#888). That is the THIRD
+  guard in this family — `engine/tests/architecture/notifyIsShared.test.ts` over
+  `runtime/core/notifyListeners.ts`, built like the two above and carrying the same shape of
+  stated blind spots. It is a different question (an exception escaping a synchronous fan-out,
+  not a stale continuation), so nothing here covers it and it does not belong in this doc's body.
 - [architecture-layers.md](./architecture-layers.md) — why the helper lives in L0 `runtime/core/`.
 - [rendering.md](./rendering.md) § "The 2D path needs the same recovery" — the renderer-side
   story behind #801, and why a recovery's cure must sit on the same success path as its bring-up.

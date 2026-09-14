@@ -8,16 +8,19 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 import { spawn, execFileSync } from 'child_process';
 import crypto, { randomUUID } from 'crypto';
-import type { Plugin } from 'vite';
+import { normalizePath, type Plugin } from 'vite';
+import { resolveModuleUrl } from './backend/moduleUrl';
 import { computeKeptAssets, enumerateRefEdges, formatBytes } from './asset-tree-shaker';
 import { assertNoConversionFallback, type ConversionFailure } from './asset-conversion-strict';
-import { loadProjectConfig, loadProjectUserConfig, validateBuildConfig, projectConfigUnionErrors } from './load-project-config';
+import { loadProjectConfig, loadProjectUserConfig, projectBuildConfigErrors } from './load-project-config';
 import { stripPrivateBuildFields } from '../project-config';
 import { resolveModules } from './detect-modules';
 import { findGamesEntry } from './findGamesEntry';
-import { resolveGcloudDir, deriveGcsBucketFromBaseUrl, OTA_SAFE_TOKEN, OTA_SAFE_BUCKET } from './backend/gcloud';
-import { projectAssetRoots } from '../scripts/projectRoots.mjs';
-import { describeUnreadablePackageJsonWarning } from '../scripts/staleNodeModulesWarning.mjs';
+// The leaf module, not './subgameBuild': that file's shared-key list would reach the Electron main bundle (#1035).
+import { subgameOutDir } from './subgameOutDir';
+import { samePath, canonicalPath } from '../scripts/pathIdentity.mjs';
+import { resolveGcloudDir, deriveGcsBucketFromBaseUrl, OTA_SAFE_TOKEN } from './backend/gcloud';
+import { projectAssetRoots, discoverProjects, PROJECT_ROOT_DIRS } from '../scripts/projectRoots.mjs';
 import { listAndroidDevices, resolveBuildAndroidSerial } from './backend/androidDevices';
 // Through the typed shell, not the .mjs directly: TypeScript consumers all enter the claim store
 // by one door, so a future caller cannot pick up a differently-typed view of the same rules.
@@ -77,10 +80,9 @@ import { type SpriteSlice, type SpriteAssetRef } from '../packages/modoki/src/ru
 import { type AtlasCacheBlock } from '../packages/modoki/src/runtime/loaders/spriteAtlas';
 import { type SceneSchema } from '../packages/modoki/src/runtime/loaders/sceneValidation';
 import { handleBackendRequest, assetJsonBytes, type BackendContext, type BackendResult } from './backend/editorBackendRouter';
-import { reclaimStaleDeviceStateAtStartup } from './backend/deviceConnection';
-import { vendorEnginePlugins, writeVendorMarker, verifyInstalledMatchesTarballResult } from './vendorPlugins';
+import { reclaimStaleDeviceStateAtStartup, shouldReclaimDeviceStateHere } from './backend/deviceConnection';
+import { healNativeProject } from './healNativeProject';
 import { spawnBuildCommand, killBuildProcess, resolveBuildStep, type BuildStep } from './buildStepShell';
-import { healNativeConfig } from './healNativeConfig';
 import {
   parseBuildVariant, keystoreRefusal, renderKeystoreProperties, renderExportOptionsPlist,
   androidReleaseSteps, iosReleaseSteps, debugBuildReleaseWarning,
@@ -88,7 +90,8 @@ import {
 } from './releaseBuild';
 import { PROJECT_USER_CONFIG_FILENAME } from '../project-config';
 import { iconIsUpToDate, iconStampValue } from './iconAssets';
-import { ensureCapacitorDeps, scaffoldNativeTarget, isNativeTargetScaffolded, type NativePlatform } from './addNativeTarget';
+import { resolveIconInputs, stampExtrasFrom, iconInputsToArgs } from '../scripts/iconInputs.mjs';
+import { scaffoldNativeTarget, isNativeTargetScaffolded, type NativePlatform } from './addNativeTarget';
 import { discoverSigningTeams, type SigningTeam } from './signingTeams';
 import { serveProjectAsset } from './backend/staticAssets';
 import { writeBackendResult } from './backend/writeResult';
@@ -273,7 +276,7 @@ export function readAssetGuid(absPath: string, type: string): string | undefined
  *  and the file rewritten — so every newly created JSON asset went out through this line.
  *  Measured live, and only live: the router's own route wrote the newline correctly and this
  *  overwrote it milliseconds afterwards, so the request looked right and the file was wrong.
- *  `meta-sidecar.ts:334` already appends its own; this now shares the router's one definition. */
+ *  `meta-sidecar.ts`'s `writeJsonAtomic` already appends its own; this now shares the router's one definition. */
 function writeJsonAtomic(absPath: string, json: unknown): void {
   const tmp = absPath + '.tmp';
   fs.writeFileSync(tmp, assetJsonBytes(json));
@@ -631,20 +634,129 @@ export function planIosInstall(o: { iosDeviceId: string; iosDevicectlId: string;
   return { ok: true, mode: o.goIos ? 'go-ios' : 'xcode-handoff' };
 }
 
-/** /api/ota/publish only ever builds+publishes the CURRENTLY OPEN project as ITSELF — see
- *  the route's own comment and ota-updates.md's Gotchas for why an override to a different
- *  bundleName used to be a silent publish-corruption risk (it would ship this project's
- *  plain shell dist/ under a DIFFERENT bundle's identity). Pure — extracted so this
- *  invariant is unit-testable without a live editor/gcloud. */
-export function otaPublishBundleNameAllowed(requestedBundleName: string, projectOtaBundleName: string): boolean {
-  return requestedBundleName === projectOtaBundleName;
+// `otaPublishTarget` (#837) moved to engine/scripts/ota/publishPreflight.mjs (#827): it is one step of
+// the publish-request check both this route and `ota-publish.mjs` now run, so it lives once, there.
+export { otaPublishTarget, type OtaPublishTarget } from '../scripts/ota/publishPreflight.mjs';
+import { otaPublishPreflight, readRawOtaBlock, type OtaPublishTarget, type OtaPublishRefusal } from '../scripts/ota/publishPreflight.mjs';
+
+type OtaSubgameDirResult =
+  | { ok: true; dir: string }
+  | { ok: false; reason: 'not-found' | 'no-game-entry' | 'ambiguous' | 'shell-itself'; error: string };
+
+/** Resolve a listed sub-game id to its project folder among ONE set of projects (#837). By folder
+ *  name, never a path: a game must stay self-contained. Only folders with a game entry are
+ *  candidates, so a plain folder that shares the name can neither be picked nor make the id look
+ *  ambiguous. Refuses the shell project itself. Pure over its inputs; `reason` lets
+ *  {@link otaResolveSubgameDir} move on to its next set after a miss. */
+export function otaSubgameProjectDir(
+  id: string,
+  projects: readonly { name: string; dir: string }[],
+  shellProjectRoot: string,
+  hasGameEntry: (dir: string) => boolean,
+): OtaSubgameDirResult {
+  const named = projects.filter((p) => p.name === id);
+  if (named.some((p) => samePath(p.dir, shellProjectRoot))) {
+    return { ok: false, reason: 'shell-itself', error: `ota.subgames lists "${id}", which is this shell project itself. A project publishes itself under its own ota.bundleName.` };
+  }
+  if (named.length === 0) {
+    return { ok: false, reason: 'not-found', error: `ota.subgames lists "${id}", but no project of that name exists next to this shell project, or under ${PROJECT_ROOT_DIRS.map((r) => `${r}/`).join(' or ')} of this repo. A sub-game is named by its project folder name.` };
+  }
+  const games = named.filter((p) => hasGameEntry(p.dir));
+  if (games.length === 0) {
+    return { ok: false, reason: 'no-game-entry', error: `ota.subgames lists "${id}", but ${named.map((p) => p.dir).join(', ')} has no game.ts or game.tsx for build-subgame.mjs to build.` };
+  }
+  if (games.length > 1) {
+    return { ok: false, reason: 'ambiguous', error: `ota.subgames lists "${id}", which names ${games.length} projects (${games.map((h) => h.dir).join(', ')}). Rename one so the id is unambiguous.` };
+  }
+  return { ok: true, dir: games[0].dir };
 }
 
-// otaSigningKeyRefusal moved to engine/scripts/ota/publishGuards.mjs (#582) — it now runs in
-// TWO places (this route's own early check below, and ota-publish.mjs itself, the by-hand path
-// this route's refusal message sends a human to), so it lives once and both import it.
+/** Resolve a listed sub-game id for the publish route (#837), searching TWO places in order:
+ *   1. **the folder of that name NEXT TO the shell project** — a shell and its sub-games travel
+ *      together, and this is the only place a packaged editor (its root is `app.asar.unpacked`,
+ *      which ships no `games/`) or a project outside the repo can find one;
+ *   2. **the `games/` and `demos/` projects under the editor's root** — a `demos/` sub-game of a
+ *      `games/` shell.
+ *  The first place holding a matching GAME wins, so the shell's own neighbour beats a same-named
+ *  project in whichever clone the editor runs from. A real refusal (the shell itself, two games of
+ *  one name in one place) stops the search. Step 1 reads the parent's names ONCE and accepts only an
+ *  EXACT match — the parent may be a home directory, so there is no per-entry work, and `statSync`
+ *  alone ignores case on macOS and Windows (`Mini` would resolve to `mini` there, not on Linux). The
+ *  same exact match is what keeps an id inside the parent: a listed name never contains a separator
+ *  and is never `.` or `..`, so no separate guard is needed (a second one could not be tested). */
+export function otaResolveSubgameDir(
+  id: string,
+  editorRoot: string,
+  shellProjectRoot: string,
+  hasGameEntry: (dir: string) => boolean,
+): OtaSubgameDirResult {
+  const siblings: { name: string; dir: string }[] = [];
+  const parent = path.dirname(shellProjectRoot);
+  try {
+    if (fs.readdirSync(parent).includes(id)) {
+      const dir = path.join(parent, id);
+      if (fs.statSync(dir).isDirectory()) siblings.push({ name: id, dir });
+    }
+  } catch { /* nothing of that name beside the shell */ }
+  let miss: OtaSubgameDirResult | undefined;
+  for (const projects of [siblings, discoverProjects(editorRoot)]) {
+    const r = otaSubgameProjectDir(id, projects, shellProjectRoot, hasGameEntry);
+    if (r.ok || (r.reason !== 'not-found' && r.reason !== 'no-game-entry')) return r;
+    // Keep the more specific miss: "a folder exists but is not a game" beats "nothing there".
+    if (!miss || (!miss.ok && miss.reason === 'not-found')) miss = r;
+  }
+  return miss as OtaSubgameDirResult;
+}
+
+/** The build and publish commands `/api/ota/publish` runs for one target (#837). Pure, so which
+ *  script builds which folder, and which dist is uploaded under which name, is unit-testable without
+ *  spawning a build or touching gcloud.
+ *
+ *  ⚠️ **A sub-game's publish passes NO `--engine-api`.** `ota-publish.mjs` reads the value its build
+ *  stamped into `subgame.json`, the number a device actually compares. Passing the shell's value here
+ *  would reintroduce the flag-versus-module disagreement that check exists to refuse. */
+export function otaPublishSteps(o: {
+  target: OtaPublishTarget;
+  projectRoot: string;
+  subgameDir?: string;
+  gcloudEnv: NodeJS.ProcessEnv;
+  buildCwd: string;
+  bucket: string;
+  bundleName: string;
+  version: string;
+  keyName: string;
+  shellEngineApi: number;
+  mandatory: boolean | undefined;
+}): { buildLabel: string; buildCmd: string; buildEnv: NodeJS.ProcessEnv; distDir: string; publishCmd: string } {
+  const mandatoryFlag = o.mandatory === true ? ' --mandatory' : o.mandatory === false ? ' --no-mandatory' : '';
+  const tail = `--bucket ${JSON.stringify(o.bucket)} --name ${JSON.stringify(o.bundleName)} --version ${JSON.stringify(o.version)} ` +
+    `--key ${JSON.stringify(o.keyName)} --repo-root ${JSON.stringify(o.buildCwd)} --project ${JSON.stringify(o.projectRoot)}${mandatoryFlag}`;
+  if (o.target.kind === 'subgame') {
+    if (!o.subgameDir) throw new Error('otaPublishSteps: a sub-game target needs its resolved project dir');
+    const distDir = subgameOutDir(o.subgameDir);
+    return {
+      buildLabel: `Building sub-game ${o.target.id}...`,
+      buildCmd: 'node engine/scripts/build-subgame.mjs',
+      buildEnv: { ...o.gcloudEnv, MODOKI_PROJECT: o.subgameDir },
+      distDir,
+      publishCmd: `node engine/scripts/ota-publish.mjs --dist ${JSON.stringify(distDir)} ${tail}`,
+    };
+  }
+  const distDir = path.join(o.projectRoot, 'dist');
+  return {
+    buildLabel: 'Building web assets...',
+    buildCmd: 'node engine/scripts/build-web.mjs --target native',
+    buildEnv: otaPublishBuildStepEnv(o.gcloudEnv, o.projectRoot),
+    distDir,
+    publishCmd: `node engine/scripts/ota-publish.mjs --dist ${JSON.stringify(distDir)} --engine-api ${o.shellEngineApi} ${tail}`,
+  };
+}
+
+// otaSigningKeyRefusal lives in engine/scripts/ota/publishGuards.mjs (#582); since #827 it runs only
+// inside `otaPublishPreflight`, which this route and ota-publish.mjs both call. Re-exported for the
+// existing tests that import it from here.
 export { otaSigningKeyRefusal } from '../scripts/ota/publishGuards.mjs';
-import { otaSigningKeyRefusal } from '../scripts/ota/publishGuards.mjs';
+import { readGitProvenance } from '../scripts/ota/buildStamp.mjs';
 
 /** The build steps for a `playable` target: the single-file inliner build (VITE_PLAYABLE=1 →
  *  games/<id>/ads/index.html) then reveal the ads/ dir. No favicon/deploy/native — the one HTML IS
@@ -704,7 +816,53 @@ export async function buildStepEnv(extra: NodeJS.ProcessEnv = {}): Promise<NodeJ
  *  own save looks external and bounces the live scene (the Windows Ctrl+S full-reload
  *  bug). Fold the drive letter to a single case and unify separators so both spellings
  *  collapse to one key. A no-op on POSIX paths (no drive letter, no backslashes), so
- *  Linux/macOS keying is unchanged. */
+ *  Linux/macOS keying is unchanged.
+ *
+ *  ⚠️ **TWO consumers, not one.** `engine/electron/assetBackend.ts` imports this for the
+ *  Electron main-process watcher's own inline guard (deliberately not `createEditorWriteGuard`,
+ *  to keep a Vite-plugin module out of the main process). Any cost added here is paid at BOTH
+ *  watchers, on the chokidar hot path — several events per save.
+ *
+ *  ⚠️ **This deliberately does NOT resolve symlinks, and that is settled — do not "fix" it**
+ *  (#960, closed not-planned). The two operands genuinely come from DIFFERENT producers, so the
+ *  "same producer, correct by construction" reasoning does not apply: `mark` receives
+ *  `fromFsUrl(<client-supplied /@fs string>)` (`editorBackendRouter.ts`), while `isWrite`
+ *  receives chokidar's path, built from `findAssetRoots(projectRoot)`. Neither chain calls
+ *  `realpath` anywhere.
+ *
+ *  What makes the symlink direction unreachable is a check UPSTREAM of this one: the same
+ *  `/@fs/` branch gates on containment first —
+ *      `const rel = path.relative(ctx.projectRoot, abs)` → `..` ⇒ **403**
+ *  — so a client spelling that differs from `projectRoot`'s by a symlink is REFUSED before a key
+ *  is ever built. Measured both directions against a real symlinked tree (logical root + physical
+ *  client, and the reverse): both 403, with a positive control confirming the probe does report a
+ *  guard miss when one exists. A `realpathSync.native` here would be insurance against a state
+ *  the containment check already rejects — and a syscall per watcher event to buy it.
+ *
+ *  The drive-letter direction, which this DOES fold, is the reachable one: `path.relative` on
+ *  win32 is case-insensitive, so a case-flipped drive passes containment and then misses the Map.
+ *
+ *  ⚠️ **The adjacent question — MEASURED, and the answer is "real mechanism, unreachable flow".**
+ *  If a client's `/@fs/` spelling can ever differ from `projectRoot`'s, that 403 is itself a bug
+ *  worse than the missed guard: it refuses the save outright. Driven against a live editor
+ *  launched with `MODOKI_PROJECT` pointing at a SYMLINK to `games/video-test`:
+ *
+ *    POST /api/write-file  /@fs<logical>/runtime/assets/probe.json   -> 200   (same file)
+ *    POST /api/write-file  /@fs<physical>/runtime/assets/probe.json  -> 403   (same file)
+ *    POST /api/write-file  /@fs/tmp/outside/probe.json               -> 403   (control)
+ *
+ *  So the mechanism is real. What makes it unreachable in the normal flow is that nothing hands
+ *  the client a PHYSICAL spelling: every `/@fs/` URL the backend mints goes through
+ *  `toFsUrl(ctx.projectRoot)`, i.e. the same lexical `path.resolve` of `MODOKI_PROJECT` that the
+ *  containment check compares against — and the open scene does not use the `/@fs/` branch at all
+ *  (it resolves as an asset-root path, `/assets/scenes/main.scene.json`). Vite serves BOTH
+ *  spellings with a 200, so it does not force a mismatch either.
+ *
+ *  ⚠️ **It stays a live trap for anything that introduces a resolved path**: a native file dialog
+ *  (macOS returns resolved paths), a pasted path, or a drag-drop would all spell it physically and
+ *  be refused. If you add such a seam, canonicalise BOTH sides of the containment check — do not
+ *  reach for `realpathSync` in the write guard below, which is a different question that #960
+ *  settled the other way. */
 export function normalizeWriteGuardKey(absPath: string): string {
   return absPath.replace(/\\/g, '/').replace(/^([a-zA-Z]):/, (_m, d: string) => `${d.toLowerCase()}:`);
 }
@@ -757,6 +915,51 @@ export function createEditorWriteGuard(ttlMs = 1500, now: () => number = Date.no
   return { mark, isWrite };
 }
 
+/** The rejection a client sends when it has no handler registered for an op. Spelled ONCE here
+ *  and matched case-insensitively, because it is simultaneously: the string `agentBridge.runAgentOp`
+ *  throws, the legacy shape a pre-#1030 tab still replies with, and the string three consumers in
+ *  `editorBackendRouter` classify on. See `settle`.
+ *
+ *  ⚠️ **ANCHORED**, unlike the three consumer-side tests, and deliberately so. Those ask "is this
+ *  message about an absent op?"; this one asks "is this reply a DECLINE rather than an answer?",
+ *  and it runs against EVERY reply, a real op's genuine throw included. An unanchored test would
+ *  miscount an op whose own error happens to contain the words — the exact miscount
+ *  `agentBridge`'s membership test exists to avoid on the CLIENT side, which it would be absurd to
+ *  reintroduce here. `runAgentOp` throws this string with nothing before it, so the anchor still
+ *  matches every legacy reply. */
+const UNKNOWN_AGENT_OP_RE = /^unknown agent op\b/i;
+
+/** Route one `modoki:response` payload into the pending-request registry.
+ *
+ *  A one-line function, exported for one reason: it is the WIRING, and the wiring is what #1030's
+ *  own close-out found untested (F1). With the mapping inline in `configureServer`, changing
+ *  `data.declined === true` to `false` left all 228 tests green — and that mutation is WORSE than
+ *  the bug being fixed: a `{declined:true}` reply then has `error === undefined`, falls past the
+ *  decline branch, and RESOLVES the request with `undefined`, so `applyMovesInRenderer` reports
+ *  `{kind:'applied', notes: []}` — a fabricated success where the old code at least said `absent`. */
+export function settleRelayReply(
+  registry: { settle: (id: number, result?: unknown, error?: string, declined?: boolean, client?: unknown) => boolean },
+  data: { id: number; result?: unknown; error?: string; declined?: boolean },
+  client?: unknown,
+): boolean {
+  return registry.settle(data.id, data.result, data.error, data.declined === true, client);
+}
+
+/** How many of `announced` are still in `live` — the decline denominator (#1030 close-out F2).
+ *
+ *  Pure and exported so the intersection is testable without a dev server. `live` is Vite's
+ *  `ws.clients` (a `Set`); when a transport exposes no membership test, every announced client is
+ *  assumed present. ⚠️ That fallback is bounded only BECAUSE the caller also prunes on
+ *  `vite:client:disconnect`; without the prune it counts every client ever seen, and after a day
+ *  of HMR full-reloads (each a fresh socket, each announcing) every relayed op would ride its full
+ *  budget. Within that bound it is the conservative direction: too HIGH degrades to the caller's
+ *  timeout, never to a premature `absent`. */
+export function countLiveBridgeClients(announced: Iterable<unknown>, live?: { has?: (c: unknown) => boolean }): number {
+  let n = 0;
+  for (const c of announced) { if (!live?.has || live.has(c)) n++; }
+  return n;
+}
+
 /** In-flight browser-request bookkeeping for `requestBrowser` — the dev server
  *  relays an op over the HMR socket and awaits the browser's `modoki:response`.
  *  Factored out (with injectable timers) because the lifecycle is the regression-
@@ -771,19 +974,40 @@ export function createBrowserRequestRegistry(
   },
 ) {
   let nextId = 1;
-  const pending = new Map<number, { resolve: (v: unknown) => void; reject: (e: Error) => void; timer: unknown }>();
+  const pending = new Map<number, {
+    resolve: (v: unknown) => void; reject: (e: Error) => void; timer: unknown;
+    /** The op name, so an all-declined settle can name it in the SAME string a single
+     *  `unknown agent op` rejection used to carry (see `settle`). */
+    op: string;
+    /** How many announced bridge clients the broadcast reached, captured at send time. */
+    expected: number;
+    /** WHICH clients have said "I do not have this op" — a set, not a count, so one client's
+     *  duplicate reply cannot stand in for a second client's silence (#1030 close-out F3). */
+    declinedBy: Set<unknown>;
+    /** Declines that arrived with no client identity (a transport that supplies none, and the
+     *  unit tests). Counted, because there is nothing to dedupe them by. */
+    declinedAnon: number;
+  }>();
 
   /** Begin a request: allocate an id, arm the timeout, register the settlers, then
    *  run `send(id)` (the actual ws.send). If `send` throws, clean up immediately
-   *  instead of leaking the timer + entry until the timeout fires. */
-  function request(send: (id: number) => void, timeoutMs: number): Promise<unknown> {
+   *  instead of leaking the timer + entry until the timeout fires.
+   *
+   *  `op` and `expected` exist for the decline counting in `settle` — see #1030.
+   *
+   *  ⚠️ **Both are REQUIRED, and that is the guard** (#1030 close-out F1). They were optional with
+   *  `expected = 1`, and dropping them at the one production call site silently restored the exact
+   *  defect this registry was written to fix — with the whole suite green, because every test
+   *  passes them explicitly. Required makes that mutation a compile error instead. A caller that
+   *  genuinely cannot count its clients passes `1` and says so. */
+  function request(send: (id: number) => void, timeoutMs: number, op: string, expected: number): Promise<unknown> {
     return new Promise((resolve, reject) => {
       const id = nextId++;
       const timer = timers.set(() => {
         pending.delete(id);
         reject(new Error('timed out waiting for the browser — is the app open at the dev URL?'));
       }, timeoutMs);
-      pending.set(id, { resolve, reject, timer });
+      pending.set(id, { resolve, reject, timer, op, expected: Math.max(1, expected), declinedBy: new Set(), declinedAnon: 0 });
       try {
         send(id);
       } catch (e) {
@@ -795,10 +1019,62 @@ export function createBrowserRequestRegistry(
   }
 
   /** Settle a pending request from a browser reply. No-op (returns false) if the id
-   *  is unknown or already settled — so a duplicate/late response can't double-reject. */
-  function settle(id: number, result?: unknown, error?: string): boolean {
+   *  is unknown or already settled — so a duplicate/late response can't double-reject.
+   *
+   *  ## ⚠️ A DECLINE IS NOT AN ANSWER (#1030)
+   *
+   *  `ws.send` is a BROADCAST — every HMR client gets the request — and this used to settle on
+   *  whichever reply arrived first. A tab on the dev server's runtime route has no editor ops
+   *  registered, so it rejects in about a millisecond and BEATS the editor tab, which has to do
+   *  the actual work. Any consumer reading that rejection as "no editor exists" then gets a false
+   *  negative about a live editor holding state: `applyMovesInRenderer` maps `unknown agent op`
+   *  to `{kind:'absent'}` and skips the path repair SILENTLY — no warn, no `repairFailed` — while
+   *  the editor's bindings, parked writes and Inspector selection still key on the dead path.
+   *
+   *  So a decline no longer settles on its own. It is COUNTED, and the request rejects only once
+   *  every client the broadcast reached has declined — at which point "nothing out there has this
+   *  op" is true rather than merely first.
+   *
+   *  ⚠️ **The all-declined rejection carries the SAME `unknown agent op '<op>'` string it always
+   *  did**, and that is load-bearing rather than lazy: `applyMovesInRenderer`, `relayProvesNoRenderer`
+   *  and `relayFailureStatus` all key off it, and they disagree about what it MEANS on purpose (a
+   *  repair's safe answer and a guard's safe answer are opposites on this string — see
+   *  `relayProvesNoRenderer`'s banner). Nothing downstream changes; only the race is removed.
+   *
+   *  ⚠️ **`declined` is also inferred from the legacy string.** A tab loaded before this change
+   *  answers `error: "unknown agent op '<op>'"` with no flag, and would otherwise settle the whole
+   *  request the old way — reintroducing the race for exactly as long as one stale tab stays open.
+   *  The string test belongs HERE, at the transport, and nowhere else: this is the only layer that
+   *  knows the send was a broadcast.
+   *
+   *  ⚠️ **A client that disconnects mid-flight never declines**, so its share of the count never
+   *  arrives and the request rides to its timeout instead of settling `absent`. Deliberate: a
+   *  timeout is the honest answer there, and every consumer already treats it as AMBIGUOUS rather
+   *  than as proof of absence (`isRelayTimeout`). */
+  function settle(id: number, result?: unknown, error?: string, declined = false, client?: unknown): boolean {
     const p = pending.get(id);
     if (!p) return false;
+    // ⚠️ `result === undefined` is part of the test, not decoration: a reply carrying a RESULT is
+    // an answer whatever its error field happens to say.
+    if (declined || (error !== undefined && result === undefined && UNKNOWN_AGENT_OP_RE.test(error))) {
+      // ⚠️ Dedupe by CLIENT. This function's header promises a duplicate reply cannot double-settle,
+      // and on the decline path that promise needs identity to keep: two declines carrying the same
+      // id from the SAME client would otherwise reach `expected` and reject while the editor tab is
+      // still doing the work — #1030 reinstated, silently. `initAgentBridge` has no idempotency
+      // flag and Vite's `hot.on` appends without dedupe, so a double-registration produces exactly
+      // that pair; what prevents it today is incidental (agentBridge.ts's module header says so).
+      if (client !== undefined) {
+        if (p.declinedBy.has(client)) return false;
+        p.declinedBy.add(client);
+      } else {
+        p.declinedAnon += 1;
+      }
+      if (p.declinedBy.size + p.declinedAnon < p.expected) return false;   // someone may still answer
+      timers.clear(p.timer);
+      pending.delete(id);
+      p.reject(new Error(error || `unknown agent op '${p.op}'`));
+      return true;
+    }
     timers.clear(p.timer);
     pending.delete(id);
     if (error) p.reject(new Error(error));
@@ -1392,7 +1668,7 @@ export function assetScannerPlugin(): Plugin {
   // and the cast kept the old `{ ws: { send } }` shape, which still compiled (the narrower type is
   // assignable) while telling the next reader `clients` was not there — the field the guard is
   // built on. A shared alias makes that impossible rather than tidy.
-  type ViteServerRef = { ws: { send: (m: object) => void; clients?: { size: number } } };
+  type ViteServerRef = { ws: { send: (m: object) => void; clients?: { size: number; has?: (c: unknown) => boolean } } };
   let viteServer: ViteServerRef | null = null;
 
   // ── Agent bridge state (dev-only AI/tooling helpers) ──
@@ -1403,6 +1679,35 @@ export function assetScannerPlugin(): Plugin {
   // waits for its modoki:response). Lifecycle + timer bookkeeping live in
   // createBrowserRequestRegistry (above), factored out so it's unit-testable.
   const browserRequests = createBrowserRequestRegistry();
+  /** HMR clients that have PROVEN they run the agent bridge, by sending us a `modoki:schema` or a
+   *  `modoki:response` (#1030 close-out F2).
+   *
+   *  ⚠️ **`ws.clients.size` is the wrong denominator for the decline count, and using it made an
+   *  ordinary case hang.** It counts SOCKETS: `/@vite/client` connects while `index.html` is still
+   *  parsing, but `initAgentBridge` is reached through a dynamic import several module-graph levels
+   *  later (`app/main.tsx`) — and never at all for a tab sitting on the Vite error overlay after a
+   *  compile error. Such a tab is counted-but-mute, its decline never arrives, and the request rides
+   *  the CALLER's full budget instead of settling: 1.5s on the move repair (which then warns and
+   *  reports `repairFailed` about a live editor that was never at risk), 60s on `/api/eval`. Before
+   *  #1030 that case was instant, silent and correct.
+   *
+   *  Counting only clients that have announced themselves makes a mute tab cost nothing.
+   *
+   *  ⚠️ **An unannounced client is DANGEROUS, not merely invisible — which is why the announce
+   *  happens at handler-registration time** (`agentBridge`'s `announce`). An earlier version of
+   *  this comment argued that a client which has not announced "has not registered any op, so
+   *  excluding it cannot hide a real answer". True, and beside the point: it cannot hide an
+   *  ANSWER, but it can still send a DECLINE, and that decline completes a count that was one too
+   *  small. Excluding a client that can reply is #1030 again. The invariant to preserve is that
+   *  nothing can answer `modoki:request` before it has announced. */
+  const bridgeClients = new Set<unknown>();
+  /** How many announced bridge clients are STILL connected — the decline denominator.
+   *
+   *  Belt and braces: entries are pruned on `vite:client:disconnect` AND the set is intersected
+   *  with the live client list on every read. Either alone would do; both, because a stale entry
+   *  inflates the count into exactly the hang this denominator exists to remove, and the prune is
+   *  the only one of the two that also stops the set growing for the process lifetime. */
+  const liveBridgeClientCount = (): number => countLiveBridgeClients(bridgeClients, viteServer?.ws?.clients);
   // Scene/prefab files the editor just saved itself (via /api/write-file). The
   // watcher skips the hot-reload broadcast for these so an editor Cmd+S doesn't
   // bounce the live scene — external edits (an agent's file write, /api/scene-
@@ -1444,9 +1749,15 @@ export function assetScannerPlugin(): Plugin {
     if (viteServer.ws?.clients?.size === 0) {
       return Promise.reject(new Error(`no renderer connected to the dev server (op '${op}' was not delivered)`));
     }
+    // ⚠️ The denominator is read HERE, at send time, and handed to the registry — it is what makes
+    // a decline countable rather than final (#1030). It counts ANNOUNCED BRIDGE CLIENTS, not
+    // sockets: see `bridgeClients` for why the socket count made an ordinary boot hang. Falls back
+    // to 1 when nothing has announced yet, which reproduces the pre-#1030 behaviour (first decline
+    // wins) rather than waiting on a reply that cannot come.
+    const expected = liveBridgeClientCount();
     return browserRequests.request((id) => {
       viteServer!.ws.send({ type: 'custom', event: 'modoki:request', data: { id, op, params } });
-    }, timeoutMs);
+    }, timeoutMs, op, expected);
   }
 
   /** Re-scan all roots, rebuild the cached manifest, and broadcast a custom
@@ -1565,17 +1876,44 @@ export function assetScannerPlugin(): Plugin {
     },
 
     configureServer(server) {
-      // The OTHER backend host — see startBackendServer in electron/backendServer.ts (#160).
-      reclaimStaleDeviceStateAtStartup();
+      // The OTHER backend host — see startBackendServer in electron/backendServer.ts (#160). Not when this
+      // Vite server is Electron's child: the lease lives in Electron main, and this child restarts on every
+      // project open (see shouldReclaimDeviceStateHere).
+      if (shouldReclaimDeviceStateHere()) reclaimStaleDeviceStateAtStartup();
       viteServer = server as unknown as ViteServerRef;
 
       // Agent bridge: cache the trait schema the browser pushes, and resolve
       // pending requestBrowser() promises when the browser replies. (See
       // app/debug/agentBridge.ts for the client half.)
       const ws = server.ws as unknown as { on: (e: string, cb: (data: any) => void) => void };
-      ws.on('modoki:schema', (data: SceneSchema) => { cachedSchema = data; });
-      ws.on('modoki:response', (data: { id: number; result?: unknown; error?: string }) => {
-        browserRequests.settle(data.id, data.result, data.error);
+      // Both handlers take Vite's second argument, the WebSocketClient (`WebSocketCustomListener`).
+      // It is this transport's only source of client IDENTITY, and #1030 needs it twice: to know
+      // which sockets actually run the bridge, and to keep one client's duplicate reply from
+      // counting as two declines.
+      // The announce (#1030 close-out): a client is counted from the instant it can decline, not
+      // from whenever its trait registry first becomes non-empty. See `agentBridge`'s `announce`.
+      ws.on('modoki:bridge-hello', (_data: unknown, client?: unknown) => {
+        if (client !== undefined) bridgeClients.add(client);
+      });
+      // Kept as a second source: a tab loaded before the announce existed still gets counted, and
+      // this is also the reconnect path for one whose hello raced a server restart.
+      ws.on('modoki:schema', (data: SceneSchema, client?: unknown) => {
+        cachedSchema = data;
+        if (client !== undefined) bridgeClients.add(client);
+      });
+      // ⚠️ **Vite DOES give us a close hook** — an earlier comment here claimed otherwise and let
+      // the set grow for the process lifetime. `vite:client:disconnect` is a custom event carrying
+      // the same `getSocketClient` identity the set holds, so the entry can be dropped rather than
+      // left to be filtered out by the live intersection forever.
+      ws.on('vite:client:disconnect', (_data: unknown, client?: unknown) => {
+        if (client !== undefined) bridgeClients.delete(client);
+      });
+      // `declined` (#1030) means "I have no handler for this op" — NOT "this op failed". The
+      // registry counts those instead of settling on them, so a runtime tab cannot answer on the
+      // editor's behalf. See `createBrowserRequestRegistry.settle`.
+      ws.on('modoki:response', (data: { id: number; result?: unknown; error?: string; declined?: boolean }, client?: unknown) => {
+        if (client !== undefined) bridgeClients.add(client);
+        settleRelayReply(browserRequests, data, client);
       });
 
       // Sanity-check the project's declared postprocessors against the runtime
@@ -1752,6 +2090,21 @@ export function assetScannerPlugin(): Plugin {
             },
             computeUnused: () => computeKeptAssets(projectRoot, assetRoots),
             computeRefEdges: () => enumerateRefEdges(projectRoot, assetRoots),
+            // #1155: the CLIENT environment's graph — the one whose URLs the renderer imported.
+            resolveModuleUrl: async (spec) => resolveModuleUrl(spec, {
+              // Vite's OWN root, not a re-derived one: on Windows Vite resolves it with the JS
+              // realpath (and maps a network share back to its drive letter).
+              viteRoot: server.config.root,
+              repoRoot: editorRoot,
+              // `canonicalPath` (`.native`) for the file: the JS realpath keeps the case a caller
+              // TYPED, so `/users/…/world.ts` missed the graph's `/Users/…` key (#881's rule).
+              // ⚠️ Windows unverified: on a mapped/subst drive Vite may key the graph by the mapped
+              // spelling `.native` unmaps, which would read as inGraph:false (docs/windows.md).
+              modulesByFile: (file) => server.environments.client.moduleGraph.getModulesByFile(normalizePath(file)),
+              browserHash: () => server.environments.client.depsOptimizer?.metadata.browserHash,
+              exists: (file) => fs.existsSync(file),
+              realpath: (file) => canonicalPath(file),
+            }),
           };
           // Read the request body (empty for GET) before dispatch.
           let raw = '';
@@ -1825,11 +2178,7 @@ export function assetScannerPlugin(): Plugin {
           const sendStep = (step: number, total: number) => { try { res.write(`event: step\ndata: ${JSON.stringify({ step, total })}\n\n`); } catch { /* disconnected */ } };
 
           const cfg = loadProjectConfig(projectRoot);
-          // #39: union errors come from a SEPARATE pass because validateBuildConfig sees the
-          // already-resolved config, where a bad value has been coerced to its default and is no
-          // longer visible. Load stays forgiving so a typo can't make a project un-openable; the
-          // build is where it's fatal, because it's the last moment before the value ships.
-          const cfgErrors = [...projectConfigUnionErrors(projectRoot), ...validateBuildConfig(cfg, loadProjectUserConfig(projectRoot))];
+          const cfgErrors = projectBuildConfigErrors(projectRoot);
           if (cfgErrors.length) {
             sendStatus(`FAILED:Invalid project settings\n${cfgErrors.join('\n')}`);
             send('Aborted — fix these Project Settings fields:\n' + cfgErrors.join('\n'));
@@ -1875,7 +2224,16 @@ export function assetScannerPlugin(): Plugin {
             send(`\n── ${label} ──`);
             // Scaffold steps (npm install / npm run build / npx cap add) are pure
             // program+args, so they run on the Windows shell unchanged (no winCmd needed).
-            const proc = spawnBuildCommand(cmd, { cwd, env: buildEnv });
+            // ⚠️ MODOKI_ICONS_HANDLED: step 3 of the scaffold runs `build-web.mjs --target native`
+            // for its `dist/` — and the platform being scaffolded DOES NOT EXIST YET at that point.
+            // So `generateNativeIcons` would filter to whatever OTHER platform dir happens to be on
+            // disk and regenerate ITS art: adding `ios/` to an android-only project would rewrite
+            // `android/**` and stamp it. Never the platform being added, always collateral.
+            // ⚠️ MODOKI_NATIVE_PLATFORM, for the same reason: without it build-web's heal covers the
+            // OTHER platform's folder, and an Android scaffold ran the iOS-only #1062 strip — which can
+            // refuse ("web build failed"). The folder being added does not exist yet, so this heals
+            // nothing platform-specific there; the scaffold ran `ensureCapacitorDeps` itself.
+            const proc = spawnBuildCommand(cmd, { cwd, env: { ...buildEnv, MODOKI_ICONS_HANDLED: '1', MODOKI_NATIVE_PLATFORM: platform ?? '' } });
             activeProc = proc;
             proc.stdout?.on('data', (d: Buffer) => send(d.toString().trimEnd()));
             proc.stderr?.on('data', (d: Buffer) => send(d.toString().trimEnd()));
@@ -2087,11 +2445,7 @@ export function assetScannerPlugin(): Plugin {
           const user = loadProjectUserConfig(projectRoot);
           // These values are interpolated into `bash -c` below — reject anything
           // with shell metacharacters before building any command string.
-          // #39: union errors come from a SEPARATE pass because validateBuildConfig sees the
-          // already-resolved config, where a bad value has been coerced to its default and is no
-          // longer visible. Load stays forgiving so a typo can't make a project un-openable; the
-          // build is where it's fatal, because it's the last moment before the value ships.
-          const cfgErrors = [...projectConfigUnionErrors(projectRoot), ...validateBuildConfig(cfg, user)];
+          const cfgErrors = projectBuildConfigErrors(projectRoot);
           if (cfgErrors.length) {
             sendStatus(`FAILED:Invalid project settings\n${cfgErrors.join('\n')}`);
             send('Build aborted — fix these Project Settings fields:\n' + cfgErrors.join('\n'));
@@ -2230,93 +2584,46 @@ export function assetScannerPlugin(): Plugin {
           const iosXcodeTarget = fs.existsSync(path.join(iosCwd, 'ios/App/App.xcworkspace'))
             ? '-workspace ios/App/App.xcworkspace'
             : '-project ios/App/App.xcodeproj';
-          // App-icon generation: the project's configured source (project-relative
-          // or absolute), else the bundled Modoki icon. `@capacitor/assets` (Easy
-          // Mode) resizes it into every iOS AppIcon / Android mipmap size. The
-          // source is copied to <project>/assets/icon.png (the tool's convention).
-          // Non-fatal: an icon failure logs a hint but never aborts the app build.
-          const iconSrcRaw = cfg.app.iconSource.trim();
-          const iconSrcAbs = iconSrcRaw
-            ? (path.isAbsolute(iconSrcRaw) ? iconSrcRaw : path.join(projectRoot, iconSrcRaw))
-            // Default = the bundled 1024² Modoki icon (the editor's own app icon).
-            : path.join(buildCwd, 'build/icon.png');
-          // `--<plat>` (a FLAG, not the positional arg) makes the platform list
-          // exclusive — the positional form still tries PWA and fails on a missing
-          // www/manifest.json. The tool version is PINNED (scripts/iconAssets.mjs); the
-          // flag does NOT keep the run inside that platform, which is what the wrapper
-          // below is for.
+          // App-icon + splash generation. Every INPUT is resolved by `resolveIconInputs`
+          // (`engine/scripts/iconInputs.mjs`) — the same function `generate-icons.mjs` calls on its
+          // own config read when `build-web.mjs --target native` runs it (#827). This plan used to
+          // resolve all fourteen inputs here by hand, and the two copies had already disagreed once
+          // (#1027, an empty `iconSource`).
+          //
+          // Resolved HERE, in-process, and handed to the script as flags (`iconInputsToArgs`, its exact
+          // inverse), rather than letting the script read the config itself: the PACKAGED editor
+          // ships no esbuild, so the spawned script cannot load the config there and sees nothing.
+          // This plan is the only place that knows the answer in the build that ships (#1011 facet B:
+          // "absent" and "cleared" splash were indistinguishable to the script, and #236's cleanup was
+          // silently dropped).
+          //
+          // `strict` (#1028): this is a BUILD, so a degraded generation must stop it rather than ship
+          // the previously committed art. A bare hand run of the script keeps the forgiving default.
+          //
           // The staging, the run, the freshness stamp and the SIDE-EFFECT CLEANUP all live in
-          // `engine/scripts/generate-icons.mjs` — one portable Node step instead of two
-          // hand-kept shell variants. It exists because the generator does not stay inside the
-          // platform it is given: `generate --android` also rewrites `ios/…/project.pbxproj`
-          // (mangling `LastUpgradeCheck = 0920` → `920`) and re-serializes AndroidManifest.xml
-          // (#236). The script restores every pre-existing NON-image file the run touched and
-          // reports what it restored; images — its actual product — are left alone.
-          // #396/#397 — the splash master, its dark twin, the title wordmark and the three icon
-          // variant overrides all resolve the same way as `iconSource`: project-relative unless
-          // absolute, and EMPTY MEANS UNSET rather than meaning a default path, so an
-          // unconfigured project generates exactly what it generated before.
-          const projectFile = (raw: string): string | undefined => {
-            const t = raw?.trim();
-            if (!t) return undefined;
-            return path.isAbsolute(t) ? t : path.join(projectRoot, t);
-          };
-          const splashSrcAbs = projectFile(cfg.app.splashSource);
-          const splashDarkSrcAbs = projectFile(cfg.app.splashDarkSource);
-          const titleSrcAbs = projectFile(cfg.app.splashTitleSource);
-          const iconDarkSrcAbs = projectFile(cfg.app.iconDarkSource);
-          const iconTintedSrcAbs = projectFile(cfg.app.iconTintedSource);
-          const iconMonochromeSrcAbs = projectFile(cfg.app.iconMonochromeSource);
-          // Engine-owned badge artwork, committed so no build depends on system fonts.
-          // ⚠️ Under `engine/`, NOT `build/`. `electron-builder.yml`'s `files:` ships
-          // `engine/**` + `dist/**` + `package.json` and nothing else — `build/` reaches the
-          // package only as `build/bin` via extraResources. Resolved under `build/`, these were
-          // MISSING in the packaged editor, and because `overlayLayersFor` builds the title layer
-          // before it reads the badge, one unreadable badge discarded the title too: a packaged
-          // -editor build produced title-less, badge-less splashes.
-          const badgeLightArt = path.join(buildCwd, 'engine/assets/splash-badge-light.png');
-          const badgeDarkArt = path.join(buildCwd, 'engine/assets/splash-badge-dark.png');
-          // The orientation decides the CROP-SAFE box the overlays are placed in, so it is a
-          // generation input, not just a runtime setting — see splashLayout.mjs.
-          const splashOrientation = cfg.capacitor.orientation;
-          // ⚠️ Every one of these is in the stamp. `iconStep` drops itself from the build plan
-          // on a stamp match, so an input the hash cannot see changes nothing until someone
-          // deletes `.cache/icon-stamp-*` by hand — the silent no-op both issues called out.
-          const stampExtras = {
-            splashSrcAbs,
-            splashDarkSrcAbs,
-            titleSrcAbs,
-            badgeArtAbs: cfg.app.splashBadge ? badgeLightArt : undefined,
-            badgeDarkArtAbs: cfg.app.splashBadge ? badgeDarkArt : undefined,
-            iconDarkSrcAbs,
-            iconTintedSrcAbs,
-            iconMonochromeSrcAbs,
-            titleWidthPct: cfg.app.splashTitleWidthPct,
-            titleOffsetPct: cfg.app.splashTitleOffsetPct,
-            badge: cfg.app.splashBadge,
-            orientation: splashOrientation,
-            // Anchors the post-processing-source hash; see splashPipelineVersion.
-            engineRootAbs: buildCwd,
-          };
+          // `engine/scripts/generate-icons.mjs` — it exists because the generator does not stay inside
+          // the platform it is given (`generate --android` also rewrites `ios/…/project.pbxproj`,
+          // #236), and it restores every pre-existing NON-image file the run touched.
+          //
+          // ⚠️ `?? ''` on the icon is a corrupt-install fallback and nothing more: the bundled default
+          // lives under `engine/assets/`, which ships, so reaching `''` means a tracked engine asset
+          // was deleted. `bundledIconExists.test.ts` catches that; this line cannot.
+          const iconInputs = resolveIconInputs({ strict: 'true' }, projectRoot, cfg, buildCwd);
+          const iconSrcAbs = iconInputs.icon ?? '';
+          // ⚠️ Every input is in the stamp. `iconStep` drops itself from the build plan on a stamp
+          // match, so an input the hash cannot see changes nothing until someone deletes
+          // `.cache/icon-stamp-*` by hand — the silent no-op #396/#397 called out.
+          const stampExtras = stampExtrasFrom(iconInputs, buildCwd);
+          const iconArgs = iconInputsToArgs(iconInputs)
+            .map(([flag, value]) => ` --${flag} ${JSON.stringify(value)}`)
+            .join('');
           const iconStep = (plat: 'ios' | 'android'): BuildStep | null => {
             if (iconIsUpToDate(projectRoot, iconSrcAbs, plat, stampExtras)) return null;
             const stamp = iconStampValue(iconSrcAbs, plat, stampExtras);
             const script = path.join(buildCwd, 'engine/scripts/generate-icons.mjs');
-            const opt = (flag: string, value: string | undefined) =>
-              (value ? ` ${flag} ${JSON.stringify(value)}` : '');
             return {
               label: 'Generating app icons...',
-              cmd: `node ${JSON.stringify(script)} --project ${JSON.stringify(projectRoot)} --platform ${plat} --icon ${JSON.stringify(iconSrcAbs)} --stamp ${stamp}`
-                + opt('--splash', splashSrcAbs)
-                + opt('--splash-dark', splashDarkSrcAbs)
-                + opt('--title', titleSrcAbs)
-                + ` --title-width ${cfg.app.splashTitleWidthPct} --title-offset ${cfg.app.splashTitleOffsetPct}`
-                + ` --badge ${cfg.app.splashBadge ? 'true' : 'false'}`
-                + (cfg.app.splashBadge ? `${opt('--badge-light', badgeLightArt)}${opt('--badge-dark', badgeDarkArt)}` : '')
-                + ` --orientation ${splashOrientation}`
-                + opt('--icon-dark', iconDarkSrcAbs)
-                + opt('--icon-tinted', iconTintedSrcAbs)
-                + opt('--icon-monochrome', iconMonochromeSrcAbs),
+              cmd: `node ${JSON.stringify(script)} --project ${JSON.stringify(projectRoot)} --platform ${plat} --stamp ${stamp}${iconArgs}`,
               cwd: plat === 'ios' ? iosCwd : androidCwd,
             };
           };
@@ -2412,13 +2719,20 @@ export function assetScannerPlugin(): Plugin {
           // `cap sync` would ship the previous run's web assets, which is invisible until players
           // report a stale game.
           const iosPrefixSteps: BuildStep[] = [
-            { label: 'Building web assets...', cmd: 'node engine/scripts/build-web.mjs --target native', cwd: buildCwd },
+            // MODOKI_ICONS_HANDLED: `build-web.mjs --target native` generates icons itself now (#1011
+            // facet A, for the CLI path that had none). This plan has its own `iconStep` below —
+            // per-platform, stamp-gated, and able to fall back to the bundled icon — so it tells
+            // build-web to stand down rather than paying for both.
+            // MODOKI_NATIVE_PLATFORM: build-web's own heal would otherwise cover every platform folder
+            // on disk, so an ANDROID build of a project with `ios/` ran the iOS-only #1062 strip —
+            // which can refuse, failing the Android build (`nativeHealPlatforms`, buildTarget.mjs).
+            { label: 'Building web assets...', cmd: 'node engine/scripts/build-web.mjs --target native', env: { MODOKI_ICONS_HANDLED: '1', MODOKI_NATIVE_PLATFORM: 'ios' }, cwd: buildCwd },
             ...(otaEmbedStep ? [otaEmbedStep] : []),
             ...(iosIconStep ? [iosIconStep] : []),
             { label: 'Syncing Capacitor iOS...', cmd: 'npx cap sync ios', cwd: iosCwd },
           ];
           const androidPrefixSteps: BuildStep[] = [
-            { label: 'Building web assets...', cmd: 'node engine/scripts/build-web.mjs --target native', cwd: buildCwd },
+            { label: 'Building web assets...', cmd: 'node engine/scripts/build-web.mjs --target native', env: { MODOKI_ICONS_HANDLED: '1', MODOKI_NATIVE_PLATFORM: 'android' }, cwd: buildCwd },
             ...(otaEmbedStep ? [otaEmbedStep] : []),
             ...(androidIconStep ? [androidIconStep] : []),
             { label: 'Syncing Capacitor Android...', cmd: 'npx cap sync android', cwd: androidCwd },
@@ -2778,7 +3092,14 @@ export function assetScannerPlugin(): Plugin {
           const runScaffoldShell = (label: string, cmd: string, cwd: string) => new Promise<boolean>((resolve) => {
             if (aborted) return resolve(false);
             send(`\n── ${label} ──`);
-            const proc = spawnBuildCommand(cmd, { cwd, env: buildEnv });
+            // ⚠️ MODOKI_ICONS_HANDLED — see the identical note on /api/add-native-target's runShell.
+            // This path is the one that bites hardest: the auto-scaffold runs INSIDE a build, and the
+            // build then `steps.shift()`s away the flag-carrying build-web step below, so without
+            // this an iOS build of an android-only project regenerates Android art and nothing in
+            // the plan ever regenerates iOS.
+            // MODOKI_NATIVE_PLATFORM rides along for the same `steps.shift()` reason — see the note on
+            // /api/add-native-target's runShell (#1062).
+            const proc = spawnBuildCommand(cmd, { cwd, env: { ...buildEnv, MODOKI_ICONS_HANDLED: '1', MODOKI_NATIVE_PLATFORM: platform ?? '' } });
             activeProc = proc;
             proc.stdout?.on('data', (d: Buffer) => send(d.toString().trimEnd()));
             proc.stderr?.on('data', (d: Buffer) => send(d.toString().trimEnd()));
@@ -2828,13 +3149,45 @@ export function assetScannerPlugin(): Plugin {
               if (steps[0]?.cmd?.startsWith('node engine/scripts/build-web.mjs')) steps.shift();
               send(`\n✅ ${platform}/ scaffolded — continuing the build.`);
             }
-            // Re-heal the native config before building so machine/identity settings
-            // edited AFTER the folder was scaffolded actually land in the generated
-            // project — notably iOS DEVELOPMENT_TEAM from build.appleTeamId (else
-            // xcodebuild dies with "Signing … requires a development team"). Idempotent
-            // + cheap; a no-op when nothing changed (or already healed by the scaffold).
+            // Heal the native project on EVERY native build — `healNativeProject`, the ONE sequence
+            // `build-web.mjs --target native` also calls (#827): machine/identity config edited after
+            // the folder was scaffolded (iOS DEVELOPMENT_TEAM, else xcodebuild dies with "Signing …
+            // requires a development team"), engine-required Capacitor plugins a project scaffolded
+            // by an older editor lacks (else `"<Plugin>" plugin is not implemented` at LAUNCH),
+            // re-vendoring a changed engine plugin (#90), and the stale-node_modules check (#685).
+            // The steps, their order and why it is load-bearing live in that module.
+            //
+            // ⚠️ BEFORE the #370 release-file writes below, not after: `healNativeConfig` is what adds
+            // `keystore.properties` to a freshly scaffolded `android/.gitignore`, and one of those
+            // writes is the upload key's passwords.
+            //
+            // ⚠️ The spawned `build-web.mjs` step below runs the same sequence again on a dev
+            // machine. Not a duplicate to remove: a PACKAGED editor ships no esbuild, the script
+            // cannot load the module there, and this in-process call is the only heal that runs.
             if (platform === 'ios' || platform === 'android') {
-              for (const n of healNativeConfig(projectRoot).notes) send(`[heal] ${n}`);
+              const heal = await healNativeProject(projectRoot, buildCwd, [platform], {
+                log: (line) => send(line),
+                warn: (line) => send(line),
+                install: (why) => runScaffoldShell(`npm install (${why})`, 'npm install', projectRoot),
+              });
+              if (aborted) return;
+              if (!heal.ok) {
+                if (heal.reason === 'install-failed') {
+                  sendStatus(`FAILED:npm install (${heal.why})`);
+                  send('Build failed — could not install the added/updated Capacitor plugin(s).');
+                } else if (heal.reason === 'stale-node-modules') {
+                  sendStatus('FAILED:stale node_modules');
+                  send(`\nBuild failed — ${heal.lines.join('\n')}`);
+                } else if (heal.reason === 'facebook-sdk-manifest') {
+                  sendStatus('FAILED:Firebase auth plugin manifest (Facebook SDK)');
+                  send(`\nBuild failed — ${heal.lines.join('\n')}`);
+                } else {
+                  sendStatus(`FAILED:Build claim not held\n${heal.message}`);
+                  send(heal.message);
+                }
+                res.end();
+                return;
+              }
             }
             // #370: write the two GENERATED, GITIGNORED inputs a release build needs. Both are
             // re-derived every run rather than hand-maintained, so the upload key and the Team ID
@@ -2888,77 +3241,6 @@ export function assetScannerPlugin(): Plugin {
                 send(`⚠️  Could not provision go-ios (${e instanceof Error ? e.message : String(e)}) — falling back to the Xcode handoff.`);
               }
               if (aborted) return;
-            }
-            // Heal engine-REQUIRED Capacitor plugins on EVERY native build. A project
-            // scaffolded before an engine feature added a runtime plugin — @capacitor/preferences
-            // (PlayerPrefs), @capacitor/app (App.tsx), @capacitor/keyboard (useKeyboardShift) — or
-            // by an OLDER editor is missing it in its own package.json. The web build still inlines
-            // the plugin's JS proxy (resolved from the editor's node_modules), so the build
-            // SUCCEEDS, but `cap sync` (run in the project dir) never registers a native impl →
-            // `"<Plugin>" plugin is not implemented on <platform>` at LAUNCH. ensureCapacitorDeps is
-            // idempotent (adds only what's missing); if it added anything, vendor + install it so
-            // the cap sync step below registers the native side. This is what makes an EXISTING
-            // native game self-heal (the scaffold path already ran this; existing builds skipped it).
-            if (platform === 'ios' || platform === 'android') {
-              const depHeal = ensureCapacitorDeps(projectRoot, platform as NativePlatform, buildCwd);
-              for (const n of depHeal.notes) send(`[heal] ${n}`);
-              // Re-vendor UNCONDITIONALLY (#90). This used to be gated on `depHeal.changed`, but
-              // `ensureCapacitorDeps` only adds MISSING deps — a plugin already depended on is
-              // never missing, so editing `engine/packages/capacitor-*/**` had NO path into an
-              // existing native game. The build succeeded, the APK installed, and it silently
-              // contained the PREVIOUS native code: a failure in the direction that looks like
-              // success. Measured 2026-08-02 while fixing #88 — the first build compiled the old
-              // Java, caught only by hand-checking the tarball hash.
-              //
-              // Running it every build is safe by design: `vendorEnginePlugins` is idempotent and
-              // content-addressed, so an unchanged plugin maps to the SAME committed tarball and
-              // re-packs nothing. Only a real content change yields a new filename, and only then
-              // does `needsInstall` force the (slow) install.
-              const v = vendorEnginePlugins(projectRoot, buildCwd);
-              if (v.vendored.length) send(`[heal] vendored engine plugin(s): ${v.vendored.join(', ')}`);
-              if (depHeal.changed || v.needsInstall) {
-                const why = depHeal.changed ? 'healed Capacitor plugins' : 'engine plugin changed';
-                if (!(await runScaffoldShell(`npm install (${why})`, 'npm install', projectRoot))) {
-                  if (aborted) return;
-                  sendStatus(`FAILED:npm install (${why})`);
-                  send('Build failed — could not install the added/updated Capacitor plugin(s).');
-                  res.end();
-                  return;
-                }
-                writeVendorMarker(projectRoot, v.expectedVendor);
-              }
-              // ⚠️ UNCONDITIONAL — outside the install `if` above, deliberately (#685). The state
-              // this catches is `node_modules` holding a PREVIOUS tarball's bytes while every
-              // other signal agrees the current one is installed: there `depHeal.changed` is
-              // false AND `v.needsInstall` is false, so the install block does nothing and `npm
-              // install` would report "up to date". A check gated on those flags could never fire
-              // in the one case it exists for.
-              //
-              // This MIRRORS `build-web.mjs`'s step 5. Keep the two in step: the editor's
-              // `/api/build` and the CLI `--target native` recipe are documented as equivalent
-              // (docs/build.md), and #148 is precisely what a divergence between them costs —
-              // a guard in only one path leaves the OTHER able to ship the previous native code.
-              //
-              // ⚠️ `verifyInstalledMatchesTarballResult` (#731): an unreadable `package.json` for
-              // THIS project must not read as "verified clean" — warn and keep going rather than
-              // silently skipping the check, matching build-web.mjs's own warn-not-throw call.
-              const { problems: stale, reason: staleCheckReason } = verifyInstalledMatchesTarballResult(projectRoot);
-              if (staleCheckReason === 'unreadable-package-json') {
-                send(describeUnreadablePackageJsonWarning(projectRoot));
-              }
-              if (stale.length) {
-                sendStatus('FAILED:stale node_modules');
-                send(`\nBuild failed — node_modules is STALE for ${stale.length} vendored plugin(s); this build would ship the WRONG native code (#685):`);
-                for (const problem of stale) send(`  • ${problem}`);
-                send(`\n⚠️ Do NOT reach for \`npm install --package-lock-only\` — measured (#685): it is what CREATES this state, writing the new resolved+integrity into both lockfiles without extracting, and a tree left there is unrecoverable by any plain install. A bare \`npm install\` or \`--force\` will not fix it either.`);
-                send(`Repair, in order:`);
-                send(`  1. delete the plugin's entry from ${projectRoot}/package-lock.json ("node_modules/<plugin>" under "packages")`);
-                send(`  2. (cd ${projectRoot} && npm install)   # a PLAIN install — it now re-resolves AND extracts`);
-                send(`  3. ONLY if step 2 reported "up to date" and this check still fires — then node_modules/.package-lock.json is ahead of the disk and nothing will re-extract:`);
-                send(`     (cd ${projectRoot} && rm -rf node_modules/<plugin> && npm install)`);
-                res.end();
-                return;
-              }
             }
             const total = steps.length;
             for (let i = 0; i < steps.length; i++) {
@@ -3046,7 +3328,7 @@ export function assetScannerPlugin(): Plugin {
         // belongs to ota-publish.mjs alone, not this route (#577) — see Step 3 below.
         if ((req.url === '/api/ota/publish' || req.url?.startsWith('/api/ota/publish?')) && req.method === 'GET') {
           const url = new URL(req.url, 'http://localhost');
-          const version = url.searchParams.get('version');
+          const versionParam = url.searchParams.get('version');
           // Tri-state, matching ota-publish.mjs's own sticky-mandatory contract:
           // "1" sets it, "0" clears it, absent inherits the existing release's value —
           // `mandatoryParam` is `undefined` in that last case, distinct from `false`.
@@ -3055,88 +3337,91 @@ export function assetScannerPlugin(): Plugin {
           const keyName = url.searchParams.get('key') || 'default';
           const cfg = loadProjectConfig(projectRoot);
           const bundleName = url.searchParams.get('bundleName') || cfg.ota.bundleName;
-          const bucket = url.searchParams.get('bucket') ?? deriveGcsBucketFromBaseUrl(cfg.ota.baseUrl);
+          const bucketParam = url.searchParams.get('bucket') ?? deriveGcsBucketFromBaseUrl(cfg.ota.baseUrl);
 
-          if (!cfg.ota.enabled) {
-            res.statusCode = 400;
-            res.end(JSON.stringify({ error: 'ota.enabled is false for this project — turn it on in Project Settings first.' }));
-            return;
-          }
-          if (!version || !OTA_SAFE_TOKEN.test(version)) {
-            res.statusCode = 400;
-            res.end(JSON.stringify({ error: `version is required and must match ${OTA_SAFE_TOKEN}` }));
-            return;
-          }
-          if (!OTA_SAFE_TOKEN.test(bundleName) || !OTA_SAFE_TOKEN.test(keyName)) {
-            res.statusCode = 400;
-            res.end(JSON.stringify({ error: `bundleName/key must match ${OTA_SAFE_TOKEN}` }));
-            return;
-          }
-          // This route only ever builds via build-web.mjs (a normal standalone web build)
-          // and publishes the CURRENTLY OPEN project's own dist/ — never build-subgame.mjs's
-          // special sub-game-module format (subgame.json + globalThis.__MODOKI_SUBGAME__
-          // IIFE) that subgameLoader.ts actually expects to fetch. Overriding `bundleName`
-          // to anything other than this project's own configured name would silently
-          // publish this project's plain shell dist/ under a DIFFERENT bundle's identity —
-          // e.g. a sub-game's manifest/files overwritten with unrelated shell content, with
-          // no error until every device that loads it fails belt-and-suspenders check #2 (or
-          // worse, doesn't). Automated sub-game build+publish isn't wired into this route yet
-          // (docs/ota-subgame-modules.md) — refuse rather than proceed with the wrong
-          // bytes under someone else's name.
-          if (!otaPublishBundleNameAllowed(bundleName, cfg.ota.bundleName)) {
-            res.statusCode = 400;
-            res.end(JSON.stringify({ error: `bundleName ("${bundleName}") does not match this project's own ota.bundleName ("${cfg.ota.bundleName}"). This route only builds+publishes the CURRENTLY OPEN project as itself — publishing under a different bundle name would ship this project's plain web build under that bundle's identity, not a real sub-game module build. Open the sub-game's own project to publish it, or build it via build-subgame.mjs and publish by hand.` }));
-            return;
-          }
-          if (!bucket || !OTA_SAFE_BUCKET.test(bucket)) {
-            res.statusCode = 400;
-            res.end(JSON.stringify({ error: `Could not derive a gs:// bucket from ota.baseUrl ("${cfg.ota.baseUrl}"). Pass ?bucket=gs://... explicitly.` }));
-            return;
-          }
           const buildCwd = editorRoot || projectRoot;
-          const keyPath = path.join(buildCwd, 'build', 'ota-keys', `${keyName}.json`);
-          if (!fs.existsSync(keyPath)) {
+          // THE publish-request check — the same `otaPublishPreflight` `ota-publish.mjs` runs (#827):
+          // enabled, the four tainted inputs, the bundle identity, the publish TARGET and the signing
+          // key. `ota-publish.mjs` (spawned below) runs it again, so this copy exists only to answer
+          // with a clean HTTP 400 before the SSE stream opens and a multi-minute build starts. It
+          // matches the script's verdict because it is the same function over the same inputs — the
+          // RAW `ota` block (`readRawOtaBlock`), NOT `cfg.ota`: merging coerces, and a merged block let
+          // a malformed `ota.subgames` past this 400 into a build the script then refused. The
+          // version, key and bucket are the same values this route passes the script's flags. Only
+          // the wording is this route's.
+          //
+          // What gets built is decided by the bundle NAME (#837): this project's own ota.bundleName
+          // builds this project as itself (build-web.mjs); an id listed in ota.subgames builds THAT
+          // project as a sub-game module (build-subgame.mjs). Any other name is refused — before it,
+          // overriding bundleName shipped this project's plain shell dist/ under another bundle's
+          // identity, with no error until every device that loaded it failed.
+          const rawConfig = readRawOtaBlock(projectRoot);
+          const preflight = otaPublishPreflight({ ota: rawConfig.ok ? rawConfig.ota : undefined, name: bundleName, version: versionParam, keyName, bucket: bucketParam, repoRoot: buildCwd });
+          if (!preflight.ok) {
+            const r = preflight;
+            const why: Record<OtaPublishRefusal, string> = {
+              'no-ota-block': rawConfig.ok
+                ? (rawConfig.ota === undefined || rawConfig.ota === null
+                  ? "This project's project.config.json has no ota settings — turn OTA on in Project Settings first."
+                  : "This project's project.config.json has an ota field that is not an object — fix it in project.config.json.")
+                : `This project's project.config.json could not be ${rawConfig.reason === 'missing' ? 'found' : `parsed (${rawConfig.error})`}, so this publish cannot be checked.`,
+              'not-enabled': 'ota.enabled is false for this project — turn it on in Project Settings first.',
+              'bad-version': `version is required and must match ${OTA_SAFE_TOKEN}`,
+              'bad-name': `bundleName must match ${OTA_SAFE_TOKEN}`,
+              'bad-key-name': `key must match ${OTA_SAFE_TOKEN}`,
+              'bad-bucket': `Could not derive a gs:// bucket from ota.baseUrl ("${cfg.ota.baseUrl}"). Pass ?bucket=gs://... explicitly.`,
+              'bad-project-bundle-name': "This project's ota.bundleName is empty — set it in Project Settings → OTA.",
+              'bad-project-subgames': "This project's ota.subgames is not a list of project ids — fix it in Project Settings → OTA → Sub-games.",
+              'bad-project-retain-versions': "This project's ota.retainVersions is not a positive whole number — set it in Project Settings → OTA → Versions kept.",
+              'ambiguous-bundle': `bundleName ("${bundleName}") is BOTH this project's own ota.bundleName and a sub-game listed in its ota.subgames, so it cannot say which build it means. Rename one.`,
+              'unknown-bundle': `bundleName ("${bundleName}") is neither this project's own ota.bundleName ("${r.bundleName}") nor a sub-game listed in its ota.subgames (${JSON.stringify(r.subgames)}). This route publishes the open project as itself, or a listed sub-game built as a sub-game module, never a plain build under another bundle's name. To publish a sub-game from here, add its project id under Project Settings → OTA → Sub-games.`,
+              'key-missing': `Signing key "${keyName}" not found. Generate one first: POST /api/ota/keygen?name=${keyName}`,
+              'key-unparseable': `Signing key "${keyName}" (${r.keyPath}) could not be parsed as JSON — regenerate it: POST /api/ota/keygen?name=${keyName}`,
+              'no-key-public-half': `Signing key "${keyName}" has no publicKey field — regenerate it: POST /api/ota/keygen?name=${keyName}`,
+              'project-public-key-empty': `This project's ota.publicKey is EMPTY, so no installed app can verify a release. Set it to the signing key's public half ("${r.keyPublicKey}") in Project Settings → OTA, rebuild + ship the native app so the new key is baked in, and publish then.`,
+              mismatch: `Signing key "${keyName}" does NOT match this project's ota.publicKey — every installed app would reject the release as signature-invalid, while this publish reported success. Key "${keyName}" public half: "${r.keyPublicKey}". project.config.json ota.publicKey: "${cfg.ota.publicKey}". Publish with the key that matches (?key=<name>), or — only if you intend to ROTATE the key — set ota.publicKey to the new value and ship a native build carrying it BEFORE publishing, or installed apps will be stranded.`,
+            };
             res.statusCode = 400;
-            res.end(JSON.stringify({ error: `Signing key "${keyName}" not found. Generate one first: POST /api/ota/keygen?name=${keyName}` }));
+            res.end(JSON.stringify({ error: why[r.refusal] }));
             return;
           }
-          // The key must be the one the SHIPPED APP verifies against, not merely a key that
-          // exists (independent review, 2026-07-30). `ota.publicKey` is baked into the binary and
-          // is the ONLY key `verifyReleaseSignature` will accept. Signing with any other keypair
-          // produces a perfectly well-formed, signed release.json that every installed app
-          // silently refuses (`outcome: 'signature-invalid'`) — while this route reported success
-          // and `/api/ota/status` then CONFIRMED the version as published. A release that no
-          // device can install, reported as a successful ship, is the worst failure this route
-          // has: it is remote, silent, and looks fine from here.
-          //
-          // #582: `ota-publish.mjs` (spawned below) now enforces this SAME refusal from the same
-          // pure `otaSigningKeyRefusal` — this is NOT the #577 duplicate-guard shape. #577's
-          // duplicate was a DIFFERENT decision procedure (existence vs content) that ran FIRST
-          // and refused a case the real guard allows. This is the identical pure function over
-          // the identical two inputs (the same key file, the same project.config.json), so it
-          // cannot refuse anything ota-publish.mjs would allow — it stays here only to return a
-          // clean HTTP 400 before the SSE stream opens and the multi-minute build starts.
-          {
-            let keyPub: string | null;
-            try {
-              keyPub = (JSON.parse(fs.readFileSync(keyPath, 'utf8')) as { publicKey?: string }).publicKey ?? null;
-            } catch {
+          // The CHECKED values — narrowed by the preflight, used from here on.
+          const { target, version, bucket } = preflight;
+          // A listed sub-game (#837): resolve its project by id, then fail its engine API early. The
+          // authoritative check is ota-publish.mjs's, against what the build actually stamps into
+          // subgame.json. This one compares the same number from the config it is stamped from
+          // (vite.config.ts reads the sub-game's own ota.engineApi), so it cannot refuse anything
+          // that check would allow. It exists only to answer with a 400 before a multi-minute build.
+          let subgameDir: string | undefined;
+          if (target.kind === 'subgame') {
+            const resolved = otaResolveSubgameDir(target.id, buildCwd, projectRoot, (dir) => findGamesEntry(dir) !== null);
+            if (!resolved.ok) {
               res.statusCode = 400;
-              res.end(JSON.stringify({ error: `Signing key "${keyName}" (${keyPath}) could not be parsed as JSON — regenerate it: POST /api/ota/keygen?name=${keyName}` }));
+              res.end(JSON.stringify({ error: resolved.error }));
               return;
             }
-            const cfgPub = cfg.ota.publicKey;
-            const refusal = otaSigningKeyRefusal(keyPub, cfgPub);
-            if (refusal) {
-              const why = {
-                'no-key-public-half': `Signing key "${keyName}" has no publicKey field — regenerate it: POST /api/ota/keygen?name=${keyName}`,
-                'project-public-key-empty': `This project's ota.publicKey is EMPTY, so no installed app can verify a release. Set it to the signing key's public half ("${keyPub}") in Project Settings → OTA, rebuild + ship the native app so the new key is baked in, and publish then.`,
-                mismatch: `Signing key "${keyName}" does NOT match this project's ota.publicKey — every installed app would reject the release as signature-invalid, while this publish reported success. Key "${keyName}" public half: "${keyPub}". project.config.json ota.publicKey: "${cfgPub}". Publish with the key that matches (?key=<name>), or — only if you intend to ROTATE the key — set ota.publicKey to the new value and ship a native build carrying it BEFORE publishing, or installed apps will be stranded.`,
-              }[refusal];
+            subgameDir = resolved.dir;
+            const subgameEngineApi = loadProjectConfig(subgameDir).ota.engineApi;
+            if (subgameEngineApi !== cfg.ota.engineApi) {
               res.statusCode = 400;
-              res.end(JSON.stringify({ error: why }));
+              res.end(JSON.stringify({ error: `Sub-game "${target.id}" would be built against engine API ${subgameEngineApi} (its own ota.engineApi), but this shell's ota.engineApi is ${cfg.ota.engineApi}. A device loads a sub-game only when the two are EXACTLY equal, so every device would refuse this bundle. Align the two before publishing.` }));
               return;
             }
+          }
+          // #906: ota-publish.mjs refuses a dist built from an uncommitted or unknown tree — but only once
+          // its stamp exists, i.e. after the multi-minute build and the CORS rewrite below. Ask the SAME
+          // question of the tree now, with the same function the build stamps from, so the editor answers
+          // before spending either. This route cannot pass the CLI's override (owner, 2026-09-13), so a
+          // late refusal here was a wasted build with nothing the dialog could do about it.
+          const tree = readGitProvenance(subgameDir ?? projectRoot);
+          if (tree.commit === null || tree.dirty !== false) {
+            res.statusCode = 400;
+            res.end(JSON.stringify({
+              error: tree.commit === null || tree.dirty === null
+                ? 'git could not report this project\'s tree (not in a git repository, or git is unavailable), so a publish could not record which source it ships. OTA publishing from the editor needs a committed git tree.'
+                : 'The repository has uncommitted changes (outside native ios/ and android/ folders), so no commit would reproduce what this publish ships. Commit them, then publish. (Only the ota-publish.mjs command line can publish an unclean build, with --allow-unclean-build.)',
+            }));
+            return;
           }
           const user = loadProjectUserConfig(projectRoot);
           const gcloudDir = resolveGcloudDir(user.sdk.gcloudPath);
@@ -3179,7 +3464,10 @@ export function assetScannerPlugin(): Plugin {
 
           const baseEnv = await buildStepEnv({ MODOKI_PROJECT: projectRoot });
           const gcloudEnv = { ...baseEnv, PATH: `${gcloudDir}:${baseEnv.PATH ?? ''}` };
-          const distDir = path.join(projectRoot, 'dist');
+          const steps = otaPublishSteps({
+            target, projectRoot, subgameDir, gcloudEnv, buildCwd, bucket, bundleName, version, keyName,
+            shellEngineApi: cfg.ota.engineApi, mandatory: mandatoryParam,
+          });
 
           let activeProc: ReturnType<typeof spawn> | null = null;
           let aborted = false;
@@ -3206,10 +3494,21 @@ export function assetScannerPlugin(): Plugin {
             // `--target native` despite the GCS upload below: an OTA bundle replaces the web
             // content INSIDE an installed native app, so it is served from the app root — never
             // `--target web`, which would bake in the project's sub-path webBasePath (#40).
-            sendStatus('Building web assets...');
-            const build = await runStep('Building web assets...', 'node engine/scripts/build-web.mjs --target native', buildCwd, otaPublishBuildStepEnv(gcloudEnv, projectRoot));
+            // A listed sub-game builds from ITS project with build-subgame.mjs instead (#837).
+            sendStatus(steps.buildLabel);
+            const build = await runStep(steps.buildLabel, steps.buildCmd, buildCwd, steps.buildEnv);
             if (aborted) return;
-            if (!build.ok) { sendStatus(`FAILED:Building web assets\n${build.output.slice(-1500)}`); res.end(); return; }
+            if (!build.ok) { sendStatus(`FAILED:${steps.buildLabel.replace(/\.\.\.$/, '')}\n${build.output.slice(-1500)}`); res.end(); return; }
+            // #837: show which engine API the sub-game build stamped, BEFORE the upload, rather than
+            // leaving it defaulted and unseen. ota-publish.mjs is what refuses a mismatch; this line is
+            // how whoever reads the log sees the number that decision was made on.
+            if (target.kind === 'subgame') {
+              let stamped: unknown = '<unreadable>';
+              try {
+                stamped = (JSON.parse(fs.readFileSync(path.join(steps.distDir, 'subgame.json'), 'utf8')) as { engineApi?: unknown }).engineApi;
+              } catch { /* shown as unreadable; ota-publish.mjs refuses an unreadable subgame.json */ }
+              send(`Sub-game "${target.id}" engine API: ${JSON.stringify(stamped)} (stamped by its build from its own ota.engineApi). This shell's ota.engineApi: ${cfg.ota.engineApi}. A mismatch is refused before anything is uploaded.`);
+            }
 
             // Step 2: verify/set bucket CORS (GCS sets none by default; `gcloud`/`curl`
             // ignore CORS entirely, so nothing catches a missing policy until a real
@@ -3253,13 +3552,7 @@ export function assetScannerPlugin(): Plugin {
             // the manifest, canonicalize) to compare against — i.e. re-implement the script
             // — and the two implementations drifting is this bug. Don't re-add it.
             sendStatus('Publishing...');
-            const mandatoryFlag = mandatoryParam === true ? ' --mandatory' : mandatoryParam === false ? ' --no-mandatory' : '';
-            const publish = await runStep(
-              'Publishing OTA bundle...',
-              `node engine/scripts/ota-publish.mjs --dist ${JSON.stringify(distDir)} --bucket ${JSON.stringify(bucket)} --name ${JSON.stringify(bundleName)} --version ${JSON.stringify(version)} --engine-api ${cfg.ota.engineApi} --key ${JSON.stringify(keyName)} --repo-root ${JSON.stringify(buildCwd)} --project ${JSON.stringify(projectRoot)}${mandatoryFlag}`,
-              buildCwd,
-              gcloudEnv,
-            );
+            const publish = await runStep('Publishing OTA bundle...', steps.publishCmd, buildCwd, gcloudEnv);
             if (aborted) return;
             if (!publish.ok) { sendStatus(`FAILED:Publishing\n${publish.output.slice(-1500)}`); res.end(); return; }
 
@@ -3278,7 +3571,8 @@ export function assetScannerPlugin(): Plugin {
             sendStatus('DONE');
             const mandatoryIntent = mandatoryParam === true ? 'set' : mandatoryParam === false ? 'cleared' : 'unchanged';
             send(
-              `\n✅ Published — effective parameters: bundleName=${bundleName} version=${version} ` +
+              `\n✅ Published — effective parameters: bundleName=${bundleName} ` +
+              `(${target.kind === 'subgame' ? `sub-game built from ${path.relative(buildCwd, subgameDir ?? '')}` : 'this project'}) version=${version} ` +
               `mandatory=${mandatoryIntent} key=${keyName} bucket=${bucket}. ` +
               `Verify with modoki_ota_status.`,
             );
@@ -3358,7 +3652,14 @@ export function assetScannerPlugin(): Plugin {
             .filter((v): v is number => typeof v === 'number' && v > 0),
         ))
         : [];
-      const result = computeKeptAssets(projectRoot, assetRoots, { excludeVideo: !buildModules.video });
+      // #934 — `target` is what lets a playable ship a different asset set, not merely smaller
+      // textures. Without it the keep-list is target-agnostic and a text-heavy game cannot reach the
+      // 5 MB cap by any amount of game-side work. Only a PLAYABLE build passes one; every other
+      // caller of this walk (the editor's Clean Up dialog, Find References) deliberately passes none.
+      const result = computeKeptAssets(projectRoot, assetRoots, {
+        excludeVideo: !buildModules.video,
+        target: playable ? 'playable' : undefined,
+      });
       // Build-time guard (#237): fail rather than ship a ref the structured walk could not see.
       // computeKeptAssets' unreachableRefs is empty on every committed project today — a
       // non-empty entry means probeTraitRefs (plugins/asset-tree-shaker.ts) has a blind spot

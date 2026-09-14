@@ -13,6 +13,7 @@
 
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { createInputRoutes, resolvePoint, HELD_POINTER_IDLE_MS, type InputOps } from '../../electron/inputRoutes';
+import { INPUT_KEYS } from '../../tools/shared/inputVocabulary';
 
 /** Ordered log of everything that happened, so we can assert on sequence.
  *  Actor-lease traffic is recorded SEPARATELY (`leaseCalls`) — it brackets every route, so
@@ -59,7 +60,17 @@ function makeRenderer(overrides?: Record<string, unknown>) {
     if (op === 'input-deliverability') return overrides?.['input-deliverability'] ?? { visibilityState: 'visible', hasFocus: true };
     calls.push(`renderer:${op}`);
     if (op === 'resolve-dom-point') {
-      const sel = (params as { selector: string }).selector;
+      const { selector: sel, label, within, gesture } = params as { selector: string; label?: string; within?: string; gesture?: string };
+      // #1153 — a label aim. The fake answers the renderer's three outcomes; the rules that PRODUCE
+      // them are domResolve.test.ts's job, this file pins what the ROUTES do with each.
+      if (label !== undefined) {
+        calls.push(`label(${label}${within ? ` within ${within}` : ''},${gesture})`);
+        if (label === 'Reload Panel') return { ok: true, x: 640, y: 20, uiId: 'panel-error.reload-panel', uiIdAddressable: false, matched: 'button[data-ui-id="panel-error.reload-panel"]', hitTarget: 'button[data-ui-id="panel-error.reload-panel"]', occluded: false };
+        if (label === 'Console') return { ok: true, x: 360, y: 546, uiId: 'layout.tab.console', uiIdAddressable: true, matched: 'span[data-ui-id="layout.tab.console"]', hitTarget: 'span[data-ui-id="layout.tab.console"]', occluded: false };
+        if (label === 'Buried') return { ok: true, x: 40, y: 50, uiId: 'inspector.a.buried', matched: 'button[data-ui-id="inspector.a.buried"]', hitTarget: 'div.modal', occluded: true };
+        if (label === 'Save') return { ok: false, code: 'AMBIGUOUS', error: 'label "Save" matches 2 on-screen chrome elements: a.b.save ("Save"), c.d.save ("Save")' };
+        return { ok: false, code: 'NOT_FOUND', error: `no on-screen editor chrome is labelled ${JSON.stringify(label)}` };
+      }
       if (sel === '#kebab') return { ok: true, x: 210, y: 110, matched: 'button#kebab', hitTarget: 'button#kebab', occluded: false };
       if (sel === '#covered') return { ok: true, x: 50, y: 60, matched: 'button#covered', hitTarget: 'div.menu', occluded: true };
       // Scrolled out of its own list: occluded, but by the chrome BEHIND it, not by something on top.
@@ -328,9 +339,9 @@ describe('tap', () => {
     expect(ops.tap).not.toHaveBeenCalled();
   });
 
-  it('400s when given no aim at all — and the message names all three modes', async () => {
+  it('400s when given no aim at all — and the message names every mode', async () => {
     const res = await post('/api/input/tap', {});
-    expect(res).toMatchObject({ status: 400, body: { error: 'tap: provide an entity {guid|name|id}, a selector, or {x,y}' } });
+    expect(res).toMatchObject({ status: 400, body: { error: 'tap: provide an entity {guid|name|id}, a selector, a label, or {x,y}' } });
     expect(ops.tap).not.toHaveBeenCalled();
   });
 
@@ -1626,5 +1637,416 @@ describe('window deliverability', () => {
     const res = await post('/api/input/tap', { x: 7, y: 8 });
     expect(ops.tap).toHaveBeenCalledWith(7, 8, expect.anything());
     expect(res).toMatchObject({ body: { ok: true } });
+  });
+});
+
+/** #1016 — the editor routes name their gesture, and `button` narrows the tap.
+ *
+ *  ⚠️ **The button carve-out first shipped in `bridge.ts`, where it was unreachable.** `device_tap`'s
+ *  schema is `{selector, x, y}` — no button can arrive — while `/api/input/tap` takes
+ *  `z.enum(['left','right','middle'])` and hands it to a real Electron mouse event, and resolved
+ *  its aim as `'tap'` regardless. Chromium fires `click` for the primary button only (right ->
+ *  `contextmenu`, middle -> `auxclick`) and `pressOrigin.ts` listens on `'click'`, so the runtime
+ *  does NOT redirect a right-press: modelling one reports a clean aim for a press that lands on the
+ *  zone. The mutation that removes this survived until these cases existed.
+ *
+ *  ⚠️ One case per `it`: `routes` captures `requestRenderer` at `beforeEach`, so reassigning it
+ *  mid-test orphans the routes under test and every assertion reads an empty mock — which looks
+ *  exactly like "the gesture was not sent". */
+describe('#1016 — gesture on the wire from the editor routes', () => {
+  const sentTo = (op: string) => requestRenderer.mock.calls
+    .filter(([o]) => o === op)
+    .map(([, params]) => (params as Record<string, unknown> | undefined)?.gesture);
+
+  it('tap sends `tap`', async () => {
+    await post('/api/input/tap', { selector: '#kebab' });
+    expect(sentTo('resolve-dom-point')).toEqual(['tap']);
+  });
+
+  it('drag sends `drag` for BOTH endpoints — the false success the split exists to prevent', async () => {
+    await post('/api/input/drag', { from: { selector: '#kebab' }, to: { selector: '#kebab' } });
+    expect(sentTo('resolve-dom-point')).toEqual(['drag', 'drag']);
+  });
+
+  it('hover sends `hover`', async () => {
+    await post('/api/input/hover', { selector: '#kebab' });
+    expect(sentTo('resolve-dom-point')).toEqual(['hover']);
+  });
+
+  it.each([
+    ['left', 'tap'],
+    [undefined, 'tap'],
+    // A JSON null is "not given" — it clicks left, so it is modelled as a tap (#1076 close-out).
+    [null, 'tap'],
+    ['right', 'press'],
+    ['middle', 'press'],
+  ])('tap with button=%s resolves its aim as %s', async (button, expected) => {
+    await post('/api/input/tap', { selector: '#kebab', ...(button !== undefined ? { button } : {}) });
+    expect(sentTo('resolve-dom-point')).toEqual([expected]);
+  });
+
+  it('an ENTITY aim carries it too — entity and selector are one category', async () => {
+    await post('/api/input/tap', { entity: { name: 'StartButton' }, button: 'right' });
+    expect(sentTo('resolve-entity-point')).toEqual(['press']);
+  });
+});
+
+describe('an unknown input vocabulary value is REFUSED before anything resolves or dispatches (#1076)', () => {
+  // Every route that takes a `button` or `modifiers` — the MCP tools enum-check both, but curl and
+  // `modoki.api` from an eval reach these routes with no schema at all. Before this, `button:'rigth'`
+  // pressed LEFT on drag/pointer (the held-move modifier fell back to leftButtonDown) and was echoed back
+  // under `ok:true`; an unknown modifier dropped out of a drag's keyDown/keyUp pair, so Cmd+drag went
+  // out as a plain drag.
+  const ROUTES: Array<{ route: string; body: Record<string, unknown>; button: boolean }> = [
+    { route: '/api/input/tap', body: { x: 5, y: 6 }, button: true },
+    { route: '/api/input/drag', body: { from: { x: 1, y: 1 }, to: { x: 9, y: 9 } }, button: true },
+    { route: '/api/input/pointer', body: { action: 'down', x: 5, y: 6 }, button: true },
+    { route: '/api/input/tap-handle', body: { id: 'bone.0' }, button: true },
+    { route: '/api/input/drag-handle', body: { id: 'bone.0', delta: { dx: 5, dy: 0 } }, button: true },
+    { route: '/api/input/hover', body: { x: 5, y: 6 }, button: false },
+    { route: '/api/input/scroll', body: { x: 5, y: 6, deltaY: 120 }, button: false },
+    { route: '/api/input/key', body: { key: 'z' }, button: false },
+  ];
+
+  /** Nothing reached the renderer (no aim resolve, no handle lookup, no key probe) and no op ran. */
+  const expectNothingHappened = () => {
+    expect(calls).toEqual([]);
+    for (const op of Object.values(ops)) expect(op).not.toHaveBeenCalled();
+  };
+
+  it.each(ROUTES.filter((r) => r.button))('$route refuses button "rigth" with the options', async ({ route, body }) => {
+    const res = await post(route, { ...body, button: 'rigth' }) as { status?: number; body: Record<string, unknown> };
+    expect(res.status).toBe(400);
+    expect(res.body).toMatchObject({ code: 'REFUSED_BY_OP', options: ['left', 'right', 'middle'] });
+    expect(res.body.error).toMatch(/button: unknown value "rigth" — nothing was dispatched/);
+    expectNothingHappened();
+  });
+
+  it.each(ROUTES)('$route refuses modifier "cmmd" with the options', async ({ route, body }) => {
+    const res = await post(route, { ...body, modifiers: ['shift', 'cmmd'] }) as { status?: number; body: Record<string, unknown> };
+    expect(res.status).toBe(400);
+    expect(res.body).toMatchObject({ code: 'REFUSED_BY_OP', options: ['shift', 'control', 'alt', 'meta', 'cmd', 'command'] });
+    expect(res.body.error).toMatch(/modifiers: unknown value "cmmd" — nothing was dispatched/);
+    expectNothingHappened();
+  });
+
+  it('a prototype key is not a button', async () => {
+    const res = await post('/api/input/tap', { x: 5, y: 6, button: 'toString' }) as { status?: number };
+    expect(res.status).toBe(400);
+    expectNothingHappened();
+  });
+
+  it('pointer: an unknown button is refused on move/up too, and the held press survives it', async () => {
+    await post('/api/input/pointer', { action: 'down', x: 5, y: 6, button: 'right' });
+    const res = await post('/api/input/pointer', { action: 'up', x: 5, y: 6, button: 'rigth' }) as { status?: number };
+    expect(res.status).toBe(400);
+    expect(ops.pointerUp).not.toHaveBeenCalled();
+    // Still held as RIGHT — the refused call neither released it nor re-labelled it.
+    await post('/api/input/pointer', { action: 'up', x: 5, y: 6 });
+    expect(ops.pointerUp).toHaveBeenCalledWith(5, 6, { button: 'right', modifiers: undefined });
+  });
+
+  it('pointer: an unknown action now carries the code and options too', async () => {
+    const res = await post('/api/input/pointer', { action: 'wiggle', x: 1, y: 1 }) as { status?: number; body: Record<string, unknown> };
+    expect(res.status).toBe(400);
+    expect(res.body).toMatchObject({ code: 'REFUSED_BY_OP', options: ['down', 'move', 'up'] });
+  });
+
+  // ACCEPT SIDE: a refusal that fired on everything would pass every case above.
+  it.each(ROUTES.filter((r) => r.button))('ACCEPT: $route still dispatches button "middle" and modifiers [cmd, shift]', async ({ route, body }) => {
+    const res = await post(route, { ...body, button: 'middle', modifiers: ['cmd', 'shift'] }) as { status?: number; body: Record<string, unknown> };
+    expect(res.status ?? 200).toBe(200);
+    expect(Object.values(ops).some((op) => (op as ReturnType<typeof vi.fn>).mock.calls.length > 0)).toBe(true);
+  });
+
+  it.each(ROUTES.filter((r) => !r.button))('ACCEPT: $route still dispatches modifiers [meta]', async ({ route, body }) => {
+    const res = await post(route, { ...body, modifiers: ['meta'] }) as { status?: number };
+    expect(res.status ?? 200).toBe(200);
+    expect(Object.values(ops).some((op) => (op as ReturnType<typeof vi.fn>).mock.calls.length > 0)).toBe(true);
+  });
+});
+
+describe('a renderer that cannot answer the deliverability probe says so (#1096)', () => {
+  // The editor-side twin of the device router's probe, and the same conflation: `null` meant both
+  // "the page answered, and it is not hidden" and "I could not ask", and `hiddenWindowRefusal`
+  // reads the first. The POLARITY is deliberate and unchanged — a renderer that cannot answer must
+  // never fail the input — so this asserts the input STILL DISPATCHES and merely stops looking
+  // qualified. One chokepoint covers all eight dispatched routes.
+
+  /** A renderer that throws for `input-deliverability` only, and behaves normally otherwise. */
+  function rendererWithDeadProbe() {
+    const base = makeRenderer();
+    return vi.fn(async (op: string, params: unknown) => {
+      if (op === 'input-deliverability') throw new Error('renderer went away');
+      return base(op, params);
+    });
+  }
+
+  it('the reply carries the unchecked note, and the input was still dispatched', async () => {
+    routes = createInputRoutes({ ops, requestRenderer: rendererWithDeadProbe() });
+    const res = await post('/api/input/key', { key: 'Escape' }) as { body: Record<string, unknown> };
+    expect(res.body.ok).toBe(true);
+    expect(ops.pressKey).toHaveBeenCalledWith('Escape', undefined);
+    expect(String(res.body.deliverabilityUnchecked)).toMatch(/could not be asked whether this input is deliverable/);
+    expect(String(res.body.deliverabilityUnchecked)).toMatch(/renderer went away/);
+  });
+
+  it('a renderer that answers NOTHING is unchecked too — nothing is not an answer', async () => {
+    const base = makeRenderer();
+    const renderer = vi.fn(async (op: string, params: unknown) => (op === 'input-deliverability' ? null : base(op, params)));
+    routes = createInputRoutes({ ops, requestRenderer: renderer });
+    const res = await post('/api/input/tap', { x: 5, y: 6 }) as { body: Record<string, unknown> };
+    expect(res.body.ok).toBe(true);
+    expect(String(res.body.deliverabilityUnchecked)).toMatch(/the renderer answered nothing/);
+  });
+
+  it('it is ONE gate for every dispatched route, not a per-route hint', async () => {
+    routes = createInputRoutes({ ops, requestRenderer: rendererWithDeadProbe() });
+    for (const [route, body] of [
+      ['/api/input/tap', { x: 5, y: 6 }], ['/api/input/hover', { x: 5, y: 6 }],
+      ['/api/input/scroll', { x: 5, y: 6, deltaY: 120 }], ['/api/input/type', { text: 'x' }],
+    ] as Array<[string, Record<string, unknown>]>) {
+      const res = await post(route, body) as { body: Record<string, unknown> };
+      expect(res.body.deliverabilityUnchecked, route).toBeDefined();
+    }
+  });
+
+  // ACCEPT SIDE: a note that rode on every reply would pass all three cases above.
+  it('ACCEPT: a renderer that ANSWERS adds no note', async () => {
+    const res = await post('/api/input/key', { key: 'Escape' }) as { body: Record<string, unknown> };
+    expect(res.body.ok).toBe(true);
+    expect(res.body).not.toHaveProperty('deliverabilityUnchecked');
+  });
+
+  // ⚠️ The review finding: the device router applies a success-only rule and this twin did not, so
+  // the note landed on 400s too — claiming "it was dispatched unqualified" about a call that
+  // dispatched NOTHING. The docs state the rule as landed on both sides; it has to be true on both.
+  it('a REFUSED call is never annotated — nothing was dispatched to be unqualified about', async () => {
+    routes = createInputRoutes({ ops, requestRenderer: rendererWithDeadProbe() });
+    const refused = await post('/api/input/key', { key: 'Retrun' }) as { status?: number; body: Record<string, unknown> };
+    expect(refused.status).toBe(400);
+    expect(refused.body).not.toHaveProperty('deliverabilityUnchecked');
+    for (const op of Object.values(ops)) expect(op).not.toHaveBeenCalled();
+  });
+
+  it('⚠️ /api/input/focus is never annotated — the note\'s own words are false for it', async () => {
+    // That route is explicitly exempt from the hidden-window refusal ("refusing it would state a
+    // reason that is untrue for it"), so "a hidden page would have been refused" is a claim about a
+    // refusal that could never have applied. The success-only fix re-read that exact statement and
+    // left the false half standing.
+    routes = createInputRoutes({ ops, requestRenderer: rendererWithDeadProbe() });
+    const res = await post('/api/input/focus', { selector: '#kebab' }) as { body: Record<string, unknown> };
+    expect(res.body.ok).toBe(true);
+    expect(ops.focusElement).toHaveBeenCalled();
+    expect(res.body).not.toHaveProperty('deliverabilityUnchecked');
+  });
+
+  it('an ok:false reply is not annotated either', async () => {
+    ops.typeText = vi.fn(async () => ({ typed: 0, editable: false, activeElement: null }));
+    routes = createInputRoutes({ ops, requestRenderer: rendererWithDeadProbe() });
+    const res = await post('/api/input/type', { text: 'x' }) as { body: Record<string, unknown> };
+    expect(res.body.ok).toBe(false);
+    expect(res.body).not.toHaveProperty('deliverabilityUnchecked');
+  });
+});
+
+describe('an unrecognised KEY NAME is refused, and a recognised one is normalised (#1094)', () => {
+  // #1076 fixed `button`, `action` and `modifiers` and left `key` an open `z.string()` — its own
+  // design said so. What an unrecognised name actually does was MEASURED on Electron 43.2.0
+  // (2026-09-12) rather than assumed: Chromium turns it into a keydown whose `key` is the EMPTY
+  // STRING, so it matches no handler, inserts nothing, and every layer answers `ok`. That is why
+  // these assert "nothing was dispatched" rather than anything about what got typed — through the
+  // shipped routes an unknown name types nothing at all.
+
+  const expectNothingHappened = () => {
+    expect(calls).toEqual([]);
+    for (const op of Object.values(ops)) expect(op).not.toHaveBeenCalled();
+  };
+
+  it('/api/input/key refuses the OBSERVED bad input `NumpadEnter`, naming the key/code confusion', async () => {
+    const res = await post('/api/input/key', { key: 'NumpadEnter' }) as { status?: number; body: Record<string, unknown> };
+    expect(res.status).toBe(400);
+    expect(res.body).toMatchObject({ code: 'REFUSED_BY_OP' });
+    expect(res.body.error).toMatch(/key: unrecognised key name "NumpadEnter" — nothing was dispatched/);
+    // The recovery hint is the point: `NumpadEnter` is a `code`, and the caller wants `Enter`.
+    expect(res.body.error).toMatch(/KeyboardEvent\.key, not \.code/);
+    expect(res.body.options).toContain('Enter');
+    expectNothingHappened();
+  });
+
+  it.each(['Excape', 'Enterr', 'zzz', 'F25', 'Del'])('/api/input/key refuses %s', async (key) => {
+    const res = await post('/api/input/key', { key }) as { status?: number };
+    expect(res.status).toBe(400);
+    expectNothingHappened();
+  });
+
+  // ⚠️ `constructor` and `__proto__` specifically, NOT `toString`: the lookup lower-cases before it
+  // reads, so `'toString'` misses an object's inherited key anyway and a test using it stays green
+  // even with the Map swapped for an object literal — it cannot fail, so it proves nothing. These
+  // two survive lower-casing, so they are the ones that discriminate (mutation-checked).
+  it.each(['constructor', '__proto__'])('a prototype key is not a key name: %s', async (key) => {
+    const res = await post('/api/input/key', { key }) as { status?: number };
+    expect(res.status).toBe(400);
+    expectNothingHappened();
+  });
+
+  it('/api/input/type refuses an unrecognised submitKey WITHOUT typing the text first', async () => {
+    const res = await post('/api/input/type', { text: 'abc', submitKey: 'Retrun' }) as { status?: number; body: Record<string, unknown> };
+    expect(res.status).toBe(400);
+    expect(res.body.error).toMatch(/submitKey: unrecognised key name "Retrun"/);
+    // The measured defect was `ok, typed:3` having submitted nothing. A refusal that typed the text
+    // and then refused would leave the field half-done, which is worse than either outcome.
+    expect(ops.typeText).not.toHaveBeenCalled();
+    expectNothingHappened();
+  });
+
+  it('dispatches the CANONICAL key, and says what it rewrote', async () => {
+    const res = await post('/api/input/key', { key: 'Esc' }) as { body: { pressed: Record<string, unknown> } };
+    expect(ops.pressKey).toHaveBeenCalledWith('Escape', undefined);
+    expect(res.body.pressed).toMatchObject({ key: 'Escape', normalizedFrom: 'Esc' });
+  });
+
+  it.each([['Return', 'Enter'], ['Up', 'ArrowUp'], ['Down', 'ArrowDown'], ['Left', 'ArrowLeft'], ['Right', 'ArrowRight'], ['Space', ' '], ['escape', 'Escape'], ['ARROWUP', 'ArrowUp']])(
+    'normalises %s to %s', async (sent, canonical) => {
+      await post('/api/input/key', { key: sent });
+      expect(ops.pressKey).toHaveBeenCalledWith(canonical, undefined);
+    });
+
+  it('a canonical name is NOT reported as rewritten', async () => {
+    const res = await post('/api/input/key', { key: 'Escape' }) as { body: { pressed: Record<string, unknown> } };
+    expect(res.body.pressed).toEqual({ key: 'Escape', modifiers: [] });
+    expect(res.body.pressed).not.toHaveProperty('normalizedFrom');
+  });
+
+  it('a single character is verbatim and CASE-SIGNIFICANT — `W` is not `w`', async () => {
+    await post('/api/input/key', { key: 'W' });
+    expect(ops.pressKey).toHaveBeenCalledWith('W', undefined);
+  });
+
+  it('the reach probe is asked about the key that will actually be sent', async () => {
+    await post('/api/input/key', { key: 'Up' });
+    expect(requestRenderer).toHaveBeenCalledWith('probe-key-reach', { key: 'ArrowUp', modifiers: undefined });
+  });
+
+  it('submitKey is normalised on the way to typeText', async () => {
+    await post('/api/input/type', { text: 'x', submitKey: 'Return' });
+    expect(ops.typeText).toHaveBeenCalledWith('x', { clearFirst: undefined, submitKey: 'Enter' });
+  });
+
+  it('an absent submitKey is not a refusal', async () => {
+    const res = await post('/api/input/type', { text: 'x' }) as { status?: number };
+    expect(res.status ?? 200).toBe(200);
+    expect(ops.typeText).toHaveBeenCalledWith('x', { clearFirst: undefined, submitKey: undefined });
+  });
+
+  // ACCEPT SIDE. A predicate that refused everything would pass every case above, and the table and
+  // the predicate drifting apart is the failure this catches: every name the refusal ADVERTISES as
+  // valid must actually be dispatched.
+  it.each([...INPUT_KEYS])('ACCEPT: %s is dispatched', async (key) => {
+    const res = await post('/api/input/key', { key }) as { status?: number };
+    expect(res.status ?? 200).toBe(200);
+    expect(ops.pressKey).toHaveBeenCalledWith(key, undefined);
+  });
+
+  it.each(['w', 'z', '1', '+', ' ', '😀'])('ACCEPT: the single character %s is dispatched', async (key) => {
+    const res = await post('/api/input/key', { key }) as { status?: number };
+    expect(res.status ?? 200).toBe(200);
+    expect(ops.pressKey).toHaveBeenCalledWith(key, undefined);
+  });
+});
+
+/** #1153 — the `label` aim. It rides `resolvePoint`'s selector branch, so every aimed route gets it
+ *  and every selector-path diagnosis (occlusion, scrolled-out, settling) applies to it unchanged. */
+describe('label aim (#1153)', () => {
+  it('tap by label resolves in the renderer BEFORE the trusted click, with the tap gesture', async () => {
+    const res = await post('/api/input/tap', { label: 'Console' });
+    expect(calls).toEqual(['renderer:resolve-dom-point', 'label(Console,tap)', 'tap(360,546)']);
+    expect(res).toMatchObject({ body: { ok: true, matched: 'span[data-ui-id="layout.tab.console"]', occluded: false } });
+  });
+
+  it('forwards `within` to the renderer', async () => {
+    await post('/api/input/tap', { label: 'Console', within: '[data-editor-panel="Console"]' });
+    expect(calls).toContain('label(Console within [data-editor-panel="Console"],tap)');
+  });
+
+  for (const [route, body, gesture, dispatched] of [
+    ['/api/input/hover', { label: 'Console' }, 'hover', 'hover(360,546)'],
+    ['/api/input/scroll', { label: 'Console', deltaY: 120 }, 'scroll', 'scroll(360,546,0,120)'],
+    ['/api/input/pointer', { action: 'down', label: 'Console' }, 'press', 'pdown(360,546,left)'],
+    ['/api/input/drag', { from: { label: 'Console' }, to: { x: 600, y: 546 } }, 'drag', 'drag(360,546→600,546)'],
+  ] as const) {
+    it(`${route} aims by label too — one resolver, every route`, async () => {
+      const res = await post(route, body) as { status?: number };
+      expect(res.status ?? 200).toBe(200);
+      expect(calls).toContain(`label(Console,${gesture})`);
+      expect(calls[calls.length - 1]).toBe(dispatched);
+    });
+  }
+
+  it('a renderer NOT_FOUND / AMBIGUOUS keeps its §5 code, and nothing is dispatched', async () => {
+    const miss = await post('/api/input/tap', { label: 'Nope' }) as { status: number; body: { code?: string; error: string } };
+    expect(miss.status).toBe(400);
+    expect(miss.body.code).toBe('NOT_FOUND');
+    const amb = await post('/api/input/tap', { label: 'Save' }) as { status: number; body: { code?: string; error: string } };
+    expect(amb.body.code).toBe('AMBIGUOUS');
+    expect(amb.body.error).toContain('a.b.save');
+    expect(ops.tap).not.toHaveBeenCalled();
+  });
+
+  it('a COVERED label target is refused OCCLUDED, naming the label and the cover', async () => {
+    const r = await post('/api/input/tap', { label: 'Buried' }) as { status: number; body: { code?: string; error: string } };
+    expect(r.body.code).toBe('OCCLUDED');
+    expect(r.body.error).toContain('label "Buried"');
+    expect(r.body.error).toContain('div.modal');
+    expect(ops.tap).not.toHaveBeenCalled();
+  });
+
+  it('label + selector and label + entity are REFUSED as two addresses — never settled by precedence', async () => {
+    const a = await post('/api/input/tap', { label: 'Console', selector: '#kebab' }) as { body: { code?: string } };
+    const b = await post('/api/input/tap', { label: 'Console', entity: { name: 'Puck' } }) as { body: { code?: string } };
+    expect(a.body.code).toBe('AMBIGUOUS');
+    expect(b.body.code).toBe('AMBIGUOUS');
+    expect(calls.filter((c) => c.startsWith('renderer:'))).toEqual([]); // refused before any resolve
+  });
+
+  it('…but stray x/y beside a label are inert, exactly as beside a selector', async () => {
+    await post('/api/input/tap', { label: 'Console', x: 1, y: 1 });
+    expect(calls[calls.length - 1]).toBe('tap(360,546)');
+  });
+
+  it('`within` without a label is refused rather than silently ignored', async () => {
+    const r = await post('/api/input/tap', { selector: '#kebab', within: '.panel' }) as { status: number; body: { code?: string } };
+    expect(r.status).toBe(400);
+    expect(r.body.code).toBe('REFUSED_BY_OP');
+    expect(ops.tap).not.toHaveBeenCalled();
+  });
+
+  describe('focus by label', () => {
+    it('resolves through the SAME renderer op, then focuses the element by its data-ui-id', async () => {
+      await post('/api/input/focus', { label: 'Console' });
+      expect(calls).toContain('label(Console,press)');
+      expect(ops.focusElement).toHaveBeenCalledWith('[data-ui-id="layout.tab.console"]');
+    });
+
+    it('REFUSES when the resolved element\'s data-ui-id is shared — re-finding it by id would focus a twin (close-out)', async () => {
+      const r = await post('/api/input/focus', { label: 'Reload Panel', within: '[data-panel-scope="inspector"]' }) as { status: number; body: { code?: string; error: string } };
+      expect(r.status).toBe(400);
+      expect(r.body.code).toBe('AMBIGUOUS');
+      expect(r.body.error).toMatch(/shared/);
+      expect(ops.focusElement).not.toHaveBeenCalled();
+    });
+
+    it('a label miss is a coded refusal, and focus is never attempted', async () => {
+      const r = await post('/api/input/focus', { label: 'Save' }) as { status: number; body: { code?: string } };
+      expect(r.status).toBe(400);
+      expect(r.body.code).toBe('AMBIGUOUS');
+      expect(ops.focusElement).not.toHaveBeenCalled();
+    });
+
+    it('label + selector is refused, and so is within without a label', async () => {
+      expect((await post('/api/input/focus', { label: 'Console', selector: '#kebab' }) as { body: { code?: string } }).body.code).toBe('AMBIGUOUS');
+      expect((await post('/api/input/focus', { within: '.x' }) as { body: { code?: string } }).body.code).toBe('REFUSED_BY_OP');
+      expect(ops.focusElement).not.toHaveBeenCalled();
+    });
   });
 });

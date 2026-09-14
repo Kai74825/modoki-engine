@@ -9,7 +9,7 @@ UI scene graph — the ECS world *is* the UI document.
 This page documents the runtime UI traits, the renderer, the projection/dirty-flag
 model that keeps it off the per-frame path, anchor positioning, directional
 controller/keyboard focus, text animation, nine-slice backgrounds, fonts, an image-ref
-gotcha, the per-game custom-React-UI escape hatch, and the cross-game
+gotcha, the game UI layer and its store hooks, and the cross-game
 [dialog-dismissal rule](#dialog-dismissal--the-house-rule-for-every-game).
 
 Related: [Architecture](./architecture.md) · [Scene Loading](./scene-loading.md) ·
@@ -25,7 +25,10 @@ node when it has the `RenderableUI` tag plus `UIElement`; the rest — `UIBindin
 controller/keyboard focus nav — opt-in, resolved per active scope by `uiFocusSystem`),
 `UIToggle` (renders the element as an on/off switch) and `Canvas2D` (marks a `UIElement`
 as hosting a 2D PixiJS canvas; child `Renderable2D` entities render into it) — are
-optional add-ons.
+optional add-ons. ⚠️ An entity missing `RenderableUI` is skipped by `buildTree()` silently —
+`get_scene_state` shows it visible and updating, nothing logs, and only
+`document.querySelector('[data-entity-id="N"]')` reveals there is no DOM node. The fast diagnostic
+is to diff its trait KEYS against a working sibling.
 
 ### `UIElement` — the consolidated element trait
 
@@ -42,7 +45,13 @@ Field groups (representative fields, verified against `UIElement.ts`):
   line read `'px' | '%'` until 2026-08-07, contradicting the viewport-units paragraph below and the
   type itself; a game had already written a three-way unit resolver that silently treated `vw` and
   `vmax` as `vmin`, which is wrong on any non-square host. **Resolve units through a map that is
-  total over the union, not a ternary chain with a fall-through.** Also:
+  total over the union, not a ternary chain with a fall-through.** The engine's own copies do
+  (#1064): the type is derived from the `UI_LENGTH_UNITS` tuple in `runtime/traits/uiLength.ts`, the
+  Inspector dropdown and every `registerTraits` unit enum spread that tuple, and every resolver —
+  `resolveLengthPx`, the editor's drag inverse, both CSS readers, and `UIRenderer`, which PUBLISHES
+  the `--ui-*` vars — reads `VIEWPORT_UNIT_AXIS`, a `Record` over the viewport units. A new unit
+  therefore fails to compile until it resolves, instead of depending on a comment that listed five
+  of the nine copies and left out the publisher. Also:
   `flexDirection`, `flexWrap`, `justifyContent`, `alignItems`, `gap` + `gapUnit`, `flexGrow`,
   `flexShrink`, per-edge `padding*`/`margin*` (each with its own `*Unit`),
   `minWidth`/`maxWidth`/`minHeight`/`maxHeight`, `alignSelf`, `zIndex`, `rotation` (see below),
@@ -136,11 +145,24 @@ Field groups (representative fields, verified against `UIElement.ts`):
   3.5% wide" — clamps to 3.5 **pixels**. Nothing errors and the element silently collapses;
   Court's `RulesClose` shipped that way and drew its label entirely outside itself (#529).
 
+  ⚠️ **Reading a length from authored data: read the PAIR, never the number alone, and never with a
+  hand-written unit fallback** (#840). A save strips a unit equal to its default, so an absent unit is
+  the normal on-disk shape — and what it means depends on the FIELD, so any blanket fallback
+  (a px or a % written in after the unit) is right for some lengths and wrong for the rest. Engine code
+  calls `readUILength(bag, field)` / `readUIAnchorLength(bag, field)` from `runtime/traits/uiLength.ts`,
+  which return `{ value, unit }` with each absent half resolved to that field's own default; game code
+  calls the public `traitFieldOrDefault(UIElement, bag, 'widthUnit')`. `UIElement` and `UIAnchor` take
+  their schema defaults FROM that table, so the schema and the reader cannot drift apart, and
+  `engine/tests/architecture/uiLengthFallback.test.ts` fails on a literal unit fallback in any
+  script under `engine/`, `games/` or `demos/`. The two readers differ in one place: `readUILength` treats an
+  EMPTY unit string as absent, `traitFieldOrDefault` only `undefined` — no tracked file authors one. It cannot see a NUMBER read with its unit ignored altogether — Court's tap-zone guard read
+  `minTapSize` that way — so that half stays a review question.
+
   The defaults are deliberately NOT aligned: of the 50 authored `min*`/`max*` values in the repo
   that rely on the px default, ~47 are genuinely pixels (`maxWidth: 460`, the `minWidth: 44` tap
   targets), so flipping them would break the many to rescue the few — and would break scenes
   authored outside this repo. What was actually broken is that the four `*Unit` companions were
-  read by the renderer (`UINode.tsx`, `canvas2DLayout.ts`) but registered in **no trait metadata**,
+  read by the renderer (`UINode.tsx`) but registered in **no trait metadata**,
   so the Inspector never showed them and no author could change one; the value fields' tooltips
   meanwhile asserted "(px)", false at the 114 sites using `vh`/`%`/`vmin`. #549 registered them and
   added them to `UNIT_FIELD_MAPS`, so they now render inline with their value like every other
@@ -181,6 +203,12 @@ Field groups (representative fields, verified against `UIElement.ts`):
   ⚠️ `lineHeight` is still px-only — leave it `0` (auto) alongside a scaling `fontSize`. So are
   `textStrokeWidth`, `textShadowOffset{X,Y}`/`textShadowBlur`, `borderWidth` and `borderRadius`;
   each has the same shape and will drift under a scaling font, and none is wired yet.
+  ⚠️ **The habitual CSS `lineHeight: 1.4` means `1.4px`** (`UINode.tsx` emits `${lineHeight}px`),
+  and every wrapped line collapses onto the next with no error — it reads as a flex bug, and it is
+  easy to miss because neighbouring length fields have a `*Unit` companion and this one does not.
+  Measured porting wordweave's dictionary: a ~12-line definition reported 17.5 px tall and a
+  3-line attribution 4.19 px, both ≈ `lines × 1.4`. Diagnose with `get_layout_bounds` — compare
+  the text block's height with `lines × fontSize`.
 - **Style (box visuals)** — `backgroundColor` (packed hex int, `0` = transparent),
   `backgroundOpacity`, `borderRadius`, `borderWidth`, `borderColor`, `borderOpacity`
   (border color alpha, folded into the `borderColor` picker), `opacity`.
@@ -422,6 +450,15 @@ Field groups (representative fields, verified against `UIElement.ts`):
   deliberately skips any entity on a genuine `pre-wrap` path (`autoFitText`, or the `TextAnimation`
   trait), where authoring a newline is correct — a false positive on legitimate multi-line text
   costs more than a miss.
+  **Code is gated too (#841)** — both instances #676 fixed were string literals in `.ts`, not scene
+  text. The same guard file scans string and template tokens (parser-located, comments stripped,
+  COOKED text, so a `\n` escape counts) for space runs and newlines: **game and demo code with no
+  "reaches UIElement.text" marker**, because the one known case (wordweave's `hudFormat`) is written
+  in one file and reaches the DOM from another; **engine code only in files that write UIElement
+  text**, because the rest of its strings are shader source, CSS and console text. Every accepted
+  site is a ledger row with a reason. ⚠️ It cannot see text built at RUNTIME — LLM chat, player
+  names, a separator computed with `repeat`/`padStart` — nor engine code that passes game text
+  through without a write marker; `tools/`, `editor/` and tests are out of scope.
 
 - **Image** — `imageSrc`, `imageMode` (`cover | contain | fill | none`).
 - **Element type** — `elementType` (`div | input | range`) and `placeholder`. Most
@@ -535,8 +572,43 @@ number straight into a field with zero game code.
 `runtime/core/actionRegistry.ts`, where games register handlers via
 `registerUIAction(name, handler)` / `unregisterUIAction(name)`. An unknown action
 **throws in dev** and warns in production, so typo'd action names surface immediately.
+
+**A handler refuses by RETURNING `refuseAction(reason, {detail?, log?})`, never `console.warn` +
+`return`** (#1129). The `dispatch-action` agent op (`modoki_dispatch_action`, `modoki_play_clip`,
+`device_dispatch_action`) reads the handler's return value and answers `ok:false` with the `reason`
+and any `detail` fields (`known` clip names, `slavedTo`); a warn is invisible to it, so a
+warn-and-return refusal was reported to an agent as `dispatched:true`. That gap is how the op came to
+carry hand-written copies of two actions' preconditions, one of which drifted from its handler — it
+refused a typo'd skeletal clip that every authored button wrote anyway. Now the handler is the only
+place a precondition lives, and the op has none. `log` picks the console channel: `'warn'` (default),
+`'error'`, or `false` for a refusal that is routine for a PLAYER — the audio/video/haptics/quality
+built-ins use `false`, because they were silent before and a shipped `console.warn` becomes a
+Crashlytics issue. A refusal is not thenable, so it never holds the input lock below; test for one
+with `isActionRefusal`. ⚠️ **An async handler must refuse BEFORE it creates its promise** — the op reads
+the return value without awaiting it, so a refusal inside the promise reaches it as a pending promise
+and is reported as dispatched (`NavigationManager`'s `engine.loadScene`/`engine.navigateBack` decide
+theirs synchronously for that reason). `engine.playClip` refuses an unknown skeletal clip only against a COMPLETE roster
+(`skeletalClipRoster`: the rig's own GLB clips plus every clip of each animset's `source` GLB, with all of
+them loaded); while any source is still loading the name is written, because the mixer merges it on
+arrival. ⚠️ **A handler whose required input only an ENGINE dispatcher can supply must refuse when it
+is absent** (#1185) — the physics demos' zone reactions need `params.self`, an Entity that the collision or zone
+dispatch passes and an agent's JSON params never can, so every agent dispatch of them used to tint
+nothing, journal a crossing that never happened, and answer `dispatched:true`.
 (Bindings are inert unless the game is running — `applyBindings` early-returns when the
 sim is stopped, so editor Stopped/Paused states never mutate the scene.)
+
+⚠️ **A declared param that arrives as `''` reaches the handler as ABSENT** (#1075). `''` is what
+every authoring route sends for "nothing chosen" — the Inspector when "use event value" is unticked
+on a string or enum param, a cleared text field, an empty input's `$value`, `modoki_dispatch_action`
+— and `params.x ?? fallback` cannot see it, so thirteen reads across nine handlers kept the empty
+string and skipped their fallback (one froze time). `dispatchUIAction` and `dispatchGameAction` drop it once, for every
+route, in `normaliseParams` (`runtime/core/actionRegistry.ts`). Only params the action DECLARES are
+touched — an undeclared key, and the schema-less `params.payload` convention, pass through as
+authored — and a string param whose empty value genuinely means empty text declares
+`allowEmpty: true`. So: **declare what your handler reads.** A schema-less handler still gets `''`
+verbatim and must handle it itself. One behaviour this deliberately gives up: a string param can no
+longer be CLEARED to `''` by authoring an empty value unless it declares `allowEmpty` — no authored
+binding or marker in the repo did that when the rule landed.
 
 ⚠️ **A click only fires a node's bindings when the PRESS that produced it also started on that
 node** (`pressOrigin.ts`, #664). A DOM `click` fires on the nearest common ancestor of the
@@ -586,6 +658,60 @@ Four stateless lifecycle/animator handlers are registered once at startup by
   binding's typed `clip` param (or the event `$value`); keyframe/sprite validate the name
   synchronously against their clip bank and no-op+warn on an unknown one, while skeletal
   clips are validated at the render layer (unknown names are ignored there).
+- **`engine.director`** — play / pause / toggle / restart the target's `Director`, with optional
+  `time` (seek, seconds) and `speed` (rate multiplier). The cutscene twin of
+  `engine.toggleAnimator`: the same `playing` field, on the timeline's own player. `action` is a
+  typed enum param, so the Inspector renders a dropdown rather than free text; omitting it means
+  `toggle`, which is what a bare Pause button wants.
+
+  ⚠️ **It REFUSES on a sub-director** (#1112). If the target is driven by a parent's
+  `subdirector:true` control clip, its playhead is recomputed from the parent's on every in-span
+  frame, so none of the six verbs can take effect — the action writes nothing, warns with the
+  parent's name and guid, and the agent bridge answers `{ok:false, dispatched:false,
+  slavedTo:'<parent guid>'}`. **Aim a nested cutscene's Pause button at the PARENT.** Mechanism and
+  why forwarding was declined: [timeline](./timeline.md) § "Sub-directors (Phase F)".
+
+  ⚠️ **`restart` and a seek to 0 are NOT the same thing, and the difference is the once-only
+  sequence-start fan-out.** `restart` rewinds and clears `Director.started`, so `@sequence`
+  `phase:'start'` (and every `t=0` marker edge) fires again; a plain `time` seek deliberately does
+  not, because scrubbing moves *within* a playthrough and re-firing start on every scrub is worse
+  than not firing it. Passing both (`{action:'restart', time: 3}`) starts the playthrough over from
+  3s — the seek applies last and wins, which is the only reading under which both arguments
+  survive.
+
+  **A seek lands INSIDE the timeline, re-poses a paused Director, and a seek onto the end still
+  ends it** (#1113, owner-settled 2026-09-13):
+  - `time` is wrapped at write (clamped to `[0, duration]`, or wrapped when the Director loops), so
+    `{action:'pause', time: 999}` on a 4 s timeline reads back `4` straight away, provided the timeline
+    has loaded. If it has not, the system wraps it the first frame it holds the def.
+  - A **paused** seek poses the scene at the new time on the next frame: the same idempotent state
+    Play applies (keyframe `Animator` scrub + activation spans), with **no** edges. Markers, audio cues
+    and signals between the old and new time do not fire; a seek moves the playhead, it does not play
+    through.
+  - A seek that lands **on the end** of a non-looping timeline fires `@sequence` `phase:'end'` (and
+    `OnSequence.onEnd`) **once, on the next frame that advances**, paused or playing, including a seek
+    made on the first frame or before the timeline loaded (for a Director that has not yet started; see
+    the limits below for one that has). A `speed 0` or `timeScale 0` frame
+    holds it rather than firing while frozen. Seeking onto an end that already fired does not fire it
+    again; playing or seeking back below the end first, or `restart`, re-arms it (except on an
+    un-slaved sub-director, see below).
+
+  All three are detected by `timelineSystem`, not by this action, so a game system writing
+  `Director.time` directly gets them too. Limits (skeletal rigs and nested timelines are not posed; an
+  in-range write made before the system first met a paused Director is not posed; a Director authored
+  at its end fires its end once; a seek away and back that completes within one skipped stretch does
+  not re-arm the end; a seek onto the end of a STARTED Director on the very frame a scene load carries
+  it in is taken as already ended; a sub-director un-slaved at its end is not re-armed by `restart`)
+  and the mechanism: [timeline](./timeline.md) § "A playhead write the
+  system did not make".
+
+  ⚠️ **Why this exists (#1093).** Before it, the `Director` was the only playable component in the
+  engine with no runtime affordance, so the only way to pause a cutscene was a scene edit — and
+  `/api/scene-mutate` refuses those while the game is Playing (by design: edits during Play are
+  discarded on Stop). That left a running cutscene unpausable by an agent, by a device, **and by a
+  Pause button authored into the game**. The last of those is why this is an engine action rather
+  than a new MCP tool: `modoki_dispatch_action` / `device_dispatch_action` reach every registered
+  action for free, but nothing reaches an MCP tool from a scene binding.
 
 Scene navigation (`engine.loadScene` / `engine.navigateBack`) is **not** here — it lives
 in `NavigationManager`, which owns the history stack (see
@@ -598,6 +724,13 @@ in `NavigationManager`, which owns the history stack (see
 activation anywhere in the UI is swallowed whole — before the click cue, so a blocked
 second tap makes no sound. Not per-button: a fast tap on a different button is also
 swallowed, by design.
+
+Why it is global and gates on the action rather than a timer (owner, 2026-09-01): *"when I
+implement this, I usually wait for the button action to be done, instead of the time. also I will
+disable all the inputs not only for buttons."* The model is "the UI is busy", not "this button is
+debounced" — a per-button debounce still lets a fumbled tap hit the neighbouring button while a
+purchase is in flight. This overruled #466's own design notes, which had required a fast tap on a
+different button to still fire.
 
 The click cue is gated on the **same** discrete/continuous predicate as the lock, not on
 the event name (#528) — it used to test `event === 'click'`, which silenced every
@@ -823,6 +956,57 @@ parent (`UIAnchor.ts`):
   see where the element ended up. That is an authoring call, not an engine bug: opt such
   an element out.
 
+#### Reserved edge bands — `reservesEdge` and `clearsReservedEdges` (#1159)
+
+Some chrome has to be kept clear the way the notch is, even though the device knows nothing about
+it. The case that created this is an ad banner under a full-screen dialog. Two opt-in `UIAnchor`
+fields handle it; both default to `false`, so nothing that predates them moves.
+
+- **`reservesEdge`**, on the strip. It is live only on a `top-stretch`/`bottom-stretch` anchor
+  (`reservedEdgeOf`). The projection (`resolveReservedEdges` in `uiTreeStore.ts`) turns the strip's
+  authored HEIGHT into a CSS length. `UIRenderer` publishes it as `--ui-reserve-top`/
+  `--ui-reserve-bottom` on the one container every root shares; with no band the value is `0px`.
+- **`clearsReservedEdges`**, on the container. It rides the stretched padding arm above:
+  `max(<padding>, calc(<inset> + var(--ui-reserve-<edge>, 0px)))` on the top and bottom edges.
+  So it needs `safeArea` on and a stretched anchor that reaches the top or bottom. The Inspector
+  greys it out elsewhere, using `inertUIAnchorBooleanReason` — the same predicate the CSS follows.
+
+The padding shrinks the box the flow children are laid out in, but the container's own background
+still paints the padding. So a dialog's scrim stays full-bleed while its centred panel sits in the
+band between the two.
+
+⚠️ **The band is the strip's HEIGHT, not its distance from the edge.** A clearing container adds
+the safe-area inset UNDER the band, so the strip is assumed to sit directly ON the safe edge. That
+holds for a banner lifted by the inset, like wordweave's `AdBannerSlot` (lifted every frame by
+`patchAnchorPct`). A strip carrying an extra authored offset would under-reserve by that offset.
+
+⚠️ **`%` is converted to `--ui-vh`, never emitted as a CSS `%`.** Padding percentages resolve
+against the containing block's WIDTH, which was the first of Court's four wrong units for the same
+problem (`games/court/menu.md` § "Every dialog is held between the notch and the banner"). `--ui-vh`
+is exact for a strip whose containing block spans the container's height: a root, or a child of a
+full-height stretched root.
+
+⚠️ **Visibility is walked down the tree.** `UINode` draws none of a hidden element's children, so
+a strip inside a hidden container reserves nothing, and neither does a hidden strip (a playable
+build hides the banner). A strip hidden only by a `UIBinding` `visibleBinding` is NOT seen, because
+that resolves at render time. Hide a band with `UIElement.isVisible`.
+
+⚠️ **A fixed-height child cannot shrink into the band without a `minHeight`.** A column flex item
+stays at its content height while `min-height` is `auto`. So a panel authored `height: 80vh` in a
+band shorter than that overflows both ends instead. Author a positive `minHeight` (`1px`; `cssVal`
+drops a `0`). Measured on wordweave's `DictionaryPanel` at the iPhone Air preset: about 1pt past each end of the
+68–793.3pt band without it, and exactly 68.0–793.2pt with it.
+
+⚠️ **The band is the authored `height` field and nothing else.** A content-sized strip (`height: 0`,
+sized by its children) publishes `0px` although the checkbox reads live, and a strip's
+`minHeight`/`maxHeight` are ignored: `height: 9.1%` with `maxHeight: 60px` on a 1024pt-tall screen
+reserves ~93pt for a 60pt strip. Author a reserving strip with an explicit height and no clamp.
+
+Two strips on one edge take the LARGER (`max(...)`), because both are anchored to that edge and so
+overlap rather than stack. Both shipping games use these fields for every dialog: wordweave since
+#1159, and Court since #1172, which deleted the per-frame `syncDialogInsets` that hand-rolled the
+same result.
+
 An anchored element is rendered with `position: absolute`; pivot is applied as a CSS
 `translate(-pivotX%, -pivotY%)`. Stretched axes ignore pivot (both edges are pinned).
 
@@ -875,7 +1059,10 @@ the selected device preset. Four things about that shape are load-bearing:
   does for the screen box — invents a top inset the device does not have.
 - **An Android tablet preset carries zero insets in both orientations** (no display cutout,
   both system bars hidden) — but unlike the phone row's measured 28, this one is REASONED,
-  not measured, and awaits a real tablet to confirm it.
+  not measured, and awaits a real tablet to confirm it. That provenance is DATA, not only this
+  sentence: each preset's `SafeAreaSet.basis` marks every orientation `measured`, `published`,
+  `inferred` or `no-device`, and the editor's device read-back reports it as `safeAreaBasis`
+  (#786, [editor.md](./editor.md) § the device-selection bullets).
 
 The bands are drawn over the preview (`editor/rendering/SafeAreaOverlay.tsx`), always on
 with a device preset: simulating an inset without showing it trades one invisible failure
@@ -1160,9 +1347,12 @@ The two also answer different questions (self-placement vs. margin) and may legi
 Caught in #757's own close-out review, after the first cut of this section claimed the guarantee it
 did not yet have.
 
-⚠️ **An absent length unit in scene JSON means `%`, not `px`** — every `UIElement` length unit
-defaults to `'%'` and a scene save strips a field equal to its default, so the number-with-no-unit is
-the common on-disk shape for a percentage. The validator read it as `px` until #757's close-out,
+⚠️ **An absent length unit in scene JSON means THAT FIELD's default — for a size or margin, `%`, not
+`px`.** The default is per field: `width`/`height`/`padding*`/`margin*` default their unit to `'%'`,
+while `gap`, `min*`/`max*`, `minTapSize`, `fontSize`, `letterSpacing` and every `UIAnchor` offset
+default to `'px'` (the one table is `runtime/traits/uiLength.ts`, #840). A scene save strips a field
+equal to its default, so for a size the number-with-no-unit is the common on-disk shape for a
+percentage. The validator read it as `px` until #757's close-out,
 which made `isNeutralSize` miss `width: 100` and produced **10 false positives across the 143
 tracked scene/prefab files** — four in `games/court`, three in `games/sling`, two in
 `games/wordweave`, one in `demos/particle-demo`, every one of them a full-bleed `100` the editor
@@ -1180,6 +1370,583 @@ the right direction for a fix here is to make its limits louder, never to give i
 Same ruling #746 made for the (now-unified) `zIndex` fields in the § sortOrder table below: the
 defect was the **silence**, not the precedence. Nothing in `games/**`/`demos/**` authored the shape
 when this was found (0 hits across 143 scene/prefab files), so no existing UI moved.
+
+### Tap zones — `UIElement.minTapSize` (#948)
+
+**A tappable element has two boxes: the one that DRAWS and the one that RECEIVES the tap. Every
+other field on `UIElement` moves them together; this is the only one that separates them.**
+
+A finger needs ~44pt (Apple HIG) / 48dp (Material). An icon control's artwork is routinely half
+that — Court authored 16 of them at 21–35pt, and a `3.4vh` close button measures **22.66pt on an
+iPhone 8** (measured: 17.242px rendered in a 507.53px-tall viewport standing for 667 logical pt).
+`minTapSize` raises the receiving box to a floor without touching the drawing box, the layout, or
+where any sibling sits.
+
+⚠️ **"A floor" holds only where the zone has room to expand into.** Between two tappable neighbours
+the reachable target is `artwork + gap` and the authored value is NOT reached — so this field cannot
+deliver the floor in a dense row or grid, and the three guards below are not the only way it can
+come out short. Read § "The ceiling the sibling rule creates" before authoring it on anything with a
+tappable neighbour.
+
+The renderer emits a transparent, absolutely-positioned child sized `max(100%, minTapSize)` per
+axis, at `zIndex: -1` inside an `isolation: isolate` stacking context. `max()` makes a value below
+the element's own size a no-op rather than a shrink — it is a minimum, and it must never take tap
+area away.
+
+⚠️ **The two obvious alternatives both fail SILENTLY, and both were measured failing.** This is the
+whole reason the field exists rather than an authoring convention:
+
+- **`padding` does nothing at all — in either direction.** `UINode.tsx` sets
+  `boxSizing: 'border-box'`, so with a definite `width`/`height` padding is carved *out of* the
+  fixed box rather than added to it, and the click handler is bound to that same box. And the icon
+  is a CSS `background-image` with nothing overriding `background-origin`, so it keeps the default
+  `padding-box` and padding does not shrink the glyph either. Measured on a live editor: Court's
+  `SettingsClose` given `padding: 10px` on all four sides re-rendered at **exactly** its original
+  17.242 × 17.242.
+- **`minWidth`/`minHeight` do grow the box — and scale a `contain` background with it.** They are
+  layout minimums. That is why `minTapSize` is documented beside the pointer fields and not beside
+  them.
+
+#### ⚠️ SIX cases where an authored `minTapSize` does NOTHING
+
+**This list is the count — nowhere else states one.** Cases 1-3 are guards in `UINode.tsx`, all of
+which exist because the failure would otherwise be invisible; 4-6 were each found later, by a
+measurement, and each has its own subsection below.
+
+1. **The node takes no click.** The expander is emitted only for a click binding or `swallowClicks`
+   — an enlarged zone on a decorative element would start swallowing taps meant for what is behind
+   it. ⚠️ `swallowClicks` is cancelled by `pointerThrough`, which WINS, so a node authoring both
+   takes no click either.
+2. **`overflow: hidden`/`scroll` clips the expander back to the box**, so the field does nothing
+   there. That combination WARNS rather than sitting inert.
+3. **An element type that cannot HOST a child** — `input`, `range` and `UIToggle` all return before
+   the container branches, and an `<input>` is a void element besides. Also a DEV warning, and the
+   check runs *before* `isolation` is set so an inert field does not leave a stacking context
+   behind.
+4. **A value control** — its floor is met by its own authored box, not by an expander (#1025).
+5. **An expander over a `Canvas2D` host** — rejected upstream at gesture ingestion (#1017).
+6. **A `TouchControl`** — case 1 in a form that does NOT warn, because the branch that warns is
+   inside the gate it fails (#1024).
+
+⚠️ **1-3 are decidable from a scene file and are what `@modoki/engine/testing/tapTargetFloor`
+models; 4 and 5 are not.** A guard that claims to enumerate them all is claiming more than authored
+data can support.
+
+#### Case 4 — value controls: the floor is met by the control's own box, not by `minTapSize` (#1025)
+
+⚠️ **This section used to say "to grow one, wrap it in a `div` that carries the binding and author
+`minTapSize` on the wrapper." That advice was unfollowable, and it is retracted.** Every under-floor
+`input`/`range`/`UIToggle` in the repo binds `change`, not `click` — so the *first* guard above
+already excludes them, before element type is ever consulted, and a wrapper carrying that same
+`change` binding is excluded for the same reason. There is no click binding to move.
+
+**A `range` or `input` needs no expander at all.** It hit-tests its **whole authored box** while the
+platform draws the control at a fixed thickness, centred — so `height` already separates the two
+boxes, which is the entire job `minTapSize` does for a `div`. Measured with `elementFromPoint` down
+the element's centre column, in **Chromium and WebKit** (WebKit is what ships on iOS):
+
+| authored height | rows hit-testing to the `<input type=range>` | painted track |
+|---|---|---|
+| 32 px | 32 | unchanged |
+| 44 px | 44 | unchanged |
+| 64 px | 64 | unchanged |
+
+⚠️ **This does not contradict #948's `minWidth`/`minHeight` finding — it is a different control.**
+That measurement was on an icon **`div`**, whose artwork is a CSS `background-image` sized `contain`
+and therefore scales with the box. A native `range` has no background artwork to scale.
+
+**A `UIToggle` is the real exception**, and the only one: `UINode.tsx` sizes the knob off the
+track's own height, so growing the host fattens the switch. Separating the boxes there does need a
+wrapper `div` — and that wrapper needs its **own `click` binding**, not the toggle's `change` one.
+⚠️ **A `change` binding copied onto the wrapper is inert**: a div never dispatches `change`, and
+`applyBindings` skips rows whose event differs, so the enlarged target silently does nothing.
+
+⚠️ **The wrapper's action must also accept a click's EMPTY payload.** A div click carries no
+`$value`, so a handler written for the toggle's boolean (`if (typeof payload !== 'boolean') return`)
+drops it and the enlarged target is a dead zone — this defect one level out. Court's
+`court.settingsHaptics` now reads a missing payload as "flip", and still refuses a non-boolean one
+so a miswired binding stays visible.
+
+⚠️ **Prefer sizing the wrapper's own box over giving it a `minTapSize`.** An expander is absolutely
+positioned and OVERHANGS its neighbours, so its correctness then rests on #977's veto; an in-flow
+wrapper takes its space in the layout and there is no overlap to adjudicate. Court's
+`SettingsHapticsTapTarget` is a plain `56 x 48` div for that reason, which is also why it needs no
+entry in that game's `KNOWN_TAP_ZONES` probe registry. ⚠️ Sized in **px**, against this doc's
+usual "size in `vmin`/`%`" advice, and deliberately: a 44 pt floor is an absolute physical target,
+and a viewport-relative height would fall back under it on the smallest screens — the ones that need
+it most.
+
+Court's members were `SettingsMusicSlider` and `SettingsSfxSlider` (both now `48 px` tall) and
+`SettingsHapticsToggle`; wordweave's two sliders were the same shape and are fixed the same way.
+
+#### Case 5 — an expander over a 2D canvas (#1017, 2026-09-10)
+
+⚠️ **Over a `Canvas2D` host, the expander is rejected UPSTREAM of everything below.** The expander is
+a real `<div>` in the UI subtree, so a press on it is blocked at gesture INGESTION by
+`isPointerBlocked` (`runtime/core/pointerBlockers.ts`) — which runs *before* the sibling rule's
+`resolveTapZoneVeto`, so that veto never gets to arbitrate. And the veto is tap-only in any case,
+while what sits under such a zone is usually a DRAG (a pan, a drag-to-spell). So the risk there is
+not stealing a neighbour's button press, which #977 handles; it is **swallowing the start of a
+gesture, which nothing in the engine arbitrates.**
+
+Measured and ruled on in wordweave, where five controls sit inside the crossword's own pan region
+and were ACCEPTED under the floor rather than grown — growing them converts live gesture surface
+into dead chrome. The measurements and the owner's split decision live with the game:
+`games/wordweave/tests/tapTargets.test.ts`'s `UNDER_FLOOR`.
+
+#### Case 6 — a `TouchControl` gets no expander at all, and nothing warns (#1024, 2026-09-10)
+
+⚠️ **A d-pad arrow is a tap target by any human definition and `minTapSize` does nothing on one —
+silently, with no DEV warning.** `UINode.tsx` gates the entire tap-zone branch on
+`takesClick = isInteractive || swallowsClicks`, and `isInteractive` reads CLICK BINDINGS. A
+`TouchControl` entity carries no `UIAction` at all — its own docblock forbids it, because a movement
+control is a held LEVEL rather than a discrete event — so it fails that outer gate, and **the three
+warnings above all live INSIDE it**. Nothing reports the field.
+
+**So a `TouchControl` under the floor is fixed by AUTHORED SIZE**, the same lever the ceiling rule
+prescribes for a dense row. `demos/forest-camp`'s four pads and its AIM button are the repo's only
+live instances; they are 48 px, so nothing is wrong today — but the RULE was wrong, which is exactly
+the shape that ships. Pinned by `demos/forest-camp/tests/tapTargets.test.ts`, which asserts all five
+are counted as targets, that none of them emits a zone, and that none of them authors one.
+
+Found while building #1024's shared resolver, not by a failure. It is listed separately rather than
+folded into case 1 because the remedy differs: the other five leave you looking for a different
+field, this one leaves you looking for a different LEVER.
+
+#### The sibling rule — a zone LOSES to real content (#977, 2026-09-09)
+
+**A tap zone is a minimum courtesy area, and it only wins a press when nothing else would have
+handled it.** The renderer stamps the expander `data-tap-zone`; `runtime/ui/pressOrigin.ts` sees a
+press land on one, asks `document.elementsFromPoint` what is actually under the point, and hands the
+press to that element when it is a real control belonging to someone else. A zone still wins over
+decoration and over empty space, which is the normal use.
+
+- **Cost is one hit-test, and only for a press that lands on a zone.** ⚠️ That is not the same as
+  "rare": the expander is `zIndex: -1`, which is above the host's own BACKGROUND, so a press
+  anywhere on a `minTapSize` control not covered by a child element targets the zone — for a
+  background-image button with no element children, every press on it. The walk is cheap and the
+  veto almost always resolves to nothing; an earlier revision of this line claimed it "never runs on
+  an ordinary press", which is false.
+- **The first non-zone entry decides, and the walk stops there.** That is what the browser would
+  have hit; looking past it would hand the press to something a decorative element was legitimately
+  covering.
+- **A zone never loses to its own host, nor to any interactive ANCESTOR of it.** An ancestor
+  receives the click by bubbling anyway, so the host is the more specific handler. ⚠️ This is the
+  load-bearing half: every one of Court's 16 authored zones sits inside a panel carrying
+  `swallowClicks`, so without the ancestor test each pad vetoed to its own panel root — whose
+  handler swallows — and the courtesy area was **deleted** rather than narrowed.
+- Two overlapping zones fall through to whatever real control is under them.
+- **The redirect only fires when the RELEASE landed in the same zone as the press.** Otherwise a
+  drag that starts on a pad and ends anywhere else would be redirected and fired, which is precisely
+  the gesture #664 exists to reject. ⚠️ Two consequences worth knowing: a CANCELLED touch gesture
+  lands its `pointercancel` on the zone (implicit pointer capture), so the veto is cleared there
+  rather than by this gate; and a MOUSE press that drifts onto a child of the host before releasing
+  gets the host's binding instead of the neighbour's — that is a drag, so the pre-#977 outcome is
+  defensible, but it is a consequence rather than an oversight.
+- **The marker is runtime-only.** The editor's authoring preview does not emit it: the press tracker
+  is registered per DOCUMENT, which the two renderers share, so stamping it there would redirect
+  click-to-select onto the neighbouring entity.
+- ⚠️ **The redirect happens at CLICK time, in a document capture listener, and that is forced.** The
+  obvious implementation — dropping `pointer-events` on the zone at pointerdown so the release
+  re-hits the neighbour — *loses* the press: `click` fires on the nearest common ancestor of the down
+  and up targets, so down-on-zone plus up-on-neighbour fires the click on their shared **parent**.
+
+⚠️ **It fixes a TAP and not a DRAG.** A finger-drag STARTING inside the overlap still does not reach
+a scroll container underneath — the browser picks the scroll target at pointerdown, before any of
+this runs, and no JS can move the expander out of the way in time. So a zone overhanging a scrollable
+still costs that band its swipe. **This is the owner's explicit call (2026-09-09)**, taken over the
+alternative (portal every zone into a layer beneath all content, which fixes the drag too but falls
+behind a dialog's scrim and needs a per-stacking-context layer). ⚠️ Scroll containers are not *stamped* interactive, but that is not the same as being invisible to
+the rule: `closest` resolves past a scroll container to whatever interactive ancestor encloses it.
+What keeps that from swallowing a pad is the ancestor test above, not the absence of a marker.
+
+**What this changed for authors:** `minTapSize` used to be "an authoring decision about a specific
+layout, not a value that is safe everywhere" — a control packed against an interactive neighbour
+needed its spacing fixed instead. That is no longer true for taps, and #969's nine adjacent Court
+controls are unblocked to the same extent. The history below is kept because it is what the rule was
+derived from.
+
+#### ⚠️ The ceiling the sibling rule creates: a zone expands into the GAP, and no further (#969)
+
+**Between two tappable neighbours, a control's reachable target is `artwork + gap` — never the
+authored `minTapSize`.** The two rules above are the same rule seen from opposite ends: the zone
+overhangs the neighbour, and the veto then hands that overhang straight back. Safe, and capped.
+
+⚠️ **The ceiling presupposes a ZONE.** With no `minTapSize` there is nothing to spread into the gap —
+a press there lands on the container and does nothing — so the reachable target is the ARTWORK alone,
+however wide the gap. #1047's first write-up read "tiles are contiguous, so `artwork + gap` likely
+delivers more" onto 31 controls that authored no zone, and none of them did. A gap only helps a control
+that has a zone to put in it.
+
+The consequence is the one that catches authors: **`minTapSize` cannot deliver a floor in a dense
+row or grid.** Set 48 on a 26pt control with a 6pt gap and you get ~32pt across, not 48. The axis
+with no neighbour (and the outer edge of a row) does get the full value, so the same field can
+succeed on one axis and quietly fail on the other.
+
+Measured in Court's piece-colour flyout, 375x667, by driving real taps and reading the game's own
+journal — the numbers are in #969, and the two that matter:
+
+- a press over a neighbour's artwork, under the neighbouring pad → **the marker actually pressed**
+  wins (`court.regionNote {region: 1}`, not region 2). The veto, working.
+- a press in the gap, with no artwork under the point → the **later sibling** wins,
+  deterministically, because paint order decides among zones and the panel is an interactive
+  ancestor of both hosts.
+
+⚠️ **The probe ran at the ORIGINAL `gap: 3.2vmin`, where the two pads all but met** — a 48pt pad on
+36pt of artwork overhangs 6pt per side, which is the whole 12pt gap, leaving ~0 of bare gap and a
+0.26px pad-on-pad sliver at the midpoint. So "in the gap" there meant "at the seam between two
+pads". #969's close-out raised the gap to `3.8vmin` (14.25pt) to clear 360dp, so today 2.25pt of
+genuinely bare gap sits between the pads. The finding is unchanged and strengthened — a press over a
+neighbour's artwork was never the pad's — but an earlier version of this list called the probe point
+a "bare 5.99px gap", which was the per-SIDE overhang wearing the wrong label.
+
+**So if a layout must MEET the 44pt floor, size or space the artwork — `minTapSize` is the courtesy
+margin on top, not the mechanism.**
+
+⚠️ **And "size the artwork" is the WORSE of the two levers — reach for SPACING first.** The obvious
+move is to inflate the control until it is 48pt on its own, and that makes a heavy, clumsy-looking
+UI for no reason. Widening the gap instead buys exactly the same target from a much smaller control,
+because **once the gap is at least `minTapSize - artwork`, the pad stops half way across it and never
+reaches a neighbour at all** — so the veto is not even consulted and the ceiling above does not bind.
+
+Court's markers, before and after, at 375x667 — same 48pt target both times:
+
+| | artwork | gap | pad overhang/side | target | pads reach a neighbour? |
+|---|---|---|---|---|---|
+| inflate the control | 48.0pt | 6.0pt | **0** | 48pt | no — the pad is a NO-OP at this size |
+| **widen the gap** | **36.0pt** | **14.25pt** | **6.0pt** | **48pt** | **no — 2.25pt of bare gap left between pads** |
+
+⚠️ The inflate row's overhang really is zero, and an earlier version of this table said "yes,
+~4.9pt/side (veto load-bearing)" — wrong on both counts. `minTapSize` emits `max(100%, 48)`, so on
+48pt artwork the expander is exactly the element's own box and there is nothing to overhang. The
+veto is not involved in that variant at all: what met the floor was the artwork. Corrected #969
+close-out; the figure could not be reproduced from the authored values and was most likely measured
+against an editor-preview viewport (this doc records a "507.53px-tall viewport standing for 667
+logical pt" further up) while being labelled 375x667.
+
+The second is what shipped (`9.6vmin` capped `5.4vh`, `gap: 3.8vmin`), and it is both lighter on
+screen and structurally safer. `minTapSize: 48` stays on the markers as the courtesy margin that
+does the work.
+
+⚠️ **Both terms scale with the host, so the floor is a per-DEVICE claim and has to be checked as
+one.** This is not a caveat — it is the bug that shipped inside #969 itself. The layout was verified
+at 375x667 and nowhere narrower, and at **360dp** — the Galaxy S22 and the A23, i.e. both Android
+handsets root `CLAUDE.md` names as Court's targets, and the commonest Android width in the world —
+the markers delivered **46.08dp** and the daily calendar's column **43.09pt**. Both under the floor,
+with two green guards, because each resolved its units against one hardcoded reference device.
+
+The matrix now lives in `games/court/tests/devices.ts` and both guards iterate it — and it is
+**DERIVED from the engine's own `DEVICE_PRESETS`**, not transcribed. That is not tidiness: the first
+version of that file hand-wrote its rows and had the Galaxy S22 at 360x800, which is the Motorola
+Edge 50's height (the S22 is 360x780). Deriving also means a narrower phone entering the catalog
+turns these floors RED instead of being accommodated, and it is why there is no accepted-exception
+list any more: all 18 shipping presets clear both floors.
+
+On the older Fold's outer 280px screen the target is 37.5pt and stays an **accepted** miss — and it
+is not a shipping preset, so it does not set the bar for the game. Clearing 48 there needs
+`artwork + gap` of **17.14vmin** against today's 13.40. Where that 3.74vmin goes decides the cost:
+into the artwork it makes a **~50pt marker** at 375x667 (against the 36pt that shipped), and into the
+gap it does not grow the marker at all but breaks the three-per-row shape the panel is sized for.
+Either way it undoes a decision that was made deliberately — "the chip looks really big" — which is
+why the miss is accepted rather than fixed.
+
+⚠️ An earlier version of this paragraph said "~64pt". That read 17.14vmin as if it were the marker
+alone; it is `artwork + gap`.
+
+⚠️ **The corollary is a retune hazard worth stating: shrinking a container's `gap` can silently
+un-meet the floor,** because the gap is carrying the target size. Court's guard records the
+`gap >= minTapSize - artwork` relationship for exactly this reason
+(`games/court/tests/tapZoneClearance.test.ts`).
+
+⚠️ **Model a round control as a CIRCLE when probing.** `borderRadius: 999` makes the hit shape the
+circle, so a pad overlapping the bounding box's corner overlaps *nothing*, and a tap there correctly
+goes to the pad. A first pass at #969's probe read that as the veto failing.
+
+**#973 OBSERVED it, twice, on the shipped Court scene** (#948's close-out only computed it). Driven
+with `document.elementsFromPoint` on the live DOM: at 375x667 the level-select pager arrows took the
+bottom **5.78 px** of two level tiles, so a tap meant for a level paged the list instead.
+
+⚠️ **The worst case is the SHORTEST screen, not the smallest control** — the pad is a fixed px and
+the layout is `vh`, so the shortfall is `24 − 0.028 × H`. It was still stealing on a 360x800
+Android, which the issue's own first estimate had written off. **Court's two instances, the
+per-device table and the authored fix live in
+[games/court/menu.md](../games/court/menu.md) § "The arrows' 48px tap pads"** — this doc owns the
+MECHANISM, that one owns the INSTANCES.
+
+**Lowering the number is not a fix** — 44 still overlaps by ~3.3 px, because the defect is the
+adjacency.
+
+⚠️ **Do not try to catch this class by reading the scene JSON.** A guard that modelled flexbox from
+the authored data was wrong 3 times out of 5, and the live probe is what caught it. Two reasons, both
+load-bearing:
+
+- **Paint order is half the mechanism.** A neighbour LATER in tree order paints ABOVE the expander
+  and wins the press. Court's `BrushFlyoutClose` overhangs its option rows by 12.75 px into a 6 px
+  gap and is completely harmless for exactly this reason.
+- **An anchored host is not in the flow at all.** `ChipFlyoutClose` carries a `UIAnchor`, so it is
+  absolutely positioned and an authored `marginTop` on it is **inert** — measured: live ECS
+  `marginTop: 6`, computed DOM `margin-top: 0px`. A model that assumes flow reasons about a box that
+  is not there.
+
+A sound static check is a layout engine. **Verify a new `minTapSize` with the live probe** (recipe in
+#973), not by reading the scene. ⚠️ Since #977 the engine rule makes the *tap* half of this harmless,
+so the probe is now checking the drag half and any layout the rule cannot see — not whether a control
+steals taps.
+
+The #664 press-origin gate needs no special handling for the ordinary case: `pressBelongsTo`
+resolves a press through `closest('[data-press-origin]')`, and the expander is a descendant of the
+marked element. In the vetoed case the recorded press/release pair is cleared before the replacement
+click is dispatched — it was recorded against the ZONE, so leaving it would make `pressBelongsTo`
+fail *closed* on the element now receiving the click.
+
+⚠️ **A tap zone is authored data, not a code constant** — it is exactly the "could the owner
+plausibly want this different after seeing it on screen?" case, so it lives on the trait and is set
+in the scene. Court authors `48` (clearing both platform minimums with one number) on all 16.
+
+#### SIZE is gateable from authored data; CLEARANCE is not (#963, #1024)
+
+**Two different defects live in this section, and only one of them can be a `verify` gate.** Getting
+this backwards produces either a guard that cannot fail or one that pushes authors to "fix"
+non-problems, and both have already happened here.
+
+| | the defect | can a scene-JSON gate decide it? |
+|---|---|---|
+| **Size** | a tappable's own box is under the 44 pt floor | **Yes** — the axis resolves from the authored unit and the viewport |
+| **Clearance** | adequately-sized tappables sit too close together | **No, in general** — see below |
+
+**Why clearance is not generally derivable.** `games/court/tests/tapZoneClearance.test.ts` records a
+first cut that tried to answer it for a whole scene from the JSON, and **it was wrong three times out
+of five**: two false positives from paint order (rows later in tree order paint above the zone and
+win the press), and one right-control-wrong-reason where `flex-wrap` plus a `UIAnchor` took the
+control out of the flow entirely. A sound general version would have to implement flex-wrap,
+absolute positioning, stacking contexts and paint order — a layout engine. **The general clearance
+check is the live `document.elementsFromPoint` probe**, which needs a running editor and therefore
+cannot be a `verify` gate.
+
+⚠️ **That probe has its own trap, and it belongs to the probe and not to the model** — a
+`borderRadius: 999` control's hit shape is the CIRCLE, so a tap in its bounding box's empty corner
+correctly reaches whatever is beneath, and Court's first pass read that as the veto failing. Model a
+round control as a circle or the probe lies to you.
+
+⚠️ **The narrow exceptions — there are TWO, and they are different shapes.** Clearance is pure
+arithmetic when the layout has no flexbox left to model, which happens in either direction:
+
+- **The FLOW carve-out** — plain non-wrapping siblings in a plain column/row container, no anchor
+  and no `z-index` override, so clearance is just `gap + margin`. This is Court's
+  (`games/court/tests/tapZoneClearance.test.ts`, its two pager rows).
+- **The ANCHORED carve-out** — every child taken out of the flow entirely by a `UIAnchor`. This is
+  forest-camp's (`demos/forest-camp/tests/dpadClearance.test.ts`, the D-pad).
+
+The anchored one needs **three** conditions, and a guard leaning on it asserts all three rather than
+assuming any:
+
+1. every child is **absolutely positioned out of the parent's flow** (it carries a `UIAnchor`);
+2. the parent's size is **authored in explicit `px`**, and its **`borderWidth` is 0** — every UI
+   node is `box-sizing: border-box`, so a bordered parent's children resolve against a containing
+   block narrower than its authored size;
+3. every child is **`safeArea: false`**.
+
+⚠️ **(3) is the one that looks like a detail and is not.** `UIAnchor.safeArea` **defaults to TRUE**,
+and for a POINT anchor `resolveAnchorRect` applies the device inset to the child — while the CSS
+emitter's `var(--ui-sa-*)` INHERITS, so a child nested inside a small box is inset by the **full
+device inset relative to that box**, not relative to the screen. forest-camp's D-pad shipped that
+way: four 48 px pads in a 196 px container, 26 px apart at zero insets and **overlapping by 2 px on
+an iPhone Air** (68/34), which is the handset the bug was reported from. The inset belongs to the
+one box that is actually anchored to the screen edge — the container — and the children opt out.
+
+forest-camp's guard additionally proves the result is **inset-independent** (the same clearance at
+zero and at non-zero insets), which is the check that catches (3) regressing regardless of how it
+regresses — a boolean assertion alone would not catch a change in the engine's own inset handling.
+
+⚠️ **Such a guard must call `resolveAnchorRect` (exported from `@modoki/engine/runtime`), not
+re-derive the anchor/pivot/offset arithmetic beside it.** Re-deriving it is how the model above went
+wrong, and a game or demo can only reach engine code through the `@modoki/engine` specifier — which
+is why that helper is exported at all.
+
+**The fix for a clearance defect is geometry, not `minTapSize`.** The ceiling above says why: between
+two tappable neighbours a zone expands into the GAP and no further, so on forest-camp's D-pad — 2 px
+of clearance — authoring `minTapSize` would have bought ~2 px per side and changed nothing. It was
+fixed by shrinking the buttons 64 -> 48 px inside their unchanged 196 px container **and** opting
+them out of `safeArea`, taking clearance to 26 px on every screen while staying over the floor.
+
+⚠️ **Never answer a clearance complaint by shrinking a control below the floor** — that trades this
+section's second defect for its first. A clearance guard should assert the size floor alongside the
+gap for exactly that reason.
+
+#### A row child's TEXT has no width bound — `min-width: 0` is unauthorable (#1119)
+
+**`flexShrink` is not the lever, and that is the whole trap.** `cssVal` returns `undefined` for `0`
+(`runtime/ui/UINode.tsx`), so **`min-width: 0` is never emitted** and every flex item keeps CSS's
+automatic minimum size. Shrinking a row child therefore floors at **min-content** — it buys exactly
+what word-wrapping can give back, and nothing more. A label that cannot wrap overflows its row
+whatever `flexShrink` says, and where the row authors `justifyContent: center` it spills past
+**both** edges.
+
+⚠️ **Making `minWidth: 0` authorable is REJECTED, not pending.** `UIElement.minWidth` defaults to `0`
+and `cssVal` drops falsy values, so an author cannot express it — but emitting `0` would strip the
+automatic minimum from **every flex item in every game**, a blast radius far past the problem. (The
+engine already reasons about that floor deliberately elsewhere: `UINode.tsx`'s `autoFitText` scaffold
+pins `min-width: max-content` *because* the auto-minimum was silently doing that job, and #727's
+review found a `minWidth: 0` on the single-line clamp path that was a no-op for the same reason.)
+
+**Measured behaviour, so the two cases are not conflated** (live at 375x667, wordweave's `LevelTabs`):
+
+| the label | what happens |
+|---|---|
+| multiple words | **wraps** to min-content (the longest word) inside its own box — no spill, but N lines in a fixed-height row |
+| a single long word | **spills**, because min-content IS max-content. Observed: tabs at `123.408..390.59` against a row at `129.969..384.018` |
+
+**The remedy is a WIDTH BUDGET over the authored string, not a rendering change** (owner, 2026-09-12:
+*refuse, do not accommodate* — the same answer #1080 gave for the HUD). Two engine-owned testing
+helpers exist for it, on the `tapTargetFloor` pattern of a shared resolver plus per-game data:
+
+- **`@modoki/engine/testing/authoredTextBudget`** — walks the parent chain to a real px width,
+  resolving units through `uiLength`'s own table, and answers whether a string fits its row on one
+  line at a given viewport. `worstTextFit` takes `SHIPPING_VIEWPORTS` rather than one constant,
+  because **no single viewport is the worst case**: a row sized in `%` is worst on the narrowest
+  screen, while one whose siblings are sized in `vh` is worst on the TALLEST screen of that width.
+- **`@modoki/engine/testing/fontMetrics`** — reads real glyph advances out of a shipped `.ttf`, so a
+  budget measures **the string** rather than a calibrated `EM_PER_CHAR`. That constant is the wrong
+  instrument whenever the strings are not from the distribution it was calibrated on: Klee One runs
+  0.470 em/char on `Vibration` and 0.607 on `Medium`, and a HUD-weighted 0.586 over-states a
+  mixed-case label by ~15%.
+
+⚠️ **`autoFitText` and `textOverflow: 'ellipsis'` were both DECLINED for this, and the reason is
+adoption as much as feel**: no scene in `games/` or `demos/` authors either, so either would be the
+first shipping use of a field exercised only by e2e fixtures — and #725 records that `ellipsis` is
+inert under `autoFitText`, so they do not compose.
+
+**There are TWO mechanisms here, and a guard that models one leaves the other open.**
+
+| | what overflows | who it applies to |
+|---|---|---|
+| `worstTextFit` | the ROW | a child with NO authored width — it is floored at min-content, so it pushes its siblings out |
+| `worstTextFitInOwnBox` | the CHILD ITSELF | a child WITH a definite width — the width caps the flex automatic minimum, so the row is safe and the text paints past its own rounded edge |
+
+⚠️ **The second is easy to talk yourself out of, and that is how it was missed.** "A child with its
+own authored width cannot be squeezed by its text" is true of the row and irrelevant to the child:
+wordweave's `SettingsHapticsValue` gives an owner-editable On/Off word an authored `width: 88` at
+`fontSize: 18`, where `"On"` needs 23.99 px and about ten characters is the ceiling — so
+`settingsOnLabel = "Vibration on"` (~103 px) spills out of its own box with nothing clipping. A
+row-only guard drops it from the population and stays green.
+
+⚠️ **`worstTextFitInOwnBox` returns `null` — "cannot tell" — for an item flex layout can RESIZE**,
+which is any item on the main axis of a row with a non-zero `flexGrow` or `flexShrink`. Its authored
+width is then the flex BASE size, not the used width: measured on wordweave's two
+`TutorialSkip{Confirm,Cancel}` buttons (`width: 50%`, `flexGrow: 1`, in a 12 px-gap row at 360 px
+wide) the base is 125.2 px and the used width ~119.2 px, so budgeting against the authored number
+would have called a 124.96 px label FITTING while it overflowed by ~5.8 px — wrong in the one
+direction a refuse-don't-accommodate gate must never be wrong. Recovering those cases needs the flex
+resolution modelled (every sibling's base, min-content floor and grow/shrink factor), which is a
+layout engine rather than a budget; tracked in #1126.
+
+**Only owner-authored strings are enumerable at test time, so only they can be budgeted this way.**
+A store-localized price (#1125) and an unbounded runtime number have no authored maximum, and need a
+different answer. The class across all six projects, and the three string sources, is **#1126**; the
+one worked instance is `games/wordweave/tests/authoredLabelBudget.test.ts`, documented in
+[../games/wordweave/docs/menu.md](../games/wordweave/docs/menu.md) § "Every owner-editable label is
+budgeted against its row".
+
+#### The engine owns the SIZE gate now — `@modoki/engine/testing/tapTargetFloor` (#1024)
+
+Three passes found under-floor controls by hand — #948 and #969 in Court, #1017 in wordweave — each
+scoped to one game, each starting from zero, each writing its own enumeration. **The instances were
+never the problem; the absence of a shared gate was.** So the resolver is engine-owned and every
+project in scope keeps a short test that supplies only DATA:
+
+```ts
+describeTapTargetFloor({
+  label: 'my-game',
+  assetsDir: ASSETS,    // walked RECURSIVELY for every *.scene.json and *.prefab.json
+  underFloor: [],       // MEASURED under 44 pt — each name needs a reason
+  unresolvable: [],     // an auto/`%` axis nothing here can size
+  expectAtLeast: 0,     // anti-vacuity
+});
+```
+
+⚠️ **It lives in the PACKAGE, not in `engine/tests/`.** A demo is published as a standalone snapshot
+(`scripts/publish-demo.sh`) carrying its own `tests/` and nothing else from the monorepo, so
+`@modoki/engine` is the only specifier it can name — the same constraint that put `resolveAnchorRect`
+on the runtime barrel.
+
+**The two lists are different questions, and merging them was measured wrong.** `underFloor` means an
+authored `px`/`vw`/`vh`/`vmin` axis really does resolve below 44 pt; `unresolvable` means the control
+has a `content`, `stretched` or `%` axis, so the scene file does not say how big it is. Court's
+`TutorialSkipNoticeConfirm` reads `62% x content` and measures **133 x 46 pt** live; wordweave's
+`DictionaryPrev` read `content x content` and measured **16.90 x 40.21 pt**. Same authored shape,
+opposite verdicts — the only honest answer for that shape is *measure it live*.
+
+Both lists are asserted as **set equality in both directions**, so the suite reds on a new
+under-floor control AND when a listed one is finally fixed, which must shrink the list deliberately
+rather than leave a stale constant behind.
+
+What the resolver owns, because each is an engine fact rather than per-game taste: the scene **and
+prefab** corpus walk; the four-outcome axis model (`pt` / `content` / `stretched` / `parent` —
+collapsing any two of them was a real defect twice in #1017); the six inert-`minTapSize` cases above;
+the population predicate; and the device matrix, derived from `DEVICE_PRESETS` rather than
+transcribed. What stays per-game is the exception list, because only the owner knows why a control is
+allowed under the floor.
+
+**Scope is the SHIPPING projects plus `demos/**`** (owner, 2026-09-10), plus `engine/templates/starter`
+so a scaffolded project is born covered. The fixtures and testbeds are exempt: enforcing 44 pt on a
+debug slider means inventing a value for a UI nobody ships.
+
+⚠️ **A project's own guard cannot see everything, and one of its lists says so out loud.** The
+resolver reads authored data only — it never resolves a parent chain to a real size, and it knows
+nothing about where a 2D board lands. `unresolvable` is that blind spot, enumerated.
+
+⚠️ **A placed prefab INSTANCE is measured as composed, never as its prefab's root (#1060).** A pooled
+cell (`level-page` placing 16 `level-tile`s, `daily-month` placing 42 `daily-day`s) is a ROW naming
+the child prefab plus `overrides` — no `traits.UIElement` of its own — and the runtime sizes each one
+as the child root PLUS that row's overrides (`effectivePrefabMemberTraits`, #1031). The resolver used
+to skip such rows and measure the cell once, from the prefab file, so resizing ONE tile in the Prefab
+editor passed the gate while that tile was 33 pt wide. Now `@modoki/engine/testing/prefabInstances`
+composes every member of every instance with the engine's own function and measures it TWICE — as
+placed (composed traits, composed parent chain continuing into the document that placed it) and as
+its prefab file measures it (standalone traits, a chain stopping at the prefab root). When the gate
+would CONCLUDE something different — a measured pt size, the blind-spot status, the scrim exclusion,
+zone coverage, the population predicates — the member becomes a control of its own, named by the
+instance's runtime name (`Tile3`, or `Tile3/Badge`, qualified by every nested row). Three consequences
+are deliberate: the corpus does not move until a placement changes a verdict (it did not move when
+this landed — 0 of 86 override rows touched `UIElement`); a deliberately LARGER instance passes rather
+than being refused for differing; and a cosmetic override (`opacity`) adds nothing, because a
+project's lists are set equality.
+
+⚠️ **Why VERDICTS and not fields — every narrower cut was measured wrong in #1060's close-out.** A
+member-only field diff missed an unchanged `100%` icon under a wrapper one placement resized to 24 px
+(the file's copy is a scrim, the placed one a 24 pt target in no list). An ancestor field diff
+re-listed children whose verdict could not move. A list of "fields the resolver reads" needed a source
+scan that missed other call spellings. And none of them saw an UNCHANGED placement under a small scene
+box. Sizes are compared EXACTLY — a rounded comparison called a 43.9996 pt instance of a 44 pt prefab
+unchanged. Three spawner facts the chain depends on: a member parented to a NESTED child's root is
+listed at the row that placed that child (`InstanceMember.parent` is an exact address, or the chain
+comes back empty); a top-level member authored with no parent hangs under the placing row's parent
+when a SCENE placed it but at the world root when a prefab did; and an ancestor that is itself a placed
+instance is read as its composed root (such a row normally carries no `UIElement` of its own, and a
+scene instance row keeps its `guid` at the top level, not under `EntityAttributes`). A `designPx`
+entry matches an instance member by its unqualified RUNTIME name — production finds design-px
+controls with `findByName` on the spawned entity, so a placement that renames a member moves it. Any other guard that sizes a pooled
+cell reads it the same way — Court's `levelSelectGeometry`, `dailyCalendarTarget` and `dailyCalendar`
+tests do. ⚠️ **Still not modelled:** a row's structural `added`/`removed` members, so a guard that
+needs a member to EXIST refuses those itself.
+
+#### The population is `UIAction` **and** `TouchControl` (#963)
+
+A sweep for tappables that keys on `UIAction` alone is **blind to every on-screen movement control**.
+`TouchControl` (`runtime/traits/TouchControl.ts`) is a separate trait for a control held as a LEVEL
+rather than clicked — a d-pad arrow, a hold-to-move button — and its own docblock says *"Do not reach
+for `UIAction` for this"*, because `UIAction`'s vocabulary is discrete events fired on release. So no
+`TouchControl` entity carries a `UIAction` in any scene today — nothing in the code FORBIDS both
+traits on one entity (`UINode` refuses `TouchControl` only on `input`/`range` and alongside
+`UIToggle`), so this is a fact about the corpus, not an invariant to rely on. `demos/forest-camp`'s
+entire D-pad was counted by nothing until #963. The 44 pt floor applies to both populations
+identically.
+
+**Enforced since #1024** — the shared resolver's `isTapTarget` takes either, so no project can
+inherit the blind spot by writing its own sweep. ⚠️ **Closing it changed no COUNT**: forest-camp's
+five controls are 48 px and clear the floor, so the rule was wrong while every number was right,
+which is the shape that ships. It also carries a consequence the `UIAction` half does not — see
+§ "Case 6 — a `TouchControl` gets no expander at all, and nothing warns".
 
 ---
 
@@ -1293,6 +2060,130 @@ longer has a `zIndex` field at all. A migration carries a truthy old `UIAnchor.z
 
 ---
 
+## Text overflow warning
+
+**In the editor and in a debug build, the runtime UI reports any element whose text paints outside
+a box that holds it** (#1126). A finding is recorded once per element per world. It shows up in
+three places:
+- a `[UIOverflow]` `console.warn`;
+- a `@ui.overflow` journal event at level `warn`;
+- `diagnose`'s `uiOverflow` block. A **current** finding fails `ok` there (owner, 2026-09-14).
+
+Decisions: `runtime/ui/uiOverflow.ts`. DOM measurement and scheduling: `runtime/ui/uiOverflowScan.ts`.
+
+**Why the layout lets it happen.** `cssVal` never emits `min-width: 0`, so every flex item keeps
+CSS's automatic minimum width, and shrinking stops at **min-content**. A single long word cannot
+wrap, so it overflows. `flexShrink` does not help. The two shapes the scan reports:
+
+| `kind` | what it looks like | measured against |
+|---|---|---|
+| `spill` | a content-sized child grows to its longest word and runs past its row (centred rows overflow on both sides) | the first enclosing UI element's padding box the text escapes (`boxEntityId`) |
+| `own-box` | a child with a definite `width` keeps it, and its text runs past that box | the element's own padding box |
+
+**Why a runtime check rather than a static budget.** The owner chose this shape on 2026-09-13.
+Where the string comes from does not matter to it:
+- an owner-authored config label;
+- a store-localized price;
+- a runtime number with no maximum.
+
+Only the first can be checked at test time, which is what #1119's
+`games/wordweave/tests/authoredLabelBudget.test.ts` does, and that gate stays. The limit is the
+other side of the same fact: **it fires only when the long string is actually rendered.**
+
+**What it deliberately does not report.** The walk compares the text's horizontal extent against
+each box, inside out, and stops early for these:
+- **Anything inside a horizontal scroll container** (`overflow: 'scroll'`). Its content extends
+  past it by design.
+- **Anything past an enclosing `overflow: 'hidden'` box.** That is also how a pager is built
+  (#743), and its off-page cards sit outside it legitimately.
+- **An authored `textOverflow: 'ellipsis'` running past the element's own box.** The author asked
+  for truncation.
+  - The ellipsis does **not** end the walk: what is still painted is the part inside the element's
+    box, and that part is compared with the boxes further out.
+  - So a 260px ellipsis box in a 200px row is still a `spill`. An ellipsis is the natural fix for an
+    overflow, and the first version let it hide one (close-out review).
+- **Anything past a scaled or rotated box.** It is compared itself, then the walk stops, because
+  its size on screen is not its layout size (a pop tween).
+  - The accepted miss: a row child with an authored `scale` that runs past its row.
+- **Where a PLACED element sits.** A placed element is `position: absolute`, or moved by a pure
+  translation, which covers every `UIAnchor` element.
+  - Past its own box, its painted **width** is compared with the **UI root's** width
+    (`boxEntityId: 0`, `boxName: '(UI root)'`, `overflowPx` = the excess width). Then the walk stops.
+  - Its host's width is not used: a corner badge overhanging its host and a caption under a 40px icon
+    are both authored on purpose, and comparing against the host flagged the caption (close-out review).
+  - A scroll view or `hidden` box further out still exempts it: anchored credits inside a scroll view,
+    a translated ticker inside a mask.
+  - Found by the live check: wordweave's anchored `AdBannerLabel`, given a long string at 360 wide,
+    painted 417px into a 358px-wide UI, and the first walk stopped at the anchor and said nothing.
+  - The accepted miss: a placed label wider than its host but narrower than the screen.
+- **Overshoot of 1px or less.** That is rounding between two laid-out boxes.
+
+**What counts as the text is its GLYPHS, not the boxes around them.** For each text node the scan
+measures every run of non-whitespace characters and takes the union of their line rects. Three
+things are left out, all measured by the close-out reviews in Chromium:
+- **A wrapper's box.** `AutoFitText`/`AnimatedText` spans are `display: block`, stretched to the host.
+- **Hanging whitespace.** In `pre-wrap` (those same spans), a space at the end of the string or at a
+  soft wrap hangs past the box. 9 of 60 wrapped sentences read as false 1.6-4.3px overflows before
+  only the runs were measured.
+- **A text animation's shake.** Pure translations on elements between a text node and its element
+  are subtracted, at that element's OWN scale (a scaled host shakes further on screen). So the glyphs
+  are measured where they are laid out, not where the animation holds them this frame. Before that,
+  `jitter` read as a 1-3px own-box overflow on 13 of 20 samples, and it flickered `current`.
+
+**The element's own clip is where its wrapper cuts.** UINode puts the ellipsis/clamp
+`overflow: hidden` on an inner wrapper, inside the host's padding, so the own box takes the wrapper's
+edges. A padded ellipsis box whose clip is flush with its row is not a spill.
+
+A per-character scale (a typewriter pop) is not subtracted. A glyph caught mid-pop can briefly read
+wider, which is part of what the confirmation pass is for.
+
+**Truncation is reported.** Text cut off by the element's own clip (`overflow: 'hidden'`, a
+`maxLines` clamp, an auto-fit floor) is a finding with `clipped: true`. Per #1125's ruling, a cut-off
+price is worse than a small one.
+
+**`current`** means overflowing in the **latest** scan. A later pass that does not see it overflow
+flips it to `false`: the author widened the box, the count went back down, or the element is no
+longer rendered (a closed screen paints nothing). `diagnose` then lists it without failing `ok`. So
+a fix made in the running editor reads as fixed without a reload, and a toast that overflowed once
+does not pin `ok: false` for the rest of the world.
+
+**When it runs.** It is one pass over the GameView's runtime UI root. It never runs in SceneView's
+preview, which is a second mount of the same tree at a simulated size. A pass is coalesced to one
+per 200ms and is triggered by:
+- a DOM child or text change (a bound `{coins}` changes only a text node);
+- a UI tree rebuild;
+- the root resizing;
+- a web font finishing loading.
+
+A finding needs a **second pass** that still sees it before it is recorded, so a label measured
+before `AutoFitText` converges is not a false alarm.
+
+⚠️ **Style-attribute changes are NOT observed.** A tween writes style every frame, and observing it
+would make the scan continuous on the debug device builds perf is measured on. A binding that moves
+only a style, with no tree rebuild and no text change, is seen on the next pass something else
+triggers. For the same reason, a CSS animation never triggers a pass on its own.
+
+⚠️ **Text that changes every frame costs a pass every 200ms**, for example a timer or an FPS readout.
+Within a pass, computed boxes and translations are cached per element. The cost on a low-end debug
+device (Galaxy A23) has **not been measured**; measure it before trusting a profile taken with the
+check on.
+
+**Coordinates are CSS px of the UI.** Rects are screen px and transform-aware, so every edge is
+divided by the root's own screen/layout ratio. Without that, the editor's scaled preview would
+report an authored 120px row as 60px. The e2e spec measures under a `scale(0.5)` for exactly this.
+
+**Gate.** `setUIOverflowCheckEnabled` is called by `engine/app/main.tsx` with
+`__MODOKI_EDITOR__ || __MODOKI_DEBUG_BUILD__`, the journal's pair. It is not `import.meta.env.DEV`,
+which is false in a debug *device* build, and real fonts and store strings live there. A release
+build installs no scan.
+
+**Tests.**
+- `engine/packages/modoki/tests/runtime/uiOverflow.test.ts`: the decisions, the confirmation pass,
+  the store, and the scan wiring with the DOM measurement stubbed.
+- `uiRenderer.test.tsx`: where the scan is installed.
+- `engine/tests/framework/diagnose.test.ts`: the verdict.
+- `engine/tests/e2e/game-view-ui-overflow.spec.ts`: the real measurement (jsdom has no layout).
+
 ## Projection & the dirty flag (no per-frame work)
 
 The UI tree is **not** rebuilt every frame. `useUIEntities()` is a thin Zustand
@@ -1402,6 +2293,109 @@ offset bug survived. So that suite also asserts the resolved rect outright (a 5%
 `bottom-stretch` band must measure x=5%, w=90%), not just that the two paths match.
 
 ---
+
+## Screen bands (`solveBands` + `ScreenBand`)
+
+A **band** is an authored claim on vertical space: `minHeight` is a floor it never goes below, and
+`flex` is its share of whatever height is left once every floor is paid (`flex: 0` is rigid). A game
+authors one `ScreenBand` entity per band and solves the stack into design-space extents.
+
+The point of the model, rather than a chain of subtractions, is that it makes **which band absorbs a
+per-device reserve an authored decision instead of an accident of arithmetic**. Both shipping games
+have exactly that reserve — the ad banner — and it swings 18-178 design px across the device set. In
+a subtraction the residual band silently paid all of it; with `flex`, whoever holds the flex pays,
+and moving it is an Inspector edit.
+
+- **`solveBands`** (`runtime/core/screenBands.ts`) is L0 arithmetic: no world, no traits, nothing
+  imported. Generic over the role string, so each game keeps its own role union end to end.
+- **`readScreenBands`** (`runtime/ui/readScreenBands.ts`) reads the authored stack out of a world.
+- **`ScreenBand`** (`runtime/traits/ScreenBand.ts`) is the trait schema.
+
+⚠️ **The reserve is subtracted BEFORE any band is paid, because it is not a band** — it is not
+authored at all, it is a per-device measurement, so it cannot take part in the flex split. A rigid
+band's height must therefore never move with the reserve.
+
+⚠️ **Every band's `minHeight` must already be RESOLVED by the caller.** A game whose floor is a
+measured quantity (Court's top band is its measured caption bottom) substitutes the number first.
+That is what keeps the solver pure arithmetic and testable without a renderer.
+
+⚠️ **`accept` and `require` are separate lists.** A role outside `accept` is skipped, never coerced;
+a missing `require` role refuses the whole authored stack in favour of the caller's fallback, because
+half an authored stack mixed with half a code one is the hardest version of this to diagnose. The two
+lists differ per game — Court requires all four of its roles, wordweave only `crossword` and `board`
+of its five.
+
+⚠️ **The engine does NOT register `ScreenBand`; each game does, with its own fields.**
+`registerTrait` silently evicts a previously-registered Trait object when the same name arrives with
+a different one, and nothing lets a game attach Inspector metadata to an engine-registered trait. So
+a game imports the trait object and calls `registerTrait` itself with its own role vocabulary and
+tooltips. Registering it in the engine would delete it from the registry with no diagnostic.
+
+⚠️ **`role` defaults to `''` deliberately** — a scene save omits every field equal to its trait
+default, so a real role name as the default would delete that band's identity on the next save.
+Because that default is reachable, **a band still holding `''` is REPORTED** (#1089): it means a band
+was dropped in the Inspector and never named, which `require` structurally cannot detect, since no
+declared role went missing.
+
+### Who judges a mis-authored stack (#1089)
+
+**`readScreenBands` is the one place a stack is judged. Downstream code may absorb a bad stack; it
+does not get to decide whether one is worth mentioning.** Four sites had four different policies —
+`panels()` threw, the reader warned, and two others returned silently — so whether a mis-authored
+stack told you anything depended on which function noticed it first.
+
+⚠️ **This states the rule; it does not unify the sites.** `panels()` still throws on an absent
+crossword or board (a missing panel has no sane rectangle, and a throw is right there);
+`giveBoardSlackToCrossword` still returns its input unchanged; `solveBands`' own `byRole` still
+keeps the first of a duplicated pair without comment. What changed is that the reader now catches
+each of those upstream, so the silent branches are no longer the only thing standing between an
+author and a wrong layout.
+
+| Authoring mistake | What happens | Falls back? |
+|---|---|---|
+| A required role is missing | reported, naming the consequence | **yes** — wholesale |
+| Two bands claim the same role | reported; the duplicate is dropped before the solver | no |
+| A band has no role picked (`''`) | reported | only if it leaves no usable band |
+| A `requireOrder` pair is stacked the wrong way | reported | no |
+| A role outside `accept` | **silently skipped** — deliberate | only if it leaves no usable band |
+
+⚠️ **The table describes a world that authors at least one usable band.** A world with none — a
+headless `createTestWorld`, a scene predating the authoring surface — is the *no-scene* case: it
+takes the fallback and reports NOTHING, deliberately, or every headless test in the repo would warn.
+That is why rows 3 and 5 fall back only "if it leaves no usable band", and why row 1 does not fire
+for an empty world even though such a world is missing every required role.
+
+Two rules hold the rest together. **Report, but do not refuse, what is merely degraded**: only a
+missing required role justifies discarding every authored value for the caller's fallback. And
+**an out-of-vocabulary role stays silent on purpose** — a game may carry a decorative band this
+reader is not meant to know about, which is the whole reason `accept` exists.
+
+⚠️ **The caller's warn latch must be per MESSAGE, not per world.** Both games latch to keep a
+per-frame read from flooding the console, and a per-world latch looks equivalent — it is not, once
+`role: ''` became reportable. Every band a human adds passes through that state, so the transient
+mistake fires first and closes the latch, and the durable problem discovered a minute later is
+swallowed for the life of the world. In Court the same latch also carries the zero-height-board
+diagnostic, so the cost was a blank board with an empty console.
+
+⚠️ **`requireOrder` is a stacking dependency the GAME declares** — EVERY pair in the list, not just
+adjacent ones (with `['a','b','c']` and `b` absent, a consecutive-only walk would never compare `a`
+with `c`), and checked only when both of a pair's roles are present. An `order` TIE counts as broken:
+`solveBands` sorts by `order`, ties are unspecified, so equal orders leave the sequence falling out
+of entity spawn order. Every role listed must also be in `accept`, or its pair is indistinguishable
+from an absent band and the dependency is unenforceable. wordweave passes `['crossword', 'board']` because its board-slack transfer
+(#1080) is a silent no-op when the board is authored above the crossword — and `order` is an
+ordinary Inspector field, so a drag in the editor is enough to switch the mechanism off. It is
+**not** the deleted `stampOrder`: that WROTE `order` onto authored data and gave `accept` a second
+meaning as a sequence; this only reads the authored order and reports on it.
+
+⚠️ **Every problem found in one read goes in ONE message.** The latch above is per message, so two
+faults reported separately would be two messages and both would survive — but they would also be
+two console lines a frame apart describing one broken stack, and the first one read would look like
+the whole story. Assembling them means the reader sees the stack's full state at the moment it was
+judged, rather than the first thing that was wrong with it.
+
+Extracted in #800 from two independently-written, arithmetically identical copies (wordweave #773,
+court #791); `engine/tests/architecture/screenBandsAreShared.test.ts` fails a third.
 
 ## Directional focus navigation (controller / keyboard)
 
@@ -1725,6 +2719,52 @@ failure, missing endpoint or malformed body — never `[]` — and the note stay
 only ever ADDS information and never disables a field, so silence on no evidence is the correct
 failure direction. (Same rule `makeTexture2D.textureRefCount` already states for its own count.)
 
+⚠️ **THE PIN IS A LOSSY OVERWRITE, so a guard that asks "did an author write this?" must read the
+PREFAB — never the pooled entity's own `UIElement`** (#1026). `applySlots` writes the resolved box
+back onto the row root (`entity.set(uiMeta.trait, {...ui, ...pinned})`) — values *and units* — so
+by frame 2 the trait no longer records what anyone authored. Every warning above therefore reads
+`EntryPrefabProvider.rootAuthoredUI`, resolving an absent field against the trait's own schema
+default (a prefab save strips any field equal to its default, so absent means "never touched").
+
+Two fields provably answered wrong before that, and they share one property — **their pin is not a
+constant**:
+
+| field | why the live trait lies about it |
+|---|---|
+| `width`/`height` | the pin forces `widthUnit`/`heightUnit` to `px`, and that unit is the exact discriminator `pooledSizeNeedsWarning` reads to grant the documented `%` exemption. So the exemption died on frame 1 for every pooled row. Court's `DailyMonth` authors `100%` and printed `authored UIElement.width=308px` — value and unit both written by the pool. |
+| `isVisible` | pinned to the slot's varying `live` state. A slot pinned parked leaves `false` on its trait; the tick it scrolls into the window, `false !== true && false !== true` warns about authoring that never happened. |
+
+The other eleven pinned fields were never exposed (a constant pin, so `cur === pinned` once
+written) but read the authored operand too — the next field added to `POOLED_ROW_PINNED_GROUPS`
+with a varying pin would otherwise reintroduce this in silence, which is exactly how #761 happened.
+
+⚠️ **This class is invisible to a single-tick test.** On the first tick the spawned trait still
+carries the prefab's values, so the defect cannot appear; the suite that shipped it had a test
+named *"stays SILENT for an authored PERCENT width"* that passed on the broken tree for precisely
+that reason. **A pooled-row authoring test must tick at least twice, with the pin's own value
+changing in between.** Related bound: `warnAuthoredOverride` is warn-once per `viewGuid:slot:field`,
+so a slot that starts live warns immediately and is then permanently quiet — an accept-side test
+has to reach `live` on a slot that has never warned (a small `countY` leaves the tail of the window
+parked on first sight).
+
+The write-back itself is CORRECT and stays: it is what makes the box definite, which is what a
+`%`-sized root needs under an auto-width row, and the DOM renderer reads the trait. Removing it
+would need a parallel pin channel from `entriesSystem` to `UIRenderer` — a real option, and a
+larger change than this was.
+
+⚠️ **Two bounds on the authored operand, both worth knowing before trusting a silence.**
+- **A nested-instance prefab root reports NO authoring** (#1031): `rootAuthoredUI` reads the prefab
+  FILE row's own traits, so a root whose `rootLocalId` names a row carrying `entry.prefab` answers
+  `undefined`, every field collapses to its schema default, and the warnings go silent — including
+  the real `200px` trap. Latent (all six entry prefabs in `games/` are plain roots) and shared with
+  `rootSize`, which reads 0 for the same reason. ⚠️ **Do not "fix" it by falling back to the live
+  trait** — that is the defect above, wearing a rescue.
+- **A source can write the row ROOT.** `splitMemberPath('')` returns `[]`, so an entry source
+  addressing the empty member path writes the root's own `UIElement`. Its value is neither authored
+  nor the pin, and the warnings correctly name the PREFAB's value rather than the source's — which
+  is also the only observable difference between reading the authored record and the live trait for
+  the DISPLAY string, and therefore the only thing that can mutation-check that half.
+
 ### Measured on the low-end target
 
 Galaxy A23 (Mali-G57 MC2), the shipped web build of `games/scroll-demo`, driven by real touch
@@ -1796,9 +2836,10 @@ and the prefab's did not — on the one branch whose entire purpose is deferring
 future call site silently keep the bug) and both branches convert through one shared helper, so
 the view's axis and the prefab's axis cannot drift apart again.
 
-⚠️ **An ABSENT unit here means `%`, not px** — every `UIElement` length unit defaults to `'%'` and
-a save strips a field equal to its default, so number-with-no-unit is the ordinary on-disk shape
-for a percentage. `wordweave`'s `dictionary-card` root is exactly that (`width: 100` with no unit
+⚠️ **An ABSENT unit here means `%`, not px** — `width`/`height` default their unit to `'%'` (per field,
+not for every length: `gap` and `min*`/`max*` default to `px`; the one table is
+`runtime/traits/uiLength.ts`, #840) and a save strips a field equal to its default, so
+number-with-no-unit is the ordinary on-disk shape for a percentage. `wordweave`'s `dictionary-card` root is exactly that (`width: 100` with no unit
 keys, i.e. `100%`); it never tripped the bug only because `DictionaryPager` authors both axes
 explicitly at `100%`, so the `0` branch is never taken. Deleting those two redundant fields — which
 is precisely what the single-source-of-truth rule above tells an author to do — would have turned
@@ -1809,6 +2850,23 @@ one test touching the real one (`resourceRefcount.test.ts`) said so in its own d
 now fixtures driving the REAL `entryPrefabProvider.rootSize` against a `%`-unit root, a no-unit-key
 root and an explicit-px root. A fake that models behaviour the real dependency lacks makes the
 guard defend the bug.
+
+⚠️ **"The prefab root" means the root a spawned instance would HAVE, not the root row in the file**
+(#1031). When that row is a nested-instance reference, its own `traits` hold little more than
+`EntityAttributes`; the size is the child prefab's root plus the row's overrides. The provider and
+the validator both resolve it through `effectivePrefabRootTraits`, which mirrors the spawner — see
+[prefabs.md](prefabs.md) § Nested prefabs — and a root that cannot resolve (its child not cached
+yet) reports the prefab **not cached**, so the never-caches warning names it instead of the view
+silently sizing to 0.
+
+⚠️ **On a delegated axis only `px` and `%` survive — a viewport unit is REFUSED** (#840, owner
+decision). The row resolves against the scroll view, and nothing on that path can see the device
+viewport, so a root authored `50vh` has no honest answer; before #840 it was folded into `%` and read,
+silently, as 50% of the VIEW. Now `rootSize` reports that axis as 0 and names the unit
+(`refusedWidthUnit` / `refusedHeightUnit`), the pool warns once per view per axis — only when the view
+actually delegates it — and the validator reports it at author time as `is unsupported`. The fix is
+px/% on the root, or a non-zero `entryWidth`/`entryHeight` on the view. Supporting viewport units here
+would need a device-viewport seam into `entriesSystem`, which was considered and declined.
 
 ### Motion is CSS, and the vocabulary matches
 
@@ -1834,6 +2892,103 @@ coordinates (the system converts, since it is what resolves entry size); the dec
 `ui.scrollTo` action does the same from a button with no game code. Both are exercised by
 `games/scroll-demo`'s strip scene — two authored buttons, one `instant` and one `smooth` — and,
 since #316, by Court's level-selector arrows, which is the first caller in a SHIPPING game.
+
+### Stepping counts from the REQUEST; snapping counts from the POSITION
+
+A stepping API (`scrollByEntry`) and a snapping one (`snapToNearest`) ask different questions, and
+answering both from live scroll is one defect that has now been found four times — #672
+(wordweave's dictionary arrows), #768 (Court's level-select and daily-month arrows), #1010 (the
+engine helper both of them route through) and #1019 (both games' own reads, blind to stage 2).
+
+**A request outlives the scroll, in two stages**, and live scroll lags both:
+
+| stage | state | cleared by |
+|---|---|---|
+| 1. entry-space | `UIEntries.scrollToEntry*` ≥ 0 | `consumeEntryRequest`, on the next system tick |
+| 2. px-space | `UIScrollView.scrollTo*` ≠ -1 | `clearScrollRequest`, once `UINode` has applied it |
+
+So two steps issued inside one frame both read the same offset, both compute "I am on entry N",
+and the second overwrites the first with an identical request: **two notches, one entry moved** —
+and `scrollByEntry` returns `true` for the one that did nothing. Measured on Court's level
+selector (2026-09-09): 0 ms gap deterministic, 30 ms a coin flip, 60 ms and up always fine —
+⚠️ **in the editor GameView on desktop Chromium and nowhere else.** No device has been measured,
+and `games/court/menu.md` records the figure as UNRESOLVED against the ~86-frame smooth-scroll
+number below: the two count different things (when the offset crosses the halfway point that flips
+the rounding, vs how long the animation runs). Do not repeat either without that qualifier.
+
+`scrollByEntry` therefore counts from stage 1, then stage 2, then live. **`snapToNearest`
+deliberately keeps reading live** — "which entry am I nearest" is a question about where the view
+IS, and honouring a pending request would re-issue a jump the viewer has already been carried most
+of the way through. Do not "make these consistent"; a test pins the difference.
+
+#### A caller that computes its own destination asks `entryIndexOf` — it must not hand-roll this
+
+**`entryIndexOf(viewGuid, axis)` is the READ half of that precedence, and it is public for exactly
+one reason: keeping it private produced #1019.** `scrollByEntry` decides its own destination, so a
+pager that clamps against a population the engine cannot see — Court's ladder length, wordweave's
+dictionary count, which grows while the panel is open — cannot use it and needs the number instead.
+Both games therefore wrote their own "is a request pending" read, and **both stopped at stage 1**:
+one system tick after the tap, `consumeEntryRequest` had cleared stage 1, each helper answered "no
+request", and each fell back to a live mirror that still reported the entry being LEFT. That is
+#768's and #672's swallow, one stage later, in the code that closed them.
+
+- It returns the same `currentEntryIndex` precedence `scrollByEntry` uses — **not a second
+  implementation**, which would be the same defect one layer down.
+- **It does not clamp.** The caller bounds the answer against its own population.
+- **`null` means "cannot answer", never entry 0** — an unknown guid, an axis the view does not
+  scroll, or nothing pending with no way to convert the live offset (no usable stride, no entries).
+  A caller keeps its own fallback for that; answering 0 during scene load teleports a pager to the
+  top of a list the player was partway down.
+- ⚠️ **Stage 1 is answered before the stride and count gates**, because it is already in entry
+  coordinates. This is not a micro-optimisation: a pager issues its OPENING request on the first
+  frame it is shown, which is exactly when the entry prefab is uncached and the source has published
+  nothing — `consumeEntryRequest` keeps that request pending on purpose. The first version of the
+  accessor gated the whole function on `usableStride`; Court's #768 suite is what FOUND that, but it
+  can no longer see it (its fixture publishes a stride now, so every case there has a usable
+  window). The one guard on the ordering is `entriesSystem.test.ts`'s "answers a stage-1 request
+  even when the view has NO usable window yet" — do not delete it as redundant.
+
+⚠️ **What this does NOT cover: the glide.** Once `UINode` has issued the DOM `scrollTo` with
+`behavior: 'smooth'`, both stages are clear and `scrollX` eases to the target over ~86 frames, so a
+step landing mid-glide still counts from an intermediate position. Nothing in trait state separates
+"gliding toward entry N" from "the viewer is dragging", and inventing that state buys a new
+staleness bug. The only shipping caller — `UINode`'s wheel handler — is covered by its
+`WHEEL_GESTURE_GAP_MS = 140` latch, which is a **latch, not a guarantee**: the next caller inherits
+the gap with no protection at all. Known and left open.
+
+### `UIEntries.strideX/strideY` — the resolved stride, published
+
+`entriesSystem` publishes the stride it actually used (`entrySize + gap`, per axis, px) alongside
+the rest of the window readback. **0 means "not resolved yet"** — no viewport, or a prefab root
+whose size is still uncached — and a caller must refuse rather than treat it as a usable window.
+
+⚠️ It is published because `scrollApi` was **recovering** it as `viewport / (visible - 1)`, a second
+derivation of a number the system already had. That is the shadowing-constant class from
+[CLAUDE.md](../CLAUDE.md)'s single-source-of-truth table, and it is exact only when the viewport is
+a whole number of entries: at a 600px viewport with a 250px entry, `visible` is `ceil(2.4) + 1 = 4`,
+so the recovery yields **200 against a true 250** — and a stepping API divides by it precisely at
+the entry boundary it is deciding. Read the field; do not re-derive it.
+
+Retiring the recovery also removed an accidental guard — **two of them, and the first fix restored
+only one.** `visible` is bounded by the entry count, so `visible <= 1` was silently refusing both a
+step on an axis the view does not scroll AND a step on an axis with fewer than two entries. Each is
+now an explicit test in `scrollByEntry` (`axis`, and `count > 1`). What the second one buys is not
+a request for a nonexistent entry — the step clamp below makes that impossible — but the fact that
+entry 0 is still a *request*: on a single entry taller than its viewport it yanks a viewer reading
+the bottom back to the top, and the `true` latches the wheel handler for 140 ms.
+
+⚠️ **A step is also clamped at the TOP now** (`count - 1`), which the old live-scroll read did not
+need: re-reading the live offset every time meant repeated steps at the end of a list kept
+computing the same index. Counting from the request removes that self-limit, and five in-frame
+steps on a ten-entry list walked the request one past the end. `count - 1` is the last entry that
+EXISTS, not the furthest the view can scroll — on a list the two differ, and the DOM clamps the
+remainder. **A step the clamp absorbs returns `false`**, so a caller at the end of a list gets the
+signal that nothing moved instead of latching its gesture on a `true`.
+
+`snapToNearest` carries the same clamp for a different reason: `Math.round(scroll / stride)` rounds
+UP past the last entry whenever the viewport is shorter than one entry, so a `countY: 1` view with a
+600px entry in a 300px viewport used to snap to entry 1. It clamps rather than refusing — unlike a
+step, a single entry is a legitimate snap target.
 
 ⚠️ **The per-request `behavior` and the authored default are TWO fields, and must stay two**
 (#409). `UIScrollView.scrollBehavior` is authored; the request rides the `runtimeOnly`
@@ -1941,12 +3096,15 @@ rebuild and is never per-frame.
   which is a separately-computed quantity. This is deliberate, not an oversight: they are also the
   intended source for the extent-derived features a pooled view cannot supply — a scrollbar thumb
   (`viewport / content`), edge fades, a "can this scroll?" affordance, scroll-to-end, near-the-end
-  prefetch, and the upper clamp `scrollByEntry` still lacks — it clamps at `0` only, so a wheel past
-  the last entry arms a request off the end, `consumeEntryRequest` hands that target back, and
-  **this frame's pooled window is planned for a place the view never reaches** before the DOM clamps
-  the offset. The view lands right; the pool spent a frame elsewhere, and nothing in the engine can
-  answer "already at the end" for a caller wanting to grey the arrow out (Court's `level-page`
-  handler clamps for itself with `clampPage`). All of those are `content − viewport`, and on a
+  prefetch, and a true "already at the end" signal. ⚠️ **This used to say `scrollByEntry` lacked an
+  upper clamp and that an over-range request cost the pool a frame — both are now false** (#1010).
+  It clamps to `count - 1`, and even before that the window could not be planned somewhere the view
+  never reaches: `entriesLayout` bounds `first` at `count - pooled`, and `entriesSystem` measures
+  travel from LIVE scroll rather than from the request target, so an over-range target produces a
+  byte-identical window. What is still missing is the END signal itself — `scrollByEntry`'s `false`
+  means "armed nothing", which also covers a view that is merely not ready yet, so a caller greying
+  an arrow out on it would grey it during scene load (Court's `level-page` handler clamps for itself
+  with `clampPage`). All of those are `content − viewport`, and on a
   `UIScrollView` carrying **no** `UIEntries` there is no other source for it.
   ⚠️ **Scope the measurement to one owning tree before building behaviour on them** — they come from
   whichever of the two editor mounts fired, which is exactly the mixed-measurement hazard above.
@@ -2053,9 +3211,14 @@ frame budget are different questions and the Air answers only the first.
   let a trackpad's continuous stream re-fire and reintroduce the runaway. Default is `'native'`
   because a long LIST wants the raw delta; capping a 5,000-row strip to one row per gesture would
   be unusable. **Touch is unaffected either way** — a swipe is not a wheel event.
-- `scrollByEntry(viewGuid, {x|y}, {behavior})` is what backs it: "move one entry from wherever I
-  am", the same window arithmetic `snapToNearest` does plus a delta. A caller cannot compute it
-  itself — the engine publishes no resolved entry stride, and `firstX` is the first POOLED entry.
+- `scrollByEntry(viewGuid, {x|y}, {behavior})` is what backs it: "move one entry from where I was
+  last SENT". A caller cannot compute it itself — `firstX` is the first POOLED entry, which
+  overscan puts an entry before the visible one. It is gated on `UIScrollView.axis`, so a step on
+  an axis the view does not scroll refuses rather than arming a request for entry 0 — which is
+  clearable, but cancels an in-flight smooth scroll on the axis that does move.
+
+  ⚠️ **It does NOT do the same arithmetic as `snapToNearest`, and the split is the point** — see
+  "Stepping counts from the request, snapping counts from the position" below.
 - ⚠️ **`scrollbar: 'hidden'` when the box is sized to fit its content exactly.** A classic
   scrollbar takes ~15px off the CROSS axis, and mobile's overlay scrollbars take none — so
   authoring the box bigger to compensate leaves a gap on the platform that ships. Court's page
@@ -2490,8 +3653,10 @@ The four parts are a **package** — any one alone still leaves the old face ren
    collision log against the font's own previous self).
 2. **The URL is cache-busted** — `withCacheBust(assetUrl(path), getAssetEntry(path)?.hash)`,
    matching `fontUrls()` in the SDF sibling. Without it the refetch is served the cached bytes and
-   the reload is a no-op. Like its sibling this is a **no-op in dev** (the Vite dev server does not
-   cache), so it is the production half of the fix; the editor half is (1) and (3).
+   the reload is a no-op. ⚠️ This used to read "like its sibling this is a **no-op in dev** … so it
+   is the production half of the fix"; that gate was removed in #1022 and the bust now applies
+   wherever a hash is known, so it is part of the editor path too. (1) and (3) are still what evict
+   the registry and the old `FontFace`, which no URL change can do.
 3. **The old `FontFace` is deleted from `document.fonts`** — the browser owns a face until
    something removes it, so re-adding alone leaves the stale one registered. A `faces` map keys the
    live face per path, and the delete happens in `doLoadFont` **immediately after the replacement is
@@ -2737,30 +3902,12 @@ variant meant for the PixiJS/Scene2D path, which the DOM can't decode. Always go
 
 ---
 
-## Custom React UI per game
+## Game UI layer and store hooks
 
-Sometimes a game's UI is easier to write as a hand-authored React component than as ECS
-entities (chat transcripts, a chessboard, etc.). A game's `GameDefinition` (exported as
-`game` from its `game.ts`) may set an optional `UIComponent`:
-
-```ts
-UIComponent?: React.LazyExoticComponent<React.ComponentType> | React.ComponentType;
-```
-
-When set, the app renders this component **instead of** the default ECS `UIRenderer`.
-The component takes **no props** — it reads Zustand stores and ECS queries directly.
-Lazy-load it to keep it out of the main bundle:
-
-```ts
-UIComponent: React.lazy(() =>
-  import('./chess/runtime/ui/ChessGameUI').then(m => ({ default: m.ChessGameUI })),
-)
-```
-
-`app/App.tsx` wires it up: the custom UI is wrapped in a `GameUIErrorBoundary` whose
-fallback is `DefaultGameUILayer`, inside a `<Suspense>` — so if the custom UI crashes or
-is still loading, the default ECS UI takes over. Games currently using it: **llm-test**
-(`LLMGameUI`) and **chess** (`ChessGameUI`).
+Every game's HUD and menus render through `DefaultGameUILayer` (`app/ui/DefaultGameUILayer.tsx`),
+which mounts the ECS-driven `UIRenderer`. There is no per-game React UI override: the
+`GameDefinition.UIComponent` hook that let a game replace the layer was removed in #1194, after
+its only two users (`chess`, `llm-test`) were deleted in #1191.
 
 ### Store-hook injection (`addStoreHook` / `removeStoreHook`)
 
@@ -2769,8 +3916,8 @@ is still loading, the default ECS UI takes over. Games currently using it: **llm
 dynamic number of `useStore()` calls, games register their stores up-front via
 `addStoreHook(hook)` / `removeStoreHook(hook)`; the layer remounts (via a `version` key)
 when the hook set changes and calls each hook. This lets multiple games contribute store
-fields to the shared UI bindings without prop-drilling. (Source: `games/CUSTOM_UI.md`,
-verified against the game's `game.ts`/`runtime/setup.ts` and `app/App.tsx`.)
+fields to the shared UI bindings without prop-drilling. `games/space-console/runtime/CameraManager.ts`
+is the live example: it adds its selector in `init()` and removes it in `dispose()`.
 
 ---
 
@@ -2855,4 +4002,4 @@ never routes through `applyBindings`. Sliders are unaffected either way — a ra
 | Text animation | `runtime/traits/TextAnimation.ts`, `runtime/ui/uiTextAnimation.ts`, `runtime/rendering/text/textAnimate.ts` |
 | Nine-slice image + editor | `runtime/ui/NineSliceImage.tsx`, `editor/panels/NineSliceEditor.tsx` |
 | Fonts (FontFace loader / MSDF convert / settings) | `runtime/loaders/fontLoader.ts`, `plugins/font-convert.ts`, `runtime/core/fontSettings.ts` |
-| Custom game UI | game's `game.ts` (`UIComponent`), `app/App.tsx`, `app/ui/DefaultGameUILayer.tsx` |
+| Game UI layer + store hooks | `app/ui/DefaultGameUILayer.tsx`, `runtime/ui/storeHooks.ts` |

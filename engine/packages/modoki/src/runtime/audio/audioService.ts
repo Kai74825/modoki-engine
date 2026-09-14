@@ -14,11 +14,17 @@
  *  still letting a test assert *what would have played* (`getAudioLog()`), with no
  *  dependency on the journal being enabled. */
 
+import { notifyListeners } from '../core/notifyListeners';
 import { getAudioContext, hasAudioSupport } from './audioContext';
 import { audioAssetProvider } from './audioAssetProvider';
+import { hasDocKey } from '../core/docKeys';
+import { warnVocabOnce } from '../core/warnVocab';
 function retryFailedAudioDecodes() { audioAssetProvider.get()?.retryFailedAudioDecodes(); }
 
-export type BusName = 'master' | 'music' | 'sfx' | 'ui';
+/** The mixer's buses — the ONE list. Enum pickers spread it rather than typing the four names out
+ *  again beside the table they must agree with (#1074; `docs/format-versioning.md` § 4b-ter). */
+export const BUS_NAMES = ['master', 'music', 'sfx', 'ui'] as const;
+export type BusName = typeof BUS_NAMES[number];
 
 export interface AudioPlaySpec {
   /** Decoded buffer (loadType 'buffer'). Mutually exclusive with `url`. */
@@ -215,8 +221,37 @@ export function setAudioMuted(m: boolean): void {
 }
 export function isAudioMuted(): boolean { return muted; }
 
+/** ⚠️ Every caller NORMALISES first — `resolveBus` on the two playback paths, an outright
+ *  refusal in `setBusVolume` — so this index is total and needs no guard of its own (#993). Do not
+ *  add one: a third check over one table is what let `loaders/primitives.ts` disagree with itself.
+ *
+ *  ⚠️ This claim has ROTTED once and been FAKED once. It said "the playback path", singular,
+ *  while `attachMediaElementToBus` passed `VideoPlayer.bus` raw; the fix for that then cited a
+ *  test file that had never existed on any branch — propping up "do not add one" with nothing.
+ *  `tests/runtime/audioBusVocabulary.test.ts` exists now and SOURCE-SCANS this file: every
+ *  `busNode(` call must pass `resolveBus(…)` or a code literal, with exactly one named exception
+ *  (`setBusVolume`, which returns first), and it goes red on a fourth caller rather than
+ *  absorbing it. */
 function busNode(g: Graph, bus: BusName): GainNode {
   return bus === 'master' ? g.master : g.buses[bus];
+}
+
+/**
+ * Normalise an authored `AudioSource.bus` to a bus the graph actually has.
+ *
+ * ⚠️ `AudioSource.bus` LOOKS like a union but its declaration is a cast on a default
+ * (`bus: 'sfx' as 'master'|'music'|'sfx'|'ui'`) and the value is read straight off the trait, so a
+ * scene carrying `bus: "constructor"` used to reach `busNode` and make `tail.connect(Object)`
+ * throw "Failed to execute 'connect' on 'AudioNode'" — killing that entity's audio (#993).
+ *
+ * Falls back rather than refusing, because the alternative on this path is SILENCE: a typo'd bus
+ * should still play. `setBusVolume` makes the opposite call deliberately — see its comment.
+ */
+export function resolveBus(bus: string | undefined): BusName {
+  if (bus === undefined) return 'sfx';
+  if (hasDocKey(busVolumes, bus)) return bus as BusName;
+  warnVocabOnce('audio', 'AudioSource.bus', bus, "treated as 'sfx'");
+  return 'sfx';
 }
 
 // Last-set bus volumes — tracked in BOTH live + record mode so a graph recreated
@@ -264,7 +299,14 @@ export function attachMediaElementToBus(
     gain.gain.value = volume;
     const src = g.ctx.createMediaElementSource(el);
     src.connect(gain);
-    gain.connect(busNode(g, bus));
+    // ⚠️ `resolveBus`, NOT the raw field (#993 close-out § 2d). `VideoPlayer.bus` is declared
+    // `'sfx' as 'master'|'music'|'sfx'|'ui'` — the same cast-on-a-default that made
+    // `AudioSource.bus` unsafe — and reaches here through `videoService.attachMediaElementToBus`
+    // as `spec.bus ?? 'sfx'`, which never fires for a prototype name. Unfixed, `connect(Object)`
+    // threw into the bare catch below AFTER `createMediaElementSource` had already redirected the
+    // element's audio into the graph: the video then played SILENTLY, with no log line anywhere,
+    // and `busRoute` was null so `setVolume` was a no-op.
+    gain.connect(busNode(g, resolveBus(bus)));
     return {
       setVolume(v: number) { gain.gain.value = v; },
       detach() {
@@ -288,9 +330,7 @@ export function resume(): void {
   // `hasAudioSupport()` is false) the signal never fired at all. Harmless for audio,
   // since there is nothing to unlock — but VIDEO does not need Web Audio to play, so
   // it would have sat behind the autoplay block forever on exactly those devices.
-  for (const fn of gestureUnlockListeners) {
-    try { fn(); } catch { /* a subsystem's retry must not break the unlock */ }
-  }
+  notifyListeners(gestureUnlockListeners, 'audioService:gestureUnlock', []); // a subsystem's retry must not break the unlock
   if (recording()) { log.push({ op: 'resume' }); return; }
   const g = graphOrNull();
   if (g && g.ctx.state === 'suspended') {
@@ -303,11 +343,31 @@ export function resume(): void {
   for (const h of active) h.resumeMedia();
 }
 
-export function setBusVolume(bus: BusName, volume: number): void {
+/** Set a bus's volume. Returns whether the bus was ACCEPTED — `false` means nothing was written,
+ *  and a caller mirroring the volume anywhere else (the `audio.setBusVolume` action's mixer store)
+ *  must take this answer rather than re-deciding it: a second copy of the rule is how the store
+ *  and the mixer came to disagree (#1074). */
+export function setBusVolume(bus: BusName, volume: number): boolean {
+  // ⚠️ REFUSE an unknown bus, and do it before the write. This line is #986's WRITE half and
+  // `busNode` below is #993's read half, and both arrive on the same agent action
+  // (`actions/audioControls.ts`, whose `bus` param is an unchecked document string — and whose
+  // store write used to run BEFORE this refusal, #1074). `bus: "__proto__"` hits `Object.prototype`'s setter, so the value is lost
+  // silently with no own key created; `bus: "constructor"` then made `busNode(…).gain.value`
+  // throw. One rejection covers both, and keeps a refused op out of the record log.
+  //
+  // ⚠️ Refuse here, FALL BACK in `resolveBus` — deliberately different, because the operations
+  // differ. A typo'd bus on the playback path should still make a sound; a typo'd bus here names
+  // nothing to set, and silently moving the volume of `sfx` instead would be a worse answer than
+  // saying so.
+  if (!hasDocKey(busVolumes, bus)) {
+    warnVocabOnce('audio', 'setBusVolume bus', bus, 'ignored (no such bus)');
+    return false;
+  }
   busVolumes[bus] = volume;
-  if (recording()) { log.push({ op: 'setBusVolume', bus, volume }); return; }
+  if (recording()) { log.push({ op: 'setBusVolume', bus, volume }); return true; }
   const g = graphOrNull();
   if (g) busNode(g, bus).gain.value = volume;
+  return true;
 }
 
 // ── Mix helper (crossfade) ────────────────────────────────────────
@@ -360,7 +420,11 @@ export function updateListener(x: number, y: number, z: number): void {
 export function play(spec: AudioPlaySpec): AudioHandle {
   if (recording()) {
     log.push({
-      op: 'play', clip: spec.clip, bus: spec.bus ?? 'sfx',
+      // ⚠️ The RESOLVED bus, not the authored one (#993 close-out § 2d). CLAUDE.md makes the
+      // journal/record log the sanctioned headless observable, so a log saying `bus: "Music"` for
+      // a voice the live graph routes to `sfx` makes the harness disagree with the behaviour it
+      // exists to verify. The typo is not lost — `resolveBus` warns it by name.
+      op: 'play', clip: spec.clip, bus: resolveBus(spec.bus),
       volume: spec.volume ?? 1, spatial: !!spec.spatial, loop: !!spec.loop,
       ...(spec.spatial && spec.position ? { position: { ...spec.position } } : {}),
     });
@@ -423,7 +487,7 @@ class LiveHandle implements AudioHandle {
       this.panner = p;
       tail = p;
     }
-    tail.connect(busNode(g, spec.bus ?? 'sfx'));
+    tail.connect(busNode(g, resolveBus(spec.bus)));
 
     if (spec.buffer) {
       const src = ctx.createBufferSource();

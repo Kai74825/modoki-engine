@@ -10,7 +10,6 @@
 
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import fs from 'node:fs';
-import os from 'node:os';
 import path from 'node:path';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
@@ -23,12 +22,14 @@ import {
   isStale,
   acquireBuildClaim,
   readBuildClaim,
+  holdsBuildClaim,
   describeBuildClaimConflict,
   resetBuildClaimsForTests,
   BUILD_CLAIM_TTL_MS,
   BUILD_CLAIM_ENV_VAR,
 } from '../../scripts/buildClaimsStore.mjs';
 import type { BuildClaim } from '../../scripts/buildClaimsStore.d.mts';
+import { makeScratchDir } from '@modoki/engine/testing/scratchDir';
 
 const execFileAsync = promisify(execFile);
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../..');
@@ -37,7 +38,7 @@ let home: string;
 let prevHome: string | undefined;
 
 beforeEach(() => {
-  home = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-home-'));
+  home = makeScratchDir('modoki-home-');
   prevHome = process.env.MODOKI_HOME;
   process.env.MODOKI_HOME = home;
 });
@@ -489,6 +490,52 @@ describe('acquireBuildClaim — a corrupt/unreadable claims file is UNKNOWN, not
   });
 });
 
+describe('holdsBuildClaim — the gate a mutating step asks before it touches a project (#827)', () => {
+  // `envToken` is passed explicitly everywhere: `acquireBuildClaim` publishes onto the REAL
+  // process.env, so an earlier test's leftover token would otherwise decide these.
+  const writeClaim = (root: string, pid: number, token: string) => {
+    fs.mkdirSync(home, { recursive: true });
+    const c: BuildClaim = { projectRoot: path.resolve(root), pid, at: Date.now(), label: 'ios build', kind: 'editor', token };
+    fs.writeFileSync(claimsFilePath(), JSON.stringify({ claims: [c] }));
+  };
+
+  it('true for the process that took the claim', () => {
+    const r = acquireBuildClaim('/proj/holds-own', 'ios build');
+    expect(r.ok).toBe(true);
+    expect(holdsBuildClaim('/proj/holds-own', { envToken: '' })).toBe(true);
+  });
+
+  it('true for a CHILD that inherited the holder\'s token (build-web.mjs under /api/build)', () => {
+    writeClaim('/proj/holds-child', 999_999, 'ancestor-token');
+    expect(holdsBuildClaim('/proj/holds-child', { envToken: 'ancestor-token', alive: () => true })).toBe(true);
+  });
+
+  it('false when nobody holds a claim on that root', () => {
+    expect(holdsBuildClaim('/proj/holds-nobody', { envToken: '' })).toBe(false);
+  });
+
+  it('false when SOMEONE ELSE holds it — a live claim is not the caller\'s claim', () => {
+    writeClaim('/proj/holds-foreign', 999_999, 'their-token');
+    expect(holdsBuildClaim('/proj/holds-foreign', { envToken: 'my-token', alive: () => true })).toBe(false);
+  });
+
+  it('false for a claim on a DIFFERENT root, even with the matching token', () => {
+    writeClaim('/proj/holds-other', 999_999, 'ancestor-token');
+    expect(holdsBuildClaim('/proj/holds-elsewhere', { envToken: 'ancestor-token', alive: () => true })).toBe(false);
+  });
+
+  it('false for a STALE claim of our own token (its holder is dead)', () => {
+    writeClaim('/proj/holds-stale', 999_999, 'ancestor-token');
+    expect(holdsBuildClaim('/proj/holds-stale', { envToken: 'ancestor-token', alive: () => false })).toBe(false);
+  });
+
+  it('false — not a throw, not true — when the claims file is unreadable (UNKNOWN answers a gate)', () => {
+    fs.mkdirSync(home, { recursive: true });
+    fs.writeFileSync(claimsFilePath(), '{ not valid json');
+    expect(holdsBuildClaim('/proj/holds-corrupt', { envToken: 'anything' })).toBe(false);
+  });
+});
+
 describe('describeBuildClaimConflict', () => {
   it('names the project root, label, kind, pid and elapsed time for an editor holder', () => {
     const held: BuildClaim = { projectRoot: '/Users/x/Projects/modoki/games/sling', pid: 8123, at: Date.now() - 5 * 60_000, label: 'ios build', kind: 'editor', token: 't' };
@@ -506,7 +553,7 @@ describe('describeBuildClaimConflict', () => {
   });
 });
 
-// #650 divergence 1 — see buildClaimsStore.mjs's `withLock` comment. deviceClaimsStore.mjs:264
+// #650 divergence 1 — see buildClaimsStore.mjs's `withLock` comment. deviceClaimsStore.mjs's `withLock`
 // gives up and proceeds WITHOUT the lock once its wait window passes ("never block hardware on a
 // lock"), which is correct for a device and WRONG for a build claim: proceeding unlocked risks
 // losing a write in the read-modify-write, which is the exact torn-claim (and so torn-dist) race
@@ -702,7 +749,7 @@ describe('round-trip through the real file', () => {
 describe('cross-process: two real node processes racing the same claim (#650)', () => {
   it('exactly one process wins the claim', async () => {
     const storePath = path.join(repoRoot, 'engine', 'scripts', 'buildClaimsStore.mjs');
-    const runnerDir = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-claim-race-'));
+    const runnerDir = makeScratchDir('modoki-claim-race-');
     const runnerPath = path.join(runnerDir, 'claim-race-runner.mjs');
     fs.writeFileSync(
       runnerPath,

@@ -6,7 +6,7 @@ See also [Architecture](./architecture.md).
 
 ## Standalone Capacitor Plugin Pattern (iOS SPM)
 
-Every native SDK is wrapped in its own Capacitor plugin package. Post-#29 these live **per-game** under `games/<id>/packages/capacitor-*/` (e.g. `games/3d-test/packages/capacitor-applovin-max`, `games/3d-test/packages/capacitor-adjust`); engine-level plugins (`capacitor-game-debug`, `capacitor-litert-lm`) live under `engine/packages/`. A package contains:
+Every native SDK is wrapped in its own Capacitor plugin package. Post-#29 a plugin lives in one of two places. **Shared** plugins live under `engine/packages/` (`capacitor-game-debug`, `capacitor-modoki-ota`, `capacitor-modoki-iap`, `capacitor-appsflyer`, `capacitor-applovin-max`) and reach each consuming game as a vendored tarball ([cross-game-infrastructure.md](./cross-game-infrastructure.md) § "The vendoring pipeline, and why it is tarballs"). **Per-game** plugins live under `games/<id>/packages/capacitor-*/` (e.g. `games/3d-test/packages/capacitor-adjust`). ⚠️ `games/3d-test/packages/capacitor-applovin-max` is a per-game **fork** of the engine plugin: identical when Court's copy was promoted in #931, and deliberately not switched over, because vendoring it would put MAX into 3d-test's native build, where blank unit ids crash at init (#510). A package contains:
 
 - `Package.swift` — declares the native SDK as a **Swift Package Manager (SPM)** dependency (e.g. `AppLovin-MAX-Swift-Package`, `adjust/ios_sdk`).
 - `*.podspec` — CocoaPods fallback manifest (SPM is the primary path).
@@ -43,16 +43,110 @@ SPM static linking **strips plugin classes that have no external framework depen
 
 `capacitor-modoki-iap` is the contrasting case: it goes through SPM normally and correctly declares both platforms, and it is verified working (real store sandboxes on hardware, 2026-08-12). Note its own `Package.swift` header is deliberately agnostic about *why* — do not read it as a rule that "a system framework import is enough to keep the class"; that causal claim is untested.
 
-`capacitor-litert-lm` is a THIRD case, and the one most easily got wrong. Its
-`ios/Sources/LitertLmPlugin/LitertLmPlugin.swift` is a **complete ~380-line MediaPipe
-implementation** (`import MediaPipeTasksGenAI`, real `LlmInference` model loading and streaming) —
-**not a stub**, despite a stale comment at the top of its `Package.swift` still calling it one. What
-actually blocks iOS is narrower: **`Package.swift` declares only `capacitor-swift-pm`, while
-`CapacitorLitertLm.podspec` declares `MediaPipeTasksGenAI` + `MediaPipeTasksGenAIC`.** So an SPM
-build of that target cannot resolve `import MediaPipeTasksGenAI` and fails to compile, and the
-podspec is not a "fallback" here — it is the only iOS path whose dependencies resolve. Declaring
-`"ios"` on this package without first adding the MediaPipe dependency to `Package.swift` turns a
-green `npm run verify` into a broken `cap sync ios` build on `games/llm-test`.
+A third case, `capacitor-litert-lm` — a podspec whose MediaPipe dependencies `Package.swift` could not
+declare, so it claimed `android` only — was deleted with its two games in #1191. The
+`capacitorPlatformDeclarations.test.ts` rule it motivated (a package must not declare `ios` while its
+`Package.swift` lacks the podspec's dependencies) still stands, with no package in the repo to reach.
+
+### Compiling the plugin CLASSES — two integration shapes (#981)
+
+Until #981 **nothing in this repo compiled a Capacitor plugin class.** `npm run verify` is vitest;
+`test:native`'s `SWIFT_LEGS`/`JAVA_LEGS` compile the extracted, dependency-free *cores*
+(`OtaCore`, `IapCore`). The `CAPPlugin` subclass Capacitor actually dispatches into was built by
+nothing.
+
+⚠️ **The two known plugin-class defects were NOT compile errors, and no leg below catches them:**
+`@PluginMethod` on a private helper in `ModokiIapPlugin.java` (#971), and a **missing** `@PluginMethod`
+on `products()` that broke every Android shelf call from that plugin's first commit. Capacitor
+indexes methods by reflection at runtime (`PluginHandle` → `getMethods()` + the annotation), so
+javac accepts both. #992 was filed expecting a compile leg to catch them. What does is
+`engine/tests/architecture/pluginMethodParity.test.ts`, under `npm run verify`, for every discovered
+package: TS interface ↔ Android annotated public methods ↔ iOS `pluginMethods`, the three plugin
+names, any annotation that sits on nothing dispatchable, and a func behind every iOS entry that
+Objective-C can perform as exactly `name:`. The iOS side has the same blind spot: `CapacitorBridge`
+dispatches by `NSSelectorFromString(name + ":")` + `responds(to:)`, so each of these builds and then
+never answers at runtime:
+- a func without `@objc`
+- an `async` or `throws` func (Swift renames the selector to `name:completionHandler:` / `name:error:`)
+- an `@objc(other:)` func
+
+All three were measured with a compiled probe.
+
+`npm run test:native` now carries an `ios/class/<plugin>` leg AND an `android/class/<plugin>` leg
+(#992) per package. The Android one synthesises a Gradle project (Capacitor's core from the root
+`node_modules` plus the package's `android/`). Once its toolchain is present, it SKIPs only on a
+network failure named in Gradle's own cause lines. Detail:
+[verify-and-ci.md](./verify-and-ci.md) § `test:native`. The iOS legs were measured 2026-09-09 on
+the reference Mac, warm SPM cache: **4–18 s each, ~59 s for all eight, and 56 s for the entire
+gate.** Cold, each package pays its SPM fetch once (AppsFlyer, AppLovin and Adjust are real network
+artifacts); the numbers above are steady-state.
+
+⚠️ Those figures predate #991, which turned the `litert-lm` leg into an instant `N/A`, and #1191,
+which deleted that package — so seven packages build now, not eight, and the totals are a little
+lower than stated. Left as measured
+rather than adjusted by arithmetic: nobody re-timed the gate, and a figure nobody measured is worse
+than a figure with a date on it.
+
+⚠️ **The obvious design — one `xcodebuild -scheme` per package — is wrong, and measurably.** It
+reports a false FAILURE on `capacitor-modoki-ota` (`cannot find type 'OtaState' in scope`) against
+code that ships and works. Two integration shapes exist and **the leg must match the package's own**:
+
+| shape | who | what the leg builds |
+|---|---|---|
+| `spm` | 6 of 7 — applovin-max, appsflyer, game-debug, modoki-iap, and 3d-test's adjust + applovin-max fork | the package's declared product, as `Package.swift` links it |
+| `flat` | `capacitor-modoki-ota` | a **synthesised** single-target package holding plugin + core sources together |
+| `no-spm` | none today | **nothing** — it reports `N/A` with a required `reason` (see below) |
+
+The `flat` shape exists because `OtaPlugin.swift` deliberately carries **no `import
+ModokiOtaCore`**: it ships as loose pbxproj file references compiled directly into the consuming
+app's target, so the core's types are already in scope — and its `Package.swift` header says the
+manifest is there "for package resolution/documentation … NOT how it's actually linked into an app".
+Building the declared product tests a shape nothing ships.
+
+⚠️ **`iap` and `ota` made opposite choices for the identical problem** (`import ModokiIapCore` vs.
+flat compilation) and nothing records why. The gate models both rather than editing a
+device-verified shipping path to make a test tidier (owner, 2026-09-09). Converging them would make
+`ota` a plain `spm` row.
+
+**Two things the table does not contain, on purpose.** The package set is discovered by **globbing**
+`engine/packages/capacitor-*` and `<PROJECT_ROOT_DIRS>/*/packages/capacitor-*`, never listed — #981's
+own hand-written enumeration missed `games/3d-test/packages/capacitor-applovin-max`, a second copy of
+court's (since #931, a fork of the engine plugin). And the xcodebuild **scheme is read from `Package.swift`'s `name:`**, which is what a
+package's scheme actually is (measured: not the product name). `nativePluginLegCoverage.test.ts`
+enforces the coverage in both directions during `npm run verify`, so a new plugin package fails until
+somebody decides its shape.
+
+#### `no-spm`, and why `N/A` is not `SKIP` (#991)
+
+**No row uses this shape today.** It was introduced for `capacitor-litert-lm`, previously an `spm`
+row pinned `knownFail: '#991'` on the theory that `Package.swift` was missing a dependency somebody
+would add. It could not be added — Google publishes no SPM distribution of `MediaPipeTasksGenAI` — and
+the package declared `capacitor: { android }` only, so it was not an SPM package at all and the leg was
+compiling a configuration the repo outlaws. That package was deleted in #1191; the runner and
+`nativePluginLegCoverage.test.ts` still model the shape for the next package that needs it.
+
+⚠️ **`N/A` and `SKIP` mean different things and `--require-all` treats them differently.** A SKIP
+says *this runner could not check it* — install Xcode, provision a JDK, and it becomes a real
+result, so counting it as a failure under `--require-all` is right. An **N/A** says *there is nothing
+here to check*, which is a fact about the package that no toolchain can change. Folding them
+together would mean a pre-release run can never be green no matter what is installed, which is how
+`--require-all` stops being used. Measured: it exited 1 on the `knownFail` and exits 0 now, with the
+gate otherwise all-PASS.
+
+⚠️ **An N/A row is only honest while its premise holds, so the premise is asserted — and it moved to
+a better gate.** `knownFail` self-expired by flipping to FAIL if the leg ever passed, but only on a
+machine with macOS *and* Xcode running `test:native`. A `no-spm` premise belongs in
+`capacitorPlatformDeclarations.test.ts` under **`npm run verify`** instead, where declaring
+`capacitor.ios` or giving `Package.swift` the podspec's dependencies goes red naming the row. The stale-row
+check now fires in front of whoever made it stale. The row's `reason` is required, printed in the
+gate summary, and enforced by `nativePluginLegCoverage.test.ts`.
+
+⚠️ **What a green `*/class/*` leg does NOT prove.** It compiles: the Swift or Java/Kotlin parses,
+resolves its imports and type-checks against the real Capacitor core (and, on Android, AndroidX and
+the vendor SDK). **No test runs**, so it says nothing about behaviour, and nothing about a
+`@PluginMethod` defect (see above). The plain-JVM `test-harness` was not extended for Android: a
+plugin class needs Capacitor's core, which drags in AndroidX AARs, so only an AGP project can
+resolve it (measured in #992).
 
 ### The SceneDelegate trap — a silently dead iOS debug bridge (#368)
 
@@ -82,7 +176,7 @@ run and verified them **on Android hardware only** — iOS was generated and nev
 
 ⚠️ **The emission rule is NOT understood, and this doc will not pretend otherwise.** That single run,
 same tool, produced a `SceneDelegate.swift` for eight projects and none for `demos/3d-physics-demo`
-or `games/chess` (which also have no `UIApplicationSceneManifest`). Nor does that run account for
+or `games/chess` (since deleted, #1191; it also had no `UIApplicationSceneManifest`). Nor does that run account for
 every file: there are **ten** tracked `SceneDelegate.swift` today — those eight, plus `games/iap-test`,
 plus `demos/postfx-demo`, which predates the run entirely and is where the trap was first found and
 fixed. Three separate origins, one unexplained split. Capacitor 8.5's templates — both
@@ -205,25 +299,6 @@ await GameDebug.startServer({ port: 9095 });
 const { running, connected } = await GameDebug.getStatus();
 ```
 
-### `capacitor-litert-lm` — on-device LLM
-
-On-device LLM inference (used by the `llm-test` game), with **one TS surface, two engines behind it**: Capacitor's `registerPlugin` routes each call to the native Android implementation (`LitertLmPlugin.kt` — LiteRT-LM Kotlin SDK) or, on web, to `LitertLmWeb` (`src/web.ts` — MediaPipe `@mediapipe/tasks-genai`, Gemma running via WebGPU). The definitions (`src/definitions.ts`) are the contract both sides implement.
-
-```typescript
-import { LitertLm } from 'capacitor-litert-lm';
-
-await LitertLm.downloadModel({ url, filename });        // Android only; progress via 'loadProgress'
-await LitertLm.loadModel({ modelPath, maxTokens: 1024 }); // topK/temperature/randomSeed optional
-const { conversationId } = await LitertLm.createConversation();
-await LitertLm.sendMessage({ conversationId, message }); // tokens stream via 'tokenReceived'
-```
-
-**Status machine:** `getStatus()` returns `idle | loading | ready | generating | error` + `modelName` + `errorMessage`; the JS callers poll it after a `{ ok: false }` result to surface the real error message.
-
-**Streaming.** `sendMessage` resolves only when generation completes; the actual output arrives token-by-token through the `'tokenReceived'` listener (`{ conversationId, token, done }`). `games/llm-test/runtime/services/CapacitorLLMService.ts` is the app-side wrapper — it registers the `tokenReceived` listener (filtered by `conversationId`) **before** calling `sendMessage`, forwards each token to an `onToken(token, done)` callback, and removes the listener in a `finally`. It similarly attaches a `loadProgress` listener around `loadModel` and multicasts to a `Set` of progress callbacks.
-
-**Model download is split by platform** (`games/llm-test/runtime/services/ModelDownloader.ts`): on **Android** `LitertLm.downloadModel` fetches via `HttpURLConnection` into app internal storage and returns the local file path (skipped if `isModelDownloaded` reports it present); on **web** the plugin's `downloadModel`/`isModelDownloaded` are no-ops — the game instead `fetch`es the model with a streaming reader for progress, stores it in the `caches.open('llm-models')` Cache API, and hands MediaPipe a `URL.createObjectURL(blob)`. Web's `loadModel` lazy-imports `@mediapipe/tasks-genai` (and its wasm fileset from jsdelivr) so the bundle isn't paid for off-web.
-
 ## Removing a plugin listener — `remove()` is NOT idempotent
 
 ⚠️ **Calling `.remove()` twice on one `PluginListenerHandle` silently evicts somebody ELSE's
@@ -247,7 +322,7 @@ then settles and its `finally` evicts the NEW listener — and that load's progr
 a multi-GB download with nothing erroring anywhere.
 
 **The shape that is safe** — the Set membership is the arbiter, so the two paths are mutually
-exclusive, and `games/llm-test/runtime/services/CapacitorLLMService.ts` is the worked example:
+exclusive (llm-test's `CapacitorLLMService.ts` was the worked example until #1191 deleted it):
 
 ```ts
 private activeListeners = new Set<PluginListenerHandle>();
@@ -389,7 +464,7 @@ four are fixed on `work-ai2`; check `git log`/the issues for whether that has re
 | #586 | `ModokiIapPlugin`'s parked `purchase()` call is a plugin FIELD that `Bridge.reset()` never clears, so the next realm's purchase was rejected forever; and a `purchasesUpdated` delivery in the reload window was dropped | A `WebViewListener.onPageStarted` releases the stale slot — registered at PARK time, **not** from `load()`; see the ⚠️ below. `purchasesUpdated` is now emitted `retainUntilConsumed: true` on both platforms, so a delivery with no listener is queued and drains into the next realm |
 | #587 | `AdsService.cleanup()` hung off a React unmount that never commits, so banners/MRECs survived every reload still refreshing and monetising with no listener — undercounting `ad_revenue`; and one interstitial was orphaned per `loadInterstitial` | `registerRealmShutdownTask` / `runRealmShutdownTasks` — the app registers, the runtime invokes (the reload sites are in `runtime/**` and cannot reach `appServices()`); plus destroy-before-reassign for the interstitial |
 | #588 | Crashlytics rate-limit budgets are module state, so a cap named "per session" was really per realm while native counted one session | The three session budgets seed from `sessionStorage`; a `[reload]` breadcrumb now explains the discontinuity in a post-reload report |
-| #585 | litert-lm re-loads an already-ready model — Android never closes the old `Engine`, iOS peaks at 2× resident | **Open, iceboxed.** The JS guard that would prevent it is a realm-scoped `let`, which is exactly the class above |
+| #585 | litert-lm re-loads an already-ready model — Android never closes the old `Engine`, iOS peaks at 2× resident | **Closed, not planned** — the plugin was deleted in #1191. The JS guard that would have prevented it was a realm-scoped `let`, exactly the class above |
 
 ⚠️ **#587's Court-side wiring is DORMANT in every build today, and the fix's stated motivation is
 therefore fixed for nobody yet.** `maxEnabled()` requires `APP_CONFIG.applovin.sdkKey !== ''` and the
@@ -535,9 +610,9 @@ the bridge staying alive through a sheet is the instrument that proved `onStop` 
 Two things follow, and both matter more than the reload:
 - **`court.purchase` is NOT dead code** — do not "fix" or delete it on the strength of never seeing
   it decline. It arms correctly for a genuine HOME press mid-purchase, which does reach `onStop`.
-  Its predicate reads `storeInFlight` (see `beginStorePurchase` in `games/court/runtime/systems.ts`;
-  cleared in that function's `finally` when the generation still matches, and wholesale by
-  `resetStoreUi`).
+  Its predicate reads the shelf session's `inFlightCount` (`ShelfSession` in
+  `engine/packages/modoki/src/runtime/iap/shelfSession.ts`, Court's `storeInFlight` until #925;
+  cleared in `settle()`'s `finally` when the generation still matches, and wholesale by `reset()`).
 - **PlayerPrefs get no background flush while a purchase sheet is open (#619) — and the severity
   was overstated here first.** `App.tsx`'s background flush was `appStateChange` ->
   `if (!isActive) flush()` with `visibilitychange`/`pagehide` as the WEB fallback only, so no edge
@@ -593,8 +668,9 @@ indexes it, so every call failed with `"ModokiIap.products() is not implemented 
 shelf could price nothing on Android and fired `store_products_failed` on every open. iOS carried its
 `CAPPluginMethod(name: "products")` entry all along, which is why it survived so long — the platform
 where IAP got the most use was the one that worked. `npm run verify` is vitest and compiles no Java,
-so nothing local could see it; `engine/tests/architecture/pluginMethodParity.test.ts` now holds the
-TS, Android and iOS method surfaces to the same set.
+so nothing local could see it. The `android/class/*` legs that exist now (#992) could not have seen it
+either, because a missing annotation compiles. `engine/tests/architecture/pluginMethodParity.test.ts`
+holds the TS, Android and iOS method surfaces to the same set, for every plugin package since #992.
 
 ⚠️ **#584's fix is complete for the shell only.** A sub-game's boot attempt IS counted on a reload
 (`beginBundleLoad` re-runs and its JS genuinely re-executes), so a sub-game bundle can still reach
@@ -609,13 +685,12 @@ re-run. The close-out sweep for #587 enumerated them — `grep -rnE "^let [a-zA-
 `engine/packages/modoki/src/runtime`, `engine/app` and `games/court/**` gives 123 module latches, 14
 of them named like once-per-process guards. Only those guarding NATIVE state are defects; a JS-only
 latch (`engineActions`, `register.ts`, `consoleCapture`, …) is CORRECT to reset, because the new
-realm genuinely must re-register. Where each of the three named ones stands:
+realm genuinely must re-register. Where each of the named ones stands (a third, llm-test's `LLMManager.ts`, was deleted in #1191):
 
 | Latch | Guards | Status |
 |---|---|---|
 | `ads.ts:initialized` | AppLovin (native) | **Covered** — #587's `app.cleanup` task tears the SDK down before the reload |
 | `attribution.ts:initialized`/`starting`/`attPrompted` | AppsFlyer + ATT (native) | **Guarded natively — #607.** The JS latches still die with the realm and `AttributionService` still declares only `init()`, so nothing tears them down; instead the invariant moved to where the state actually lives — a per-process static in the plugin's `start()`, on both ports. ⚠️ `initialize()` is deliberately still unguarded (the SDK declines to re-set its read-only devKey/appId). **RECONCILED on Android, 2026-09-04** — the "two launch events across a reload" reading this row used to carry is REFUTED as an attribution: a re-measurement on an S22 with the guard absent from the binary showed the reload's `start()` posts NO Launch, and that the second Launch came from the RESUME that followed. AppsFlyer's Launch is driven by the foreground transition, not by `start()`. So the guard is inert for Launch counts (it still stops a second `registerSessionReadyListener`). **iOS across a reload is still unmeasured.** Full run + the limits: `games/court/attribution.md` § "#607/#654 — the Android leg measured" (private) |
-| `llm-test/LLMManager.ts` | litert-lm engine (native) | **Open — #585**, iceboxed |
 
 `milestones.ts:started` looks like the same shape and is not: its `fired` ledger lives in
 `PlayerPrefs`, so a re-run is idempotent. That is the distinction to apply — not "is it a module
@@ -650,7 +725,7 @@ Analytics, crashlytics, ads, and attribution are **app/game concerns, not engine
 
 ⚠️ **`<project>/packages/app-services/` is a REQUIRED path, not a naming convention.** `projectNativeSdkDeps` in `engine/vite.config.ts` reads `<project>/packages/app-services/package.json` to force-prebundle the wrapped native-SDK deps, and returns `[]` when the path is missing — an app-service package placed anywhere else makes the editor's project-open flow silently skip the pre-bundle and visibly re-optimize/reload mid-session instead.
 
-⚠️ **Declare a native plugin dep in BOTH the game-root `package.json` and the app-services one** (as `games/court` and `games/3d-test` do for their real plugins). The root copy is not redundant: `healNativeConfig.ts`'s `usesCrashlytics()` reads only the project **root** `package.json` to gate the iOS dSYM upload phase, and **`cap sync` scans only the app's own root `package.json`**, never the nested one. A dep declared solely on the nested `app-services` package is exactly why `games/3d-test`'s `capacitor-applovin-max` — declared only in `packages/app-services/package.json` — is absent from both its generated `ios/App/CapApp-SPM/Package.swift` and `android/capacitor.settings.gradle` today. Only a JS-only SDK peer dep (e.g. `firebase` itself) legitimately stays app-services-only.
+⚠️ **Declare a native plugin dep in BOTH the game-root `package.json` and the app-services one** (as `games/court` and `games/3d-test` do for their real plugins). The root copy is not redundant: `healNativeConfig.ts`'s `usesCrashlytics()` reads only the project **root** `package.json` to gate the iOS dSYM upload phase, and **`cap sync` scans only the app's own root `package.json`**, never the nested one. A dep declared solely on the nested `app-services` package is exactly why `games/3d-test`'s `capacitor-applovin-max` — declared only in `packages/app-services/package.json` — is absent from both its generated `ios/App/CapApp-SPM/Package.swift` and `android/capacitor.settings.gradle` today. Only a JS-only SDK peer dep (e.g. `firebase` itself) legitimately stays app-services-only. ⚠️ **A vendored ENGINE plugin is the opposite exception: game root ONLY.** Court's `capacitor-appsflyer` (#632) and `capacitor-applovin-max` (#931) are declared in `games/court/package.json` alone. The root spec is a hashed tarball name that `vendor-plugins.mjs` rewrites on every re-vendor, and nothing rewrites a nested workspace's `package.json`, so an app-services copy would go stale on the first re-vendor. Node resolves the root copy by walking up from `packages/app-services/src`. The comment in Court's `app-services/package.json` carries the same argument. ⚠️ **In THIS repo a missing game-root declaration does not fail where you would look for it.** Every engine plugin is also a repo-root workspace, so `node_modules/<plugin>` at the repo root answers a bare import from ANY game by walking up: `require.resolve('capacitor-applovin-max')` from `games/wordweave`, which does not declare it, resolves to `engine/packages/capacitor-applovin-max`. Typecheck and the editor both pass; only `cap sync` (which reads the game root's `package.json`) leaves the plugin out, so the failure lands on a device. A game copied out of the repo would fail at import instead. Nothing guards this for any engine plugin today.
 
 ⚠️ **`cap sync` is a STEP in promoting a plugin, and its generated files are part of the commit** — not a follow-up. Wordweave's Firebase JS wiring once landed without regenerating `ios/App/CapApp-SPM/Package.swift` and `android/capacitor.settings.gradle` + `android/app/capacitor.build.gradle`, and nothing caught it: the files self-heal on whoever next runs a native build, so the tree only churns silently, and `npm run verify` is vitest — it compiles no native project. Both platforms shipped with no Firebase Capacitor plugin actually linked while every test stayed green. `npx cap update android` alone is not enough to regenerate them — it exits `ENOENT` on `assets/capacitor.plugins.json`, which only `cap copy` writes, so it needs a real `--target native` build first.
 
@@ -676,7 +751,7 @@ journal, which `setJournalEnabled` switches off in a release build.
   not a separate destination (`globalErrors.ts` — see the comment at its `deliver()`: *"'warn'
   delivers as an ISSUE exactly like 'error' — it is a separate BUDGET, not a separate destination.
   Only 'breadcrumb' takes the log path."*). The two Crashlytics concepts still differ — an issue is
-  grouped and alerted on, a breadcrumb is visible only inside somebody else's report — and the
+  grouped (by the report's group, below) and alerted on, a breadcrumb is visible only inside somebody else's report — and the
   reason warns get their own cap is so a warn flood cannot spend the crash budget.
 - ⚠️ **It is installed by a SIDE-EFFECT IMPORT above `./App.tsx`, not by a call.** ES imports are
   hoisted and evaluated before any statement of the importing module, so the installer written as
@@ -697,6 +772,53 @@ journal, which `setJournalEnabled` switches off in a release build.
 - The **re-entrancy latch is synchronous and a real service is async**, so what bounds the
   report-the-report bounce is the game wrapper's own once-per-message latch. Measured at two
   messages and pinned by a test.
+- **Caught failures: `journalError` files a `caught` report, in every build (#1056).** A failure a
+  game catches and carries on from never crashes and never reaches the console, and the journal is
+  off in a release build, so a journal-only `journalError` reached nobody from a store build (Court
+  had 28 such sites). `gameJournal.ts`'s `journalError` now also calls
+  `captureToCrashlytics('caught', '[journalError] <name> <payload>')`, outside the journal's enable
+  gate. `journalWarn` stays journal-only, so **the level is the decision**: `error` means a person
+  should look at it. ⚠️ The payload is sent as text: guids, keys, product/transaction ids and error
+  text only, never player content or an account id. **Verified on an iPhone 8 (2026-09-11):** one
+  `recordException` per call, reading `[journalError] <name> {…}`, and none for `journalWarn`.
+  An Error object in the payload is fine: every exit renders it as text through
+  `runtime/core/jsonSafe.ts`. That covers the Crashlytics text, the device and editor journal reads,
+  and the in-game Journal tab. (The editor read used to show it as `{}`, #1068.)
+- ⚠️ **`caught` has its OWN session budget (100), like `warn`, and ranks between `error` and
+  `warn`** in the boot queue and in the stash. Both read `bootStash.ts`'s `reportKindRank`, the one
+  definition. A caught failure that recurs with a varying payload (a new transaction id each time)
+  defeats dedupe, and on the crash budget it would silence every later crash (owner, 2026-09-11).
+- ⚠️ **An `Error` is rendered by `runtime/core/errorText.ts`, never `stack || message` (#1055).**
+  JavaScriptCore (every iOS build) writes a stack of frames only, with no `Name: message` line, so
+  that shape sent Crashlytics a bare frame with the message gone: observed twice on an iPad mini 5.
+  V8's output comes back byte-identical, so Android reports, and the rate limiter's dedupe keys
+  built from them, did not move.
+  `engine/tests/architecture/errorTextIsShared.test.ts` fails a new copy of the pattern in
+  `engine/packages/modoki/src` or `engine/app`.
+- ⚠️ **Every report carries a GROUP, or they all share one console issue (#1063).** A bare
+  `recordException({ message })` gives the plugin no grouping inputs:
+  - iOS records an `NSError` with domain `""` and code `-1001`, and Crashlytics groups NSErrors by
+    domain and code.
+  - Android builds a `JavaScriptException` inside the plugin, and Crashlytics groups a throwable by
+    its stack, which is then the plugin's own Java site.
+
+  So every JS report most likely landed in ONE issue per platform, and a new kind of failure raised
+  no alert. That is read from the plugin's source, not seen in the console.
+  - **The grain is kind + name** (owner, 2026-09-11), computed by `runtime/core/crashlyticsGroup.ts`:
+    `journalError/<name>` with the payload ignored, `uncaught/TypeError`, `unhandledrejection/FirebaseError`,
+    `console.warn/MeshCache` from a console line's leading `[Tag]`, and a `prev-boot/` prefix on a replay.
+    Rejected: by throw site (minified names change every release, so a bug re-alerts per build) and
+    by exact message (an id splits one failure into many issues).
+  - **It is derived from the message text**, because the engine composes every issue-kind label.
+    That reaches the boot queue and the cross-boot stash without a field threaded through them. A
+    producer that changes its label shape degrades to a coarser group, so `crashlyticsGroup.test.ts`
+    drives every real producer.
+  - **Each game wrapper sends `crashlyticsExceptionOptions(message, Capacitor.getPlatform())`.** iOS
+    gets `domain` + a fixed `code`. Android gets a one-frame `stacktrace` named after the group. They
+    are never combined, because iOS drops `domain` once a stacktrace is present.
+    `engine/tests/architecture/crashlyticsPayloadShared.test.ts` fails a hand-built payload.
+  - **Not verified in the console.** Only the owner can open it. The check is whether two different
+    `journalError` names now appear as two issues.
 
 **A JS fault during boot has to reach `appServices().crashlytics` to be reported, and there are
 THREE distinct windows depending on how far boot got before it died** (#823, #825, #860):
@@ -886,6 +1008,66 @@ Two limits worth knowing:
 A worked example of a game filling the slot — including the Firebase wrapper, the Proxy-thenable
 trap, the gradle/dSYM wiring and the on-device verification — is
 [games/court/attribution.md](../games/court/attribution.md) § "Phase 7 — Crashlytics".
+
+## iOS privacy manifest (#1051)
+
+Apple builds an app's privacy report from every `PrivacyInfo.xcprivacy` in the bundle: the app's
+own, plus one for each SDK that ships one. **So the app declares only what no SDK in its resolved
+package graph already declares.** A declaration the app does not need is still a false statement to
+Apple. Court and Weaveling each carry one at `ios/App/App/PrivacyInfo.xcprivacy`, in the App target's
+Resources phase. `engine/tests/architecture/iosPrivacyManifest.test.ts` checks the file, the wiring
+and the exact declarations.
+
+Measured 2026-09-11 from each game's `Package.resolved` and Xcode's package cache (Firebase 12.18.0,
+AppsFlyer 7.0.2, capacitor-swift-pm 8.4 / 8.5):
+
+| Ships its own manifest | Does not |
+|---|---|
+| Capacitor and CapacitorCordova (both empty) · AppsFlyerLib (tracking + domains, UserDefaults, FileTimestamp) · FirebaseCore, CoreInternal, Crashlytics, Auth, Installations, Firestore · GoogleUtilities · GoogleDataTransport · grpc · leveldb · gtm-session-fetcher · nanopb · promises · abseil · AppAuth · GTMAppAuth · GoogleSignIn · ~~Facebook (tracking)~~ stripped from the graph by #1062 | **`@capacitor/preferences`**, which calls `UserDefaults.standard` · the `@capacitor-firebase/*` and `capacitor-appsflyer` wrappers (no required-reason calls) · `capacitor-modoki-iap` · `GameDebugPlugin.swift` · **GoogleAppMeasurement** and GoogleAdsOnDeviceConversion (binary artifacts; no manifest in the checkout or the artifact) |
+
+- **Required-reason APIs: UserDefaults `CA92.1` only**, for `@capacitor/preferences`. The app
+  target's own Swift uses none. The guard derives this from each game's `package.json`.
+- **Tracking: `false`, with no domains.** The SDKs that track (AppsFlyer; Facebook in Court's graph
+  until #1062 stripped it) declare it in their own manifests.
+- **Collected data: only the game's OWN first-party collection** (owner, 2026-09-11). Court declares
+  User ID, Gameplay Content and Purchase History (its Firestore cloud save), each linked, App
+  Functionality, not tracking. Weaveling declares none today; revisit when #927, #925 or #932 lands.
+- ⚠️ **GoogleAppMeasurement ships no manifest, so Firebase Analytics' own collection is declared by
+  nothing in the graph.** That is App Store privacy-label work (#933), not something to paper over
+  in the app's manifest. Confirmed in a built Court `App.app`, whose bundle carries ~45 SDK
+  manifests and none for it.
+- ⚠️ **`@capacitor-firebase/authentication` links the Facebook iOS SDK unconditionally, and the
+  build heal strips it (#1062).** Its `Package.swift` lists FacebookCore + FacebookLogin as products
+  of its one target and defines `RGCFA_INCLUDE_FACEBOOK`; SPM has no optional products, so
+  `providers` in `capacitor.config.json` never reached it, and Court shipped FBSDKCoreKit,
+  FBSDKLoginKit, FBAEMKit and their tracking-declaring manifests without offering Facebook sign-in
+  (observed in a simulator build, 2026-09-11). Owner ruling 2026-09-13: strip, with a guard.
+  `engine/plugins/stripFirebaseAuthFacebook.ts` is step 6 of `healNativeProject` — after that
+  sequence's own `npm install`, because an install re-extracts the original manifest — and removes
+  the dependency, both products and the define (every FBSDK use in the plugin's Swift is behind
+  that `#if`). **It refuses the build if any Facebook reference survives**, which is how a plugin
+  upgrade that reshapes the manifest gets re-checked instead of silently shipping the SDK again.
+  A game that lists `facebook.com` in `plugins.FirebaseAuthentication.providers` keeps it. Android
+  needs nothing: the plugin's `build.gradle` already gates Facebook on `rgcfaIncludeFacebook`
+  (default false). The same step drops the now-stale `facebook-ios-sdk` pin from the gitignored
+  `Package.resolved`: with that pin and fresh DerivedData, `xcodebuild` crashed resolving packages
+  (`INTERNAL ERROR … count of array (33) differs from count of index set (32)`, reproduced 2 of 2,
+  gone with the pin absent). It also REFUSES when a project lists `facebook.com` over a manifest an
+  earlier build stripped — the plugin's whole Facebook flow is behind the `#if` with no `#else`, so
+  that build would hang `signInWithFacebook` rather than fail. Skipped for an Android build: the
+  editor's per-platform `build-web.mjs` step names its platform in `MODOKI_NATIVE_PLATFORM`
+  (`nativeHealPlatforms`, `engine/scripts/buildTarget.mjs`), and so do both scaffold runners (the
+  auto-scaffold inside `/api/build` `shift()`s the plan's own step away). A hand-run CLI build still
+  covers every platform folder present, and so does the OTA publish — its bundle is platform-agnostic.
+  ⚠️ **Only a heal-running build is covered** — building straight from Xcode after the plugin is
+  re-extracted (a fresh clone, `npm ci`, a version bump), without the editor or `build-web.mjs
+  --target native`, ships the SDK again.
+- ⚠️ **A re-scaffold refuses to delete an `ios/` that holds this file**, through the same survivor
+  guard as `GoogleService-Info.plist` (`engine/plugins/addNativeTarget.ts`). `cap add` cannot
+  regenerate it, and a project without it still builds.
+- ⚠️ **Adding a native dependency means re-checking this table**: does the new package ship a
+  manifest, and if not, which required-reason APIs does its native code call? The guard cannot see
+  either.
 
 ## AppLovin MAX Mediation (12 networks)
 

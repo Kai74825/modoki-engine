@@ -136,7 +136,30 @@ export interface ModokiIapPlugin {
     kind: IapProductKind;
     /** Android subscriptions only: which base plan / offer to buy. */
     planId?: string;
-  }): Promise<{ transaction: IapTransaction | null; pending?: boolean }>;
+  }): Promise<{
+    transaction: IapTransaction | null;
+    pending?: boolean;
+    /** WHICH cancel this was, when the platform could say (#946). Present only alongside
+     *  `transaction: null` and `pending` absent/false.
+     *
+     *  ⚠️ **Diagnostic only.** A cancel is a cancel whether or not this arrives — an older plugin
+     *  build resolves without it and the engine treats that identically. It exists because iOS
+     *  reaches "cancelled" by two different routes that used to be indistinguishable: StoreKit
+     *  RETURNING `.userCancelled` (unambiguous — the player said no), and a THROWN cancel, which
+     *  is `'storekit.userCancelled'` or the StoreKit 1 `'SKErrorDomain:2'`. The first route is
+     *  `'storekit.result.userCancelled'`; the second is `classify()`'s string.
+     *
+     *  ⚠️ An `'ASDErrorDomain:…'`/`'AMSErrorDomain:…'` string never appears in this field — this
+     *  comment used to imply it could. Those faults are not cancellations, so they take the
+     *  REJECT path. When one UNDERLIES a StoreKit cancel the reason is still
+     *  `'storekit.userCancelled'` and the fault's identity is in `storeError`, which is why #946
+     *  needed both fields. The full value set is pinned by
+     *  `test-vectors/iap-classification-vectors.json` (#971). */
+    cancelReason?: string;
+    /** The platform's own error detail for a `cancelReason` that came from a thrown error. Same
+     *  shape as the `storeError` on a rejection. Log-only. */
+    storeError?: unknown;
+  }>;
 
   /**
    * Every transaction the store still considers UNFINISHED. **The recovery source** — this is what

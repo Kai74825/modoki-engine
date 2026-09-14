@@ -16,6 +16,11 @@ export {
   collectUnknownFields, mergeUnknownFields,
   type FormatVerdict, type UnreadableReason, type ClassifyOptions,
 } from './core/formatVersion';
+// #986's two primitives, next to formatVersion because they answer the same question one layer
+// down: `collectUnknownFields` already builds ITS bag with a null prototype, and these are how
+// every other document-keyed bag in the engine says the same thing. Exported so a GAME can use the
+// one vocabulary instead of hand-rolling a third (see docKeys.ts § NAMING).
+export { emptyDocMap, hasDocKey, putOwn } from './core/docKeys';
 export { WHITE_HDR_GUID, DEFAULT_FONT_GUID } from './assets/builtinAssets';
 export { getCurrentWorld, setCurrentWorld, onWorldSwap } from './core/ecs/world';
 export { hostCanvases, hostCanvasUnder } from './ui/hostCanvas';
@@ -42,7 +47,30 @@ export {
   type EntryCoord, type EntryContent, type EntryResolver,
 } from './ui/entrySource';
 export { parseEntryPrefabs } from './traits/UIEntries';
-export { scrollToEntry, snapToNearest, scrollByEntry, NO_ENTRY_REQUEST } from './ui/scrollApi';
+export { scrollToEntry, snapToNearest, scrollByEntry, entryIndexOf, NO_ENTRY_REQUEST } from './ui/scrollApi';
+// #1016 — the agent AIM surface must model press routing with the SAME function the router uses,
+// not a second copy of the rule (§9: a rule implemented twice diverges, and these two already did).
+export { resolveTapZoneVeto, UI_TAP_ZONE_ATTR, UI_PRESS_ORIGIN_ATTR } from './ui/pressOrigin';
+// Exported for AUTHORING GUARDS as much as for runtime use (#963). A test that wants to know where
+// an anchored child actually lands has two choices: call this, or re-implement the anchor/pivot/
+// offset arithmetic beside it — and Court's `tapZoneClearance.test.ts` records what the second one
+// costs (its hand-rolled layout model was wrong 3 times out of 5). A game or demo can only reach
+// engine code through the `@modoki/engine` specifier, so an unexported helper is one a portable
+// guard cannot use at all.
+export { resolveAnchorRect, ZERO_INSETS, type AnchorData, type SafeAreaPx }
+  from './ui/anchorLayout';
+// The vertical band stack (#800), extracted from two identical per-game copies. The SOLVER is L0
+// arithmetic with no world; the READER needs one. ⚠️ `ScreenBand` is exported but deliberately NOT
+// registered by the engine — each game calls `registerTrait` with this object and its own role
+// vocabulary and tooltips. The trait's own banner says what registering it here would break.
+export { solveBands, type Band, type SolvedBand, type SolvedBands } from './core/screenBands';
+export { ScreenBand, SCREEN_BAND_DEFAULTS } from './traits/ScreenBand';
+export { readScreenBands, type ReadScreenBandsOptions } from './ui/readScreenBands';
+// `AnchorData.anchor` is typed `AnchorMode`, so exporting the interface without it leaves a public
+// type whose own field type is unreachable — `npm run docs:api` says so out loud ("referenced by
+// index.AnchorData.anchor but not included in the documentation"), and a caller building an
+// AnchorData literal cannot name the union.
+export type { AnchorMode } from './traits/UIAnchor';
 export { entriesSystem, resetEntriesSystem, ENTRIES_CONTENT_NAME, setEntryPrefabProvider, getEntryPrefabProvider, type EntryPrefabProvider } from './ui/entriesSystem';
 export { patchUI, patchToggle, restartClip, readChromeUI, findChromeEntity, resetSceneChromeCache, patchAnchorPct, type ChromeUIPatch, type ChromeTogglePatch, type ChromeAnchorPatch } from './ui/sceneChrome';
 export { installEntryPrefabProvider, entryPrefabProvider } from './loaders/entryPrefabProvider';
@@ -63,6 +91,11 @@ export {
 export {
   installGlobalErrorHandlers, captureToCrashlytics, reportReactError, type CaptureKind,
 } from './core/globalErrors';
+// The plugin payload a game's CrashlyticsService must send, carrying each report's group (#1063).
+export {
+  crashlyticsGroup, crashlyticsExceptionOptions,
+  type CrashlyticsExceptionOptions, type CrashlyticsStackFrame,
+} from './core/crashlyticsGroup';
 // Deliberate NATIVE fault triggers (#278) — the half of the crash pipeline JS cannot reach.
 // The app shell installs the implementation over capacitor-game-debug; the engine only owns the seam.
 export {
@@ -101,10 +134,16 @@ export {
   purchase as iapPurchase, reconcile as iapReconcile, spend as iapSpend,
   balanceOf as iapBalanceOf, productInfo as iapProductInfo,
   describeStoreError as iapDescribeStoreError,
-  IapLedger, NoopStoreBackend, LocalVerifier, MockStoreBackend, pickStoreBackend,
-  type ConfigureIapOptions, type StoreBackend, type IapLedgerStore, type PurchaseVerifier,
+  IapLedger, NoopStoreBackend, LocalVerifier, MockStoreBackend, pickStoreBackend, isStoreCancelled,
+  type ConfigureIapOptions, type StoreBackend, type StoreCancelled, type IapLedgerStore, type PurchaseVerifier,
   type ProductKind, type IapProduct, type IapProductInfo, type StoreTransaction,
   type PurchaseOutcome, type PurchaseResult, type IapGrant,
+  shelfProductId, sellableShelfOffers, buildShelfCatalog, shelfOfferForProduct, shelfEffectOf,
+  visibleShelfOffers, extendPassExpiry, isPassActive, noAdsActive, noAdsRemaining, shelfView, quickBuyView,
+  type ShelfOffer, type ShelfEffect, type NoAdsState, type NoAdsRemaining, type ShelfState, type ShelfRefusal,
+  type ShelfRowWords, type ShelfRowView, type ShelfNoticeWords, type ShelfInputs, type ShelfView, type QuickBuyView,
+  ShelfSession, SHELF_WATCHDOG_MS,
+  type ShelfSessionOptions, type ShelfTimers, type ShelfBegin, type ShelfSettle,
 } from './iap';
 export { registerIapControls } from './actions/iapControls';
 export { hapticsSystem } from './haptics/hapticsSystem';
@@ -148,6 +187,8 @@ export {
   type MeshAsset, type MaterialAsset, type SpriteClip, type BodyType2D, type ColliderShape2D, type JointType2D,
   type BodyType3D, type ColliderShape3D, type JointType3D,
 } from './traits';
+// The one list of UI length units (#1064) — `registerTraits` spreads it into every `*Unit` enum.
+export { UI_LENGTH_UNITS } from './traits/uiLength';
 // Particle schema + loader. The schema/types are pure (no THREE); the rendering backend
 // lives behind `@modoki/engine/runtime/rendering` so the top-level runtime entry stays
 // free of the `three/webgpu` import.
@@ -186,7 +227,7 @@ export {
 export {
   getTimeline, setTimeline, invalidateTimeline, clearTimelineCache, loadTimelineNow,
 } from './loaders/timelineCache';
-export { timelineSystem, resolveTimelineAt, applyTimelineState, previewTimelineAt, previewTimelineStep } from './timeline/timelineSystem';
+export { timelineSystem, resolveTimelineAt, applyTimelineState, previewTimelineAt, previewTimelineStep, findSlavingParent } from './timeline/timelineSystem';
 export { requestSkeletalSeek, getSkeletalSeek, clearSkeletalSeeks, hasSkeletalSeeks } from './core/skeletalSeek';
 export { setTimelinePreviewActive, isTimelinePreviewActive } from './core/timelinePreview';
 export { clearControlSpawns } from './timeline/controlSpawnRegistry';
@@ -226,7 +267,7 @@ export { buildRig2D, autoRig2D, type BuildRig2DOptions, type AutoRig2DOptions } 
 export { paintWeights, boneWeightField, dominantBoneField, type PaintWeightsOptions, type PaintWeightsResult } from './skinning/rig2dWeightPaint';
 export {
   findEntity, getEntityTraits, readTraitData, readTraitDataFull, writeTraitField,
-  getAllEntities, buildEntityTree, deleteEntity, deleteEntities, deriveLayer,
+  getAllEntities, entityDisplayName, buildEntityTree, deleteEntity, deleteEntities, deriveLayer,
   onStructureDirty, markStructureDirty, getStructureVersion,
   type EntityInfo,
 } from './core/ecs/entityUtils';
@@ -411,6 +452,8 @@ export { isPrimitive, createPrimitiveMesh, PRIMITIVE_NAMES } from './loaders/pri
 export { PRIMITIVE_SPRITE_NAMES } from './loaders/sceneValidation';
 export { loadSceneFile, collectResourceRefsFromEntities, instantiatePrefabIntoWorld, spawnPrefabInstance, deriveInstanceMemberGuids, type SceneData, type LoadSceneOptions, type SceneResourceRef, type SceneEntityEntry } from './loaders/loadSceneFile';
 export { markOverride, getOverrideMarkSet, clearOverrideMarks, clearAllOverrideMarks } from './loaders/overrideMarks';
+export { resolveCanvas2DHost, type ResolveCanvas2DHostOptions } from './scene/canvas2DHost';
+export { loadedScenePath } from './core/ecs/sceneLoaded';
 export { sceneManager, gameIdFromScenePath, type Scene, type SceneState, type LoadOptions as SceneLoadOptions, type SceneManager, type LoadedSceneEntry } from './scene/SceneManager';
 export { validateSceneData, typeMismatch, REF_FIELDS_BY_TRAIT, type SceneSchema, type ValidationResult, type AssetRefVerdict, type AssetRefResolver, makeAssetRefResolver } from './loaders/sceneValidation';
 export { buildSceneSchema } from './scene/sceneSchema';
@@ -419,7 +462,9 @@ export { applyOps, type MutateOp, type MutableScene, type MutableEntity, type En
 // since #166 so the DEVICE create-entity op can build the SAME entities the editor does — the
 // editor half of the package is stripped from a shipped game build. See
 // docs/mcp-tool-conventions.md §9.
-export { buildEntityCreateSpecs, type CreateEntitySpec, type CreateSpecs, type TraitSpec, type LightKind } from './scene/entityCreateSpecs';
+export { buildEntityCreateSpecs, CREATE_ENTITY_KINDS, LIGHT_KINDS, type CreateEntitySpec, type CreateSpecs, type TraitSpec, type LightKind } from './scene/entityCreateSpecs';
+// The one vocabulary check both create-entity ops (editor + device) share, returned as data (#1070).
+export { resolveCreateEntitySpec, type CreateEntitySpecResolution } from './scene/createEntitySpec';
 export { buildUiCreateSpecs, type UiPreset, type UiTraitSpec } from './ui/uiAuthoring';
 // Hierarchy legality (#166 P7) — the ONE self-parent/cycle rule, shared by the editor's undoable
 // reparent and the device's direct parentId write. See runtime/core/ecs/hierarchy.ts.
@@ -433,6 +478,13 @@ export { loadFont, loadAllFonts, loadFontFamily, getLoadedFontFamilies, getLoade
 // able to prove the result still fits the panel it draws it in, and a game may only reach the
 // engine through this package specifier (see the portability guard). Pure — no GPU, no DOM.
 export { layoutText, type LayoutFont, type LayoutOptions, type TextLayout, type TextAlign } from './rendering/text/layoutText';
+/** #1038 — the seam that lets GAME code measure real rendered 2D text. `layoutText` above was
+ *  already exported but is unusable from a game without a `LayoutFont`, and the only source of one
+ *  (`getLoadedFont`) is deliberately still not exported: it hands back a font whose atlas may not
+ *  hold the glyphs yet, and measuring through it silently returns the 0.5 em fallback advance.
+ *  `measureText2D` wraps the `ensureGlyphs` + `layoutText` pair so that trap is not re-exported
+ *  with it. */
+export { measureText2D, type MeasureText2DOptions } from './loaders/measureText2D';
 export {
   isGuid, isExternalUrl, isInternalAssetPath, newGuid, deriveGuid, registerAsset, unregisterAsset, resolveGuidToPath,
   getGuidForPath, getAssetType, getAssetEntry, getAudioLoadType, resolveRef, loadManifestJson, ensureManifestLoaded, serializeManifest,
@@ -446,6 +498,12 @@ export { UIRenderer } from './ui/UIRenderer';
 // should use `UIAnchor.safeArea` and never touch this — it exists for a game that has to
 // compute WITH the inset (a reserved bottom band, a board fitted into what is left).
 export { getSafeAreaInsets, resetSafeAreaInsets, type SafeAreaInsets } from './ui/safeArea';
+// UI text overflow warning (#1126) — the gate the app shell turns on in editor/debug builds, and the
+// findings store `diagnose` reads. See the module header in `ui/uiOverflow.ts`.
+export {
+  setUIOverflowCheckEnabled, isUIOverflowCheckEnabled, getUIOverflowFindings, recordUIOverflow, refreshUIOverflowCurrent, resetUIOverflowFindings,
+  type UIOverflowFinding, type UIOverflowKind,
+} from './ui/uiOverflow';
 // Whether a native TOUCH gesture is live anywhere in the DOM, independent of the canvas-scoped
 // `Input` resource (which deliberately excludes a press starting on DOM chrome). Touch only —
 // see the module's own header for why mouse/pointer tracking was tried and dropped. For deferring
@@ -454,7 +512,8 @@ export { getSafeAreaInsets, resetSafeAreaInsets, type SafeAreaInsets } from './u
 export {
   wireDomGestureTracking, unwireDomGestureTracking, isDomGestureActive, resetDomGestureTracking,
 } from './ui/domGestureTracking';
-export { registerUIAction, unregisterUIAction, dispatchUIAction, dispatchGameAction, hasUIAction, getUIActionNames, getUIActionParams } from './core/actionRegistry';
+export { registerUIAction, unregisterUIAction, dispatchUIAction, dispatchGameAction, hasUIAction, getUIActionNames, getUIActionParams, refuseAction, isActionRefusal } from './core/actionRegistry';
+export type { UIActionRefusal } from './core/actionRegistry';
 export type { UIActionContext, UIActionHandler, UIActionDef, UIActionPayload, DispatchOptions } from './core/actionRegistry';
 export { registerEngineActions } from './actions/engineActions';
 export { applyBindings, VALUE_TOKEN } from './ui/bindings';
@@ -593,9 +652,10 @@ export {
   type PickProvider,
 } from './core/screenPick';
 export {
-  registerHandleProvider, collectHandles, resolveHandle,
+  registerHandleProvider, collectHandles, resolveHandle, normalizeHandleLabel,
   type InteractionHandle, type HandleFilter, type HandleProvider,
 } from './rendering/interactionHandles';
+export { MIXED_PLACEHOLDER } from './rendering/mixedPlaceholder';
 export {
   getAssetSchema, defaultAssetData, validateAssetData, normalizeAssetData,
   type AssetSchemaType, type AssetSchema, type FieldMeta, type AssetFieldType,
@@ -635,10 +695,23 @@ export {
   setTrustedAnchor, trustedNow, hasTrustedAnchor, trustedAnchorSource, clearTrustedAnchor,
   type TrustedClockSource,
 } from './core/trustedClock';
+export {
+  DAYS_PER_MONTH_GRID, dateKeyOf, dayCostsCoins, daysForMonth, effectiveDayKey, effectiveNowMs,
+  isDailyUnlocked, isDateKey, isDayInteractive, isMonthInRange, isRealDateKey, isTodayUnplayed,
+  monthOf, monthsForCalendar, pickDailyLevel, previousMonth, sameMonth,
+  type DailyCompletion, type DailyProgress, type DateKey, type DayCell, type DayState, type MonthRef,
+} from './core/dailyCalendar';
+export {
+  drawLoginBonusSegment, loginBonusAvailability, loginBonusClaimRecord, loginBonusSegments,
+  resolveLoginBonusPayout,
+  type LoginBonusClaim, type LoginBonusPayout, type LoginBonusPolicy, type LoginBonusSegment,
+  type LoginBonusSegmentId, type LoginBonusSubstitution, type LoginBonusVerdict,
+} from './core/loginBonus';
 export { stepSimulation, type StepOptions } from './core/stepSimulation';
 export { seedRng, rngNext, rngFloat, rngInt, rngBool, rngPick } from './core/rng';
 export {
   emit, entityRef, journalEvents, drainJournal, clearJournal, setJournalTick, journalTick, setJournalEnabled,
+  JOURNAL_LEVELS, isJournalLevel,
   resolveRefName, setVerboseCapture, verboseCaptureState, isVerboseType,
   isJournalEnabled,
   type GameEvent, type JournalLevel,
@@ -681,6 +754,7 @@ export {
   setLinvel3D, setAngvel3D, setBodyTranslation3D, resetForces3D, wakeBody3D,
 } from './physics/physics3DSystem';
 export { initRapier3D, isRapier3DReady } from './physics/rapier3DLoader';
+export { ensurePhysicsReady, pendingPhysics, type PhysicsReadiness } from './physics/physicsReady';
 export { getContactState } from './physics/physicsContactIndex';
 export { zone2DSystem } from './zones/zone2DSystem';
 export { zone3DSystem } from './zones/zone3DSystem';
@@ -801,7 +875,7 @@ export {
 // only through its declared `exports` map — so an agent op cannot register without these.
 export {
   noteInputResolution,
-  startInputWatch, stopInputWatch, clearInputPresses, readInputPresses, isInputWatchOpen,
+  startInputWatch, stopInputWatch, clearInputPresses, readInputPresses, isInputWatchOpen, isUnresolvedPress,
   type InputPressRecord, type InputResolution,
 } from './input/pointerRecorder';
 export {

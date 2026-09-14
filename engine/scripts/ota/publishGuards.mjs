@@ -29,41 +29,65 @@ export function otaSigningKeyRefusal(keyPublicKey, projectPublicKey) {
   return keyPublicKey === projectPublicKey ? null : 'mismatch';
 }
 
-/** Why an OTA publish must be REFUSED on the dist's KIND vs. the identity it's published
- *  under, or null when it's consistent.
+/** Why an OTA publish must be REFUSED on the dist's KIND vs. the target it's published as, or null
+ *  when they agree. `targetKind` is `otaPublishPreflight`'s answer (`publishPreflight.mjs`): the
+ *  shell's own bundle name, or a sub-game LISTED in `ota.subgames`.
+ *   - A plain shell `dist/` published as a sub-game ships shell content under someone else's identity.
+ *   - A `subgame-dist/` published as the shell REPLACES the shell with a module the OTA client cannot
+ *     boot (it expects `subgame.json` + `globalThis.__MODOKI_SUBGAME__`, not a standalone app).
+ *  Both are silent on the publishing side — they fail only once a device fetches the release. Only
+ *  `ota-publish.mjs` needs this: the editor route builds whatever kind its target names.
  *
- *  This is the CLI's equivalent of the route's `otaPublishBundleNameAllowed` — but it is a
- *  DIFFERENT check, deliberately not a port of that one. `otaPublishBundleNameAllowed` is a
- *  strict `requestedBundleName === projectOtaBundleName` equality guard, and it is
- *  route-specific: the route only ever builds a plain shell `dist/` via `build-web.mjs`, so for
- *  IT any name other than the project's own is definitely wrong. But the route's own refusal
- *  message directs a human to `build-subgame.mjs` plus a hand invocation of THIS CLI for exactly
- *  the case that guard exists to block — publishing a sub-game module under its own bundle
- *  name. Porting the equality guard into the CLI verbatim would refuse the exact use the route
- *  sends people here for.
- *
- *  The invariant the CLI can actually enforce is the one that matters: the dist's KIND must
- *  match the identity it is published under.
- *   - A plain shell `dist/` published under a sub-game's bundle name ships shell content under
- *     someone else's identity — the bug `otaPublishBundleNameAllowed` exists to prevent.
- *   - A `subgame-dist/` published under the project's own shell bundleName REPLACES the shell
- *     with a module the OTA client cannot boot (it expects `subgame.json` +
- *     `globalThis.__MODOKI_SUBGAME__`, not a standalone app).
- *  Both are silent on the publishing side — they fail only once a device fetches the release.
- *
- *  ⚠️ CAVEAT: this pins the dist's kind to the SHAPE of the identity (plain shell vs.
- *  subgame-dist/), not to a SPECIFIC sub-game's identity — `subgame.json` carries no name, and
- *  neither this function nor its caller ever checks that `--dist` belongs to `--project`. So
- *  `--dist games/A/subgame-dist --name B` (A's sub-game content published under B's name) is
- *  allowed. Still strictly better than the pre-#582 no-guard state, and left this way
- *  DELIBERATELY: a sub-game publish legitimately pairs a sub-game's own dist with the shell
- *  project it's staged from (`--dist games/A/subgame-dist --project games/<shell>`), so a
- *  containment check here would refuse the very case this guard exists to allow. See the #582
- *  Gotchas entry in docs/ota-updates.md. */
-export function otaBundleDistKindRefusal({ bundleName, projectBundleName, distIsSubgameModule }) {
-  if (bundleName !== projectBundleName && !distIsSubgameModule) return 'subgame-name-with-shell-dist';
-  if (bundleName === projectBundleName && distIsSubgameModule) return 'shell-name-with-subgame-dist';
+ *  ⚠️ CAVEAT: this pins the dist's kind, not WHICH sub-game it is — `subgame.json` carries no name.
+ *  Since #827 the name must at least be one the shell lists, but `--dist games/A/subgame-dist --name B`
+ *  with B listed still publishes A's content as B. Left that way DELIBERATELY: a sub-game publish
+ *  legitimately pairs a sub-game's own dist with the shell project it is published into
+ *  (`--dist games/A/subgame-dist --project games/<shell>`), so a containment check here would refuse
+ *  the very case this guard exists to allow. See the #582 Gotchas entry in docs/ota-updates.md. */
+export function otaBundleDistKindRefusal({ targetKind, distIsSubgameModule }) {
+  if (targetKind === 'subgame' && !distIsSubgameModule) return 'subgame-name-with-shell-dist';
+  if (targetKind === 'shell' && distIsSubgameModule) return 'shell-name-with-subgame-dist';
   return null;
+}
+
+/** The engine-API value a SUB-GAME publish stamps, or why it must be REFUSED (#837).
+ *
+ *  A device loads a sub-game only when its manifest's `engineApi` EXACTLY equals the running shell's
+ *  `ENGINE_API_VERSION` (`engine/app/subgameLoader.ts`, never `>=`) and refuses anything else — but
+ *  on the device, long after the publish reported success. So the value comes from what the build
+ *  actually stamped (`subgame.json.engineApi`), a flag may only agree with it, and it must equal the
+ *  SHELL project's own `ota.engineApi`, the value that shell's builds declare they run.
+ *
+ *   - `stamped`: `subgame.json`'s `engineApi` as parsed (any value).
+ *   - `requested`: the `--engine-api` flag as a number, or `undefined` when it was omitted.
+ *   - `shellEngineApi`: the shell project's `ota.engineApi`, with an absent key already resolved to
+ *     {@link OTA_DEFAULT_ENGINE_API}.
+ *
+ *  Returns `{ engineApi }` when publishable, else `{ refusal }`. Pure. */
+export function otaSubgameEngineApi({ stamped, requested, shellEngineApi }) {
+  if (!Number.isInteger(stamped) || stamped < 1) return { refusal: 'stamped-invalid' };
+  if (requested !== undefined && requested !== stamped) return { refusal: 'flag-mismatch' };
+  if (stamped !== shellEngineApi) return { refusal: 'shell-mismatch' };
+  return { engineApi: stamped };
+}
+
+/** The engine-API value `project.config.json`'s `ota.engineApi` resolves to when the key is ABSENT.
+ *  MUST equal `DEFAULT_PROJECT_CONFIG.ota.engineApi` — the same deliberate second authored copy as
+ *  {@link OTA_DEFAULT_BUNDLE_NAME} below, for the same reason, pinned by the same test file. */
+export const OTA_DEFAULT_ENGINE_API = 1;
+
+/** How many versions of each bundle an OTA publish keeps when `ota.retainVersions` is ABSENT (#836).
+ *  MUST equal `DEFAULT_PROJECT_CONFIG.ota.retainVersions` — the same deliberate second authored copy
+ *  as {@link OTA_DEFAULT_BUNDLE_NAME}, pinned by the same test file. The owner-facing knob is the
+ *  project field; this only answers for a config that never set it. */
+export const OTA_DEFAULT_RETAIN_VERSIONS = 5;
+
+/** `ota.retainVersions` resolved from a RAW `ota` block: the default when absent, the value when it is
+ *  a positive integer, and `null` for anything else — a malformed retention count must refuse, never
+ *  silently become "keep everything" or "keep one". Pure. */
+export function otaRetainVersions(ota) {
+  const value = ota?.retainVersions === undefined ? OTA_DEFAULT_RETAIN_VERSIONS : ota.retainVersions;
+  return Number.isInteger(value) && value >= 1 ? value : null;
 }
 
 /** The bundle name `project.config.json`'s `ota.bundleName` resolves to when the key is

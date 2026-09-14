@@ -8,9 +8,22 @@ export function otaSigningKeyRefusal(
 ): 'no-key-public-half' | 'project-public-key-empty' | 'mismatch' | null;
 
 export function otaBundleDistKindRefusal(o: {
-  bundleName: string;
-  projectBundleName: string;
+  targetKind: 'shell' | 'subgame';
   distIsSubgameModule: boolean;
 }): 'subgame-name-with-shell-dist' | 'shell-name-with-subgame-dist' | null;
+
+export function otaSubgameEngineApi(o: {
+  stamped: unknown;
+  requested: number | undefined;
+  shellEngineApi: unknown;
+}):
+  | { engineApi: number; refusal?: undefined }
+  | { refusal: 'stamped-invalid' | 'flag-mismatch' | 'shell-mismatch'; engineApi?: undefined };
+
+export const OTA_DEFAULT_ENGINE_API: number;
+
+export const OTA_DEFAULT_RETAIN_VERSIONS: number;
+
+export function otaRetainVersions(ota: unknown): number | null;
 
 export const OTA_DEFAULT_BUNDLE_NAME: string;

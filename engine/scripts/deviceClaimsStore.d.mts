@@ -48,6 +48,13 @@ export interface DeviceClaim {
    *  and an absent model as "cannot tell" — never as "different". */
   model?: string;
   osVersion?: string;
+  /** (#1082) WHO holds this claim, when the holders named themselves — `lease:<guid>`, `wda`. One
+   *  process can hold one device id through two independent holders (a USB lease and the
+   *  WebDriverAgent launch both key an iPhone as `ios:<udid>`), and `(deviceId, pid)` cannot tell
+   *  them apart, so the first to release handed the phone back while the other was still using it.
+   *  The device is free when the LAST holder releases. Absent on a claim whose caller named none,
+   *  which keeps the whole-record release behaviour. */
+  holders?: string[];
 }
 
 export interface ClaimRequest {
@@ -64,6 +71,10 @@ export interface ClaimRequest {
   /** (#285) The phone's own report of itself — see `DeviceClaim.model`. */
   model?: string;
   osVersion?: string;
+  /** (#1082) Register this holder on the claim — see `DeviceClaim.holders`. A re-claim by a
+   *  DIFFERENT holder in the same process adds to the set rather than replacing the record, and an
+   *  unnamed re-claim leaves an existing set alone. */
+  holder?: string;
 }
 
 export type ClaimResult =
@@ -78,6 +89,9 @@ export interface StaleOpts {
 export interface ReleaseOpts extends StaleOpts {
   /** (#285) Release an owner-claim by its token instead of by this process's pid. */
   owner?: string;
+  /** (#1082) Release only THIS holder's hold — see `DeviceClaim.holders`. The record survives while
+   *  another holder in this process still has it. Omitted, the whole record goes, as before. */
+  holder?: string;
 }
 
 /** Wall-clock backstop for a pid-claim whose pid check cannot settle it (12h). */
@@ -93,6 +107,10 @@ export declare const MAX_CLAIM_TTL_MS: number;
 export declare function clampTtlMs(ttlMs: number | undefined | null): number | undefined;
 
 export declare function claimsDir(): string;
+/** The fallback claims dir for `pid` under vitest (#1117). */
+export declare function vitestClaimsDir(pid?: number): string;
+/** Remove this process's fallback dir, plus dead-pid ones touched at or after `sinceMs`. Returns the removed paths. */
+export declare function reapVitestClaimsDirs(opts: { sinceMs: number; alive?: (pid: number) => boolean; tmp?: string }): string[];
 
 export declare function adbDeviceId(serial: string): DeviceId;
 export declare function iosDeviceId(udid: string): DeviceId;

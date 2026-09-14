@@ -24,8 +24,7 @@ import {
   getCurrentWorld,
   newGuid,
   buildEntityCreateSpecs,
-  PRIMITIVE_NAMES,
-  PRIMITIVE_SPRITE_NAMES,
+  resolveCreateEntitySpec,
   type CreateEntitySpec,
 } from '@modoki/engine/runtime';
 
@@ -51,19 +50,26 @@ function attrMeta() {
   return getAllTraits().find((m) => m.name === 'EntityAttributes');
 }
 
-function guidOf(id: number): string {
+/** An entity's authored guid, or `null` when it has none (#1199).
+ *
+ *  ⚠️ NEVER `String(id)` as the fallback. That is what this used to return, and it is a live id
+ *  disguised as a guid: it looks addressable, and every guid-addressed op then refuses it (a
+ *  guid-less entity is not in the guid index) with a message telling the caller to use guids.
+ *  `null` says "no guid yet" in the reply's own type; the row's `id` is still there beside it.
+ *  Exported so the `set-traits` op reports the same way. */
+export function liveGuidOf(id: number): string | null {
   const meta = attrMeta();
   const d = meta ? (readTraitDataFull(id, meta) as Record<string, unknown> | null) : null;
-  return ((d?.guid as string) || '') || String(id);
+  return (d?.guid as string) || null;
 }
 
 /** Give a freshly-spawned entity a stable guid. The editor mints one via its undo-aware
  *  `ensureGuid`; here we write the field directly, because the reply MUST hand back a guid — an
  *  agent told only a numeric id has been handed an address that expires on the next scene reload. */
-function mintGuid(id: number): string {
+function mintGuid(id: number): string | null {
   const meta = attrMeta();
   const entity = findEntity(id);
-  if (!meta || !entity) return String(id);
+  if (!meta || !entity) return null;   // not String(id) — see liveGuidOf (#1199)
   const existing = (readTraitDataFull(id, meta) as Record<string, unknown> | null)?.guid as string | undefined;
   if (existing) return existing;
   const guid = newGuid();
@@ -90,17 +96,13 @@ export function createEntityLive(params: unknown): unknown {
   const p = (params ?? {}) as { spec?: CreateEntitySpec; parentGuid?: string; parentId?: number };
   if (!p.spec) return { ok: false, error: 'create-entity requires { spec } — nothing was created.' };
 
-  // Same vocabulary check the editor op makes: `{kind:'primitive', mesh:'pyramid'}` used to return a
-  // clean success and produce an entity whose renderer resolves to nothing — invisible, no error.
-  const spec = p.spec as { kind?: string; mesh?: string; shape?: string };
-  if (spec.kind === 'primitive' && !spec.mesh) spec.mesh = 'sphere';
-  if (spec.kind === '2d' && !spec.shape) spec.shape = 'square';
-  if (spec.kind === 'primitive' && spec.mesh && !PRIMITIVE_NAMES.includes(spec.mesh)) {
-    return { ok: false, error: `unknown primitive mesh "${spec.mesh}" — nothing was created.`, options: [...PRIMITIVE_NAMES] };
-  }
-  if (spec.kind === '2d' && spec.shape && !(PRIMITIVE_SPRITE_NAMES as readonly string[]).includes(spec.shape)) {
-    return { ok: false, error: `unknown 2D shape "${spec.shape}" — nothing was created.`, options: [...PRIMITIVE_SPRITE_NAMES] };
-  }
+  // The ONE vocabulary check both create-entity ops share (#1070): the per-kind defaults, then the
+  // kind, mesh, shape, light and preset — returned as DATA so this op answers in its own
+  // `{ok:false, error, options}` shape. `{kind:'primitive', mesh:'pyramid'}` once returned a clean
+  // success for an invisible entity; the light/preset checks then THREW out of the spec builders,
+  // which the device relay flattened into a bare error string with no options.
+  const resolved = resolveCreateEntitySpec(p.spec);
+  if (!resolved.ok) return { ok: false, error: resolved.error, options: resolved.options };
 
   let parentId = 0;
   if (p.parentGuid != null) {
@@ -113,9 +115,9 @@ export function createEntityLive(params: unknown): unknown {
     parentId = p.parentId;
   }
 
-  const { name, specs } = buildEntityCreateSpecs(p.spec, parentId);
+  const { name, specs } = buildEntityCreateSpecs(resolved.spec, parentId);
   const id = spawnFromSpecs(specs);
-  if (id == null) return { ok: false, error: `nothing was created for spec ${JSON.stringify(p.spec)} — a referenced trait is not registered in this build.` };
+  if (id == null) return { ok: false, error: `nothing was created for spec ${JSON.stringify(resolved.spec)} — a referenced trait is not registered in this build.` };
   return { ok: true, id, guid: mintGuid(id), name, saved: false, savedNote: LIVE_ONLY };
 }
 
@@ -175,7 +177,7 @@ export function duplicateEntityLive(params: unknown): unknown {
     return { id, parentId: parent, traits };
   });
 
-  const roots: Array<{ id: number; guid: string }> = [];
+  const roots: Array<{ id: number; guid: string | null }> = [];
   // Everything this call spawns, so a mid-flight failure can be ROLLED BACK. Without it, a spawn
   // that failed on the child of a 2-entity subtree left the parent's copy live in the world while
   // the reply said "nothing was kept" — a half-applied mutation behind a failure verdict, which is
@@ -216,7 +218,7 @@ export function duplicateEntityLive(params: unknown): unknown {
       idMap.set(src.id, newId);
     }
     const newRoot = idMap.get(rootId)!;
-    roots.push({ id: newRoot, guid: guidOf(newRoot) });
+    roots.push({ id: newRoot, guid: liveGuidOf(newRoot) });
   }
 
   return {
@@ -258,9 +260,9 @@ export function deleteEntitiesLive(params: unknown): unknown {
 
   // Read every guid BEFORE deleting anything. deleteEntity CASCADES to the subtree, so deleting a
   // parent destroys a child that is also in `targets` — and reading that child's guid afterwards
-  // falls through to String(id), reporting a live entity id disguised as a guid. Same
+  // finds no entity, reporting `null` for an entity that had a real guid. Same
   // snapshot-before-mutating discipline duplicateEntityLive uses one function up.
-  const deleted = targets.map(guidOf);
+  const deleted = targets.map(liveGuidOf);
   for (const id of targets) deleteEntity(id);   // a second delete of a cascaded child is a safe no-op
   return { ok: true, deleted: deleted.length, guids: deleted, saved: false, savedNote: LIVE_ONLY };
 }

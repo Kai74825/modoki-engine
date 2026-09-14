@@ -86,14 +86,17 @@
  */
 
 import { createWorld, type World, type Entity } from 'koota';
-import { setCurrentWorld, getCurrentWorld, spawnEntity } from '../core/ecs/world';
+import { setCurrentWorld, getCurrentWorld, spawnEntity, findEntityById } from '../core/ecs/world';
 import { createTeardownToken, type LivenessCheck } from '../core/liveness';
+import { notifyListeners } from '../core/notifyListeners';
 import { getAllTraits } from '../core/ecs/traitRegistry';
 import { resolveKootaSchema } from './sceneSchema';
 import { resolveSceneChain, type SceneRef, type FetchSceneMeta } from './sceneChain';
 import { emit } from '../core/journal';
+import { markSceneLoaded, isSceneFilePath } from '../core/ecs/sceneLoaded';
 import { beginBootSpan, endBootSpan, bootSpanAsync } from '../core/bootTimeline';
-import { clearAllOverrideMarks, getOverrideMarkSet, markOverride } from '../loaders/overrideMarks';
+import { ensurePhysicsReady } from '../physics/physicsReady';
+import { clearAllOverrideMarks, getOverrideMarkSet, restoreOverrideMarks } from '../loaders/overrideMarks';
 import { clearAuthoredWritesWhileStopped } from '../core/ecs/authoredWrites';
 import { SCENE_FORMAT_VERSION } from '../core/version';
 
@@ -112,6 +115,11 @@ import { acquireFont } from '../loaders/fontAtlasLoader';
 import { loadFontFamily, loadFontFamilyForRef } from '../loaders/fontLoader';
 import { registerAsset, isGuid, resolveGuidToPath, getAudioLoadType } from '../loaders/assetManifest';
 import { loadTimelineNow } from '../loaders/timelineCache';
+import { loadAnimationClipNow } from '../loaders/animationClipCache';
+import { loadParticleEffectNow } from '../loaders/particleCache';
+import { loadAnimSetNow } from '../loaders/animSetCache';
+import { loadSpriteAnimNow } from '../loaders/spriteAnimCache';
+import { loadRig2DNow } from '../loaders/rig2dCache';
 import { collectTimelineAudioRefs, collectTimelineControlRefs, collectTimelineVideoRefs } from '../timeline/types';
 import { ASSET_FETCH_INIT, parseAssetJson } from '../loaders/assetFetch';
 import { assetUrl } from '../loaders/assetUrl';
@@ -339,10 +347,19 @@ class SceneManagerImpl implements SceneManager {
   }
 
   private fireSceneCallbacks(scenePath: string) {
+    // Fan out through the shared helper (#953). Its report is `console.error`, so a game callback
+    // that throws spends the crash budget like any other listener defect (owner ruling on #953);
+    // this used to be a `console.warn`.
+    notifyListeners(this.matchingSceneCallbacks(scenePath), 'SceneManager:onSceneLoaded', []);
+  }
+
+  /** The callbacks whose pattern matches, yielded LAZILY from the live Map. A snapshot array would
+   *  change what the old loop did when a callback (un)registers another mid-fan-out: an
+   *  unregistered later match must not fire, and a newly registered one fires in the same pass —
+   *  the Map semantics `notifyListeners` documents keeping. */
+  private *matchingSceneCallbacks(scenePath: string): Generator<() => void> {
     for (const [pattern, cb] of this.sceneCallbacks) {
-      if (pattern === '*' || scenePath.includes(pattern)) {
-        try { cb(); } catch (e) { console.warn(`[SceneManager] onSceneLoaded callback failed:`, e); }
-      }
+      if (pattern === '*' || scenePath.includes(pattern)) yield cb;
     }
   }
 
@@ -714,9 +731,11 @@ class SceneManagerImpl implements SceneManager {
       // instance serializes as "no override" and reverts to the prefab's bare defaults
       // on the next load (A9 defect 2 —
       // docs/reviews/a9-carried-instance-overrides-investigation.md).
+      // Marks are keyed by the packed entity (#868), so resolve each carried id in the old world.
       const carriedMarks = new Map<number, string[]>();
       for (const entry of carriedSnapshots) {
-        const set = getOverrideMarkSet(entry.id);
+        const old = findEntityById(entry.id);
+        const set = old ? getOverrideMarkSet(old) : undefined;
         if (set && set.size > 0) carriedMarks.set(entry.id, [...set]);
       }
       const persistentOnlySnapshots = carriedSnapshots.filter((e) => e.traits['Persistent'] === true);
@@ -926,12 +945,7 @@ class SceneManagerImpl implements SceneManager {
             // the cross-contamination that got an earlier A8 attempt reverted.
             onEntitySpawned: (entity: { id(): number }, oldId: number) => {
               const keys = carriedMarks.get(oldId);
-              if (!keys) return;
-              for (const key of keys) {
-                const dot = key.indexOf('.'); // key is `${trait}.${field}`
-                if (dot <= 0) continue;
-                markOverride(entity.id(), key.slice(0, dot), key.slice(dot + 1));
-              }
+              if (keys) restoreOverrideMarks(entity as unknown as Entity, keys);
             },
           },
         );
@@ -1016,6 +1030,11 @@ class SceneManagerImpl implements SceneManager {
       // world) — one of the three boot phases #238 names, and the reason this span is separate.
       const swapWorld = nextWorld;
       await bootSpanAsync('scene-before-swap-hooks', () => this.fireBeforeSwapHooks(swapWorld));
+      // Physics WASM: a scene with bodies is never swapped in before Rapier can step it (#1175).
+      // Queried on the SPAWNED world, so bodies that arrived through a prefab count. A permanent
+      // init failure does not abort the load — the loader has already logged it, and refusing the
+      // swap would only trade a scene without physics for no scene at all.
+      await bootSpanAsync('scene-physics-init', () => ensurePhysicsReady(swapWorld));
 
       if (this.isSuperseded(controller, enteredGeneration)) throw new DOMException('Aborted', 'AbortError');
 
@@ -1058,6 +1077,10 @@ class SceneManagerImpl implements SceneManager {
       this.currentBaseScene = data.baseScene;
       this.nextLoad = null;
 
+      // #1135 — BEFORE the promote, so the first GAME tick against this world already knows its scene
+      // is here, and a host-resolving system cannot mistake it for the pre-scene boot window. Only a
+      // scene FILE: an untitled snapshot reload or the prefab-edit world is not one (`isSceneFilePath`).
+      if (isSceneFilePath(path)) markSceneLoaded(promotedWorld, path);
       setCurrentWorld(promotedWorld); // fires onWorldSwap → renderers clear caches
       nextWorld = null; // ownership transferred to current; do not destroy in catch
       // From here on, `allocatedSceneIds` is owned by `loadedScenes` (already
@@ -1535,7 +1558,7 @@ class SceneManagerImpl implements SceneManager {
   /** For tests + shutdown. Releases everything and resets the manager.
    *
    *  Async (F1): a normal scene swap disposes the active scene/game managers and
-   *  re-resolves the active scope (loadScene lines ~437-459); `unloadAll` is the
+   *  re-resolves the active scope (loadScene's gameChanged block); `unloadAll` is the
    *  asymmetric teardown path, so it must do the same or every active manager's
    *  dispose() is skipped — TimeManager/NavigationManager keep their onWorldSwap /
    *  registerReadSource subscriptions live, scene/game managers keep their owned
@@ -1949,7 +1972,8 @@ function snapshotPersistentEntities(world: World, keptBaseGuids: Set<string> = n
  *  spanning them would spend the boot timeline's cap on hundreds of zero-length rows and push
  *  the real work off the end of it. */
 const LOADING_RESOURCE_TYPES: ReadonlySet<string> = new Set([
-  'model', 'riggedModel', 'mesh', 'material', 'prefab', 'font', 'environment', 'audio',
+  'model', 'riggedModel', 'mesh', 'material', 'prefab', 'font', 'environment', 'audio', 'animation',
+  'particle', 'animset', 'spriteanim', 'rig2d',
 ]);
 
 /** Per-resource boot spans (#238). The stall being hunted is per-project and bimodal, and the
@@ -1977,43 +2001,54 @@ async function acquireResourceInner(sceneId: SceneId, ref: SceneResourceRef): Pr
       // Never preloaded: a video is STREAMED or downloaded on demand by videoSystem —
       // pulling whole clips into memory at scene load is the opposite of what the
       // delivery policy exists to do. Listed as a resource for the build tree-shaker,
-      // same as texture/particle/animation.
+      // same as texture/particle.
       return;
     case 'prefab':   return acquirePrefab(sceneId, ref.path);
+    // ── Lazily-cached asset DEFS: PRELOADED (#1097, #1162) ──────────────────────────────
+    // Each kind below has a per-frame consumer that lazy-loads its def and SKIPS the entity while
+    // the def is null. Left to that alone, a def still in flight at the swap paints the entity's
+    // authored state for as many frames as its fetch takes (measured for Animator clips in
+    // games/court/intro.md § the pre-pose window, and for a 2D rig in docs/scene-loading.md).
+    // Awaiting it here, before the swap, makes the first frame already use it. The lazy getters
+    // stay as the fallback for a prefab spawned by code the manifest never saw. What they depend
+    // on in turn (flipbook frames, rig part textures, particle textures) stays lazy, like every 2D
+    // texture — only the animset's source GLB is acquired, because models are preloaded.
     case 'particle':
-      // `.particle.json` effects referenced by ParticleEmitter entities. The per-frame
-      // particle sync lazy-loads + caches the def via getParticleEffect (retrying until
-      // ready), so no preload is needed here. Listed as a resource so the build
-      // tree-shaker keeps the file; the acquire is a no-op (mirrors texture/font).
+      // `.particle.json` effects referenced by ParticleEmitter entities: no emitter until loaded.
+      await loadParticleEffectNow(ref.path);
       return;
     case 'animation':
-      // `.anim.json` clips referenced by Animator entities. The animation system
-      // lazy-loads + caches the clip via getAnimationClip (retrying until ready),
-      // so no preload is needed. Listed as a resource for the build tree-shaker.
+      // `.anim.json` clips referenced by Animator banks: no pose until loaded (#1097).
+      await loadAnimationClipNow(ref.path);
       return;
     case 'timeline':
       // `.timeline.json` sequences referenced by Director entities. Fetched above (the
       // transitive-ref walk) to pull out audio cues; the timelineSystem lazy-loads +
-      // caches the def via getTimeline (retrying until ready), so no preload is needed
-      // here. Listed as a resource for the build tree-shaker (mirrors animation).
+      // caches the def via getTimeline (retrying until ready), and the walk above already
+      // warmed that cache, so nothing is left to load here.
       return;
-    case 'animset':
-      // `.animset.json` per-clip params referenced by SkeletalAnimator entities.
-      // driveAnimator lazy-loads + caches the set via resolveAnimSetParams
-      // (retrying until ready), so no preload is needed. Listed as a resource for
-      // the build tree-shaker (mirrors animation/particle).
+    case 'animset': {
+      // `.animset.json` per-clip params referenced by SkeletalAnimator.animSet and
+      // AnimationLibrary.animSets. Without it clips play at ANIMSET_DEFAULTS, and a library merges
+      // no clips — a bare rig holds its bind pose. A library ALSO needs the set's `source` GLB,
+      // which the manifest walk does not list, so acquire it here under this scene: the render
+      // sync's own `lazyAcquireRiggedModel(source)` would otherwise fetch it after the swap.
+      const set = await loadAnimSetNow(ref.path);
+      // `typeof`: `source` is passed through unchecked from the JSON, and a non-string one would
+      // throw inside the acquire and reject the whole scene load rather than just this rig.
+      if (typeof set?.source === 'string' && set.source) await acquireRiggedModel(sceneId, set.source);
       return;
+    }
     case 'spriteanim':
-      // `.spriteanim.json` flipbook clip sets referenced by SpriteAnimator.clipSet.
-      // spriteAnimationSystem lazy-loads + caches the set via activeSpriteClip
-      // (retrying until ready), so no preload is needed. Listed as a resource for
-      // the build tree-shaker (mirrors animset/animation/particle).
+      // `.spriteanim.json` flipbook clip sets referenced by SpriteAnimator.clipSet: the authored
+      // sprite shows instead of the clip's frame until loaded.
+      await loadSpriteAnimNow(ref.path);
       return;
     case 'rig2d':
-      // `.rig2d.json` 2D skinning rigs referenced by SkinnedSprite2D.rig. skin2DSystem
-      // lazy-loads + caches the rig via getRig2D (retrying until ready), so no preload is
-      // needed. Listed as a resource for the build tree-shaker (mirrors spriteanim). Phase 1:
-      // not yet scene-scoped refcounted (nor is its texture) — a documented follow-up.
+      // `.rig2d.json` 2D skinning rigs referenced by SkinnedSprite2D.rig: no skin buffer, so the
+      // entity is INVISIBLE, until loaded. Not scene-scoped refcounted (nor is its texture) — a
+      // rig is plain data and its cache outlives the swap.
+      await loadRig2DNow(ref.path);
       return;
     case 'shader':
       // `.shader.json` 2D custom materials referenced by Renderable2D.material. Scene2D's

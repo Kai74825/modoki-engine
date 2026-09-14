@@ -20,29 +20,29 @@
 import { describe, it, expect } from 'vitest';
 import { execFileSync, spawnSync } from 'node:child_process';
 import path from 'node:path';
-import { hasPrivateTooling } from '../helpers/repoLayout';
 import { readScannedSource } from '@modoki/engine/testing';
 import {
   backendPortForClone,
   vitePortForBackend,
   cdpPortForBackend,
+  editorCdpPortForBackend,
 } from '../../scripts/editorPorts.mjs';
 
 const CLI = path.resolve(__dirname, '../../scripts/editorPorts.mjs');
-// Skipped where the CLONE TABLE has no meaning — NOT because the CLI is missing. `engine/scripts/**`
-// DOES ship in the public snapshot (`git ls-files -- engine`, publish-engine-oss.sh:127, with no
-// exclusion), and it must: this file's top-level import of `../../scripts/editorPorts.mjs` would
-// throw before any `skipIf` could run. An earlier draft of this comment claimed the opposite, copied
-// from the same premise in editorPorts.test.ts — worth stating plainly, because that false reason is
-// what would mislead whoever next decides to un-skip.
+// ⚠️ NOT gated, deliberately, and the reasoning it replaces is worth keeping (#1084). This file used
+// to skip entirely on `!hasPrivateTooling()` — `.mcp.json exists` — which meant it never ran on the
+// public 3-OS leg. `engine/scripts/**` DOES ship in the public snapshot (`git ls-files -- engine`,
+// with no exclusion), and it must: the top-level import of `../../scripts/editorPorts.mjs` would
+// throw before any `skipIf` could run.
 //
-// The real reason: the OSS publish gate STAGES the snapshot into `$(mktemp -d …/modoki-oss-XXXXXX)`
-// and runs `engine/tests/architecture/` from inside it (publish-engine-oss.sh:102,635). That
-// directory is not one of the five clones, so every assertion of the form "the repo I am running in
-// has a pinned port" is false there. `hasPrivateTooling()` is `.mcp.json exists`, which the snapshot
-// lacks — a PROXY that happens to coincide, so the tests below are ALSO written to hold when the
-// port is null, rather than resting on the proxy alone.
-const skip = !hasPrivateTooling();
+// The stated reason was that the OSS publish gate STAGES the snapshot into
+// `$(mktemp -d …/modoki-oss-XXXXXX)` and runs `engine/tests/architecture/` from inside it, and that
+// directory is not one of the five clones — so "the repo I am running in has a pinned port" is false
+// there. True, and it gates nothing: ten of the tests below drive the CLI with SYNTHETIC clone paths
+// (`KNOWN`/`UNKNOWN` and the spaced/non-ASCII pair), which resolve by basename and hold in any
+// checkout, and the two that read the real root are written null-tolerant on purpose — see the
+// comments at their `backendPortForClone(...) === null` branches. A gate on top of that bought
+// nothing but silence on the one platform (Windows) where this seam is most likely to break.
 const KNOWN = '/Users/dev/Projects/modoki-ai3';
 const UNKNOWN = '/Users/dev/Projects/some-scratch-clone';
 
@@ -64,7 +64,7 @@ function run(args: string[]): { out: string; err: string; status: number } {
   return { out: r.stdout ?? '', err: r.stderr ?? '', status: r.status ?? -1 };
 }
 
-describe.skipIf(skip)('editorPorts.mjs CLI — the bash seam (#349)', () => {
+describe('editorPorts.mjs CLI — the bash seam (#349)', () => {
   it('prints a BARE integer on stdout for a known clone', () => {
     const { out, err, status } = run(['backend', KNOWN]);
     expect(status).toBe(0);
@@ -79,10 +79,24 @@ describe.skipIf(skip)('editorPorts.mjs CLI — the bash seam (#349)', () => {
       ['backend', backendPortForClone(KNOWN)],
       ['vite', vitePortForBackend(backendPortForClone(KNOWN)!)],
       ['cdp', cdpPortForBackend(backendPortForClone(KNOWN)!)],
+      ['editor-cdp', editorCdpPortForBackend(backendPortForClone(KNOWN)!)],
     ] as const) {
       expect(Number(run([cmd, KNOWN]).out)).toBe(expected);
     }
     expect(run(['url', KNOWN]).out).toBe('http://127.0.0.1:5182');
+  });
+
+  it('`editor-cdp` and `cdp` are DIFFERENT numbers, and the help line offers both (#1102)', () => {
+    // The whole reason the verb exists. `cdp` prints the launcher's fallback derivation; on every
+    // clone the editor is actually on the 932x override, which bash could not ask for at all —
+    // so each consumer that needed it re-derived `9322 + (backend - 5179)` by hand.
+    const cdp = Number(run(['cdp', KNOWN]).out);
+    const editorCdp = Number(run(['editor-cdp', KNOWN]).out);
+    expect(cdp).toBe(9225);
+    expect(editorCdp).toBe(9325);
+    expect(editorCdp).not.toBe(cdp);
+    // A verb missing from the help line is a verb nobody finds.
+    expect(run(['bogus', KNOWN]).err).toContain('editor-cdp');
   });
 
   it('an UNKNOWN clone prints nothing on stdout, warns on stderr, and exits 0', () => {
@@ -144,7 +158,7 @@ describe.skipIf(skip)('editorPorts.mjs CLI — the bash seam (#349)', () => {
 
   it('the bash idiom the launchers use captures exactly the port, warning excluded', () => {
     // The real thing, not a paraphrase: `${VAR:-$(…)}` under `set -euo pipefail`, which is
-    // what launch-editor.sh line ~80 does. Two properties at once — the substitution yields
+    // what launch-editor.sh's non-MULTI BACKEND_PORT derivation does. Two properties at once — the substitution yields
     // the bare port, and a failing/warning CLI does not abort the shell.
     const script = `set -euo pipefail; PORT="\${MODOKI_BACKEND_PORT:-$(node '${CLI}' backend '${KNOWN}')}"; echo "[$PORT]"`;
     expect(execFileSync('bash', ['-c', script], { encoding: 'utf8', env: NO_PIN }).trim()).toBe('[5182]');

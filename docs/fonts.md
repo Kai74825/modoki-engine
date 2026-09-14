@@ -290,18 +290,32 @@ chunked to fit it.
 
 ## 6. Debugging text that looks wrong
 
+- **A codepoint missing from the bake is measured at a flat 0.5em** (`FALLBACK_ADVANCE_EM` in
+  `layoutText.ts`). The Arimo bake has no em dash (U+2014, ~1.0em in real faces) and no ellipsis
+  (U+2026), so text containing them is modelled too NARROW — optimistic, the one direction a width
+  budget must never err. #362: a Court refusal modelled at 276.9px against a 294.1px budget while
+  really needing ~286.9. When fitting text to a budget, REFUSE characters the bake lacks rather than
+  measuring them (Court's `unmeasurableChars` in `games/court/tests/hintPanelFitKit.ts`), and prefer
+  a separator the bake carries (a colon) in any string that has to fit.
+
 - **Measure the PROVIDER, not the served bytes.** `getLoadedFont(guid).metrics` +
   `.getGlyph(cp).advance` is the ground truth for *which typeface actually got rasterized*.
   Vertical metrics are the cheapest fingerprint separating two faces, and they do not move
   with a variation axis. In the dev editor:
-  `await import('/packages/modoki/src/runtime/loaders/fontAtlasLoader.ts')` reaches the app's
-  own module instance — a `/@fs/…` import gives a **second** instance with an empty provider
-  map, which reads as "no fonts are loaded".
+  `await modoki.import('/packages/modoki/src/runtime/loaders/fontAtlasLoader.ts')` reaches the
+  app's own module instance — a hand-written `/@fs/…` import (or a bare `/packages/…` one after a
+  hot update) gives a **second** instance with an empty provider map, which reads as "no fonts are
+  loaded" ([debug-tools-mcp.md](debug-tools-mcp.md) § "Second module instance").
 - **A rect is not a weight measurement.** `get_layout_bounds` returns the quad union, which
   includes the field padding — and the baked and dynamic paths pad differently (msdf-atlas-gen
   uses `-pxpadding` = `pxRange` *plus* `range/2`; the generator uses `floor(range/2)` alone).
   Two fonts with different `pxRange` are not comparable by rect. Compare *modelled* widths, or
   measure ink.
+- **⚠️ Text INVISIBLE (not wrong — gone) on an OLD iOS device, correct everywhere else?** Do not
+  re-diagnose the shader. The atlas is being decoded PREMULTIPLIED, which destroys the distance
+  field: mechanism, the measurement that identifies it, and the fix are in
+  [rendering.md](rendering.md) § "2D SDF text (MTSDF)" (#1045). Note that the entity data,
+  geometry, UVs and uniforms all read as CORRECT while this is happening.
 - **Compare at matched settings or not at all** — Block A of the reference scene.
 - **`weight` and the effects scale with `pxRange/size`** (§2) before you conclude a knob is dead.
 
@@ -320,5 +334,7 @@ chunked to fit it.
 | Runtime generation (shared worker + lock) | `runtime/rendering/text/msdfGenerate.ts` |
 | Generator output → our glyph format | `runtime/rendering/text/dynamicGlyphMap.ts` |
 | Layout (shared by 2D + 3D) | `runtime/rendering/text/layoutText.ts` |
+| Codepoints for `ensureGlyphs` (shared by 2D + 3D) | `runtime/rendering/text/textCodepoints.ts` |
+| Measuring rendered text from GAME code (#1038) | `runtime/loaders/measureText2D.ts` |
 | Shaders | `runtime/rendering/text/mtsdfShader.ts` (Three/TSL), `mtsdfPixiShader.ts` (Pixi WGSL+GLSL), `mtsdfStyle.ts` (shared budgets) |
 | Reference scene | `games/text_demo/runtime/assets/scenes/font-parameters.scene.json` |

@@ -23,7 +23,16 @@
  *  ⚠️ **This is NOT a licence to leave a ledger row unbacked in THIS repo.** Every root is present
  *  in a developer clone, so a stale row still fails at authorship, which is where it should. The
  *  filter only ever removes a row whose ROOT is absent — never one whose root is there and whose
- *  token has gone. */
+ *  token has gone.
+ *
+ *  ⚠️ **A guard's OTHER hand-written path lists are in this class too, and using this helper for
+ *  the ledger does not cover them.** `notifyIsShared`'s `EXEMPT` list went red in the snapshot for
+ *  exactly the #830 reason while its ledger passed, because only the ledger was filtered — caught
+ *  at the hub's `verify:publish` on a merge, again the only place that can see it. It could not
+ *  just call this helper: some of its rows live INSIDE `SCAN_DIRS`, where the throw above fires by
+ *  design. So it filters on file existence with its own non-vacuity floor. If a THIRD guard needs
+ *  the same, that is the point to generalise this into a "rows this checkout can validate" pass
+ *  rather than transcribe the rule a third time. */
 
 import fs from 'node:fs';
 import path from 'node:path';
@@ -59,7 +68,25 @@ export function repoRootOf(rel: string): string {
  *  Now: for each file outside `scanDirs`, walk down from the top until no scanDir descends any
  *  further, and take THAT directory. `engine/plugins/x.ts` yields `engine/plugins`;
  *  `engine/packages/modoki/src/three/traits/Light.ts` yields `engine/packages/modoki/src/three`,
- *  because a scanDir reaches `.../src/runtime` but not `.../src/three`. Nothing is dropped. */
+ *  because a scanDir reaches `.../src/runtime` but not `.../src/three`. Nothing is dropped.
+ *
+ *  ⚠️ **The walk can EXHAUST, and keeping `dir` then returns a root that CONTAINS the scanDirs**
+ *  (#950). For a file sitting directly under a partially-scanned root — `engine/vite.config.ts` —
+ *  there is one iteration, every scanDir still starts with `engine/`, the `break` never fires, and
+ *  the loop ends having proved the OPPOSITE of what keeping `dir` assumes. Measured on this
+ *  checkout: that yielded `engine` AND `engine/packages/modoki`, which between them contain all
+ *  three `SCAN_DIRS`. A guard's "the roots I do NOT scan" pass then re-scanned everything it had
+ *  already policed and reported each offender TWICE — the second time under a message telling the
+ *  reader the instance was somewhere the guard does not look.
+ *
+ *  ⚠️ Both consumers were GREEN throughout, purely because neither has an offender inside its own
+ *  `SCAN_DIRS` — which is what those guards exist to ensure. Green by being SATISFIED, not by the
+ *  derivation being right. Observed only when a third guard's mutation check put one there.
+ *
+ *  When the walk exhausts, no directory is an honest answer, and dropping the file reopens the
+ *  "covered by nothing" hole above — so the maximal path is the FILE itself. `repoFiles({under})`
+ *  matches `rel === under`, so a file path is a legal root to hand back. Measured: 5 such files,
+ *  both containing roots gone, and the "a returned root contains a scanDir" set now empty. */
 export function deriveUnscannedRoots(scanDirs: readonly string[]): string[] {
   const inside = (rel: string) => scanDirs.some((d) => rel === d || rel.startsWith(`${d}/`));
   const out = new Set<string>();
@@ -67,11 +94,14 @@ export function deriveUnscannedRoots(scanDirs: readonly string[]): string[] {
     if (inside(rel)) continue;
     const parts = rel.split('/');
     let dir = parts[0];
+    let bounded = false;
     for (let i = 0; i < parts.length - 1; i++) {
       dir = parts.slice(0, i + 1).join('/');
-      if (!scanDirs.some((d) => d.startsWith(`${dir}/`))) break;
+      if (!scanDirs.some((d) => d.startsWith(`${dir}/`))) { bounded = true; break; }
     }
-    out.add(dir);
+    // Exhausted ⇒ every ancestor of this file still has a scanDir beneath it, so the file is its
+    // own maximal unscanned path. See the ⚠️ in the docblock — keeping `dir` here is #950.
+    out.add(bounded ? dir : rel);
   }
   return [...out].sort();
 }

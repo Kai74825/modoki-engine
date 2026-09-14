@@ -1,6 +1,7 @@
 /** healNativeConfig — heal-on-open native config (android/local.properties +
  *  iOS DEVELOPMENT_TEAM). Exercised against real temp project dirs. */
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { expectInOrder, found } from '@modoki/engine/testing/inOrder';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -33,7 +34,7 @@ let root: string;
 let savedToolchainDir: string | undefined;
 
 beforeEach(() => {
-  root = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-heal-'));
+  root = makeScratchDir('modoki-heal-');
   // The sdk.dir heal resolves the SDK through the shared toolchain probe, which only honours
   // ANDROID_HOME in DEV-editor mode. A dev box that exports MODOKI_TOOLCHAIN_DIR (some do, so CLI
   // builds find toktx) is bundled-only, so the fixture SDK below would be ignored — unset it.
@@ -144,7 +145,7 @@ function readPbxproj(): string {
 describe('healNativeConfig — android/local.properties', () => {
   it('writes sdk.dir when android/ exists and the file is missing', () => {
     fs.mkdirSync(path.join(root, 'android'));
-    const sdk = fs.mkdtempSync(path.join(os.tmpdir(), 'fake-sdk-'));
+    const sdk = makeScratchDir('fake-sdk-');
     // A usable SDK has platform-tools — the shared toolchain probe now requires it (the
     // consistent marker check that unified this with vite-asset-scanner's build-time probe).
     fs.mkdirSync(path.join(sdk, 'platform-tools'));
@@ -172,7 +173,7 @@ describe('healNativeConfig — android/local.properties', () => {
     fs.mkdirSync(path.join(root, 'android'));
     const lp = path.join(root, 'android', 'local.properties');
     fs.writeFileSync(lp, 'sdk.dir=C:\\Users\\winuser\\AppData\\Roaming\\modoki-app\\toolchain\\android-sdk\n');
-    const sdk = fs.mkdtempSync(path.join(os.tmpdir(), 'fake-sdk-'));
+    const sdk = makeScratchDir('fake-sdk-');
     fs.mkdirSync(path.join(sdk, 'platform-tools')); // the toolchain probe requires this marker to accept an SDK — without it detectAndroidSdk returns null on a host with no other discoverable SDK (e.g. Windows CI), so the repair never runs
     process.env.ANDROID_HOME = sdk;
     healNativeConfig(root);
@@ -558,8 +559,8 @@ describe('healNativeConfig — Android Crashlytics gradle wiring (#282)', () => 
     expect(app, 'the plugin apply landed despite the comment')
       .toContain("apply plugin: 'com.google.firebase.crashlytics'");
     // and INSIDE the guard, not merely somewhere in the file
-    const guardOpen = app.indexOf('if (servicesJSON.text) {');
-    const applyIdx = app.indexOf("apply plugin: 'com.google.firebase.crashlytics'");
+    const guardOpen = found(app.indexOf('if (servicesJSON.text) {'), 'the servicesJSON guard');
+    const applyIdx = found(app.indexOf("apply plugin: 'com.google.firebase.crashlytics'"), 'the crashlytics apply-plugin line');
     expect(applyIdx).toBeGreaterThan(guardOpen);
     expect(applyIdx).toBeLessThan(app.indexOf('} catch(Exception e)'));
     // the commented `dependencies {` anchor survived too
@@ -621,7 +622,7 @@ describe('healNativeConfig — Android Crashlytics gradle wiring (#282)', () => 
     expect(top).toContain('modoki:crashlytics-classpath-begin');
     expect(top).toContain(`classpath 'com.google.firebase:firebase-crashlytics-gradle:3.0.3'`);
     // anchored after the google-services classpath, not the AGP one
-    expect(top.indexOf("google-services:4.4.4'")).toBeLessThan(top.indexOf('firebase-crashlytics-gradle'));
+    expectInOrder(top, ["google-services:4.4.4'", 'firebase-crashlytics-gradle'], 'the top-level build.gradle');
 
     const app = readApp();
     expect(app).toContain('modoki:crashlytics-ndk-begin');
@@ -632,18 +633,13 @@ describe('healNativeConfig — Android Crashlytics gradle wiring (#282)', () => 
     expect(app).toContain("implementation \"com.google.firebase:firebase-crashlytics-ndk:"
       + "${project.hasProperty('firebaseCrashlyticsVersion') ? rootProject.ext.firebaseCrashlyticsVersion : '20.0.3'}\"");
     // right after `dependencies {`
-    const depIdx = app.indexOf('dependencies {');
-    const ndkIdx = app.indexOf('firebase-crashlytics-ndk');
-    const fileTreeIdx = app.indexOf('fileTree');
-    expect(depIdx).toBeGreaterThanOrEqual(0);
-    expect(ndkIdx).toBeGreaterThan(depIdx);
-    expect(ndkIdx).toBeLessThan(fileTreeIdx);
+    expectInOrder(app, ['dependencies {', 'firebase-crashlytics-ndk', 'fileTree'], 'the app build.gradle');
 
     // the apply-plugin line lands INSIDE the servicesJSON guard, not merely somewhere in the file
     expect(app).toContain('modoki:crashlytics-apply-begin');
-    const guardOpen = app.indexOf("if (servicesJSON.text) {");
+    const guardOpen = found(app.indexOf("if (servicesJSON.text) {"), 'the servicesJSON guard');
     const guardClose = app.indexOf('\n    }', guardOpen);
-    const applyIdx = app.indexOf("apply plugin: 'com.google.firebase.crashlytics'");
+    const applyIdx = found(app.indexOf("apply plugin: 'com.google.firebase.crashlytics'"), 'the crashlytics apply-plugin line');
     expect(applyIdx).toBeGreaterThan(guardOpen);
     expect(applyIdx).toBeLessThan(guardClose);
   });
@@ -801,7 +797,7 @@ describe('healNativeConfig — iOS Local Network / Bonjour keys', () => {
     const out = readPlist();
     expect(out).toContain('NSLocalNetworkUsageDescription');
     expect(out).toContain('<string>_game-debug._tcp</string>');
-    expect(out.indexOf('NSBonjourServices')).toBeLessThan(out.lastIndexOf('</dict>')); // before root close
+    expect(found(out.indexOf('NSBonjourServices'), 'NSBonjourServices')).toBeLessThan(out.lastIndexOf('</dict>')); // before root close
   });
 
   it('is idempotent — a second pass adds nothing', () => {
@@ -1378,8 +1374,7 @@ describe('healNativeConfig — Android debugBuild meta-data (#112)', () => {
     healNativeConfig(root);
     const m = readManifest();
     expect(m).toContain(`<meta-data android:name="${NAME}" android:value="true" />`);
-    expect(m.indexOf(NAME)).toBeLessThan(m.indexOf('</application>'));
-    expect(m.indexOf('<application')).toBeLessThan(m.indexOf(NAME));
+    expectInOrder(m, ['<application', NAME, '</application>'], 'AndroidManifest.xml');
     expect(m).toContain('<activity android:name=".MainActivity"'); // existing children intact
   });
 
@@ -1433,7 +1428,7 @@ describe('healNativeConfig — Android game mode (#228)', () => {
     const m = readManifest();
     expect(m).toContain('android:appCategory="game"');
     expect(m).toContain('<meta-data android:name="android.game_mode_config" android:resource="@xml/game_mode_config" />');
-    expect(m.indexOf('android.game_mode_config')).toBeLessThan(m.indexOf('</application>'));
+    expectInOrder(m, ['android.game_mode_config', '</application>'], 'AndroidManifest.xml');
 
     const xml = fs.readFileSync(path.join(root, ...GAME_MODE_XML), 'utf8');
     // Opted OUT: an OS-imposed downscale or fps cap would fight the engine's own quality tiers
@@ -1575,6 +1570,22 @@ describe('healNativeConfig — orientation + status bar', () => {
       }
     },
   );
+
+  // The Android half is the OPPOSITE of the iPad rule above, and it rests on a different heal. For
+  // an app targeting API 36+, Android ignores `screenOrientation` on a >= 600dp display unless the
+  // app declares itself a game (`android:appCategory`), so a portrait game stays portrait on a
+  // tablet only while BOTH heals land in the same manifest (#782). Each heal's own suite passes
+  // with the other deleted, which is why this pins them together.
+  it('a portrait game gets BOTH the orientation lock and the game category that keeps it honoured on Android tablets', () => {
+    writeManifest();
+    writeCapConfig({ orientation: 'portrait', statusBarHidden: false, statusBarStyle: 'default' });
+    healNativeConfig(root);
+    const out = fs.readFileSync(manifestPath(), 'utf8');
+    const activity = out.match(/<activity\b[^>]*android:name="\.MainActivity"[^>]*>/)?.[0] ?? '';
+    const application = out.match(/<application\b[^>]*>/)?.[0] ?? '';
+    expect(activity).toContain('android:screenOrientation="portrait"');
+    expect(application, 'without appCategory="game" Android 16+ ignores the lock on tablets').toContain('android:appCategory="game"');
+  });
 
   it('replaces the existing orientation array with portrait-only + adds status-bar keys', () => {
     writeIosPlist();
@@ -2668,7 +2679,7 @@ describe('healNativeConfig — Android release signing + keystore ignores (#370)
     const block = /modoki:release-signing-begin([\s\S]*?)modoki:release-signing-end/.exec(readGradle())![1];
     expect(block).toContain('if (modokiKeystoreFile.exists()) {');
     // and every signing statement is INSIDE that guard, not before it
-    expect(block.indexOf('if (modokiKeystoreFile.exists())')).toBeLessThan(block.indexOf('signingConfigs'));
+    expectInOrder(block, ['if (modokiKeystoreFile.exists())', 'signingConfigs'], 'the release-signing block');
   });
 
   it('is idempotent — a second pass writes nothing', () => {
@@ -2855,3 +2866,5 @@ describe('healNativeConfig — #370 review findings', () => {
     expect(readIgnore(), 'a #196-cited block is left byte-identical').toBe(aged);
   });
 });
+
+import { makeScratchDir } from '@modoki/engine/testing/scratchDir';

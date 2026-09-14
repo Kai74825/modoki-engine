@@ -8,10 +8,13 @@
 import { isGuid, registerAsset } from './assetManifest';
 import { resolveRefWarnOnce } from './modelGlbUrl';
 import { assetUrl } from './assetUrl';
+import { awaitLazyLoad } from './awaitLazyLoad';
 import { ASSET_FETCH_INIT, parseAssetJson } from './assetFetch';
 import { defaultParticleEffect, PARTICLE_FORMAT_VERSION, type ParticleEffectDef, type CollisionConfig } from '../particles/types';
 import { particleDefProvider } from '../particles/particleDefProvider';
+import { resolveColliderShape } from '../particles/colliders';
 import { createTeardownToken } from '../core/liveness';
+import { fireDirtyListeners } from '../core/renderDirty';
 import { classifyFormatVersion } from '../core/formatVersion';
 
 const cache = new Map<string, ParticleEffectDef>();
@@ -35,9 +38,19 @@ const liveness = createTeardownToken<string>();
 /** Migrate a legacy collision config (infinite horizontal plane at `planeY`, no `shape`)
  *  to the explicit `plane` collider so old assets upgrade on their next save. */
 function migrateCollision(c?: CollisionConfig): CollisionConfig | undefined {
-  if (!c || c.shape) return c; // already in the new (shape-tagged) format, or absent
+  if (!c) return c;
+  // ⚠️ Normalise the SHAPE here too, not only at the two runtime readers (#993 review). This
+  // is the one place the INSPECTOR also goes through — the docblock above says this module is
+  // shared with the Particle Editor so loaded and edited defs normalize identically — and
+  // without it a `.particle.json` carrying `shape: "spere"` renders a Shape dropdown holding a
+  // value absent from its own options while every geometry block (`shape === 'plane'`, …) is
+  // `===`-guarded and therefore hidden. The author could see neither the typo nor the plane the
+  // runtime was actually simulating.
+  const shape = resolveColliderShape(c.shape);
+  if (c.shape) return c.shape === shape ? c : { ...c, shape };
+  // Legacy: no `shape` at all — an infinite horizontal plane at `planeY`.
   const { planeY, ...rest } = c;
-  return { ...rest, shape: 'plane', planeNormal: [0, 1, 0], planePoint: [0, planeY ?? 0, 0] };
+  return { ...rest, shape, planeNormal: [0, 1, 0], planePoint: [0, planeY ?? 0, 0] };
 }
 
 /** Hard ceiling on pool size — guards against a corrupt/huge maxParticles allocating
@@ -173,7 +186,7 @@ export function getParticleEffect(ref: string, opts?: { load?: boolean }): Parti
         // pre-loaded manifest (e.g. a freshly created effect in the editor).
         const id = (json as Partial<ParticleEffectDef>)?.id;
         if (id && isGuid(id)) registerAsset(id, path, 'particle');
-        cache.set(path, normalizeParticleDef(json as Partial<ParticleEffectDef>));
+        storeEffect(path, json as Partial<ParticleEffectDef>);
       })
       .catch((e) => {
         if (stillLive()) failed.add(path);
@@ -183,6 +196,18 @@ export function getParticleEffect(ref: string, opts?: { load?: boolean }): Parti
     loading.set(path, p);
   }
   return null;
+}
+
+/** Resolve a `.particle.json` ref, AWAITING its load — the scene acquire's preload (#1162). The
+ *  particle syncs create no emitter while the def is null, so an effect still in flight at the
+ *  swap starts late. A textured effect still waits on its texture after this (the backends'
+ *  bounded hidden wait). Contract: {@link awaitLazyLoad}. */
+export function loadParticleEffectNow(ref: string): Promise<ParticleEffectDef | null> {
+  return awaitLazyLoad(
+    () => getParticleEffect(ref),
+    () => { const path = particleCacheKey(ref); return path ? loading.get(path) : undefined; },
+    () => getParticleEffect(ref, { load: false }),
+  );
 }
 
 /** Resolve an editor cache key. The cache is keyed by the resolved path; the
@@ -199,8 +224,18 @@ function particleCacheKey(refOrPath: string): string | undefined {
 export function setParticleEffect(refOrPath: string, def: ParticleEffectDef): void {
   const path = particleCacheKey(refOrPath);
   if (!path) return;
-  cache.set(path, normalizeParticleDef(def));
+  storeEffect(path, def);
   failed.delete(path);
+}
+
+/** The ONE write into the cache, and it wakes the render loops — same rule as `rig2dCache`'s
+ *  `storeRig` (#1141). An effect def is not an ECS trait, so a write fires nothing on its own, and a
+ *  stopped Game view skips every frame nothing marked dirty. Observed live: `modoki_particle_set`
+ *  adding a t=0 burst to `demos/particle-demo`'s Confetti showed 0 particles, with 0 renders, until
+ *  an unrelated trait write drew all 60. The Particle Editor's own apply goes through here too. */
+function storeEffect(path: string, def: Partial<ParticleEffectDef>): void {
+  cache.set(path, normalizeParticleDef(def));
+  fireDirtyListeners();
 }
 
 /** Drop a cached effect so the next access re-fetches (e.g. after an external edit). */

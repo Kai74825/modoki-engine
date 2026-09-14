@@ -24,6 +24,8 @@ import { createTeardownToken } from '../core/liveness';
 import { isGuid } from '../core/assetRefRules';
 import { getGuidForPath, resolveRef } from './assetManifest';
 import { emitAssetInvalidated } from '../core/assetInvalidation';
+import { notifyListeners } from '../core/notifyListeners';
+import { errorText } from '../core/errorText';
 
 const programs = new Map<string, PixiShaderProgram>(); // guid → resolved program
 const loading = new Map<string, Promise<void>>();      // guid → in-flight compile
@@ -93,11 +95,14 @@ export function ensureSpriteMaterial(guid: string, onReady?: () => void): PixiSh
       if (!stillLive()) return;
       loading.delete(guid);
       const wakes = waiters.get(guid); waiters.delete(guid);
-      if (program) { programs.set(guid, program); wakes?.forEach((cb) => cb()); }
+      // Isolated per waiter (#888), and the ordering is why it matters: `waiters.delete(guid)`
+      // above has already run, so a throwing waiter used to leave every waiter behind it parked
+      // forever with nothing left to settle them. Same shape as `fontTexturePixi.settleWaiters`.
+      if (program) { programs.set(guid, program); if (wakes) notifyListeners(wakes, 'spriteMaterialCache', []); }
       else failed.add(guid); // missing body / wrong space / reserved-name — buildPixiShaderProgram warned
     })
     .catch((e) => {
-      console.warn(`[spriteMaterialCache] failed to build 2D material ${guid}: ${e instanceof Error ? e.stack || e.message : String(e)}`);
+      console.warn(`[spriteMaterialCache] failed to build 2D material ${guid}: ${e instanceof Error ? errorText(e) : String(e)}`);
       if (!stillLive()) return; // superseded — see .then above
       loading.delete(guid); waiters.delete(guid);
       failed.add(guid);
@@ -123,7 +128,9 @@ export function clearSpriteMaterialCache(): void {
   loading.clear();
   waiters.clear();
   failed.clear();
-  for (const cb of pending) cb();
+  // Isolated per waiter (#953): every map above is already cleared, so a throwing wake would leave
+  // each wake behind it permanently unfired — those renderers stay on the fallback sprite.
+  notifyListeners(pending, 'spriteMaterialCache', []);
 }
 
 /** The ONE definition of "a `.shader.json` changed" (#842, made per-key by #852). Both the
@@ -191,7 +198,9 @@ export function invalidateShader(manifestPath: string): void {
     failed.delete(guid);
     loading.delete(guid);
     waiters.delete(guid);
-    for (const cb of pending) cb();
+    // Isolated per waiter (#953): a throwing wake used to escape here and skip BOTH the wakes
+    // behind it and `invalidatePixiShaderProgram` below, so the shader edit silently didn't take.
+    notifyListeners(pending, 'spriteMaterialCache', []);
   } else {
     // Unresolved guid — fail SAFE, not silent. See the docblock above: "unknown" must not be
     // treated as "absent", or an edit to a not-yet-indexed shader would silently not take.

@@ -10,9 +10,15 @@
  *  this machine. Mocks `node:child_process` so the assertion is "pkill was never called",
  *  not just "the function threw" — a guard that threw AFTER already calling pkill would be
  *  worthless. */
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterAll } from 'vitest';
 import { execFileSync } from 'node:child_process';
-import { killPackaged, productName } from '../../scripts/packagedAppPaths.mjs';
+import * as fs from 'node:fs';
+import * as path from 'node:path';
+import { insideShellSubstitution, readScannedSource, shellLogicalLines } from '@modoki/engine/testing';
+import { accessPath, findNodes, lineOf, parseSource, ts } from '@modoki/engine/testing/sourceAst';
+import { killPackaged, altPathSpelling, decodeWinReap, REAP_KILLED, REAP_NONE, REAP_ERROR, productName } from '../../scripts/packagedAppPaths.mjs';
+import { makeDirLink } from '../helpers/linkFixture';
+import { makeScratchDir } from '@modoki/engine/testing/scratchDir';
 
 vi.mock('node:child_process', () => {
   const execFileSyncMock = vi.fn();
@@ -21,7 +27,8 @@ vi.mock('node:child_process', () => {
 
 describe.skipIf(process.platform === 'win32')('packagedAppPaths.killPackaged refuses an empty/short appDir', () => {
   // this guard, and the mocked pattern assertions below, are POSIX-only (see the source comment
-  // in killPackaged) — Windows uses `taskkill /IM <name>.exe`, a different code path entirely.
+  // in killPackaged) — Windows goes through PowerShell + Win32_Process.ExecutablePath, a
+  // different code path entirely (covered by packagedAppPaths.test.ts).
   beforeEach(() => {
     vi.mocked(execFileSync).mockClear();
   });
@@ -83,5 +90,371 @@ describe.skipIf(process.platform === 'win32')('packagedAppPaths.killPackaged ref
 
   it('sanity: productName() still resolves through the mocked module', () => {
     expect(typeof productName()).toBe('string');
+  });
+});
+
+/** #959 — the SECOND SPELLING. `killPackaged`'s appDir is caller-supplied by five scripts, and a
+ *  clone (or a temp dir) reached through a symlink puts one spelling in our pattern while the
+ *  process we are hunting carries the other in its argv. `repo-reap.sh` solved this for the bash
+ *  reaps by matching a SET of spellings; this is the same contract in JS.
+ *
+ *  ⚠️ **The symlink is MANUFACTURED**, exactly as in `repoReapSpellings.test.ts`: no clone on this
+ *  machine is reached through one, so a test using ordinary paths would pass with the mechanism
+ *  deleted — this repo's dominant defect class.
+ *
+ *  ⚠️ **The base is `realpathSync.native(os.tmpdir())`, not `os.tmpdir()`.** On macOS the temp dir
+ *  is ITSELF reached through a symlink (`/var` → `/private/var`), so a control built on the raw
+ *  value would find a second spelling it did not create and assert the opposite of what it means.
+ *
+ *  ⚠️ **Nothing here can reach a real process**: `node:child_process` is mocked at the top of this
+ *  file, so every `pkill` below is a recorded call, not an executed one. */
+describe.skipIf(process.platform === 'win32')('killPackaged matches BOTH spellings of an appDir (#959)', () => {
+  let base: string;
+  let dirs: string[] = [];
+
+  beforeEach(() => {
+    vi.mocked(execFileSync).mockClear();
+    vi.mocked(execFileSync).mockReturnValue(undefined as never);
+    base = makeScratchDir('modoki-killpkg-', { canonical: true });
+    dirs.push(base);
+  });
+
+  afterAll(() => {
+    for (const d of dirs) fs.rmSync(d, { recursive: true, force: true });
+    dirs = [];
+  });
+
+  /** A real app dir plus a symlinked route to it. Returns both spellings of the SAME app dir. */
+  function symlinkedApp() {
+    const real = path.join(base, 'real');
+    const app = path.join(real, 'mac-arm64', 'Modoki Editor.app');
+    fs.mkdirSync(app, { recursive: true });
+    const link = path.join(base, 'link');
+    makeDirLink(real, link);
+    return { viaLink: path.join(link, 'mac-arm64', 'Modoki Editor.app'), viaReal: app };
+  }
+
+  const patterns = () => vi.mocked(execFileSync).mock.calls.map((c) => (c[1] as string[])[1]);
+
+  it('reaps the LINK spelling AND the real one when handed the link', () => {
+    const { viaLink, viaReal } = symlinkedApp();
+    killPackaged(viaLink);
+    expect(patterns()).toEqual([`${viaLink}/Contents/`, `${viaReal}/Contents/`]);
+  });
+
+  it('as TWO invocations, never an ERE alternation (#69)', () => {
+    const { viaLink } = symlinkedApp();
+    killPackaged(viaLink);
+    // `pkill -f` takes an ERE: a single pattern joining the two with "|" would match every
+    // process on the machine the moment either side were empty. Two calls cannot do that.
+    expect(vi.mocked(execFileSync)).toHaveBeenCalledTimes(2);
+    for (const p of patterns()) expect(p).not.toContain('|');
+  });
+
+  it('CONTROL: a path with no symlink in it reaps ONCE', () => {
+    const app = path.join(base, 'plain', 'mac-arm64', 'Modoki Editor.app');
+    fs.mkdirSync(app, { recursive: true });
+    killPackaged(app);
+    expect(patterns()).toEqual([`${app}/Contents/`]);
+  });
+
+  it('CONTROL: a NONEXISTENT appDir reaps once — an unresolvable path yields no second spelling', () => {
+    // The common case when there is nothing to reap anyway. `realpathSync.native` throws here,
+    // and the catch must yield NOTHING rather than falling back to something broader.
+    const app = path.join(base, 'gone', 'mac-arm64', 'Modoki Editor.app');
+    killPackaged(app);
+    expect(patterns()).toEqual([`${app}/Contents/`]);
+  });
+
+  it('the ALTERNATE spelling clears the same width guard as the argument', () => {
+    // A 40-char appDir can be a symlink to a very short real path, and the empty/short check only
+    // ever saw the ARGUMENT — so an unchecked alternate slipped a pattern past the one guard whose
+    // stated contract is that every branch here guards against WIDENING the match.
+    //
+    // `realpathSync.native` is stubbed rather than staged on disk: producing a genuinely <10-char
+    // ABSOLUTE real path means writing outside the temp root, which a test must not do. The stub
+    // is of the resolver, not of the guard under test.
+    const app = path.join(base, 'widthguard', 'mac-arm64', 'Modoki Editor.app');
+    fs.mkdirSync(app, { recursive: true });
+    const spy = vi.spyOn(fs.realpathSync, 'native').mockReturnValue('/m/x');
+    try {
+      killPackaged(app);
+      // Exactly ONE reap: the argument's. The 4-char alternate is dropped, not reaped.
+      expect(patterns()).toEqual([`${app}/Contents/`]);
+      expect(patterns().some((p) => p.startsWith('/m/x')), 'a 4-char real path became a reap pattern').toBe(false);
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  it('CONTROL: the machine-wide fallback (no appDir) stays a single reap', () => {
+    killPackaged(undefined, 'Modoki Editor');
+    expect(patterns()).toEqual(['Modoki Editor.app/Contents/']);
+  });
+
+  describe('altPathSpelling — every branch yields NOTHING rather than something wider', () => {
+    it('returns null for an empty or non-string path', () => {
+      expect(altPathSpelling('')).toBeNull();
+      expect(altPathSpelling(undefined)).toBeNull();
+    });
+
+    it('returns null when the path does not resolve', () => {
+      expect(altPathSpelling(path.join(base, 'no-such-thing'))).toBeNull();
+    });
+
+    it('returns null when the spellings are identical', () => {
+      const d = path.join(base, 'same');
+      fs.mkdirSync(d, { recursive: true });
+      expect(altPathSpelling(d)).toBeNull();
+    });
+
+    it('returns the real spelling when they differ', () => {
+      const real = path.join(base, 'r2');
+      fs.mkdirSync(real, { recursive: true });
+      const link = path.join(base, 'l2');
+      makeDirLink(real, link);
+      expect(altPathSpelling(link)).toBe(real);
+    });
+  });
+});
+
+/** #944's half — a reap that cannot say what it did. `pkill` has THREE exit states and they all
+ *  used to land in one silent `catch`, which is why every bash caller appends `|| true` and the
+ *  silence became structural. */
+describe.skipIf(process.platform === 'win32')('killPackaged reports its outcome (#944)', () => {
+  beforeEach(() => {
+    vi.mocked(execFileSync).mockClear();
+  });
+
+  const failWith = (status: unknown) => {
+    vi.mocked(execFileSync).mockImplementation(() => {
+      const e = new Error('pkill') as Error & { status?: unknown };
+      e.status = status;
+      throw e;
+    });
+  };
+
+  it('KILLED when pkill exits 0 — it matched and signalled', () => {
+    vi.mocked(execFileSync).mockReturnValue(undefined as never);
+    expect(killPackaged(undefined, 'Modoki Editor')).toBe(REAP_KILLED);
+  });
+
+  it('NONE when pkill exits 1 — the normal "nothing running" case', () => {
+    failWith(1);
+    expect(killPackaged(undefined, 'Modoki Editor')).toBe(REAP_NONE);
+  });
+
+  it('ERROR when pkill exits 2 — a usage error must NOT read as "nothing was running"', () => {
+    // This is the state the single catch erased. `exit 0` is still right for the caller, but the
+    // caller has to be able to TELL, or a reap that never ran looks exactly like a clean one.
+    failWith(2);
+    expect(killPackaged(undefined, 'Modoki Editor')).toBe(REAP_ERROR);
+  });
+
+  it('ERROR when pkill is missing entirely (no numeric status)', () => {
+    failWith(undefined);
+    expect(killPackaged(undefined, 'Modoki Editor')).toBe(REAP_ERROR);
+  });
+
+  it('an ERROR on either spelling is never masked by a success on the other', () => {
+    const base = makeScratchDir('modoki-killpkg-o-', { canonical: true });
+    try {
+      const real = path.join(base, 'real', 'mac-arm64', 'Modoki Editor.app');
+      fs.mkdirSync(real, { recursive: true });
+      makeDirLink(path.join(base, 'real'), path.join(base, 'link'));
+      let n = 0;
+      vi.mocked(execFileSync).mockImplementation(() => {
+        if (++n === 1) return undefined as never; // first spelling: killed
+        const e = new Error('pkill') as Error & { status?: unknown };
+        e.status = 2; // second spelling: usage error
+        throw e;
+      });
+      expect(killPackaged(path.join(base, 'link', 'mac-arm64', 'Modoki Editor.app'))).toBe(REAP_ERROR);
+    } finally {
+      fs.rmSync(base, { recursive: true, force: true });
+    }
+  });
+});
+
+
+/** For every string or template part in `code` holding `needle`, the call it is handed to — the dotted
+ *  callee of the nearest call it is an ARGUMENT of (`console.log`), or `<not an argument>`.
+ *
+ *  ⚠️ **The message's own call, not its line (#1179).** The line test found the first line holding
+ *  `FAILED to reap` and asked whether `console.log` was also on it: a formatter moving the message
+ *  onto its own line under `console.error(` failed it for the wrong reason, a `console.log` elsewhere
+ *  on the line — `ok ? console.log(a) : console.error('FAILED to reap')` — passed it, and a second
+ *  copy of the message further down was never read. */
+function messageSinks(code: string, label: string, needle: string): Array<{ line: number; sink: string }> {
+  const texts = findNodes(parseSource(code, label), (n): n is ts.StringLiteralLike | ts.TemplateLiteralLikeNode =>
+    (ts.isStringLiteralLike(n) || ts.isTemplateHead(n) || ts.isTemplateMiddle(n) || ts.isTemplateTail(n)) && n.text.includes(needle));
+  return texts.map((t) => {
+    let cur: ts.Node = t;
+    for (let p = t.parent; p && !ts.isStatement(p); cur = p, p = p.parent) {
+      if (ts.isCallExpression(p) && p.arguments.some((a) => a === cur)) return { line: lineOf(t), sink: accessPath(p.expression) ?? '<unnamed callee>' };
+    }
+    return { line: lineOf(t), sink: '<not an argument>' };
+  });
+}
+
+describe('the message-sink reader asks each message which call it is handed to (#1179)', () => {
+  const sinks = (src: string) => messageSinks(src, 'fixture.mjs', 'FAILED to reap').map((m) => m.sink);
+
+  it('reads a wrapped call, a template, and every copy', () => {
+    expect(sinks("console.log(\n  '[kill] FAILED to reap',\n  b,\n);\nconsole.error(`${p} FAILED to reap`);")).toEqual(['console.log', 'console.error']);
+  });
+
+  it('a message re-spelt inside the log call is still that call\'s', () => {
+    expect(sinks("console.log('[kill] FAILED to reap'.trim(), b);")).toEqual(['console.log']);
+  });
+
+  it('a console.log elsewhere on the line does not vouch for the message', () => {
+    expect(sinks("ok ? console.log('[kill] killed') : console.error('[kill] FAILED to reap');")).toEqual(['console.error']);
+  });
+
+  it('a message built first and logged by name is not an argument — it fails rather than passing unread', () => {
+    expect(sinks("const m = '[kill] FAILED to reap'; console.log(m);")).toEqual(['<not an argument>']);
+  });
+});
+
+/** Close-out review findings, pinned. Each of these was CONFIRMED against the running code, and
+ *  each is a way the #944 half of the fix reached nobody. */
+describe('the reap outcome actually reaches a consumer (#944 close-out)', () => {
+  // Through the shared reader, and STRIPPED. That matters here rather than being ceremony: the
+  // source's own comments discuss `console.error`/`FAILED to reap` at length (they explain this
+  // very defect), so a raw scan would find a COMMENT before the code and assert on prose (#812).
+  const cliSource = readScannedSource(
+    path.resolve(__dirname, '../../scripts/packagedAppPaths.mjs'), { language: 'js' },
+  ).code;
+
+  it('the ERROR verdict is printed on stdout, not a stream every caller mutes', () => {
+    // MEASURED: all five bash callers invoke this as `node "$PATHS" kill … 2>/dev/null || true`,
+    // so an alarm on stderr is discarded by every consumer that exists — the two HARMLESS
+    // outcomes printed and the one that matters did not. A source scan, because the alternative is
+    // spawning the CLI with pkill removed from PATH, which is not portable in-suite.
+    const sinks = messageSinks(cliSource, 'packagedAppPaths.mjs', 'FAILED to reap');
+    expect(sinks.length, 'the ERROR branch disappeared').toBeGreaterThan(0);
+    expect(
+      sinks.filter((m) => m.sink !== 'console.log').map((m) => `packagedAppPaths.mjs:${m.line} → ${m.sink}`),
+      'the reap ERROR must go to stdout — every bash caller redirects stderr to /dev/null, so '
+        + 'console.error here makes the whole reporting half of #944 a no-op',
+    ).toEqual([]);
+  });
+
+  it('every bash caller still mutes stderr — the premise of the rule above', () => {
+    // Anti-vacuity: if a future change dropped `2>/dev/null` from the call sites, the rule above
+    // would be defending a constraint that no longer applies, and should be revisited rather
+    // than silently kept.
+    // Derived, not a hardcoded list of four: a rename would silently drop a file from a
+    // hardcoded list and the rest would keep this green (close-out re-review).
+    const scriptsDir = path.resolve(__dirname, '../../scripts');
+    const scripts = fs.readdirSync(scriptsDir).filter((f) => f.endsWith('.sh')).map((f) => path.join(scriptsDir, f));
+    const kills = scripts.flatMap((f) => pathsKillCommands(readScannedSource(f).code));
+    const callers = kills.map((c) => c.command);
+    expect(callers.length, 'no `$PATHS kill` call sites found — this rule lost its subject').toBeGreaterThan(0);
+    expect(kills.filter((k) => k.captured).map((k) => k.command), 'the call is captured by $( … ) — its ERROR line never reaches the terminal').toEqual([]);
+    expect(kills.filter((k) => k.piped).map((k) => k.command), 'the call is piped into another command — its ERROR line never reaches the terminal').toEqual([]);
+    for (const c of callers) {
+      expect(c).toContain('2>/dev/null');
+      // …and stdout must stay OPEN. A future `>/dev/null 2>&1` at a call site would satisfy the
+      // line above while re-muting the alarm the fix exists to deliver — the same defect, moved.
+      expect(c, 'stdout is redirected too — the ERROR line is muted again').not.toMatch(MUTES_STDOUT);
+    }
+  });
+});
+
+/** A redirect that sends STDOUT nowhere: `>`, `>>`, `>|` or `1>` to /dev/null, or `&>`/`&>>` — attached to
+ *  the word before it or not (`"$APP">/dev/null`). `2>/dev/null` is the premise, not a mute. */
+const MUTES_STDOUT = /&>>?\s*\/dev\/null|(?<![0-9&>])1?>>?\|?\s*\/dev\/null/;
+
+/** Each `node "$PATHS" kill …` COMMAND in stripped shell source: its logical line (a backslash-wrapped
+ *  call is one), cut at the first command separator after the call — so the redirect judged is the one
+ *  ON this call. Per physical line (#1179), a call wrapped before its `2>/dev/null` failed for the wrong
+ *  reason, and `node "$PATHS" kill || true; other 2>/dev/null` passed on its neighbour's redirect. */
+function pathsKillCommands(code: string): Array<{ line: number; command: string; captured: boolean; piped: boolean }> {
+  // `||`, `&&`, `;`, a pipe, or a BACKGROUND `&` — never the `&` of a `2>&1` or `&>` redirect.
+  const separator = /\|\||&&|;|\||(?<![<>&])&(?![>&])/;
+  return shellLogicalLines(code).flatMap(({ text, line }) => {
+    const out: Array<{ line: number; command: string; captured: boolean; piped: boolean }> = [];
+    const re = /\$PATHS" kill/g;
+    for (let m = re.exec(text); m; m = re.exec(text)) {
+      // Inside `$( … )` or backticks the ERROR line becomes a value, not output — muted as surely as a
+      // redirect. Counted from the START of the line: cutting at the last separator first threw away
+      // the `$(` of `$(cd "$REPO" && node "$PATHS" kill …)` (#1179 P7 re-review).
+      const command = text.slice(m.index).split(separator)[0]!;
+      // Cut at a PIPE, the call's stdout is the next command's input, not the terminal — `| cat >/dev/null`
+      // or `| grep -q .` swallow the ERROR line as surely as a redirect (#1179 final review). ⚠️ Only the
+      // separator right after THIS command: a `{ …; } | grep` group, or a quoted `;` that cuts the command
+      // early, is not seen — no real caller has either shape.
+      const piped = /^\|(?!\|)/.test(text.slice(m.index + command.length));
+      out.push({ line, command, captured: insideShellSubstitution(text, m.index), piped });
+    }
+    return out;
+  });
+}
+
+describe('the `$PATHS kill` reader judges each call by its own command (#1179)', () => {
+  const commands = (src: string) => pathsKillCommands(src).map((c) => `${c.line}: ${c.command.trim()}`);
+
+  it('reads a call wrapped over backslash-continued lines as one command', () => {
+    expect(commands('node "$PATHS" kill "$APP" \\\n  2>/dev/null \\\n  || true')).toEqual(['1: $PATHS" kill "$APP"   2>/dev/null']);
+  });
+
+  it("a neighbour's redirect on the same line — after ||, && or ; — is not this call's", () => {
+    expect(commands('node "$PATHS" kill || true; other 2>/dev/null\nnode "$PATHS" kill && x 2>/dev/null\nnode "$PATHS" kill 2>&1 | tee log'))
+      .toEqual(['1: $PATHS" kill', '2: $PATHS" kill', '3: $PATHS" kill 2>&1']);
+  });
+
+  it('two calls on one line are two commands, and a background & ends one', () => {
+    expect(commands('node "$PATHS" kill a 2>/dev/null; node "$PATHS" kill b')).toEqual(['1: $PATHS" kill a 2>/dev/null', '1: $PATHS" kill b']);
+    expect(commands('node "$PATHS" kill & sleep 1 2>/dev/null\nnode "$PATHS" kill &>/dev/null')).toEqual(['1: $PATHS" kill', '2: $PATHS" kill &>/dev/null']);
+  });
+
+  it('MUTES_STDOUT is any stdout redirect to /dev/null, and not the stderr one the rule requires', () => {
+    expect(['node x >/dev/null 2>&1', 'node x 2>/dev/null >/dev/null', 'node x 1>/dev/null 2>/dev/null', 'node x &>/dev/null', 'node x > /dev/null',
+      'kill "$APP">/dev/null 2>/dev/null', 'kill 2>/dev/null>/dev/null', 'kill 2>/dev/null >>/dev/null', 'kill >| /dev/null', 'kill &>>/dev/null']
+      .map((c) => MUTES_STDOUT.test(c))).toEqual([true, true, true, true, true, true, true, true, true, true]);
+    expect(['node x 2>/dev/null || true', 'node x 2>>/dev/null', 'node x 2>/dev/null 2>&1'].map((c) => MUTES_STDOUT.test(c))).toEqual([false, false, false]);
+  });
+
+  it('a call piped into another command is marked; a || after it is not a pipe', () => {
+    expect(pathsKillCommands('node "$PATHS" kill 2>/dev/null | cat >/dev/null || true\nnode "$PATHS" kill 2>/dev/null || true\nnode "$PATHS" kill 2>&1 | grep -q .')
+      .map((k) => k.piped)).toEqual([true, false, true]);
+  });
+
+  it('a call captured by $( … ) is marked — its output is a value, not a line on the terminal', () => {
+    expect(pathsKillCommands('x=$(node "$PATHS" kill 2>/dev/null)\ny=1; node "$PATHS" kill\nR="$(cd "$REPO" && node "$PATHS" kill || true)"\nOUT=$(node x) node "$PATHS" kill')
+      .map((k) => k.captured)).toEqual([true, false, true, false]);
+  });
+});
+
+describe('the Windows reap decode (#944 close-out)', () => {
+  // ⚠️ **Executed, not scanned.** Every behavioural describe in this file is
+  // `skipIf(process.platform === 'win32')`, so on a Mac NOTHING runs the win32 branch — and the
+  // text scan this replaces covered 15KB of source, from `candidates()` to `killPackaged`, while
+  // claiming to check "the win32 branch". It was blind to the defect it sat next to: the code
+  // said `Number.isFinite`, the comment said an empty stdout is an ERROR, and `Number('')` is 0
+  // so `isFinite` passed it straight through as "nothing running". `decodeWinReap` is pure and
+  // exported for exactly this reason, the way `winKillCommand` already was.
+  const CASES: [stdout: string, expected: string, why: string][] = [
+    ['1', REAP_KILLED, 'one process matched and was stopped'],
+    ['3', REAP_KILLED, 'several matched'],
+    ['0', REAP_NONE, 'a real, printed count of zero — the genuine "nothing running"'],
+    ['', REAP_ERROR, 'EMPTY stdout: the command never got far enough to print a count'],
+    ['   ', REAP_ERROR, 'whitespace only — same as empty'],
+    ['WARNING: blah\n0', REAP_ERROR, 'a warning ahead of the number is not a count'],
+    ['not-a-number', REAP_ERROR, 'unparseable'],
+  ];
+  it.each(CASES)('decodeWinReap(%j) → %s (%s)', (stdout, expected) => {
+    expect(decodeWinReap(stdout)).toBe(expected);
+  });
+
+  it('treats empty stdout as ERROR, not as an empty match — the regression this exists for', () => {
+    // Called out on its own because it is the one the table above would be easiest to "fix"
+    // wrongly: on Windows `Stop-Process -EA SilentlyContinue` exits 0 whether it stopped
+    // something or matched nothing, so the COUNT is the only signal there is. Reading its absence
+    // as zero is a reap that never ran reporting success.
+    expect(decodeWinReap('')).toBe(REAP_ERROR);
+    expect(decodeWinReap('0')).toBe(REAP_NONE);
   });
 });

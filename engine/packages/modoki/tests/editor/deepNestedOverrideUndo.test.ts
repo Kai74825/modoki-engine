@@ -12,6 +12,7 @@
  *  deep-nest override path and the async undo stack compose correctly. */
 
 import { describe, it, expect, beforeEach, vi } from 'vitest';
+import { setRunMode } from '../../src/runtime/core/playState';
 import { createWorld, trait } from 'koota';
 
 const Transform = trait({ x: 0, y: 0, z: 0 });
@@ -100,6 +101,9 @@ vi.mock('../../src/runtime/loaders/assetUrl', () => ({ assetUrl: (p: string) => 
 vi.mock('../../src/runtime/scene/SceneManager', () => ({ sceneManager: { loadScene: vi.fn(), getLoadedScenes: () => new Map() } }));
 // NB: undoManager is REAL here — this test drives its async undo/redo.
 
+// Undo/redo refuse outside the authoring mode (#1148), and the runtime defaults to 'playing'.
+beforeEach(() => { setRunMode('stopped'); });
+
 beforeEach(async () => {
   testWorld = createWorld(); index.clear(); guidN = 0;
   const { clearAllOverrideMarks } = await import('../../src/runtime/loaders/overrideMarks');
@@ -146,12 +150,12 @@ describe('Missing Test 6 — deep-nested override + per-field edit + undo (real 
     // mark the override, with an undo that restores the prior value + clears the mark.
     const prior = 0;
     const next = 7;
-    const doEdit = () => { writeTraitFieldImpl(a, TRAITS[0], 'x', next); markOverride(a, 'Transform', 'x'); };
+    const doEdit = () => { writeTraitFieldImpl(a, TRAITS[0], 'x', next); markOverride(index.get(a), 'Transform', 'x'); };
     doEdit();
     pushAction({
       label: 'Edit A1.Transform.x',
-      redo: () => { writeTraitFieldImpl(a, TRAITS[0], 'x', next); markOverride(a, 'Transform', 'x'); },
-      undo: () => { writeTraitFieldImpl(a, TRAITS[0], 'x', prior); clearOverrideMarks(a); },
+      redo: () => { writeTraitFieldImpl(a, TRAITS[0], 'x', next); markOverride(index.get(a), 'Transform', 'x'); },
+      undo: () => { writeTraitFieldImpl(a, TRAITS[0], 'x', prior); clearOverrideMarks(index.get(a)); },
     });
 
     // After the edit: deep override serializes onto D's path "2.2".

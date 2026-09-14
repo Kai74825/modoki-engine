@@ -103,12 +103,119 @@ phone that had just crashed** (fixed in `5fb7f3b1`; the `trimEnd()` in
 [engine/plugins/backend/deviceAndroidDiag.ts](../engine/plugins/backend/deviceAndroidDiag.ts) is
 load-bearing and commented as such).
 
-- **Normalize once, at the boundary.** Three separate places in the Android diagnostics know
-  about line endings; that is two too many. Prefer trimming where the subprocess output enters.
+- **Normalize once, at the boundary — and the boundary has a name now.**
+  [engine/scripts/subprocessText.mjs](../engine/scripts/subprocessText.mjs) is it for
+  `engine/scripts/**`: `outputLines(out)` splits on `\r\n`, `\n` **and a lone `\r`**, so its
+  postcondition is the thing every `$`-anchored pattern needs — *no line it returns contains a
+  `\r`*. (A lone `\r` counts because `ps` prints a process's own argv: a CR mid-argument makes an
+  end-anchored capture drop the row WHOLESALE, pid included. Breaking at the CR costs the tail of
+  one exotic row instead.) `parsePidRows(out)` then parses the `pid=,<col>=` shape once, where
+  three copies of the same regex used to live.
+- ⚠️ **The invariant these parses actually depended on was a CONTROL-FLOW ACCIDENT** (#1118). Three
+  `ps` parsers in `engine/scripts/**` carried `parseLogcatLine`'s exact end-anchored shape and were
+  safe only because a `win32` branch returned before them — nothing said so anywhere, and
+  `livePackagedEditor.mjs` disagreed with itself about it (Windows half `/\r?\n/`, POSIX half
+  `'\n'`, one function, no comment). None of it was ever observed failing and, with those branches
+  in place, none of it could be. The sites were one edit from reachable; the normalisation is
+  cheaper than the invariant.
+- **`joinCapturedStreams` is NOT part of that boundary, deliberately.** It protects a `^`-anchored
+  pattern from a GLUED stream boundary and **preserves `\r\n` on purpose** (its text goes to the
+  console as well as the classifier), so it stays in
+  [engine/scripts/nativePluginLegs.mjs](../engine/scripts/nativePluginLegs.mjs) next to the patterns
+  it exists to protect. Two opposite rules, two homes, one cross-reference each — one helper doing
+  both would need a flag, which is how a caller ends up on the wrong side of it.
+- **A game cannot use the shared helper, and that is the rule working.**
+  `games/court/tests/changedLevels.ts` normalises in its own `git()` because a project is opened
+  standalone and copied OUT of the repo (#29), and `gamePortability.test.ts` enumerates
+  `games/<id>/tests/**` too. Its comment says so, so the duplicate is not "cleaned up" into a gate
+  failure.
+- **Guarded by** `engine/tests/architecture/subprocessLineEndings.test.ts`: a line from a bare
+  `'\n'` split must not meet an end-anchored capture, over `engine/{scripts,tests,tools,plugins,
+  electron}`, `scripts/`, `games/` and `demos/`. ⚠️ It keys on the SHAPE, not on "is this a
+  subprocess" — that is a data-flow question no regex answers. The file-level approximation was
+  measured first and rejected: on the PRE-FIX tree, `spawn + bare '\n' split + any $-anchor` matched
+  **14** files, only **2** of which carried an unprotected defect — the other 12 being end-anchored
+  regexes on FILE PATHS (`/\.json$/`) or parses already protected by a `trimEnd()`
+  (`deviceAndroidDiag.ts`). A 12-entry allowlist, and an allowlisted guard rots. (Re-run after the
+  fix it matches 12, all false — the two real ones no longer split on a bare `'\n'`. Quote this
+  figure with the tree it was taken on; it moves when the fix lands. ⚠️ The three predicates are
+  spelled out as regexes in the guard's own docblock — a reviewer could not reproduce this count
+  from the prose description, having tried six plausible spellings.)
+- The guard's population is **five sites, all fixed**, so it ships with no allowlist:
+  `livePackagedEditor.mjs` ×2, `stopDevServer.mjs`, `agentDefinitions.test.ts` and
+  `gen-memory-index.mjs`. It carries no allowlist — only a one-entry SELF exclusion, because the
+  file spells the offending shapes as fixtures and `readScannedSource` blanks comments but preserves
+  string literals. ⚠️ Court's `changedLevels.ts` is a **sixth instance of the mechanism that
+  this guard cannot see** — its consumer is `.endsWith('.court.json')`, not a regex, so no anchor
+  appears anywhere near the split. It is covered by its own unit tests instead. A guard keyed on a
+  shape only sees that shape; the mechanism is wider than the shape.
 - **Keep captured-device fixtures byte-faithful** — [.gitattributes](../.gitattributes) pins
   `*.txt text eol=lf` so real logcat captures are not rewritten into a shape no device emits.
 - A test proving the parser handles a `\r` *you typed* is weaker evidence than one real phone.
   Both are worth having; only the phone proves adb's actual output shape.
+
+### Gradle emits CRLF too — and the shape of the regex decides whether that matters
+
+**Measured on `win` 2026-09-12 (#1079): every one of the 334 output lines from a real
+`gradlew.bat` run is CRLF.** So `test:native`'s SKIP-vs-FAIL classifier
+(`networkFailureCause`, [engine/scripts/nativePluginLegs.mjs](../engine/scripts/nativePluginLegs.mjs))
+parses CRLF on every Windows run, not as an edge case.
+
+It survives where `parseLogcatLine` did not, and the difference is structural rather than luck:
+**none of its four patterns carries `$`**, so a trailing `\r` sits harmlessly past the match, and
+the cause is `.trim()`ed before it is reported. (Three are start-anchored line shapes;
+`NETWORK_FAILURE` is a deliberate phrase-anywhere match with no `^`, gated by `RESOLVE_TASK_CAUSE`
+— the looseness its own comment block warns about twice. The CRLF-relevant half is the absent `$`,
+not the `^`.) The adb parser broke because it ended in `(.*)$`.
+
+**The generalizable rule: never end-anchor a subprocess-output regex without `/m`, and trim at the
+boundary.** ⚠️ State the mechanism precisely, because the intuitive version is backwards —
+measured in Node:
+
+| pattern | against `"x\r"` | |
+|---|---|---|
+| `/^x$/` | `false` | no `/m`: `$` does **not** match before `\r`, so the match fails outright |
+| `/^x$/m` | `true` | with `/m`, `$` **does** match before `\r` — end-anchoring is CRLF-safe here |
+| `/^(.*)$/` | `null` | `.` never crosses `\r`, and `$` then cannot match |
+| `/^(.*)$/m` | `["x","x"]` | |
+
+So it is not that "`$` anchors before the `\r`" — without `/m` it never matches at all, and a
+`/m`-flagged end-anchor is fine. `parseLogcatLine` carried no `/m`.
+
+⚠️ `/m` makes an end-anchor safe for a `test()`/`exec()` classifier, **not** for a line splitter:
+`'a\r\nb'.match(/^(.*)$/gm)` returns `["a", "", "b"]`, because `^` and `$` both see the `\r` as a
+terminator and a phantom empty line falls out between them. Inert when you are asking "does any
+line match"; wrong when you are enumerating lines.
+
+⚠️ **Confirm CRLF is actually PRESENT before crediting a parser with handling it.** "No CRLF bug"
+proves nothing if the stream was LF all along — the 334/334 count above is what makes the
+classifier's correctness an observation instead of a hope.
+
+Pinned by `describe('the same decisions under Windows CRLF (#1079)')` in
+[engine/tests/architecture/nativePluginLegCoverage.test.ts](../engine/tests/architecture/nativePluginLegCoverage.test.ts).
+Every other fixture in that file is LF, so none of them could tell a start-anchored pattern from an
+end-anchored one — end-anchoring `WRAPPER_NETWORK` leaves the LF suite fully green and reddens only
+the CRLF block. ⚠️ **A CRLF fixture built by converting separators alone is VACUOUS**: `join('\n')`
+leaves the last line unterminated, and if the cause line is last it carries no `\r` to trip over.
+That test passed with the classifier's `.trim()` deleted until the fixture appended a trailing
+newline — caught by mutation check, and the reason the helper adds one.
+
+### A CRLF checkout cannot reach the sources the native gates read
+
+[.gitattributes](../.gitattributes) pins `*.ts`, `*.java`, `*.kt`, `*.swift` and `*.gradle` to
+`eol=lf`, and an explicit `eol=lf` **overrides `core.autocrlf=true`**. Those pins cover every type
+`pluginMethodParity.test.ts` scans — `.ts` for the definitions, `.java`/`.kt` for Android, `.swift`
+for iOS (it reads no `.gradle`; that pin matters to the Gradle legs, not to this test) — so the
+CRLF-checkout failure it was feared to have is structurally impossible, not merely unobserved.
+⚠️ `eol=lf` stops CRLF being ADDED on checkout; it does not strip CRLF already committed in a blob.
+`git ls-files --eol engine/packages` shows 0 non-`i/lf` entries among those extensions, so there is
+no counterexample in tree — but that is a fact to re-check, not an invariant git enforces.
+
+Verified on `win` 2026-09-12 (#1079) by cloning with `core.autocrlf=true` genuinely set and
+counting line endings per extension: `.java` 12, `.kt` 1, `.swift` 22, `.ts` 18 and `.gradle` 8 all
+LF — while the 4 unpinned `.gitignore` files **did** convert to CRLF. That last row is the control:
+without a file that converts, an all-LF result cannot distinguish "the pin works" from "the
+conversion never engaged".
 
 ## Paths
 
@@ -207,15 +314,38 @@ load-bearing and commented as such).
   The `isUnderOrSame` column is #881's `canonicalWithMissingTail` handling all four, which is exactly
   the shape #892 then borrowed.
 
-  ⚠️ **The post-fix Windows behaviour is EXPECTED, not measured.** `samePath` now calls the same
-  helper that produced the `true` column above, so all four rows should pass — but nobody has re-run
-  the table on Windows since #892 landed, and #893 (the verification ticket) closed before it. Worth
-  one run on `win`.
+  ✅ **Now MEASURED on `win`, 2026-09-08** — the run the paragraph here used to ask for. Three of the
+  four rows re-ran green against a path that does not exist:
+
+  | spelling of the missing path | `samePath` (post-#892) | `isUnderOrSame` |
+  |---|---|---|
+  | through a `subst`ed drive | **true** ✓ | true |
+  | through a junction | **true** ✓ | true |
+  | drive-letter case / case-flipped name | **true** ✓ | true |
+  | under an 8.3 SHORT ancestor | **not re-measurable** — see below | — |
+
+  ⚠️ **Three `true`s prove nothing on their own, so the probe was made to fail first.** Rebuilding the
+  PRE-#892 shape in the same process — `canonicalPath(a) === canonicalPath(b)` — returns **false** for
+  all three rows on this machine today, while `samePath` returns true, and two genuinely different
+  paths still compare false. That contrast is the evidence; the `true` column alone is equally
+  consistent with a probe that cannot say no.
+
+  ⚠️ **The 8.3 row is unverified, and cannot be re-run on this machine.** 8.3 short-name generation is
+  off: a freshly created `aVeryLongDirectoryName` gets no alias in `dir /x`, and nothing under `E:\`
+  or `C:\Users` has one. `fsutil 8dot3name query` needs an elevated shell, so even the setting could
+  not be read. The row stays **inferred-fixed** — it went through the same `canonicalWithMissingTail`
+  as the other three, which is a mechanism argument, not a measurement, and this file's own history is
+  about exactly that distinction.
 
   ⚠️ **This over-claim reached its SECOND retraction before it died.** #881 retracted it inside
   `pathIdentity.mjs` and left the copy here standing, so #892 was diagnosed against a doc that said
   the hole was already closed. **A retraction has to sweep every copy of the claim** — and note the
-  fold itself is now the subject of a follow-up, #905 (it over-matches on a case-SENSITIVE volume).- **Use `samePath` / `canonicalPath` / `pathCaseKey` / `isUnderOrSame` from
+  fold itself over-matches on a case-SENSITIVE volume — raised as #905 and **ruled accepted by the
+  owner on 2026-09-08**, on cost/benefit rather than on the (dead) "a stat per comparison" reason.
+  The standing rationale lives in `CASE_INSENSITIVE`'s docblock in `pathIdentity.mjs`; do not
+  restate it here.
+
+- **Use `samePath` / `canonicalPath` / `pathCaseKey` / `isUnderOrSame` from
   `engine/scripts/pathIdentity.mjs`** — the one implementation (#869, #881), reachable from
   electron TS, `engine/plugins/**` TS and the bare-node `.mjs` CLIs alike. Before it existed the
   repo had hand-rolled this **eight** times in four mutually inconsistent recipes.
@@ -271,14 +401,346 @@ load-bearing and commented as such).
     now a guard failure, and both are strictly better on `.native`. `realDir` keeps its deliberate
     shape — it canonicalises the CONTAINING directory only, so a symlink inside the project is not
     followed out to its target.
-  - **`userDataDir.cloneId`, `userDataDir.multiProfileKey` and `instanceToken.rootKey` HASH the
-    path into a PERSISTED identity** — a userData profile dir and a per-project auth token.
-    Re-normalising them relocates every existing user's profile (prefs silently reset) and 403s
-    them against their own editor. Their omission of realpath is arguably right for a stable
-    identity: a `subst` mapping can vanish and take the identity with it. ⚠️ `multiProfileKey`
-    has already drifted from the other two — it lost the trailing-slash trim, so
-    `MODOKI_PROJECT=…/x/` and `…/x` mint two profiles. That is a real defect needing a migration
-    decision, not a sweep.
+  - **`userDataDir.cloneId`, `userDataDir.multiProfileKey` and `instanceToken.rootKey` were
+    EXEMPTED here, and the exemption was wrong** (#899, fixed 2026-09-08). This entry used to say
+    they HASH the path into a persisted identity, so re-normalising them "relocates every existing
+    user's profile (prefs silently reset) and 403s them against their own editor" — and therefore
+    that their omission of realpath was "arguably right for a stable identity: a `subst` mapping
+    can vanish and take the identity with it."
+
+    ⚠️ **The relocation claim is measurably false, and it parked three live defects.** Measured
+    over the six real clone and project roots on a developer machine, the key is BYTE-IDENTICAL
+    under the old and new recipes for every one. The only paths that move are those traversing a
+    symlink — precisely the ones that already had TWO identities, which was the bug: a clone opened
+    through a symlink got a second profile ("prefs randomly reset"), and a project opened through
+    one got a second token, so `checkToken` returned `mismatch` and the user was 403'd "WRONG
+    EDITOR" against their own editor. Both driven end to end before the fix.
+
+    All three now go through the SSOT. The two halves get **opposite** migration answers, and the
+    asymmetry is deliberate:
+    - **`instanceToken` keeps a legacy-key read-through.** `readToken` consults the pre-#899 key on
+      a miss, and `ensureToken` ADOPTS that entry under the new key rather than minting a rival —
+      so Connect is a write-forward that converges the two spellings. ⚠️ **One case IS still a 403,
+      and an earlier draft of this bullet said "nobody is 403'd meanwhile"** (close-out review): a
+      user who had connected pre-#899 through BOTH spellings has two entries, and after the
+      migration `rootKey(link)` collides with `legacyRootKey(real)`, so one of the two tokens must
+      lose and an `.mcp.json` carrying the other gets `mismatch`. That is inherent to unifying two
+      identities — the cost is ONE 403, and the remedy is the one the error already prints.
+    - **`userDataDir` has NONE, and a symlink-reached clone loses its prefs once.** There is no
+      write-forward moment for a directory, and both keyings are broken: keyed on the RAW spelling
+      it adopts a different old dir per spelling, so the profiles never converge and the fix does
+      nothing for the only people who need it; keyed on the CANONICAL spelling it is byte-identical
+      to the new id — dead code that can never fire. Both measured. Renaming is worse: that dir is a
+      live Chromium profile holding a LevelDB lock.
+
+    ⚠️ **The `multiProfileKey` "already drifted" note is NARROWED, not retired.** It said the
+    missing trailing-slash trim meant `MODOKI_PROJECT=…/x/` and `…/x` mint two profiles, and called
+    it "a real defect needing a migration decision". For ordinary paths that is false — `path.resolve`
+    strips a trailing separator, so the trim its siblings carried was dead code, and
+    `userDataDir.test.ts`'s *"a trailing slash is the SAME project (stable key)"* had been green on
+    exactly that point the whole time. ⚠️ **But an earlier draft of this bullet retracted it FLAT,
+    from a Mac, and that over-reached** (close-out review): `path.win32.resolve('C:\')` returns
+    `'C:\'` — the separator SURVIVES for a drive root — so on Windows the trim did fire and the
+    drift was real, if unreachably narrow (nobody opens a drive root as a project). Retracting a
+    Windows claim from a Mac is the mistake this section keeps repeating.
+
+    ⚠️ **Windows is INFERRED for all of the above.** Every measurement here is darwin/APFS with a
+    symlink. On win32 the fold half already worked (these recipes folded on `win32||darwin`), and
+    the half that was broken — junction, `subst`, 8.3 — is not driven. Same shape as #893, and it
+    wants the `win` clone.
+- ⚠️ **"Am I the entry point?" is `isEntryPoint(import.meta.url)`, never
+  `` `file://${process.argv[1]}` `` (#904, #910).** This is the same family as everything above — two
+  spellings of one file compared as strings — but it is the member that fails SILENTLY, so it is the
+  one that ships. `argv[1]` is a raw OS path and `import.meta.url` is a URL of the REALPATH, so on
+  Windows the comparison is `file:///E:/…` against `file://E:\…` and is **never true**. The CLI block
+  then never runs: the script prints nothing, **exits 0**, and a caller reading the exit code sees
+  success.
+
+  ```js
+  import { isEntryPoint } from './entryPoint.mjs';   // engine/scripts/entryPoint.mjs
+  if (isEntryPoint(import.meta.url)) { /* …CLI… */ }
+  ```
+
+  ⚠️ **The census of sites, recipes and exemptions is that module's own docblock — read it there,
+  don't re-derive it here.** Two riders it records and this page must not contradict: `clonePort.mjs`
+  keeps a LOCAL copy on purpose (`clonePortCli.test.ts` copies that file *alone* into a directory
+  with a space in the name, so an import of a sibling makes the copy unrunnable), and the helper
+  deliberately does **not** case-fold, unlike the inline `samePath` recipe `editorPorts.mjs` carried
+  from #881 to #910.
+
+  ⚠️ **Neither near-miss is a fix.** `new URL(...).href` around the template repairs the Windows half
+  by luck — the URL parser normalises the drive letter and the backslashes — and leaves the SYMLINK
+  half broken, because `import.meta.url` is already the realpath and `argv[1]` is not (on darwin
+  `os.tmpdir()` is `/var` → `/private/var`). An `endsWith('name.mjs')` fallback answers a different
+  question: it is true for any path ending in that name.
+
+  **The Windows member that mattered is `generate-icons.mjs`** — `vite-asset-scanner.ts` spawns it as
+  a native-build step with an absolute path, so on Windows icon and splash generation did nothing at
+  all *and reported success*. Measured on `win` 2026-09-08, alongside `releaseBranch.mjs`, whose nine
+  child-process cases went red the moment `main` reached this clone (#904).
+
+  ⚠️ **This class was fixed on two clones at once, and the merge is the record of it** —
+  `win` swept it inline (#904) while `work-qa` promoted a shared helper (#910). The helper won and
+  every site now uses it; the inline recipe survives only in this paragraph as history. Two clones
+  reaching the same defect independently is what the claim step in CLAUDE.md exists to prevent.
+
+  The template is banned in `engine/{electron,scripts,plugins}` by a fourth pattern in
+  `pathIdentityIsShared.test.ts`. Its non-vacuity case is written against SAMPLES rather than live
+  source, because the sweep left no instance for it to find — and a regex narrowed into never matching
+  is otherwise indistinguishable from a clean repo.
+
+  ⚠️ **Still open, and NOT the same fix:** `scripts/publish-engine-oss.sh`'s demo-scrub guard does
+  `import … from "${HERE}/scripts/lib/scrub-project-config.mjs"` inside a `node -e` module. A bare
+  drive path is not a legal ESM specifier — Windows needs a `file://` URL — so that guard cannot run
+  under Git Bash. It executes only under `--with-demos` on the hub, where it works, and it gates a
+  permanent public commit, so it was left for the owner rather than changed blind from `win`.
+
+- ⚠️ **A test's link fixture is a Windows path bug waiting to happen — use
+  `engine/tests/helpers/linkFixture.ts`** (#949). Two traps, both of which shipped:
+
+  **The link type.** A `'dir'` symlink needs `SeCreateSymbolicLinkPrivilege`; a **junction needs
+  nothing**. The repo spelled this four ways across 17 sites, including one with no `type` at all,
+  and two sites created a link in `beforeAll` with no skip — where an unelevated box ERRORS the
+  whole describe. `makeDirLink` is the one answer. Substituting a junction is safe **because
+  everything here resolves through `canonicalPath` → `realpathSync.native`, which treats both
+  reparse types identically** (measured; `lstat().isSymbolicLink()` is also true for a junction).
+  ⚠️ The exception: a test whose SUBJECT is the link type — reproducing an on-disk shape some other
+  tool made, rather than aliasing a directory — must keep its own call and say so.
+  `vendorPlugins.test.ts` is the live case.
+
+  **The path SPELLING handed to a shell.** `repoReapSpellings.test.ts` registered roots built from
+  `os.tmpdir()` — native `E:\…` — and `reap_alt_pattern`'s absolute-root test is `case "$PHYS" in
+  /*)`. A native path fails it, the second-spelling mechanism yields nothing, and the suite went RED
+  on Windows while proving nothing; it was green on macOS only because `os.tmpdir()` is POSIX there.
+  ⚠️ **Converting the string in JS is not good enough** — MSYS has a mount table, so with
+  `TEMP=E:\dev-temp`, `cygpath -u 'E:\dev-temp\x'` is `/tmp/x`, not `/e/dev-temp/x`. `cloneRootSpellings`
+  runs production's own `pwd`/`pwd -P` instead, so there is nothing left to convert.
+
+  **The path SHAPE handed to a route.** Same class, third instance, and this one is about the
+  fixture speaking a vocabulary production never speaks. `editorActionRouter.test.ts`'s
+  stale-disclosure fixtures built paths with `path.join(os.tmpdir(), …)` and passed them to
+  `/api/validate-prefab`. The route keys its staleness gate on `normalizeAssetUrl`, whose first act
+  is `startsWith('/') ? p : '/' + p` — so `/var/folders/…` passed through unchanged on macOS and
+  matched the held path, while `E:\dev-temp\…` became `/E:\dev-temp\…` and matched nothing.
+  `staleInputs` came back `undefined`; **red on Windows, green on every Mac**.
+
+  ⚠️ **The FIXTURE was wrong, not the route — and this is the discrimination that matters.**
+  Production `resolveAssetPath` resolves only paths under an asset root's `urlPrefix`, so a native
+  absolute path never gets past the 404 and never reaches the gate. The shape existed only because
+  the test's `resolveAssetPath` stub is the identity function, which lets through what production
+  rejects. "Fixing" `normalizeAssetUrl` to accept it would widen production code to serve a path
+  production cannot produce — the mistake #958 row 3 already made once. The fix is a fixture that
+  speaks asset URLs, with the stub mapping them onto the temp file.
+
+  **The rule: a test's stub must not be more permissive than the thing it stands in for**, or the
+  test explores a region production cannot reach — and on the platform where the two spellings
+  differ, that region is where it fails.
+
+  ⚠️ **That rule is NOT a Windows rule, and filing it as one here would make it look narrower than
+  it is.** Windows only *exposed* this instance, because it is where the two path spellings differ;
+  the same shape has a mirror image with no platform in it at all — a fake that DOES more than the
+  real dependency, which makes the guard defend the bug. Both let a test explore a region production
+  cannot reach. The general shape, both surfaces, and why widening production to accept the test's
+  input is the wrong fix: [docs/falsifiable-tests.md](falsifiable-tests.md) § "Shape (D)". What
+  belongs *here* is only the Windows instance above.
+
+- ⚠️ **`rmSync` on a link removes the LINK ONLY — and this one is NOT Windows-specific** (#883).
+  Measured on `win` with a junction *and* on macOS with a directory symlink: the link is gone, the
+  target's contents survive, and the call reports success. A junction is merely the Windows spelling
+  of it; `rm -r` on a POSIX dir symlink does the same thing, by design.
+
+  ⚠️ **Recorded here because that is where it was found, but do not read it as a Windows mechanism**
+  — an earlier version of this bullet said "on a junction" and would have sent the next reader
+  hunting for a win32-only cause. A guard against it belongs on every platform, unconditionally, and
+  its regression test can run on all three.
+
+  Any delete path holding a caller-supplied directory must decide explicitly whether it means the
+  NAME or the DATA. Note this points the OPPOSITE way from the reap rule above — there, do not
+  canonicalise what you were given; here, you must resolve what you hold.
+
+- ⚠️ **"Is this a link?" is `lstatSync(p).isSymbolicLink()` on the FINAL component — never
+  `realpath(p) !== p`.** The two are indistinguishable on Windows and diverge badly on macOS, which
+  makes this a predicate you cannot choose correctly from this clone. Measured, same probe, both
+  platforms:
+
+  | target | `lstat.isSymbolicLink` | `realpath !== p` |
+  |---|---|---|
+  | a junction / a dir symlink | true | true |
+  | `%APPDATA%`, `%LOCALAPPDATA%`, `os.tmpdir()` **on win32** | false | **false** |
+  | `os.tmpdir()` **on macOS** | false | **true** ← would false-refuse |
+  | `/tmp`, `/var`, `/etc` **on macOS** | **true** | true |
+
+  So `realpath(p) !== p` answers *"is some ancestor aliased"*, which is not the question — on macOS
+  it is true for ordinary paths and a destructive-operation guard built on it refuses on a clean
+  machine, teaching the user to override the guard.
+
+  ⚠️ **And state the scope of the right predicate NARROWLY.** It is not "false for system paths": on
+  macOS `/tmp`, `/var` and `/etc` are themselves symlinks at their final component. It is false for
+  the paths *these scripts actually target*, which is the claim worth asserting — a test should pin
+  the real per-platform targets, not "system paths" in general.
+
+- ⚠️ **The link check must run BEFORE `existsSync`, because `existsSync` FOLLOWS links.** A DANGLING
+  link reports absent, so the near-universal `if (!existsSync(p)) continue;` skips it in silence —
+  and skipping is exactly the fail-open this family keeps producing. Measured identically on both
+  platforms (junction / POSIX symlink):
+
+  ```
+  existsSync(dangling)    false   <- a "skip if absent" branch drops it
+  lstatSync(dangling)     ok, isSymbolicLink() true
+  realpathSync(dangling)  throws ENOENT
+  ```
+
+  ⚠️ That third line is a second trap in the same breath: a resolver written
+  `try { …realpath… } catch { return false }` fails OPEN precisely on the dangling case. Catch the
+  throw into a **reported** unknown, never into a skip.
+
+- **The landed shape, for a delete path: REFUSE the whole run and name the target** (#883, owner's
+  call, `clean-packaged-cache.mjs` § `linkedTargets`). The two rejected alternatives are worth
+  recording because both look reasonable:
+  - **Skip the linked entry** — trades one false report for another. The run still claims to have
+    cleaned while the largest thing on its list survives.
+  - **Follow the link and wipe the target** — resolves a directory the caller never named. That is
+    #69's blast radius, and it is the *widening* half of the trade this doc makes twice (see the
+    `subst` gap under § Comparing two paths).
+
+  ⚠️ **The refusal applies under `--dry-run` too.** A dry run's job is to answer *"what would this
+  do"*, and the honest answer under a link is *"report success and delete almost nothing"* — a dry
+  run that prints the reassuring version is the defect wearing its own disguise.
+
+  **There is ONE exemption, and getting it wrong re-opened the defect.** A link whose target is
+  *itself another candidate* is allowed through, because that other candidate's own `rmSync` deletes
+  the payload — the ordinary "C: is small" arrangement where `MODOKI_TOOLCHAIN_DIR` is junctioned to
+  the default location. The condition must be *"some other candidate **exists**, is **not itself a
+  link**, and resolves to this target"*.
+
+  ⚠️ **Do not write that condition with `samePath`.** It canonicalises BOTH sides through links —
+  precisely the resolution the guard exists to see through — so two candidates each linking to the
+  same target exempt **each other**, and the run prints `[done] removed 2 path(s)`, exit 0, payload
+  intact. That is the original defect, produced by its own fix; measured through the real CLI.
+  ⚠️ And "not a link" alone is not enough: `lstat` returns `undefined` for an **absent** path, so an
+  absent candidate would authorise the exemption and then be skipped by the delete loop.
+
+  ⚠️ **The delete loop must use `lstat`, not `existsSync`, for the same reason the guard does** —
+  otherwise a *successful* run is what breaks the next one. Once the loop deletes the real
+  directory, the link pointing at it dangles, `existsSync` reads it as absent, it survives, and
+  every later run refuses on it — with a remedy message blaming a human for hand-deleting the
+  target. The script's own success created the state.
+
+- **The predicate above is the FINAL COMPONENT of one candidate, which is one point in a three-axis
+  space** (#990/#989/#1004, landed 2026-09-09). The question that actually decides whether `rmSync`
+  misreports is *"is this subtree SELF-CONTAINED?"*, and #883's guard missed it three ways: in
+  **depth** (a link nested below the final component), in **kind** (a mount point, which `lstat`
+  does not call a link), and in **site** (`engine/toolchain/index.ts`'s `forceRemoveDir` deletes the
+  same directories and had no pre-flight at all). One walk — `engine/scripts/deleteBoundary.mjs` —
+  now answers it at **all six** delete sites: `clean-packaged-cache.mjs`, `forceRemoveDir`,
+  `addNativeTarget`'s `<platform>/` removal, `asset-fs-ops`'s Linux trash fallback (#1006), and —
+  found by re-sweeping in that issue's close-out — the two provisioners that REPLACE a persistent
+  destination, `androidSdkProvision` (`<sdkRoot>/cmdline-tools/latest`) and `wdaProvision`
+  (`srcDir`). Both do `rmSync(dest)` then `renameSync(fresh, dest)`, and both sit one line from a
+  `staging` removal, which is how the first sweep's "a temp dir the code itself just created"
+  exemption swallowed them. They share ONE policy module, `engine/toolchain/replaceGuard.ts` —
+  a sibling of `forceRemoveDir`'s guard rather than a merge with it, because the VERB differs
+  (remove vs restore) and so does the remedy sentence.
+
+  ⚠️ **The DETECTION is shared; the POLICY is the caller's, and the two callers added in #1006
+  answer differently on purpose.** `deleteBoundary.mjs` says so in its own docblock — *"Not a
+  policy. This reports; it never deletes, never follows, never repairs."* A single helper that also
+  decided what to do would have forced one of these two sites into the wrong answer:
+
+  | site | policy | why |
+  |---|---|---|
+  | `clean-packaged-cache.mjs`, `forceRemoveDir`, `addNativeTarget`, both provisioners | **REFUSE** | the payload is user-owned and has no other copy. A refused `cap add` costs one sentence; a severed hand-customised `ios/` — or a junctioned SDK — is gone with nothing in the log to say so. |
+  | `asset-fs-ops.moveToTrash` (Linux fallback) | **REPORT** into `failed` | this caller already HAS a per-path failure channel that the Assets panel surfaces. The defect there was never a missing throw — it was `return { failed: [] }` claiming success for paths it had just destroyed (#884's shape, different cause). Throwing would also cost the paths that CAN safely go. |
+
+  **The test for a fifth site: does a per-path failure channel already exist and reach a human?**
+  If yes, report into it; if not, refuse. Do not copy whichever neighbouring policy you read first.
+
+  ⚠️ **`addNativeTarget` refuses under `--force` too**, for the same reason the refusal applies
+  under `--dry-run` above: `--force` means *"regenerate this target"*, not *"sever whatever link is
+  standing here"*. Its neighbouring Firebase-survivor guard already drew that distinction for the
+  same flag, which is why the pre-flight sits beside it — at ENTRY, before `npm install` and the
+  web build, so a doomed run fails in seconds instead of holding the shared build slot first.
+
+  ⚠️ **`asset-fs-ops`'s darwin/win32 paths are deliberately NOT pre-flighted**, and "completing the
+  sweep" by adding them is a regression: those hand the delete to the OS trash, which MOVES rather
+  than unlinks, so it cannot orphan a link's payload. Only the Linux fallback is a real `rmSync`.
+  (`engine/electron/main.ts`'s boot-time dep-cache wipe stays excluded too — see #1006.)
+
+  ⚠️ **"Refuse on ANY nested link" is not viable, and the Windows evidence is the trap.** A
+  provisioned toolchain here measured **0 symlinks across 23,303 entries**, so the blunt rule looks
+  free — but that is an artifact of npm using `.cmd` shims on Windows. On POSIX the same provision
+  carries `node_modules/.bin` symlinks (60 of 60 in one `.bin`), so the blunt rule refuses on every
+  run. The property that separates them is whether the link's target **escapes the subtree**; a
+  `.bin` shim points inside. **The accept side is the load-bearing half of this guard.**
+
+- **A fourth axis the walk deliberately does NOT cover: "is this OURS to delete at all?"** (#1005).
+  `findDeleteBoundaries` answers *"would a recursive delete MISREPORT this subtree?"*. A home
+  directory or a repo root handed in as `MODOKI_TOOLCHAIN_DIR` is a perfectly ordinary,
+  self-contained tree — no boundary exists, the walk is happy, and the delete would remove it
+  **accurately**. That is a different question and it needs a different check, so
+  `engine/scripts/toolchainRoot.mjs` asks it by CONTENTS (the top-level entries the toolchain owns)
+  at both delete sites. Neither check subsumes the other; both run.
+
+  ⚠️ **The guard it replaced asked about the NAME** — `basename(dir) !== 'toolchain'` — which
+  rejected every renamed `MODOKI_TOOLCHAIN_DIR` (so "Remove all tools" was dead on this clone, whose
+  override is `E:\dev-cache\modoki-toolchain`) while accepting any unrelated directory that happened
+  to be named `toolchain`. And the identity test that looks right — `samePath` against
+  `process.env.MODOKI_TOOLCHAIN_DIR` — is **vacuous**, because the only production caller passes
+  exactly that value in. Full reasoning: [editor-toolchain.md](editor-toolchain.md) § Removing tools.
+
+- ⚠️ **libuv discriminates a reparse point by its substitute-name FORM, not its tag — so a volume
+  mount point is NOT a symlink to `lstat`, and a junction is.** Both carry
+  `IO_REPARSE_TAG_MOUNT_POINT`, so reasoning from the tag gives the wrong answer, and that was the
+  natural wrong guess. Measured on Windows 11 (NTFS), a volume mounted at a directory:
+
+  ```
+  lstat.isSymbolicLink()   false     <- #883's shipped guard is BLIND to it
+  Dirent.isSymbolicLink()  TRUE      <- the directory ENUMERATION disagrees with lstat
+  readlinkSync             throws EINVAL   (a junction returns its target)
+  realpathSync.native      C:\
+  readdirSync              enumerates the MOUNTED volume's entries
+  ```
+
+  Two consequences worth carrying: `lstat` is the **authority** for link-ness and a `Dirent` must
+  never be trusted for it (trusting it classified a nested mount as a link — refusing correctly, but
+  handing the reader "remove the link", which does nothing to a mounted volume); and that
+  **disagreement is itself an exact, free mount detector** during a walk, with no `dev` comparison.
+
+  ⚠️ **Reproducing one needs NO elevation, which is what makes it testable.** `mountvol` requires
+  admin; `mklink /J <link> \\?\Volume{GUID}\` does not, and writes the identical reparse point —
+  confirm with `fsutil reparsepoint query` (Microsoft / Name Surrogate / Mount Point). Get the GUID
+  from `(Get-CimInstance Win32_Volume | Where-Object { $_.DriveLetter -eq 'E:' }).DeviceID`.
+
+  ⚠️ **Tear such a fixture down with non-recursive `rmdir`, and NEVER let a recursive delete reach
+  a tree that has held one** — `rmSync(recursive)` walks INTO the mounted volume and starts deleting
+  it. A test whose `afterEach` does that is one thrown assertion away from the bug under test.
+
+- **Detecting "is this path itself a mount root": resolve the PARENT and re-append the component.**
+  ⚠️ This is *not* `realpathSync(p) !== p`, the predicate #883 rejected — that one is true whenever
+  ANY ancestor is aliased (`os.tmpdir()` on macOS is `/var/…` → `/private/var/…`), so it refuses on a
+  clean machine. Resolving the parent first puts both sides in one space, so an aliased ancestor
+  cancels out and only the final component's own redirection survives.
+
+  ⚠️ **Compare with `pathCaseKey`, never `samePath`** — `samePath` canonicalises through links and
+  would resolve the very redirection under test, which is #883's re-opening mistake in a new place.
+  And `path.resolve` **both** sides first: one comes from `path.join` and one from
+  `realpathSync.native`, and the two need not agree on separator style — a mismatch there is a false
+  REFUSAL, the direction that breaks a working setup.
+
+  A `dev` comparison is the POSIX half and is weaker: it is blind to a **same-volume** mount (an
+  identical `dev`), so no message built on it may claim more than "not a mount root onto another
+  volume". Its polarity is **candidate vs its own PARENT** — comparing against anything of ours
+  would refuse the ordinary setup where `MODOKI_TOOLCHAIN_DIR` legitimately lives on another drive.
+
+- ⚠️ **A shell script's node calls: a path inside `-e` code is NOT converted, a path in argv IS**
+  (#904). Under Git Bash, MSYS rewrites an argument that *looks* like an absolute path
+  (`/e/Projects/…` → `E:\Projects\…`) before native `node.exe` sees it — but it does not touch path
+  text embedded in a longer string. So `node "${HERE}/foo.mjs"` is fine and needs no care, while
+  `node -e "console.log(require('${HERE}/package.json').version)"` dies `MODULE_NOT_FOUND` on
+  `/e/Projects/…`. In `publish-engine-oss.sh` that crashed the script **before its own argument
+  validation**, so `--release --branch x` exited 1 instead of refusing with 2. Pass the path through
+  argv and read it as `process.argv[1]`.
+
 - ⚠️ **A test must seed its expected value with the SAME canonicaliser as its subject**, or the
   baseline quietly encodes a second claim nobody meant to assert.
 
@@ -311,6 +773,18 @@ load-bearing and commented as such).
   just non-`C`.
 - **MSYS/Git-Bash hands native `.exe`s a MIXED-mode path** (`E:/a/b`), *not* the backslash form
   `cygpath -w` returns. Code matching process command lines must handle both spellings.
+  ⚠️ **Matching is not the only consumer — anything that treats a path as an IDENTITY is exposed
+  too**, and there the symptom is silent divergence rather than a failed match. `clonePort` hashed
+  the repo root raw, so a path arriving through bash's argv (`E:/Projects/modoki`) and the same
+  directory derived in-process (`E:\Projects\modoki`) hashed as two different clones: **9268** vs
+  **9254**, measured. Fixed by normalising at the hash. **The general rule: normalise a path the
+  moment it crosses the bash→`node` argv seam, before anything derives a key, a port or a cache
+  entry from it.** Note the fix cannot be "convert to POSIX" — see the mount-table trap above at
+  `cygpath -u`.
+  ⚠️ **That one was LATENT, and the entry first claimed it was live** — that the launch banner named
+  a port nothing would aim at. It cannot: the only consumer of that hashed lane derives it on one
+  side of the seam and both prints and binds the same value. The 9268 came from invoking the CLI by
+  hand. Worth keeping as the class's clearest measurement, not as an incident.
 - Vite `/@fs/` URLs, `:`-joined PATH assumptions, and `chmod 0600` are the other members of this
   family. The repo has had a steady trickle of these; they are readable from any machine once you
   know to look, unlike the process-behaviour class below.
@@ -483,6 +957,115 @@ load-bearing and commented as such).
   and there is nothing to remember. The two stores are otherwise deliberate twins, and
   `buildClaimsStore.mjs`'s header enumerates its three intended divergences — this was not one of
   them, which is exactly why it went unnoticed.
+
+### Comparing two paths and MATCHING a foreign process's argv are different problems
+
+Both look like "does this path equal that path", and the same fix does not serve them. Getting this
+wrong is what #913 was.
+
+**Comparing two paths we both produced** — `identityMismatch` against `process.cwd()`, a persisted
+project root against a `__dirname` repo root. Both operands are ours, so canonicalise BOTH sides
+and compare. That is what `pathIdentity.mjs` exists for, and `isUnderOrSame` / `samePath` are the
+entry points.
+
+**Matching a foreign process's argv** — every reap in `repo-reap.sh`, `stopDevServer`,
+`packagedAppPaths`. One operand is the command line some other process was LAUNCHED with, and we
+do not control its spelling. There is nothing to canonicalise on that side, so:
+
+⚠️ **Canonicalising only our own side is strictly WORSE than doing nothing.** It fixes the
+symlinked spelling and breaks the ordinary one that works today. The only correct shape is to
+match a **set** of spellings — the clone's logical root (bash `pwd`) and its physical one
+(`pwd -P`). `reap_repo_register_roots` registers both once and every reap in that file inherits it.
+
+⚠️ **Windows normalises NOTHING — it hands back the spelling the caller used** (#958, measured on
+`win` 2026-09-09). This paragraph used to say the Windows half was UNMEASURED and to be settled by
+this clone. It is settled, and the answer is the strongest possible form of the rule above: a
+process started through an aliased path reports that alias, verbatim, on every surface a matcher
+can read.
+
+```
+# junction  E:\…\link -> E:\…\real          # subst  W: -> E:\…\real
+Win32_Process.ExecutablePath : …\link\probe.exe      W:\probe.exe
+Win32_Process.CommandLine    : "…\link\probe.exe"    "W:\probe.exe"
+(Get-Process).Path           : …\link\probe.exe      W:\probe.exe
+    StartsWith('E:\…\real\', OrdinalIgnoreCase) → False      ← the defect
+```
+
+So `Resolve-Path` on our own side is not merely insufficient here, it is a **regression**: it
+breaks the case that works today and repairs nothing. `subst` is the cheapest reproduction of the
+whole class and needs no elevation.
+
+⚠️ **A path test that fails does NOT fail the same way depending on how it is combined — and both
+ways are bad.** Measured on `win` 2026-09-09, same junction, same `ExecutablePath`:
+
+| shape | when the path test fails under a junction |
+|---|---|
+| **AND**-ed (a `Where-Object` after a `Name` filter) | fails **CLOSED** — the target is silently dropped. `REAP_NONE`, *"nothing running"* while it is |
+| **OR**-ed with a name test | fails **OPEN** — the target is kept, along with every other process matching the name |
+
+⚠️ **Neither is safe, and an earlier version of this section said the `-or` form was "harmless".
+That is wrong in the direction that matters.** An `-or` is only harmless when the *other* clause is
+itself correctly scoped — and in `uninstall-editor-windows.ps1` the other clause is
+`$_.ProcessName -eq $productName`, which is machine-wide by construction and is the exact shape
+that **killed the owner's running editor on 2026-08-02** (recorded in `packagedAppPaths`). So that
+site is a latent defect being masked, not a clean one, and the fix is to make its path clause work
+rather than to rely on the name clause.
+
+⚠️ **And measure at the level the code is CALLED, not at the function you are looking at.** The
+same session "fixed" `winKillCommand` to match two spellings, having measured that function in
+isolation. Its caller `killPackaged` already looped over both spellings — so the fix was redundant,
+and because it recomputed the alternate without the caller's width guard, a junction pointing at
+`C:\` emitted `StartsWith('C:\')`: every packaged editor on the drive. #69's blast radius,
+introduced by the fix meant to prevent it. Reverted. **A single-function measurement is not a
+measurement of the behaviour.**
+
+⚠️ **The spelling set is OPEN, not a pair.** It is tempting to enumerate "the link spelling and the
+real one" and call the second direction structurally unfixable. Two spellings is the common case,
+not the bound: an 8.3 short name and a `subst` drive are further spellings, and `realpath` folds
+some of them and not others. Where the caller holds the resolved path and the process was launched
+through *some* alias, there is nothing to compute — you cannot enumerate the aliases pointing at a
+directory. Closing that needs the LAUNCHER to export one canonical spelling so its children carry
+it (#961, `needs-owner`).
+
+⚠️ **`pwd -P` resolves a junction and a directory symlink, but NOT a `subst` drive.** Measured:
+through a junction `pwd` gives `/e/…/link` and `pwd -P` gives the target; through `subst W:`,
+**both** print `/w`. So the registered pair genuinely is two spellings for a junctioned clone —
+this mechanism is live on Windows — and collapses to one for a `subst`ed clone.
+
+**That `subst` gap is documented, not fixed** (owner, 2026-09-09): deriving a third spelling by a
+mechanism different from the other two means widening a reap pattern, which is #69's blast radius,
+for a configuration nobody here runs. Same trade as #883's *refuse rather than widen*.
+
+⚠️ **The bash and JS twins of this contract disagree on how they test "absolute", and only one is
+portable.** `altPathSpelling` (in `pathIdentity.mjs` since #988 — `packagedAppPaths.mjs` re-exports
+it, and `engine/toolchain/` is the third caller) uses `path.isAbsolute`, which is correct on both
+platforms; `reap_alt_pattern` hand-rolls `case "$PHYS" in /*)`, which is POSIX-only. That is not a
+live defect — every production caller passes bash `pwd` output — but it IS a narrower contract than
+it looks, and a test that fed it a native `E:\…` root was red on the public Windows leg for weeks
+while proving nothing (#958). **Roots handed to `repo-reap.sh` are bash-spelled, always.**
+
+⚠️ **Two sequential invocations, never an alternation.** `pkill -f` takes an ERE, so a pattern
+built as `"$A|$B"` with either side empty collapses into one that matches **every process on the
+machine** — the #69 disaster, reintroduced by the fix meant to prevent it. `reap_alt_pattern`
+therefore prints *nothing* rather than a fallback, and refuses unless both roots are set, they
+differ, the physical one is absolute, and the pattern is genuinely under the logical root (a bare
+prefix test would rewrite a SIBLING clone's path — clone names here are prefixes of each other).
+
+**This closes one direction only.** Both spellings are still ours, so stop-via-link/launched-real
+is covered and a process launched by something that derived a third spelling is not. The
+structurally complete fix is to export the physical root at launch so every child carries the
+canonical spelling — ⚠️ **not done on purpose**: `editorPorts`' `backendPortForClone` keys off the
+clone DIRECTORY NAME, so a link whose basename differs from its target's would silently move the
+clone to auto ports (#349's class).
+
+**And the identity refusal is two properties, not one.** `identity.ts` declines the SSOT with a
+correct argument about case-FOLDING (`/a/B` must not sit inside `/a/b` on case-sensitive Linux).
+That says nothing about REALPATH, which `canonicalPath` does without folding. Do not read the one
+refusal as covering both — and do not "simplify" the result to `samePath`, which reintroduces the
+fold. ⚠️ Order matters: normalise separators and the drive case FIRST, then canonicalise, then
+normalise again — `path.resolve` is platform-specific, so on POSIX a Windows-shaped
+`E:\Projects\x` is not absolute and gets anchored under the cwd, after which the drive letter is
+no longer leading and cannot be folded.
 
 ## Never shell out to a platform binary whose shape you assumed
 
@@ -672,6 +1255,19 @@ Match on `Get-CimInstance Win32_Process` `CommandLine` instead, and:
   like `engine/electron/dist/main.cjs`, so a loose pattern kills a sibling clone's editor.
   Enforced by [engine/tests/architecture/reapScoping.test.ts](../engine/tests/architecture/reapScoping.test.ts),
   which fails any `pkill -f` pattern in `engine/scripts/**` not anchored to `/` or `$`.
+- ⚠️ **Scope a path match with `.StartsWith(dir + '\', OrdinalIgnoreCase)` — NEVER `-like`** (#988).
+  `-like` is a WILDCARD match, so a `[`, `]`, `*` or `?` anywhere in the path (all legal on Windows,
+  and reachable because `MODOKI_TOOLCHAIN_DIR` and `%LOCALAPPDATA%` are user-influenced) is read as
+  a character class and matches **nothing** — a reap that silently does nothing, followed by
+  whatever it was unblocking failing anyway. Measured with `E:\dev-temp\a[1]b`: `-like` **False**
+  for the image that IS under the dir, `StartsWith` **True**, and a no-bracket control at `-like`
+  **True**. Keep the trailing separator, or `…\jdk` also matches a sibling `…\jdk-old`.
+  Enforced across `engine/{scripts,toolchain,electron,plugins}` — `.ps1` included, which no guard
+  here could see before — by
+  [engine/tests/architecture/winProcessPredicates.test.ts](../engine/tests/architecture/winProcessPredicates.test.ts).
+  ⚠️ It sweeps the CORPUS on purpose: the previous assertion was scoped to `packagedAppPaths.mjs`,
+  and the identical defect sat in `engine/toolchain/index.ts` for months — with that file's own
+  comment already explaining why `-like` is wrong. **A scope restriction is a claim.**
 - Killing a process does not kill its children — stopping Vite must take its build tree with it.
 
 ## Shell dependence
@@ -711,6 +1307,16 @@ the old `engine/packages/` path is a relocation, not a dropped SDK; only the loc
   one as a hang, and re-measure rather than trusting any number written down, this doc included.
   (This bullet said the opposite until 2026-08-20 — "Windows does not get the cap, and that is
   correct for a homogeneous CPU". It was wrong: see the measurement below.)
+- **The ~2.5–4.5x gap to the Mac is settled — do not re-propose these two levers** (owner chose
+  "leave it alone"). ① `engine/vite.config.ts` sets `environment: 'jsdom'` globally, so DOM-free
+  app-suite files pay ~1.5 s each: on 66 files (`tests/plugins` + `tests/assets`),
+  `--environment=node` took 22 s → 10 s and cumulative environment time 98.57 s → 19 ms with all 745
+  tests green (the engine package is already node, ~0.1 s/file). The jsdom split was NOT
+  implemented. ② `--pool=threads` measured 60 s → 41 s but breaks 2 tests in
+  `tests/plugins/toolchainResolve.test.ts` (they fail on that file alone, so it is module
+  isolation, not env leakage). Antivirus is ruled out — `fsutil devdrv query E:` shows a trusted
+  Dev Drive with no filters — so the residual gap is `CreateProcess` vs `fork()` and syscall-heavy
+  module resolution, not something configurable away.
 - **Do not run the two vitest suites concurrently by hand.** Under contention a file reads far
   slower, and the first casualties are the tests sitting closest to `testTimeout` — they fail as
   *timeouts*, not assertions, which is indistinguishable from a real regression until you re-run
@@ -794,6 +1400,51 @@ the old `engine/packages/` path is a relocation, not a dropped SDK; only the loc
 - Toolchain env vars set with `setx` are **not** picked up by an already-running editor or an
   already-running shell — env is read at process start. Pass them inline until the shell restarts.
 
+### `test:native`'s synthesized Gradle projects clean up — the daemon holds a DIFFERENT directory
+
+Validated on `win` 2026-09-12 (#1079), over four full `npm run test:native` runs: **zero leaked
+`modoki-plugin-class-*` directories in `%TEMP%`, zero cleanup warnings**, and no `build/` left in
+`engine\packages\capacitor-*\android\` or `node_modules\@capacitor\android\capacitor\`.
+
+⚠️ **That is a claim about ONE glob, and it does not generalise to "the gate leaks nothing" —
+`test:native` leaks a different family, one directory per run, on every platform.**
+`test-native.mjs` mkdtemps `modoki-ota-zip-fixture-*` at module scope and never removes it (no
+`finally`, no `removeTempDir`); the four runs above left exactly four such directories behind.
+The measurement could not see it because #1079 asked about `modoki-plugin-class-*` and that is
+what was globbed. **A leak check is only ever as wide as its pattern** — enumerate `%TEMP%` by
+prefix before concluding a gate is clean.
+
+#992 expected the opposite — a Gradle or Kotlin daemon still holding handles under `build/`,
+`.gradle` or `.kotlin` when a leg ends, which is why `removeTempDir()`
+([engine/scripts/test-native.mjs](../engine/scripts/test-native.mjs)) retries and warns instead of
+throwing. **The fear was justified but aimed one directory off.** The daemon does hold handles on
+Windows — deleting a scratch `GRADLE_USER_HOME` immediately after a run failed with `EBUSY` on
+`fileHashes.bin`, `modules-2.lock` and the daemon logs, and succeeded on a retry moments later —
+but those handles live in `GRADLE_USER_HOME`, not in the synthesized project the legs build in. So
+the retry-and-warn is the right shape and its retries are load-bearing; the leg's own temp dir was
+simply never the contended one.
+
+⚠️ Scope that to the directories `removeTempDir()` actually guards. Other cleanups in the same file
+— the derived-project teardown, and the `javac` self-test's `outDir` — call bare
+`fs.rmSync(…, {recursive, force})` with no `maxRetries`, inside a `finally`, so an `EBUSY` there
+throws out of the loop before the summary prints: the exact failure `removeTempDir` exists to
+prevent. The `modoki-java-selftest-*` one runs on Windows. Unobserved so far (0 such dirs left
+after four runs), so this is a known gap rather than a measured defect.
+
+⚠️ Cited by SYMBOL, not line number, on purpose. An earlier draft of this paragraph cited those
+cleanups by line — and the very commit that added the citation shifted one of them two lines down,
+so the doc shipped pointing at an unrelated statement. A hand-synced line number is the
+shadowing-constant failure in prose form, which is why `docCitations.test.ts` (#686) fails the
+build over one. It caught this paragraph, in the draft that was explaining the rule.
+
+⚠️ `%TEMP%` on this box nevertheless held **8,551 `modoki-*` entries (6,788 dirs + 1,763 files)**,
+almost all `mkdtemp` scratch from vitest suites (`claims-vitest`, `recents`, `race-flag`, `scrub`,
+`glb`, …) rather than from builds. File content is negligible (~0.1 KB/dir sampled), though each
+NTFS directory also costs an MFT record of roughly 1 KB, so the real floor is nearer a few MB than
+half of one. The cost that matters is the **entry count**: nothing expires these the way `/tmp`
+does on macOS, so it grows without bound and only a Windows clone ever sees it. `test:native`
+contributes one `modoki-ota-zip-fixture-*` per run (above) and nothing else.
+
 ## Diagnosing a Windows-only failure
 
 Split the failure into one of two classes before doing anything:
@@ -803,6 +1454,61 @@ Split the failure into one of two classes before doing anything:
   diagnosable remotely. Shipping mechanism-guesses for CI to adjudicate burns rounds and lands
   wrong fixes; CI is a pass/fail **oracle, never a diagnosis**. Report the evidence, name the
   competing theories, and let a real Windows box measure it.
+
+### The same split decides what a test can COVER — and one half is free
+
+The classes above are about diagnosing a failure. The same cut decides whether a cross-platform
+defect is reachable from a gate you already run, and getting it wrong is how a missing CI leg gets
+blamed for a defect a **function parameter** would have caught.
+
+| | what it is | how it gets covered |
+|---|---|---|
+| **platform RULE** | pure logic that merely BRANCHES on the platform — `appSupportRoot`, path-shape derivation, `needsWinShell`, `spawnable`, a reap pattern's construction | make it **injectable** (`platform`, `env`, `home`) and every leg pins EVERY branch. No runner, no minutes, no decision. |
+| **platform BEHAVIOUR** | what the OS actually DOES — `/var` → `/private/var` aliasing, `rmSync` unlinking a dir symlink and sparing the payload, a mount point traversed, junction semantics, whether `os.homedir()` honours `HOME` | only the platform can answer. No amount of injection reaches it. |
+
+⚠️ **A rule wearing behaviour's clothing is the trap.** `cleanPackagedCacheLinkGuard`'s exemption case
+failed on macOS and read as *"we need a macOS CI leg"*. It was a RULE: `appSupportRoot` reads
+`APPDATA` on win32 and `XDG_CONFIG_HOME` on linux and **neither** on darwin, so a fixture that
+sandboxes the environment moves the root on two platforms and not the third. The darwin branch was
+unreachable **for want of a parameter, not for want of a Mac** — injected, all three branches are
+pinned from Windows (`packagedAppPaths.test.ts`).
+
+**So classify before proposing a runner.** The free half covers every rule; a paid leg is worth
+arguing for on the BEHAVIOUR half, which is real and which injection cannot touch. Leading with the
+paid half sells a leg for a class a parameter already covers, and buries its actual value.
+
+### Running the two-clone loop — and what a second platform actually bought
+
+The rule above says *a Windows path bug is not diagnosable from a Mac*. This is the operational half:
+how the `win` clone and a Mac session actually work a cross-platform defect together. Measured over
+one full assignment (#949/#883/#955/#958, 2026-09-09).
+
+**The pattern: send the artifact BEFORE it lands.** The predicate before the code, the diff before
+the push, and a real sha only once you have seen your OWN lane green. Every defect found by the other
+side that day was found inside that window; **none was findable from a green branch and a summary.**
+⚠️ **The cost is more round trips, and the round trips ARE the mechanism** — a review that arrives
+after the work is integrated can only ratify it.
+
+⚠️ **Each side triages its own failures before attributing them.** A red on the peer's machine is
+theirs until they have ruled out their own setup. In that session the Mac side hit two reds that were
+its own — gitignored build artifacts absent in a fresh worktree, and a CLI correctly refusing in
+detached HEAD — and reported them as *its* setup rather than as findings. Sent the other way they
+would have cost the `win` clone an afternoon chasing a phantom.
+
+**The honest accounting, because it decides which ask it supports** — and these are two claims, not
+one:
+
+| question | answer that session |
+|---|---|
+| Was the **platform** necessary? | **Twice.** The `/var` → `/private/var` aliasing, and the `rmSync`-on-a-dir-symlink repro. Both BEHAVIOUR. |
+| Was a **second party** necessary? | Considerably more often — a truncated probe recorded as settled, an unpinned shared derivation, two unstated gaps in a guard's scope, a wrong count from a too-narrow grep. |
+
+⚠️ **Do not merge those two numbers.** The first buys a `macos-14` CI leg; the second buys the working
+pattern above, and it is the larger. Conflating them oversells the runner and undersells the practice
+— the same error as the one the rule/behaviour split corrects, pointed the other way. A second party
+works because their instrument differs **by accident** (different OS, Node major, shell habits) and
+they have no stake in the first answer; asking someone to re-run a probe the way you already ran it
+buys nothing.
 
 Then ask **which Windows**. The hosted runner and a real dev box differ in ways that decide tests:
 the runner's `%TEMP%` arrives **8.3-shortened** (`C:\Users\RUNNER~1\…`), because the account name

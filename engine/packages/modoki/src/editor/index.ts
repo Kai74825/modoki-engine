@@ -9,7 +9,7 @@
 export { backendFetch, backendPostJson, backendEventSource, backendBase, backendUrl, jsonFileBody, writeAssetFile } from './backend/editorBackend';
 export { createEditor, setExtraMenus, type EditorOptions, type ExtraMenuItem, getResolvedRender3d } from './createEditor';
 export {
-  pushAction, undo, redo, canUndo, canRedo, clearHistory, undoLabel, redoLabel, getEditVersion,
+  pushAction, undo, redo, undoStep, type UndoStepResult, undoRefusedReason, setPreviewUndoSession, dropPreviewSceneEdits, canUndo, canRedo, clearHistory, undoLabel, redoLabel, getEditVersion, getUndoVersion,
   beginActionCapture, endActionCapture, isCapturingActions, type UndoAction,
 } from './undo/undoManager';
 export { runAsCompositeAction, composeUndoActions, type CompositeActionOptions } from './undo/compositeAction';
@@ -23,12 +23,13 @@ export {
   buildEntityCreateSpecs, type CreateEntitySpec, type CreateSpecs, type LightKind,
 } from '../runtime/scene/entityCreateSpecs';
 export { buildUiCreateSpecs, type UiPreset } from '../runtime/ui/uiAuthoring';
-export { enterPlay, stopPlay, pausePlay, resetPlayMode } from './scene/playMode';
+export { enterPlay, stopPlay, pausePlay, resetPlayMode, getModeOwner } from './scene/playMode';
+export { onAuthoringSettled, isWorldReplacementInFlight } from './scene/authoringSettle';
 // GameView device simulation. Exported for the agent ops behind `modoki_set_game_view_device` /
 // `modoki_game_view_devices` (#367) — the catalog is the single source of truth for what screens
 // exist, so an op that hardcoded a table would go stale on the next device added.
 export {
-  DEVICE_PRESETS, DEVICE_CATEGORY_ORDER, FREE_PRESET, NO_SAFE_AREA, NO_INSETS,
+  DEVICE_PRESETS, DEVICE_CATEGORY_ORDER, SHIPPING_DEVICE_CATEGORIES, FREE_PRESET, NO_SAFE_AREA, NO_INSETS,
   resolveLogicalSize, resolvePhysicalSize, resolveSafeArea, safeAreaCssVars, presetDpr, presetLabel,
   filterDevices, findPresetByName, makeCustomPreset, validateCustomSize, describeDeviceSelection,
   CUSTOM_PRESET_NAME, CUSTOM_SIZE_MIN, CUSTOM_SIZE_MAX, CUSTOM_DPR_MIN, CUSTOM_DPR_MAX,
@@ -39,6 +40,7 @@ export {
   editorEmit, readEditorJournal, clearEditorJournal, setEditorJournalEnabled,
   withEditorActor, openActorLease, closeActorLease, ACTOR_LEASE_TTL_MS, ACTOR_LEASE_GRACE_MS,
   waitForEditorJournal, type EditorEvent, type WaitForEditResult,
+  EDITOR_JOURNAL_SOURCES, isEditorJournalSource, type EditorJournalSource,
 } from './editorJournal';
 export {
   getEditorViewportCamera, setEditorViewportCamera, focusEntityInSceneView,
@@ -57,7 +59,7 @@ export {
 export {
   PREFAB_FORMAT_VERSION,
   serializePrefab, instantiatePrefab, instantiatePrefabAsync, setPrefabSource,
-  getPrefabSource, setPrefabCache, getOverrides, getOverrideValues,
+  getPrefabSource, setPrefabCache, refreshPrefabSourceForPath, getOverrides, getOverrideValues,
   captureInstanceOverrides, applyOverridesByRootInstance,
   applyToPrefab, applyToPrefabSelective,
   revertOverridesSelective, rebuildInstance,
@@ -137,15 +139,32 @@ export { ensureGuid, entityRef, type EntityRef } from './undo/entityRef';
 export { makePrefabInstantiateAction } from './undo/prefabInstantiateUndo';
 
 // C7: agent ops must refuse to DESTROY unsaved live work (load_scene/new_scene swap the world).
-export { hasUnsavedChanges, unsavedChangeCauses, markSceneSaved, type SaveResult } from './scene/serialize';
+export {
+  hasUnsavedChanges, unsavedChangeCauses, markSceneSaved, causeSpecs, flushParked,
+  type SaveResult, type UnsavedCauses, type PathKeyedCause, type SceneWrittenCause,
+  type FlushPhase, type ParkedFlushResults,
+} from './scene/serialize';
 // The ONE Save All command + its message, shared by the Cmd+S keymap and the native File menu.
 export { runSaveAll, toastForSave, sceneNeedsWriting, type SaveOutcome } from './scene/saveCommand';
+// #901 — the wording a modal editor shows when Save does not write. Exported for its unit test:
+// the DECISION is a plain module precisely so it can be asserted without mounting a dialog
+// (docs/editor.md § Panels). The `SaveRefusedNotice` component that renders it stays internal.
+export {
+  saveRefusalMessage, saveRefusalConsoleMessage, type SaveRefusal,
+} from './panels/saveRefusal';
+// #889 — the Clean Up dialog's staleness DECISION, exported for its unit test. The dialog itself
+// is .tsx; the decision is a plain module so it is assertable without a jsdom mount
+// (docs/editor.md § Panels).
+export { readUnusedStaleness, type UnusedStaleness } from './panels/assetOps';
 
 // C7: the agent save-all path must honour prefab-edit mode like the human paths do —
 // otherwise an explicit `path` writes the SYNTHETIC prefab-edit world over a real scene.
 // #125: prefab-edit is also the only round-trip that re-serializes a .prefab.json, so the
 // bulk re-save sweep (engine/scripts/resave-prefabs.sh) drives these three as agent ops.
 export { isEditingPrefab, openPrefabForEditing, savePrefabEdit, exitPrefabEditing } from './scene/prefabEdit';
+// The PURE predicate, and the ground truth `isEditingPrefab`'s store flag only approximates.
+// Exported because a PROBE must not use the self-healing one — see its docblock (#889 close-out).
+export { isPrefabEditWorld, PREFAB_EDIT_SCENE_PREFIX } from './scene/prefabEditWorld';
 
 // QA-PHYS-0003: `/api/input/key` needs to know whether a key it is about to press will reach
 // ANYTHING — the editor keymap, or the running game past the input gate. Both answers live

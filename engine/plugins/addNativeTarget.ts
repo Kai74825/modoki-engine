@@ -18,9 +18,13 @@
 
 import fs from 'node:fs';
 import path from 'node:path';
+// The ONE subtree pre-flight (#883/#990/#989/#1004) — see engine/scripts/deleteBoundary.mjs.
+// It REPORTS; the refusal policy below is this caller's own, per that module's docblock.
+import { findDeleteBoundaries, describeBoundary } from '../scripts/deleteBoundary.mjs';
 import type { ProjectConfig } from '../project-config';
 import { vendorEnginePlugins, writeVendorMarker } from './vendorPlugins';
 import { healNativeConfig } from './healNativeConfig';
+import { holdsBuildClaim } from '../scripts/buildClaimsStore.mjs';
 
 export type NativePlatform = 'ios' | 'android';
 
@@ -273,12 +277,33 @@ export function ensureCapacitorConfig(projectRoot: string, cfg: ProjectConfig): 
  *  the app will crash on launch (FirebaseApp.configure throws). Returns
  *  human-readable warnings (empty = nothing missing / no Firebase). */
 export function detectMissingFirebase(projectRoot: string, platform: NativePlatform): string[] {
+  return detectMissingFirebaseResult(projectRoot, platform).warnings;
+}
+
+/** {@link detectMissingFirebase} plus WHETHER the project's `package.json` could be read (#1096).
+ *
+ *  The docblock above promises `empty = nothing missing / no Firebase`, and the old single `catch`
+ *  could not keep it: an unreadable `package.json` also returned `[]`. That matters because of what
+ *  the caller does with the list — `vite-asset-scanner`'s build path PAUSES the build on a non-empty
+ *  one, so `[]` from a truncated or merge-conflicted manifest let a Firebase build run to completion
+ *  and ship an app that crashes on launch in `FirebaseApp.configure`, with a `✅` on the console.
+ *
+ *  ⚠️ A MISSING `package.json` is a THIRD case — ABSENT, not unknown — and stays SILENT
+ *  (`reason: null`). Several real projects genuinely have none, and #731's own review found that
+ *  reporting "could not check" for those was false. Only a manifest that EXISTS and will not
+ *  read/parse is the genuine unknown. Same split, same reason, as `verifyInstalledMatchesTarballResult`. */
+export function detectMissingFirebaseResult(
+  projectRoot: string, platform: NativePlatform,
+): { warnings: string[]; reason: null | 'unreadable-package-json' } {
   let deps: Record<string, string>;
   try {
     deps = JSON.parse(fs.readFileSync(path.join(projectRoot, 'package.json'), 'utf8')).dependencies ?? {};
-  } catch { return []; }
+  } catch (e) {
+    if ((e as NodeJS.ErrnoException)?.code === 'ENOENT') return { warnings: [], reason: null };
+    return { warnings: [], reason: 'unreadable-package-json' };
+  }
   const usesFirebase = Object.keys(deps).some((d) => d.startsWith('@capacitor-firebase/'));
-  if (!usesFirebase) return [];
+  if (!usesFirebase) return { warnings: [], reason: null };
 
   const warnings: string[] = [];
   if (platform === 'ios') {
@@ -299,7 +324,7 @@ export function detectMissingFirebase(projectRoot: string, platform: NativePlatf
       );
     }
   }
-  return warnings;
+  return { warnings, reason: null };
 }
 
 /** Scaffold one native target end-to-end: deps + capacitor.config.json + vendored engine
@@ -329,6 +354,17 @@ export async function scaffoldNativeTarget(opts: {
   force?: boolean;
 }): Promise<{ warnings: string[] }> {
   const { projectRoot, platform, buildCwd, cfg, send, runShell, force = false } = opts;
+  // #1160: the same gate `healNativeProject` carries, for the same reason. Every step below writes
+  // the project, so the caller must hold its build claim. Both callers (`/api/add-native-target`
+  // through `acquireBuildSlot`, and `add-native-targets.mjs`) already claim first, so this closes no
+  // live race. It makes a third caller that forgets refuse at entry, before it touches anything,
+  // instead of racing a build.
+  if (!holdsBuildClaim(projectRoot)) {
+    throw new Error(
+      `refusing to scaffold ${platform}/ in ${projectRoot}: this process does not hold its build claim. `
+      + 'A scaffold writes the project, so it must run under the claim a build takes first (#1160).',
+    );
+  }
   const platformDir = path.join(projectRoot, platform);
   const alreadyComplete = isNativeTargetScaffolded(projectRoot, platform);
   const willRemove = fs.existsSync(platformDir) && (force || !alreadyComplete);
@@ -340,27 +376,69 @@ export async function scaffoldNativeTarget(opts: {
   // destroying a working project if one of them fails first.
   //
   // The one case worth refusing outright is checked HERE, at entry, before any of steps 1-3: a
-  // Firebase config file inside the folder. Nothing user-authored belongs in a folder that fails
+  // hand-authored file inside the folder that `cap add` cannot regenerate (the survivors listed
+  // below). Nothing else user-authored belongs in a folder that fails
   // isNativeTargetScaffolded under the ordinary (non-force) repair path — a kill during template
   // extraction only ever leaves PRISTINE template files (step 3 below writes machine-derived
   // config like android/local.properties into the same folder via healNativeConfig, but that's
-  // regenerated identically every run, not user content). Firebase config is the one exception
-  // that can plausibly land there out-of-band, and it's the ONLY thing a genuinely COMPLETE
-  // target's `force` removal could destroy for real, so the same guard covers both cases.
+  // regenerated identically every run, not user content). Those survivors are the exception that
+  // can plausibly land there out-of-band, and the ONLY thing a genuinely COMPLETE target's `force`
+  // removal could destroy for real, so the same guard covers both cases.
   // Checking this before steps 1-3 also means a doomed run fails in seconds instead of holding
   // the shared build slot through a multi-minute install first.
   if (willRemove) {
-    const firebaseFiles = platform === 'ios'
-      ? [path.join(platformDir, 'App', 'App', 'GoogleService-Info.plist')]
+    // Files a human authored INTO the platform folder that `cap add` cannot regenerate: the Firebase
+    // config, and on iOS the app's privacy manifest (#1051), a hand-written declaration to Apple of
+    // what the app collects. Losing either leaves a project that still builds and is wrong.
+    const survivors = platform === 'ios'
+      ? [
+        path.join(platformDir, 'App', 'App', 'GoogleService-Info.plist'),
+        path.join(platformDir, 'App', 'App', 'PrivacyInfo.xcprivacy'),
+      ]
       : [path.join(platformDir, 'app', 'google-services.json')];
-    const survivor = firebaseFiles.find((f) => fs.existsSync(f));
-    if (survivor) {
+    // ALL of them, not the first: Court and Weaveling carry both iOS files, and naming one per run
+    // made the user move a file, rerun, and get refused again for the other.
+    const present = survivors.filter((f) => fs.existsSync(f));
+    if (present.length > 0) {
       const why = alreadyComplete
         ? `${platform}/ is a complete target, but --force was requested and it`
         : `${platform}/ is incomplete (an earlier scaffold was interrupted) but`;
+      const names = present.map((f) => path.relative(projectRoot, f)).join(' and ');
       throw new Error(
-        `${why} contains ${path.relative(projectRoot, survivor)} — move that file somewhere ` +
+        `${why} contains ${names} — move ${present.length > 1 ? 'those files' : 'that file'} somewhere ` +
         `safe, delete ${platform}/ by hand, then run this again.`,
+      );
+    }
+    // #1006/#883: the removal below is `rmSync(recursive)`, which acts on the NAME, not the data.
+    // If `<platform>/` — or anything inside it — is a link out of the tree, that link is severed,
+    // the payload is orphaned somewhere else, and `cap add` then regenerates a pristine native
+    // project on top while every step reports success. The user's customised one is simply gone,
+    // with nothing in the log to say so.
+    //
+    // ⚠️ **REFUSE rather than warn-and-delete** (owner, on this issue). The same trade the owner
+    // made for `forceRemoveDir` on #1004, and the case here is stronger, not weaker: a refused
+    // `cap add` costs one sentence and is recoverable, while a hand-customised `ios/`/`android/`
+    // project has no other copy. Deliberately NOT exempted for `--force`: `--force` means
+    // "regenerate this target", not "sever whatever link happens to be standing here" — the same
+    // distinction the Firebase guard above already draws for the same flag.
+    //
+    // Checked HERE, beside that guard and before steps 1-3, for its reason too: a doomed run
+    // fails in seconds instead of holding the shared build slot through a multi-minute install.
+    //
+    // ⚠️ **That placement leaves a TOCTOU window minutes wide, and it is accepted, not overlooked.**
+    // The `rmSync` this protects runs after `npm install` and a full web build, so a link created
+    // (or a volume mounted) inside `<platform>/` during those is severed unreported. Inherited from
+    // the Firebase guard's own placement, and traded knowingly: moving the check down to the delete
+    // would close the window but spend the shared build slot on a run that was doomed at entry.
+    // The realistic subject is a link a human made deliberately, minutes or months earlier — not
+    // one that appears mid-build.
+    const boundaries = findDeleteBoundaries(platformDir);
+    if (boundaries.length > 0) {
+      throw new Error(
+        `Refusing to remove ${platform}/ — it is not self-contained, so a recursive delete would ` +
+        `not do what it reports:\n${boundaries.map((b) => '  ' + describeBoundary(b)).join('\n')}\n` +
+        `Remove the link itself (that deletes no payload), move the real folder into the project, ` +
+        `or unmount the volume — then run this again.`,
       );
     }
   }
@@ -387,5 +465,19 @@ export async function scaffoldNativeTarget(opts: {
   if (!(await runShell(`cap add ${platform}`, `npx cap add ${platform}`, projectRoot))) throw new Error(`cap add ${platform} failed`);
   // 5. Heal native config (local.properties / DEVELOPMENT_TEAM) + flag missing Firebase.
   for (const n of healNativeConfig(projectRoot).notes) send(n);
-  return { warnings: detectMissingFirebase(projectRoot, platform) };
+  // #1096: the caller PAUSES the build on a non-empty list, so an unreadable manifest must not
+  // reach it as an empty one. Surfaced as a warning, not a throw — "warn, never throw" (owner,
+  // 2026-09-06, #731) — but it is a warning the caller treats exactly like a real finding, because
+  // the thing it is uncertain about is whether the app crashes on launch.
+  const firebase = detectMissingFirebaseResult(projectRoot, platform);
+  return {
+    warnings: firebase.reason === 'unreadable-package-json'
+      // Worded to what the check ESTABLISHES. Only ENOENT is split out above, so this branch also
+      // covers ENOTDIR (projectRoot is a file) and EACCES — "exists but did not parse" would be a
+      // claim the code has not earned in those two cases.
+      ? [`could not check this project for Firebase config: its package.json could not be read or parsed. `
+        + `If it does use Firebase and its ${platform === 'ios' ? 'GoogleService-Info.plist' : 'google-services.json'} `
+        + 'is missing, the app will crash on launch — fix the manifest and run this again.']
+      : firebase.warnings,
+  };
 }

@@ -18,10 +18,12 @@
  */
 
 import { isGuid, registerAsset } from './assetManifest';
+import { emptyDocMap } from '../core/docKeys';
 import { resolveRefWarnOnce } from './modelGlbUrl';
 import { assetUrl } from './assetUrl';
+import { awaitLazyLoad } from './awaitLazyLoad';
 import { defaultSpriteClip, type SpriteClip } from '../traits/SpriteAnimator';
-import { parseAssetJson } from './assetFetch';
+import { ASSET_FETCH_INIT, parseAssetJson } from './assetFetch';
 import { createTeardownToken } from '../core/liveness';
 
 /** The subset of a SpriteAnimator instance the resolvers below read. */
@@ -78,7 +80,12 @@ function normalizeClip(raw: unknown): SpriteClip {
  *  `.spriteanim.json` on the first save (`xukhAP0gWNnD9MFRHb0P`). Mirrors
  *  `normalizeAnimationClip` / `normalizeTimeline`. */
 export function normalizeSpriteAnim(json: Partial<SpriteAnimDef> | undefined): SpriteAnimDef {
-  const clips: Record<string, SpriteClip> = {};
+  // `emptyDocMap()` (#986) — clip names come straight out of the `.spriteanim.json`. This one
+  // bag also fixes the two READS downstream (`getSpriteAnim(...)?.clips[name]` in
+  // `resolveSpriteClip`/`spriteAnimHasClip`), where `SpriteAnimator.clip: "toString"` authored in
+  // a scene made `spriteAnimHasClip` answer TRUE and `resolveSpriteClip` hand back a FUNCTION
+  // typed as a SpriteClip.
+  const clips: Record<string, SpriteClip> = emptyDocMap();
   const src = json?.clips;
   if (src && typeof src === 'object' && !Array.isArray(src)) {
     for (const [name, clip] of Object.entries(src)) clips[name] = normalizeClip(clip);
@@ -103,7 +110,7 @@ export function getSpriteAnim(ref: string, opts?: { load?: boolean }): SpriteAni
   if (opts?.load === false) return null;
   if (!loading.has(path)) {
     const stillLive = liveness.capture(path);
-    const p = fetch(assetUrl(path))
+    const p = fetch(assetUrl(path), ASSET_FETCH_INIT)
       .then((r) => {
         return parseAssetJson(r, path);
       })
@@ -122,6 +129,18 @@ export function getSpriteAnim(ref: string, opts?: { load?: boolean }): SpriteAni
     loading.set(path, p);
   }
   return null;
+}
+
+/** Resolve a sprite-anim ref, AWAITING its load — the scene acquire's preload (#1162).
+ *  `spriteAnimationSystem` skips an entity while its set is null, so a set still in flight at the
+ *  swap paints the authored `Renderable2D.sprite` instead of the clip's frame. Contract:
+ *  {@link awaitLazyLoad}. */
+export function loadSpriteAnimNow(ref: string): Promise<SpriteAnimDef | null> {
+  return awaitLazyLoad(
+    () => getSpriteAnim(ref),
+    () => { const path = spriteAnimCacheKey(ref); return path ? loading.get(path) : undefined; },
+    () => getSpriteAnim(ref, { load: false }),
+  );
 }
 
 /** Resolve a single named clip within a sprite-anim set, or undefined if the set

@@ -11,6 +11,7 @@ import { assetUrl } from './assetUrl';
 import { ASSET_FETCH_INIT, parseAssetJson } from './assetFetch';
 import { normalizeAnimationClip, type AnimationClipDef } from '../animation/types';
 import { createTeardownToken } from '../core/liveness';
+import { awaitLazyLoad } from './awaitLazyLoad';
 
 const cache = new Map<string, AnimationClipDef>();
 const loading = new Map<string, Promise<void>>();
@@ -74,6 +75,23 @@ export function getAnimationClip(ref: string, opts?: { load?: boolean }): Animat
     loading.set(path, p);
   }
   return null;
+}
+
+/** Resolve a clip ref, AWAITING its load — the scene acquire's preload (#1097).
+ *
+ *  The lazy getter above returns null on a miss, and `animationSystem` pushes no pose for a null
+ *  clip, so a clip still in flight when a world goes live leaves every Animator entity painting its
+ *  AUTHORED values (a `UIElement` at opacity 1 behind an authored fade-in) until the fetch lands.
+ *  Awaiting this before the swap is what makes the first projected frame already posed.
+ *
+ *  The contract (one fetch path, never throws, no retry — unlike `loadTimelineNow`) is
+ *  {@link awaitLazyLoad}'s, shared with the other def caches (#1162). */
+export function loadAnimationClipNow(ref: string): Promise<AnimationClipDef | null> {
+  return awaitLazyLoad(
+    () => getAnimationClip(ref),
+    () => { const path = clipCacheKey(ref); return path ? loading.get(path) : undefined; },
+    () => getAnimationClip(ref, { load: false }),
+  );
 }
 
 /** Directly seed/override a cached clip by path or GUID (editor live-preview + post-save). */

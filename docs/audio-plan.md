@@ -228,6 +228,11 @@ trait fields controlled by built-in actions** — and every game gets it for fre
   `audioUi` (0..100) + `…Pct` label strings via `addStoreHook`, because a slider's
   `inputBinding` reads `storeState` ONLY (not read-sources). Lets sliders resolve bus
   volumes with **no per-game store**; `audio.setBusVolume` updates the store + the bus.
+  ⚠️ **The service decides, the store follows** (#1074): `setBusVolume` returns whether it
+  accepted the bus, and the handler writes the store only on `true`. It used to write the store
+  first, so a bus the service refused still left store fields nothing reads, and `bus: ''` threw
+  out of `dispatchUIAction` before the service was asked. An **empty** `bus` param means unset
+  (`setBusVolume` → `master`, `playOneShot` → the target's bus), the reading `key` already had.
 - **`games/audio-demo` is now fully declarative** — a **Music `AudioSource` entity**
   in the Hierarchy (autoplay/loop), track buttons → `audio.setClip`, transport →
   `audio.toggle`/`audio.stop`, crossfade toggle → `audio.toggleCrossfade` with a
@@ -348,6 +353,14 @@ log. That log can prove a voice *started* and, until the fix below, nothing else
 | `unresolved` | an entity source whose clip will not resolve. `warn` |
 
 Payload: `{ phase, entity?, clip, bus, loop, spatial, crossfadeSec?, reason? }`.
+⚠️ **`bus` is the RESOLVED bus, not the authored one** (#993). `AudioSource.bus` and
+`VideoPlayer.bus` are declared as a union by a CAST on a default, so the authored value is an
+unchecked string from scene JSON; an unrecognised one falls back to `sfx` with a one-time warning
+(`resolveBus`). A scene authoring `bus: "Music"` therefore journals `bus: 'sfx'` — which is where
+the sound actually went. The journal is the sanctioned headless observable (root `CLAUDE.md`
+§ Time, Determinism), so it reports behaviour rather than intent; the typo is not lost, it is in
+the warning. The record-mode log (`getAudioLog`) reports the same resolved value, for the same
+reason.
 `entity` is `entityRef` (the stable GUID, so a trace survives a scene hot-reload) and
 is **omitted for a fire-and-forget cue one-shot**, which has no owning entity by
 design — that absence is the signal, not a gap. `reason` distinguishes the four

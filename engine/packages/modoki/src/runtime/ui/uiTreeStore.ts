@@ -21,8 +21,10 @@ import { UISettings } from '../traits/UISettings';
 import { scrollSnapChildStyle } from './scrollViewDom';
 import { NO_BEHAVIOR_REQUEST } from '../traits/UIScrollView';
 import { findLengthUnitSuspects, formatLengthUnitWarning, lengthUnitWarningKey } from './lengthUnitWarning';
+import { readUILength, readUIAnchorLength } from '../traits/uiLength';
+import { reservedBandLength, reservedEdgeOf } from './anchorCss';
 export { onEditorDirty, setEditorDirtyCallback, markUIDirty } from '../core/uiDirty';
-import type { World } from 'koota';
+import type { Entity, World } from 'koota';
 import type { UIActionBinding } from './bindings';
 import type { AnchorMode } from '../traits/UIAnchor';
 export interface UINodeData {
@@ -52,6 +54,7 @@ export interface UINodeData {
   minHeight: number; minHeightUnit: string; maxHeight: number; maxHeightUnit: string;
   alignSelf: string; zIndex: number; rotation: number; scale: number;
   overflow: string; isVisible: boolean; pointerThrough: boolean; swallowClicks: boolean;
+  minTapSize: number; minTapSizeUnit: string;
   scrollbarStyle: string; scrollbarThumbColor: number; scrollbarTrackColor: number;
   // ── Style ──
   backgroundColor: number; backgroundOpacity: number;
@@ -91,8 +94,8 @@ export interface UINodeData {
   // already a union) and the layout modules (whose switches have no `default`), so
   // widening here would hand an unrecognised mode straight through to a silently
   // unpositioned element.
-  anchor?: { anchor: AnchorMode; top: number; topUnit: string; right: number; rightUnit: string; bottom: number; bottomUnit: string; left: number; leftUnit: string; pivotX: number; pivotY: number; safeArea: boolean };
-  canvas2D?: { referenceWidth: number; referenceHeight: number; scaleMode: string; maxReferenceWidth: number };
+  anchor?: { anchor: AnchorMode; top: number; topUnit: string; right: number; rightUnit: string; bottom: number; bottomUnit: string; left: number; leftUnit: string; pivotX: number; pivotY: number; safeArea: boolean; reservesEdge?: boolean; clearsReservedEdges?: boolean };
+  canvas2D?: { referenceWidth: number; referenceHeight: number; scaleMode: string; maxReferenceWidth: number; maxReferenceHeight: number };
   /** UIToggle trait — this entity renders as an on/off switch (a track with a knob)
    *  rather than a plain box. Optional nested block, not scalars: a toggle is rare,
    *  and its absence has to survive `_scalarKeys` being derived from whichever node
@@ -152,11 +155,18 @@ interface UITreeState {
    *  every root by ordinary CSS inheritance instead of needing to be re-authored on each root's
    *  own `UIElement`. `''` when no `UISettings` entity exists, or both its font fields are empty. */
   rootFontFamily: string;
+  /** The reserved edge bands (#1159) as CSS lengths, published by `UIRenderer` as
+   *  `--ui-reserve-top`/`--ui-reserve-bottom`. `'0px'` when no visible strip reserves that edge.
+   *  Two STRINGS rather than one object so a rebuild that changes nothing re-renders nothing. */
+  reserveTop: string;
+  reserveBottom: string;
 }
 
 export const useUITreeStore = create<UITreeState>(() => ({
   tree: [],
   rootFontFamily: '',
+  reserveTop: '0px',
+  reserveBottom: '0px',
 }));
 
 // ── Dirty flag (core/uiDirty.ts owns the state — see the import above) ──
@@ -189,7 +199,7 @@ function ensureInitialized() {
     resetFontRefWarnings();
     _prevById = new Map(); // drop old-scene refs so they're never reused
     _warnedLengthUnitMismatches.clear();
-    useUITreeStore.setState({ tree: [], rootFontFamily: '' });
+    useUITreeStore.setState({ tree: [], rootFontFamily: '', reserveTop: '0px', reserveBottom: '0px' });
   });
   _initialized = true;
 }
@@ -399,22 +409,22 @@ function buildTree(world: World): UINodeData[] | null {
         guid: '',
         generation: entity.generation(),
         width: ui.width, height: ui.height,
-        widthUnit: ui.widthUnit || 'px', heightUnit: ui.heightUnit || 'px',
+        widthUnit: readUILength(ui, 'width').unit, heightUnit: readUILength(ui, 'height').unit,
         flexDirection: ui.flexDirection, flexWrap: ui.flexWrap || 'nowrap', justifyContent: ui.justifyContent,
-        alignItems: ui.alignItems, gap: ui.gap, gapUnit: ui.gapUnit || 'px',
+        alignItems: ui.alignItems, gap: ui.gap, gapUnit: readUILength(ui, 'gap').unit,
         flexGrow: ui.flexGrow, flexShrink: ui.flexShrink,
-        paddingTop: ui.paddingTop, paddingTopUnit: ui.paddingTopUnit || 'px',
-        paddingLeft: ui.paddingLeft, paddingLeftUnit: ui.paddingLeftUnit || 'px',
-        paddingRight: ui.paddingRight, paddingRightUnit: ui.paddingRightUnit || 'px',
-        paddingBottom: ui.paddingBottom, paddingBottomUnit: ui.paddingBottomUnit || 'px',
-        marginTop: ui.marginTop || 0, marginTopUnit: ui.marginTopUnit || 'px',
-        marginRight: ui.marginRight || 0, marginRightUnit: ui.marginRightUnit || 'px',
-        marginBottom: ui.marginBottom || 0, marginBottomUnit: ui.marginBottomUnit || 'px',
-        marginLeft: ui.marginLeft || 0, marginLeftUnit: ui.marginLeftUnit || 'px',
-        minWidth: ui.minWidth || 0, minWidthUnit: ui.minWidthUnit || 'px',
-        maxWidth: ui.maxWidth || 0, maxWidthUnit: ui.maxWidthUnit || 'px',
-        minHeight: ui.minHeight || 0, minHeightUnit: ui.minHeightUnit || 'px',
-        maxHeight: ui.maxHeight || 0, maxHeightUnit: ui.maxHeightUnit || 'px',
+        paddingTop: ui.paddingTop, paddingTopUnit: readUILength(ui, 'paddingTop').unit,
+        paddingLeft: ui.paddingLeft, paddingLeftUnit: readUILength(ui, 'paddingLeft').unit,
+        paddingRight: ui.paddingRight, paddingRightUnit: readUILength(ui, 'paddingRight').unit,
+        paddingBottom: ui.paddingBottom, paddingBottomUnit: readUILength(ui, 'paddingBottom').unit,
+        marginTop: ui.marginTop || 0, marginTopUnit: readUILength(ui, 'marginTop').unit,
+        marginRight: ui.marginRight || 0, marginRightUnit: readUILength(ui, 'marginRight').unit,
+        marginBottom: ui.marginBottom || 0, marginBottomUnit: readUILength(ui, 'marginBottom').unit,
+        marginLeft: ui.marginLeft || 0, marginLeftUnit: readUILength(ui, 'marginLeft').unit,
+        minWidth: ui.minWidth || 0, minWidthUnit: readUILength(ui, 'minWidth').unit,
+        maxWidth: ui.maxWidth || 0, maxWidthUnit: readUILength(ui, 'maxWidth').unit,
+        minHeight: ui.minHeight || 0, minHeightUnit: readUILength(ui, 'minHeight').unit,
+        maxHeight: ui.maxHeight || 0, maxHeightUnit: readUILength(ui, 'maxHeight').unit,
         alignSelf: ui.alignSelf || 'auto', zIndex: ui.zIndex || 0, rotation: ui.rotation || 0,
         // `?? 1`, NOT `|| 1`: 0 is a legitimate authored scale (a pop-in clip's first keyframe),
         // and `||` would silently promote it to full size — the animation would start already-open.
@@ -422,6 +432,7 @@ function buildTree(world: World): UINodeData[] | null {
         overflow: ui.overflow, isVisible: ui.isVisible,
         pointerThrough: ui.pointerThrough === true,
         swallowClicks: ui.swallowClicks === true,
+        minTapSize: ui.minTapSize || 0, minTapSizeUnit: readUILength(ui, 'minTapSize').unit,
         scrollbarStyle: ui.scrollbarStyle || 'auto',
         scrollbarThumbColor: ui.scrollbarThumbColor ?? 0x888888,
         scrollbarTrackColor: ui.scrollbarTrackColor ?? 0xdddddd,
@@ -441,11 +452,11 @@ function buildTree(world: World): UINodeData[] | null {
         // fix" and "eleven borders in a shipped project got darker" are the same edit.
         borderColor: ui.borderColor ?? 0x333333, borderOpacity: ui.borderOpacity ?? 1, opacity: ui.opacity ?? 1,
         text: ui.text || '', fontFamily: resolveUIFontFamily(ui.fontFamily as string, ui.systemFont as string),
-        fontSize: ui.fontSize || 16, fontSizeUnit: ui.fontSizeUnit || 'px', fontWeight: ui.fontWeight || 'normal',
+        fontSize: ui.fontSize || 16, fontSizeUnit: readUILength(ui, 'fontSize').unit, fontWeight: ui.fontWeight || 'normal',
         autoFitText: ui.autoFitText === true, fontSizeMin: ui.fontSizeMin || 0,
         fontStyle: ui.fontStyle || 'normal', textColor: ui.textColor ?? 0xffffff, textOpacity: ui.textOpacity ?? 1,
         textAlign: ui.textAlign || 'left',
-        lineHeight: ui.lineHeight || 0, letterSpacing: ui.letterSpacing || 0, letterSpacingUnit: ui.letterSpacingUnit || 'px',
+        lineHeight: ui.lineHeight || 0, letterSpacing: ui.letterSpacing || 0, letterSpacingUnit: readUILength(ui, 'letterSpacing').unit,
         textShadowColor: ui.textShadowColor || 0, textShadowOpacity: ui.textShadowOpacity ?? 1, textShadowOffsetX: ui.textShadowOffsetX || 0,
         textShadowOffsetY: ui.textShadowOffsetY || 0, textShadowBlur: ui.textShadowBlur || 0,
         textStrokeColor: ui.textStrokeColor || 0, textStrokeOpacity: ui.textStrokeOpacity ?? 1, textStrokeWidth: ui.textStrokeWidth || 0,
@@ -501,17 +512,19 @@ function buildTree(world: World): UINodeData[] | null {
         const anc = entity.get(_anchorMeta.trait) as any;
         node.anchor = {
           anchor: anc.anchor,
-          top: anc.top || 0, topUnit: anc.topUnit || 'px',
-          right: anc.right || 0, rightUnit: anc.rightUnit || 'px',
-          bottom: anc.bottom || 0, bottomUnit: anc.bottomUnit || 'px',
-          left: anc.left || 0, leftUnit: anc.leftUnit || 'px',
+          top: anc.top || 0, topUnit: readUIAnchorLength(anc, 'top').unit,
+          right: anc.right || 0, rightUnit: readUIAnchorLength(anc, 'right').unit,
+          bottom: anc.bottom || 0, bottomUnit: readUIAnchorLength(anc, 'bottom').unit,
+          left: anc.left || 0, leftUnit: readUIAnchorLength(anc, 'left').unit,
           pivotX: anc.pivotX || 0, pivotY: anc.pivotY || 0,
           safeArea: anc.safeArea,
+          reservesEdge: !!anc.reservesEdge,
+          clearsReservedEdges: !!anc.clearsReservedEdges,
         };
       }
       if (_canvas2dMeta && entity.has(_canvas2dMeta.trait)) {
         const c = entity.get(_canvas2dMeta.trait) as any;
-        node.canvas2D = { referenceWidth: c.referenceWidth, referenceHeight: c.referenceHeight, scaleMode: c.scaleMode, maxReferenceWidth: c.maxReferenceWidth };
+        node.canvas2D = { referenceWidth: c.referenceWidth, referenceHeight: c.referenceHeight, scaleMode: c.scaleMode, maxReferenceWidth: c.maxReferenceWidth, maxReferenceHeight: c.maxReferenceHeight };
       }
       if (_toggleMeta && entity.has(_toggleMeta.trait)) {
         const t = entity.get(_toggleMeta.trait) as any;
@@ -603,8 +616,8 @@ function buildTree(world: World): UINodeData[] | null {
   // watched value mutated via a raw entity.set (bypassing markUIDirty) won't re-resolve
   // until the next dirty — see the REPAINT INVARIANT on the UIBinding trait.
   if (highlights.length && _attrMeta) {
-    const byGuid = new Map<string, any>();
-    world.query(_attrMeta.trait).updateEach(([attr]: any[], entity: any) => {
+    const byGuid = new Map<string, Entity>();
+    world.query(_attrMeta.trait).updateEach(([attr]: any[], entity: Entity) => {
       if (attr.guid) byGuid.set(attr.guid, entity);
     });
     for (const h of highlights) {
@@ -683,5 +696,36 @@ export function uiTreeProjection(world: World) {
   // not per frame.
   const settings = world.queryFirst(UISettings)?.get(UISettings);
   const rootFontFamily = resolveUIFontFamily(settings?.fontFamily, settings?.systemFont, 'UISettings');
-  useUITreeStore.setState({ tree, rootFontFamily });
+  const bands = resolveReservedEdges(tree);
+  useUITreeStore.setState({ tree, rootFontFamily, reserveTop: bands.top, reserveBottom: bands.bottom });
+}
+
+/**
+ * The reserved edge bands of a built tree (#1159): every VISIBLE `reservesEdge` strip on a
+ * `top-stretch`/`bottom-stretch` anchor contributes its authored height to its edge.
+ *
+ * ⚠️ **Visibility is walked down the tree, not read per node.** `UINode` returns early on
+ * `!isVisible` and so draws none of that element's children, while the build above still creates
+ * nodes for them. A banner inside a hidden container must therefore reserve nothing, or every
+ * dialog would clear a strip that is not on screen. A strip hidden only by a `UIBinding`
+ * `visibleBinding` is NOT seen here — that resolves at render time against the store — so hide a
+ * band with `UIElement.isVisible`.
+ *
+ * Two strips on one edge take the LARGER, not the sum: both are anchored to the same edge, so they
+ * overlap rather than stack.
+ */
+export function resolveReservedEdges(tree: readonly UINodeData[]): { top: string; bottom: string } {
+  const found = { top: [] as string[], bottom: [] as string[] };
+  const walk = (n: UINodeData): void => {
+    if (!n.isVisible) return;
+    const edge = n.anchor?.reservesEdge ? reservedEdgeOf(n.anchor.anchor) : null;
+    if (edge) {
+      const len = reservedBandLength(n.height, n.heightUnit);
+      if (len !== '0px') found[edge].push(len);
+    }
+    for (const c of n.children) walk(c);
+  };
+  for (const r of tree) walk(r);
+  const join = (l: string[]): string => l.length === 0 ? '0px' : l.length === 1 ? l[0] : `max(${l.join(', ')})`;
+  return { top: join(found.top), bottom: join(found.bottom) };
 }

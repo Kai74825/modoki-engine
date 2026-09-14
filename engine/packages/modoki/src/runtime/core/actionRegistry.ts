@@ -53,12 +53,55 @@ export interface UIActionContext {
 // sign-in case. Detected at runtime by duck-typing `.then`, not by this static type.
 export type UIActionHandler = (ctx: UIActionContext) => unknown;
 
+/** The brand on a refusal. A plain string key rather than a Symbol so it survives declaration emit and
+ *  a second module instance alike (an eval'd `/@fs` import loads its own copy of this file). */
+const REFUSAL = '__modokiUIActionRefusal';
+
+/** What a handler RETURNS when it declines to act — so a caller that needs the truth can read it
+ *  instead of re-deriving the handler's preconditions (#1129). Build it with `refuseAction`, test it
+ *  with `isActionRefusal`. Not thenable, so it never holds the #466 input lock. */
+export interface UIActionRefusal {
+  readonly __modokiUIActionRefusal: true;
+  /** One sentence a human or an agent can act on — what was wrong and what to aim at instead. */
+  readonly reason: string;
+  /** Extra fields a caller forwards verbatim (the agent bridge spreads them into its reply), e.g. the
+   *  `known` clip names or the `slavedTo` parent guid — so the retry is mechanical. */
+  readonly detail?: Readonly<Record<string, unknown>>;
+}
+
+/** Refuse a UI action: log it (by default) and return the refusal for the caller to read.
+ *
+ *  ⚠️ **A handler that refuses must `return refuseAction(...)`, never `console.warn` + `return`**
+ *  (#1129). The dispatch-action agent op reads this return value to answer `ok:false`; a warn is
+ *  invisible to it, so a warn-and-return refusal is reported to an agent as `dispatched:true`. That
+ *  is how the bridge came to carry hand-written copies of two handlers' preconditions — and one of
+ *  them drifted from its handler.
+ *
+ *  `log` picks the console channel. `false` refuses WITHOUT logging, for a refusal that is routine for
+ *  a player (a haptics toggle in a scene that authors no HapticSettings): in a shipped build a
+ *  `console.warn` becomes a Crashlytics issue (see `engine/app/ota.ts`), so a site that was silent
+ *  before stays silent, and only a caller that reads the result learns why nothing happened. */
+export function refuseAction(
+  reason: string,
+  opts: { detail?: Record<string, unknown>; log?: 'warn' | 'error' | false } = {},
+): UIActionRefusal {
+  const log = opts.log ?? 'warn';
+  if (log) console[log](reason);
+  return Object.freeze({ [REFUSAL]: true as const, reason, ...(opts.detail ? { detail: Object.freeze({ ...opts.detail }) } : {}) });
+}
+
+/** True when a handler's return value is a `refuseAction` refusal. */
+export function isActionRefusal(value: unknown): value is UIActionRefusal {
+  return typeof value === 'object' && value !== null && (value as Record<string, unknown>)[REFUSAL] === true;
+}
+
 /** A registered action: a handler plus an optional typed-argument schema. The
  *  bare-function form is shorthand for `{ handler }` (no declared params). */
 export interface UIActionDef {
   handler: UIActionHandler;
-  /** Editor-facing schema for this action's arguments — drives typed widgets in
-   *  the Inspector's binding editor. Omit for actions that take no authored args. */
+  /** Schema for this action's arguments — drives typed widgets in the Inspector's binding editor,
+   *  AND dispatch: a declared param arriving as `''` is dropped before the handler runs
+   *  (`normaliseParams`, #1075). Omit for actions that take no authored args. */
   params?: Record<string, FieldHint>;
 }
 
@@ -78,6 +121,34 @@ const defs = new Map<string, UIActionDef>();
 
 function asDef(def: UIActionHandler | UIActionDef): UIActionDef {
   return typeof def === 'function' ? { handler: def } : def;
+}
+
+/** A declared param that arrives as `''` reaches the handler as ABSENT (#1075).
+ *
+ *  `''` is what every authoring route delivers for "nothing chosen": the Inspector writes it when
+ *  "use event value" is unticked on an enum or string param, a cleared text field commits it, an
+ *  empty input's `$value` carries it, and `modoki_dispatch_action` forwards whatever an agent sent.
+ *  It is not nullish, so a handler's `params.x ?? fallback` kept it and the fallback never ran —
+ *  at thirteen sites across nine handlers, one of them freezing time (`Number('')` is 0). Patching each handler was
+ *  the whack-a-mole #1074 had started; this is the one door every route (UI bindings, timeline
+ *  signal markers, MCP) comes through, so the rule lives here instead.
+ *
+ *  - Only DECLARED params are touched. An undeclared key — the schema-less `params.payload`
+ *    convention included — passes through exactly as authored, so a schema-less handler still sees
+ *    `''` and must handle it itself. Declaring what a handler reads is what opts it in.
+ *  - A param declared `allowEmpty: true` keeps `''`: empty text that genuinely means empty.
+ *  - The authored params object is never mutated — it is the scene's binding data. A copy is made
+ *    only when something is dropped. */
+function normaliseParams(def: UIActionDef, params: Record<string, unknown> | undefined): Record<string, unknown> | undefined {
+  const schema = def.params;
+  if (!params || !schema) return params;
+  let out: Record<string, unknown> | undefined;
+  for (const key of Object.keys(params)) {
+    if (params[key] !== '' || !Object.prototype.hasOwnProperty.call(schema, key) || schema[key].allowEmpty) continue;
+    out ??= { ...params };
+    delete out[key];
+  }
+  return out ?? params;
 }
 
 export function registerUIAction(name: string, def: UIActionHandler | UIActionDef) {
@@ -121,7 +192,7 @@ export function dispatchUIAction(name: string, opts?: DispatchOptions): unknown 
   // Returned so applyBindings' input lock (#466) can hold open until an async handler
   // settles (duck-typed there, not by static type). Every other caller keeps discarding it,
   // which is exactly what `unknown` allows.
-  return def.handler({ payload: opts?.payload, params: opts?.params, target, world, emit: (type, payload) => emitJournal(type, payload, world) });
+  return def.handler({ payload: opts?.payload, params: normaliseParams(def, opts?.params), target, world, emit: (type, payload) => emitJournal(type, payload, world) });
 }
 
 export function getUIActionNames(): string[] {
@@ -154,6 +225,6 @@ export function dispatchGameAction(name: string, opts?: DispatchOptions): boolea
       if (attr.guid === opts.targetGuid) target = entity;
     });
   }
-  def.handler({ payload: opts?.payload, params: opts?.params, target, world, emit: (type, payload) => emitJournal(type, payload, world) });
+  def.handler({ payload: opts?.payload, params: normaliseParams(def, opts?.params), target, world, emit: (type, payload) => emitJournal(type, payload, world) });
   return true;
 }

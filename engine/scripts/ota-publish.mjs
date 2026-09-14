@@ -3,15 +3,17 @@
  *
  *  Takes an already-built `dist/` directory (from `node engine/scripts/build-web.mjs`),
  *  hashes it into a bundle manifest, uploads the content-addressed files + manifest
- *  ADDITIVELY (no `--delete-unmatched-destination-objects` — this bucket namespace is
- *  shared by every version ever published; deleting would strand clients still on an
- *  older version), then merges/signs/uploads `release.json`.
+ *  ADDITIVELY (no `--delete-unmatched-destination-objects` — a sync would wipe every other
+ *  version and bundle in the namespace), then merges/signs/uploads `release.json`, and only
+ *  then prunes this bundle's old versions down to `ota.retainVersions` plus the live one (#836,
+ *  ota/pruneBundle.mjs — a deliberate, bounded delete, never a sync).
  *
- *  It takes its bucket/dist/version/engine-api as explicit arguments so it can be exercised
- *  and tested independently of the editor build UI. It DOES read the target project's
- *  `project.config.json` (via `--project`), but for exactly two publish-identity guards —
- *  the signing key and the dist kind, below — never for the bucket/version/engine-api
- *  themselves, which stay explicit CLI arguments.
+ *  It takes its bucket/dist/version as explicit arguments so it can be exercised and tested
+ *  independently of the editor build UI. It DOES read the target project's `project.config.json`
+ *  (via `--project`), but only for its publish guards — the signing key, the dist kind, and
+ *  (#837) a sub-game's engine API against the shell's `ota.engineApi`, below — never for the
+ *  bucket or version themselves. A shell dist's engine API is still an explicit argument; a
+ *  sub-game dist's comes from its own `subgame.json`.
  *
  *  #582: these two guards used to exist ONLY in the editor's `/api/ota/publish` route, but
  *  that route's own refusal message sends a human here BY HAND for a sub-game publish
@@ -23,7 +25,16 @@
  *    node engine/scripts/ota-publish.mjs \
  *      --dist games/<id>/dist --bucket gs://modoki-ota/<id> \
  *      --name shell --version v13 --engine-api 1 --key default --project games/<id> \
- *      [--mandatory | --no-mandatory]
+ *      [--mandatory | --no-mandatory] [--allow-unclean-build]
+ *
+ *  The dist must carry the `modoki-build.json` its build wrote (#906, ota/buildStamp.mjs) naming a
+ *  clean commit; that stamp goes into the signed manifest as `build`. A dirty, unknown or unstamped
+ *  build is refused. `--allow-unclean-build` publishes it anyway with `build.forced: true` — a CLI-only
+ *  override: the editor route and `modoki_ota_publish` deliberately cannot pass it (owner, 2026-09-13).
+ *
+ *  `--engine-api` is required for a SHELL dist. A SUB-GAME dist (one carrying `subgame.json`) takes
+ *  its engine API from that file instead, so omit the flag there; a flag that disagrees with it, or
+ *  a stamped value that differs from the shell project's `ota.engineApi`, is refused (#837).
  *
  *  `mandatory` is STICKY across publishes: `--mandatory` sets it true, `--no-mandatory`
  *  clears it, and passing NEITHER flag inherits the existing release's `mandatory` value
@@ -34,6 +45,7 @@
  *    release.json                          (signed, no-cache)
  *    bundles/<name>/<version>/manifest.json (no-cache)
  *    bundles/<name>/<version>/files/<hash>  (immutable — content-addressed)
+ *    bundles/<name>/<version>/bundle.zip    (immutable)
  *
  *  NOTE: files are re-uploaded per version even when a hash is unchanged from the
  *  previous version (a file is stored under `.../<version>/files/<hash>`, not deduped
@@ -49,41 +61,22 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { buildManifestFiles } from './ota/buildManifest.mjs';
-import { isGcloudObjectNotFoundError } from './ota/gcloud.mjs';
+import { isGcloudObjectNotFoundError, shellQuote } from './ota/gcloud.mjs';
 import { createManifest, createRelease, manifestHashPayload, validateManifest, validateRelease } from './ota/schema.mjs';
-import { OTA_DEFAULT_BUNDLE_NAME, otaBundleDistKindRefusal, otaSigningKeyRefusal } from './ota/publishGuards.mjs';
+import { OTA_DEFAULT_BUNDLE_NAME, OTA_DEFAULT_ENGINE_API, otaBundleDistKindRefusal, otaSubgameEngineApi } from './ota/publishGuards.mjs';
+import { otaPublishPreflight, readRawOtaBlock } from './ota/publishPreflight.mjs';
 import { OTA_SAFE_TOKEN, OTA_SAFE_BUCKET } from './ota/otaSafeTokens.mjs';
 import { signRelease } from './ota/signing.mjs';
 import { buildZipFromDir } from './ota/zip.mjs';
+import { BUILD_STAMP_FILENAME, otaBuildProvenance } from './ota/buildStamp.mjs';
+import { pruneBundleVersions } from './ota/pruneBundle.mjs';
 import { acquireBuildClaim } from './buildClaimsStore.mjs';
+import { samePath } from './pathIdentity.mjs';
 
 const defaultRepoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
-// Wraps a value for interpolation into the `execSync` calls below, each of which runs through
-// a real shell (`/bin/sh` on POSIX, `cmd.exe` on Windows — see buildStepShell.ts's own header
-// for the same POSIX/Windows split on the editor's build-step pipeline). This is DEFENSE IN
-// DEPTH, not the primary guard: by the time any value reaches here, --name/--version/--bucket
-// have already been rejected above if they don't match OTA_SAFE_TOKEN/OTA_SAFE_BUCKET, so none
-// of those three can carry a shell metacharacter to begin with. What this still protects are
-// the local filesystem paths this script derives itself and never runs through that charset
-// check — the staging directories it makes with mkdtempSync (stageDir, manifestStageDir,
-// releaseStageDir) and the files it writes under them (zipPath, manifestPath,
-// tmpReleasePath) — which legitimately CAN contain characters like spaces (e.g. a repo
-// checked out under a path with one) and must still round-trip through the shell safely.
-//
-// The old `q = (s) => JSON.stringify(s)` emitted DOUBLE-quoted output, and POSIX shells still
-// expand `$(...)`, backticks and `${...}` INSIDE double quotes — so against a value carrying
-// one of those, it only ever JSON-escaped, it never actually neutralized shell interpolation.
-// POSIX single quotes suppress all expansion, which is what's needed here; `'\''` is the
-// standard trick for a literal `'` inside a single-quoted string (close the quote, emit an
-// escaped `'`, reopen the quote).
-//
-// win32 keeps the old double-quote form: cmd.exe does not treat `'` as a quote character at
-// all, so single-quoting there would not group the argument — it would paste stray quote
-// characters straight into it. ⚠️ Like buildStepShell.ts's own `winCmd` forms, this win32
-// branch is UNVALIDATED against a real Windows shell from this machine.
-const q = process.platform === 'win32'
-  ? (s) => JSON.stringify(s)
-  : (s) => `'${String(s).replace(/'/g, "'\\''")}'`;
+// Quotes a value for the `execSync` calls below, each of which runs through a real shell — see
+// `shellQuote` (ota/gcloud.mjs, shared with the #836 prune) for why, and why it is defense in depth.
+const q = shellQuote;
 
 function parseArgs(argv) {
   // `mandatory` starts `undefined` (not `false`) so the release-merge loop can tell
@@ -94,6 +87,9 @@ function parseArgs(argv) {
     const a = argv[i];
     if (a === '--mandatory') { args.mandatory = true; continue; }
     if (a === '--no-mandatory') { args.mandatory = false; continue; }
+    // A bare switch like the two above: the generic `--key value` parse below would swallow the
+    // NEXT argument as its value.
+    if (a === '--allow-unclean-build') { args.allowUncleanBuild = true; continue; }
     if (!a.startsWith('--')) continue;
     const key = a.slice(2).replace(/-([a-z])/g, (_, c) => c.toUpperCase());
     args[key] = argv[++i];
@@ -122,42 +118,12 @@ async function main() {
   const bucket = args.bucket?.replace(/\/+$/, '');
   const name = args.name;
   const version = args.version;
-  const engineApi = Number(args.engineApi);
+  // `undefined` when omitted: a sub-game dist takes its engine API from its own subgame.json (#837).
+  const engineApiFlag = args.engineApi === undefined ? undefined : Number(args.engineApi);
   const projectDir = args.project ? path.resolve(repoRoot, args.project) : null;
 
   if (!distDir || !existsSync(distDir)) fail(`--dist is required and must exist (got ${args.dist})`);
-  // Charset-validated with the SAME regexes the editor's `/api/ota/publish` and
-  // `/api/ota/status` routes already enforce before reaching this same shared publish
-  // operation (#649, following #582's precedent: a guard enforced by only one of two entry
-  // points to the same operation is a trap for whichever entry point lacks it). This is the
-  // PRIMARY guard against shell injection — `bucket`/`name`/`version` all get interpolated
-  // into `gcloud storage ...` commands below (via `q()`, hardened separately as
-  // defense-in-depth, not as the thing doing this job).
-  if (!bucket || !OTA_SAFE_BUCKET.test(bucket)) fail(`--bucket must be a gs:// URL matching ${OTA_SAFE_BUCKET} (got ${args.bucket})`);
-  if (!name) fail('--name is required (the bundle name, e.g. "shell" or a sub-game id)');
-  if (!OTA_SAFE_TOKEN.test(name)) {
-    // A "/" is the concrete, NON-malicious way to hit this: it would silently write bucket
-    // objects under a NESTED path (bundles/<name-with-slash>/<version>/...) while
-    // release.json still records --name as the flat string the caller passed. The
-    // version-collision guard further below reads back that SAME flat
-    // bucket/<name>/<version>/manifest.json path, so it would never see what actually landed
-    // in the bucket — defeating the exact guard #577 exists to provide, reachable here with
-    // no hostile intent at all.
-    fail(`--name must match ${OTA_SAFE_TOKEN} (got ${JSON.stringify(name)}) — in particular, a "/" is rejected: it would silently write bucket objects under a NESTED path while release.json still records --name as a flat string, so the version-collision guard below (which reads back that same flat path) would never see what actually landed. Use a plain bundle-name token, not a path.`);
-  }
-  if (!version) fail('--version is required (e.g. "v13")');
-  if (!OTA_SAFE_TOKEN.test(version)) fail(`--version must match ${OTA_SAFE_TOKEN} (got ${JSON.stringify(version)})`);
-  if (!Number.isInteger(engineApi) || engineApi < 1) fail('--engine-api must be a positive integer');
-  // --key is the FOURTH tainted input, and both route surfaces validate it (`keyName`) with the
-  // same token. The first cut of this fix validated three of the four, which is the very asymmetry
-  // it exists to close — caught in review. Unlike the other three this one is never
-  // shell-interpolated; it is joined into a path, so the exposure is TRAVERSAL rather than
-  // injection: `--key ../../../../etc/something` would read and JSON.parse a file well outside
-  // build/ota-keys/. Modest, since whoever runs this CLI already has a shell — but the guard costs
-  // one line and the route does not make the caller argue about it either.
-  if (!OTA_SAFE_TOKEN.test(args.key)) {
-    fail(`--key must match ${OTA_SAFE_TOKEN} (got ${JSON.stringify(args.key)}) — it names a keypair in build/ota-keys/, not a path.`);
-  }
+  if (engineApiFlag !== undefined && (!Number.isInteger(engineApiFlag) || engineApiFlag < 1)) fail('--engine-api must be a positive integer');
   if (!projectDir) {
     fail('--project is required (the project dir whose project.config.json this release is published for, e.g. games/ota-test) — its ota.publicKey is the key the SHIPPED APP verifies against, and its ota.bundleName decides whether this dist may be published under --name.');
   }
@@ -166,62 +132,83 @@ async function main() {
   // missing fields — this script must NOT degrade an unreadable/malformed config to
   // "unguarded"; it must abort loudly instead, the same fail-closed shape the version-collision
   // guard below already uses for "could not check" vs "definitely fine").
-  const projectConfigPath = path.join(projectDir, 'project.config.json');
-  if (!existsSync(projectConfigPath)) fail(`--project's project.config.json not found: ${projectConfigPath}`);
-  let projectConfig;
-  try {
-    projectConfig = JSON.parse(readFileSync(projectConfigPath, 'utf8'));
-  } catch (e) {
-    fail(`--project's project.config.json (${projectConfigPath}) could not be parsed as JSON: ${e.message}`);
-  }
-  const ota = projectConfig?.ota;
-  if (typeof ota !== 'object' || ota === null || Array.isArray(ota)) {
-    fail(`${projectConfigPath} has no object-typed "ota" field — cannot verify this publish's signing key or bundle identity against it.`);
-  }
-  // `enabled` defaults to `false`, so an ABSENT field correctly means "not enabled" — no
-  // default-resolution subtlety here (unlike `bundleName` just below). The editor route
-  // already refuses `!cfg.ota.enabled` with a 400 (vite-asset-scanner.ts), but that refusal
-  // reaches only the route's own SSE path — a hand publish (the exact by-hand path #582 exists
-  // to guard) had nothing stopping it from writing a real, inert entry into the shared
-  // bucket's release.json for a project that opted OUT of OTA in Project Settings.
-  if (!ota.enabled) {
-    fail(`${projectConfigPath}'s ota.enabled is not true — this project has not opted into OTA updates. Enable OTA in Project Settings first, then publish.`);
-  }
-  // `bundleName`'s default IS the real value, unlike `publicKey` below (whose default `''`
-  // means "unset" and must still refuse). `pruneProjectConfig` (engine/project-config.ts,
-  // called on every Project Settings save) omits any field equal to its default when the
-  // on-disk file didn't already carry that key — so a project that enables OTA and leaves the
-  // bundle name at its `"shell"` placeholder gets an `ota` block with NO `bundleName` key at
-  // all. That is a perfectly valid config, not a malformed one: absent means "the default".
-  // Only a bundleName that is PRESENT but not a non-empty string is a genuine config defect.
-  const projectBundleName = ota.bundleName === undefined ? OTA_DEFAULT_BUNDLE_NAME : ota.bundleName;
-  if (typeof projectBundleName !== 'string' || !projectBundleName) {
-    fail(`${projectConfigPath}'s ota.bundleName is present but not a non-empty string (got ${JSON.stringify(ota.bundleName)}) — it decides whether this dist may be published under --name "${name}", so this publish cannot be checked. Set it in project.config.json, or remove the key to use the default ("${OTA_DEFAULT_BUNDLE_NAME}").`);
-  }
+  const rawConfig = readRawOtaBlock(projectDir);
+  const projectConfigPath = rawConfig.file;
+  if (!rawConfig.ok && rawConfig.reason === 'missing') fail(`--project's project.config.json not found: ${projectConfigPath}`);
+  if (!rawConfig.ok) fail(`--project's project.config.json (${projectConfigPath}) could not be parsed as JSON: ${rawConfig.error}`);
+  const ota = rawConfig.ota;
 
-  const keyPath = path.join(repoRoot, 'build', 'ota-keys', `${args.key}.json`);
-  if (!existsSync(keyPath)) fail(`Signing key not found: ${path.relative(repoRoot, keyPath)}. Run: node engine/scripts/ota-keygen.mjs ${args.key}`);
-  const keypair = JSON.parse(readFileSync(keyPath, 'utf8'));
+  // THE publish-request check — the same `otaPublishPreflight` the editor's `/api/ota/publish` runs
+  // before it builds (#827): enabled, the four tainted inputs, the project's bundle identity, the
+  // publish target (the shell's own name or a LISTED sub-game — #837, which this script lacked until
+  // #827), and the signing key. BEFORE any hashing/zipping/upload, so a refusal provably reaches
+  // nothing in the bucket. Only the wording is this script's; every refusal is keyed below, and
+  // `otaPublishPreflight.test.ts` holds this map to the full list.
+  const preflight = otaPublishPreflight({ ota, name, version, keyName: args.key, bucket, repoRoot });
+  if (!preflight.ok) {
+    const r = preflight;
+    fail({
+      'no-ota-block': `${projectConfigPath} has no object-typed "ota" field — cannot verify this publish's signing key or bundle identity against it.`,
+      'not-enabled': `${projectConfigPath}'s ota.enabled is not true — this project has not opted into OTA updates. Enable OTA in Project Settings first, then publish.`,
+      'bad-version': `--version must match ${OTA_SAFE_TOKEN} (got ${JSON.stringify(version)})`,
+      'bad-name': `--name must match ${OTA_SAFE_TOKEN} (got ${JSON.stringify(name)}) — in particular, a "/" is rejected: it would silently write bucket objects under a NESTED path while release.json still records --name as a flat string, so the version-collision guard below (which reads back that same flat path) would never see what actually landed. Use a plain bundle-name token, not a path.`,
+      'bad-key-name': `--key must match ${OTA_SAFE_TOKEN} (got ${JSON.stringify(args.key)}) — it names a keypair in build/ota-keys/, not a path.`,
+      'bad-bucket': `--bucket must be a gs:// URL matching ${OTA_SAFE_BUCKET} (got ${args.bucket})`,
+      'bad-project-bundle-name': `${projectConfigPath}'s ota.bundleName is present but not a non-empty string (got ${JSON.stringify(ota?.bundleName)}) — it decides whether this dist may be published under --name "${name}", so this publish cannot be checked. Set it in project.config.json, or remove the key to use the default ("${OTA_DEFAULT_BUNDLE_NAME}").`,
+      'bad-project-subgames': `${projectConfigPath}'s ota.subgames is present but not a list of project ids (got ${JSON.stringify(ota?.subgames)}) — it decides which sub-game names may be published into this shell, so this publish cannot be checked.`,
+      'bad-project-retain-versions': `${projectConfigPath}'s ota.retainVersions is present but not a positive integer (got ${JSON.stringify(ota?.retainVersions)}) — it decides how many versions of "${name}" this publish keeps in the bucket, so it cannot prune. Set it in project.config.json, or remove the key to keep the default.`,
+      'ambiguous-bundle': `--name "${name}" is BOTH ${projectConfigPath}'s own ota.bundleName and a sub-game listed in its ota.subgames — it cannot say whether it publishes the shell or that sub-game. Rename one.`,
+      'unknown-bundle': `--name "${name}" is neither ${projectConfigPath}'s own ota.bundleName ("${r.bundleName}") nor a sub-game listed in its ota.subgames (${JSON.stringify(r.subgames)}). A sub-game is published into this shell only once the shell lists it (Project Settings → OTA → Sub-games) — the same rule the editor's Publish OTA Update… enforces (#837, #827). Pass --name ${q(String(r.bundleName))} to publish this project as itself.`,
+      'key-missing': `Signing key not found: ${path.relative(repoRoot, String(r.keyPath))}. Run: node engine/scripts/ota-keygen.mjs ${args.key}`,
+      'key-unparseable': `Signing key "${args.key}" (${r.keyPath}) could not be parsed as JSON — regenerate it: node engine/scripts/ota-keygen.mjs ${args.key}`,
+      'no-key-public-half': `Signing key "${args.key}" (${r.keyPath}) has no publicKey field — regenerate it: node engine/scripts/ota-keygen.mjs ${args.key}`,
+      'project-public-key-empty': `${projectConfigPath}'s ota.publicKey is EMPTY, so no installed app can verify a release. Set it to the signing key's public half ("${r.keyPublicKey}") in project.config.json, rebuild + ship the native app so the new key is baked in, and publish then.`,
+      mismatch: `Signing key "${args.key}" does NOT match ${projectConfigPath}'s ota.publicKey — every installed app would reject the release as signature-invalid, while this publish would report success. Key "${args.key}" public half: "${r.keyPublicKey}". project.config.json ota.publicKey: "${ota?.publicKey}". Publish with the key that matches (--key <name>), or — only if you intend to ROTATE the key — set ota.publicKey to the new value and ship a native build carrying it BEFORE publishing, or installed apps will be stranded.`,
+    }[r.refusal] ?? `refused: ${r.refusal}`);
+  }
+  const { target, keypair, bundleName: projectBundleName } = preflight;
 
-  // Publish-identity guards (#582) — checked immediately after the keypair is loaded and
-  // BEFORE any hashing/zipping/upload work, so a refusal here provably reaches nothing in the
-  // bucket.
+  // The dist's KIND must match the target — only this script receives a pre-built dist, so this half
+  // is not in the shared preflight (the route builds the kind its target names).
   const distIsSubgameModule = existsSync(path.join(distDir, 'subgame.json'));
-  const kindRefusal = otaBundleDistKindRefusal({ bundleName: name, projectBundleName, distIsSubgameModule });
+  const kindRefusal = otaBundleDistKindRefusal({ targetKind: target.kind, distIsSubgameModule });
   if (kindRefusal === 'subgame-name-with-shell-dist') {
-    fail(`--name "${name}" does not match ${projectConfigPath}'s ota.bundleName ("${projectBundleName}"), and ${path.relative(repoRoot, distDir)} is a plain shell dist/ (no subgame.json) — publishing it would ship this project's own shell content under "${name}"'s identity. Build a real sub-game module dist (build-subgame.mjs) if you meant to publish "${name}" as a sub-game, or pass --name ${q(projectBundleName)} to publish this project as itself.`);
+    fail(`--name "${name}" is a sub-game listed in ${projectConfigPath}'s ota.subgames, but ${path.relative(repoRoot, distDir)} is a plain shell dist/ (no subgame.json) — publishing it would ship this project's own shell content under "${name}"'s identity. Build a real sub-game module dist (build-subgame.mjs) if you meant to publish "${name}" as a sub-game, or pass --name ${q(projectBundleName)} to publish this project as itself.`);
   }
   if (kindRefusal === 'shell-name-with-subgame-dist') {
     fail(`--name "${name}" matches ${projectConfigPath}'s own ota.bundleName, but ${path.relative(repoRoot, distDir)} is a sub-game module dist (subgame.json present) — publishing it under "${name}" would replace this project's shell bundle with a module the OTA client cannot boot standalone. Publish it under its own sub-game --name instead.`);
   }
-  const keyRefusal = otaSigningKeyRefusal(keypair.publicKey ?? null, ota.publicKey);
-  if (keyRefusal) {
-    const why = {
-      'no-key-public-half': `Signing key "${args.key}" (${keyPath}) has no publicKey field — regenerate it: node engine/scripts/ota-keygen.mjs ${args.key}`,
-      'project-public-key-empty': `${projectConfigPath}'s ota.publicKey is EMPTY, so no installed app can verify a release. Set it to the signing key's public half ("${keypair.publicKey}") in project.config.json, rebuild + ship the native app so the new key is baked in, and publish then.`,
-      mismatch: `Signing key "${args.key}" does NOT match ${projectConfigPath}'s ota.publicKey — every installed app would reject the release as signature-invalid, while this publish would report success. Key "${args.key}" public half: "${keypair.publicKey}". project.config.json ota.publicKey: "${ota.publicKey}". Publish with the key that matches (--key <name>), or — only if you intend to ROTATE the key — set ota.publicKey to the new value and ship a native build carrying it BEFORE publishing, or installed apps will be stranded.`,
-    }[keyRefusal];
-    fail(why);
+  // Engine API (#837). A SHELL dist states it with --engine-api, which stays required. A SUB-GAME
+  // dist already carries the value its build stamped into subgame.json, and that is exactly what a
+  // device compares against its own ENGINE_API_VERSION, for EXACT equality (subgameLoader.ts). So
+  // it is read from the dist, a flag may only agree with it, and it must equal the shell project's
+  // own ota.engineApi. Before this, a disagreeing --engine-api published a manifest saying one
+  // number over a module saying another: every device refused it while this script reported
+  // success. Like the identity guards above, it runs before the claim and before any upload.
+  let engineApi;
+  if (!distIsSubgameModule) {
+    if (engineApiFlag === undefined) fail('--engine-api is required for a shell dist (a sub-game dist takes its engine API from its own subgame.json).');
+    engineApi = engineApiFlag;
+  } else {
+    const subgameJsonPath = path.join(distDir, 'subgame.json');
+    let subgameMeta;
+    try {
+      subgameMeta = JSON.parse(readFileSync(subgameJsonPath, 'utf8'));
+    } catch (e) {
+      fail(`${subgameJsonPath} could not be parsed as JSON (${e.message}) — cannot tell which engine API this sub-game was built against.`);
+    }
+    const shellEngineApi = ota.engineApi === undefined ? OTA_DEFAULT_ENGINE_API : ota.engineApi;
+    const stamped = subgameMeta?.engineApi;
+    const resolved = otaSubgameEngineApi({ stamped, requested: engineApiFlag, shellEngineApi });
+    if (resolved.refusal) {
+      fail({
+        'stamped-invalid': `${subgameJsonPath} has no positive-integer engineApi (got ${JSON.stringify(stamped)}) — rebuild the sub-game with build-subgame.mjs.`,
+        'flag-mismatch': `--engine-api ${engineApiFlag} disagrees with ${subgameJsonPath}, which was built against engine API ${stamped}. The manifest would contradict its own module and every device would refuse it. Omit --engine-api for a sub-game dist.`,
+        'shell-mismatch': `Sub-game "${name}" was built against engine API ${stamped} (${subgameJsonPath}), but ${projectConfigPath}'s ota.engineApi is ${JSON.stringify(shellEngineApi)}. A device loads a sub-game only when its engine API EXACTLY equals the running shell's, so every device would refuse this bundle. Rebuild the sub-game against this shell's engine API, or publish it into a shell that runs ${stamped}.`,
+      }[resolved.refusal]);
+    }
+    engineApi = resolved.engineApi;
+    console.log(`[ota-publish] Sub-game engine API ${engineApi}, read from ${path.relative(repoRoot, subgameJsonPath)}; matches the shell's ota.engineApi.`);
   }
 
   // Cross-process build claim (#650) — closed here, right where the file's own comment above
@@ -236,8 +223,56 @@ async function main() {
   // editor, matching what the editor's own `/api/ota/publish` route already does.
   const buildClaim = acquireBuildClaim(projectDir, `OTA publish (CLI): ${name}@${version}`, { kind: 'cli' });
   if (!buildClaim.ok) fail(buildClaim.message);
+  // #837 close-out: a SUB-GAME dist belongs to a DIFFERENT project than --project (the shell), and
+  // build-subgame.mjs claims THAT project while it writes the dist. Claiming only the shell left the
+  // dist unguarded for the whole hash-and-upload below, so a build of the same sub-game started
+  // meanwhile would empty the folder mid-read and upload a torn module. Claim the dist's own project
+  // too. A build already running there makes this publish refuse, loudly, instead. Skipped when the
+  // dist sits inside --project itself: a second claim on one root from one process is refused.
+  let distClaim = null;
+  const distProjectDir = path.dirname(distDir);
+  if (distIsSubgameModule && !samePath(distProjectDir, projectDir)) {
+    const claimed = acquireBuildClaim(distProjectDir, `OTA publish (CLI): ${name}@${version} (sub-game dist)`, { kind: 'cli' });
+    if (!claimed.ok) {
+      buildClaim.release();
+      fail(claimed.message);
+    }
+    distClaim = claimed;
+  }
 
   try {
+    // Build provenance (#906): which tree built this dist, read from the stamp the BUILD wrote into it
+    // (ota/buildStamp.mjs) — never from this script's own checkout, which may not be the tree that
+    // built it at all. Read under the claim, like the hashing below, so a concurrent rebuild cannot
+    // swap the stamp out from under the bytes it describes. Before any upload, so a refusal reaches
+    // nothing in the bucket.
+    const stampPath = path.join(distDir, BUILD_STAMP_FILENAME);
+    let stampText = null;
+    try {
+      stampText = readFileSync(stampPath, 'utf8');
+    } catch (e) {
+      // Only ABSENT is "no stamp"; an unreadable file is not a missing one (#1120's lesson).
+      if (e?.code !== 'ENOENT') fail(`Could not read ${stampPath}: ${e.message}`);
+    }
+    const provenance = otaBuildProvenance({ stampText, allowUnclean: args.allowUncleanBuild === true });
+    if (provenance.refusal) {
+      const rel = path.relative(repoRoot, distDir);
+      // Functions, not strings: the `dirty` wording parses the stamp, which only that refusal guarantees.
+      const why = {
+        'no-stamp': () => `${rel} has no ${BUILD_STAMP_FILENAME}, so nothing records which source tree built it. Rebuild it (build-web.mjs --target native, or build-subgame.mjs) — a build stamps its own dist.`,
+        'bad-stamp': () => `${stampPath} is not a valid build stamp ({ commit, dirty }). Rebuild the dist.`,
+        'unknown-tree': () => `${rel} was built where git could not report the tree (not a repository, or git unavailable), so this publish cannot say which source it ships.`,
+        dirty: () => `${rel} was built from a tree with uncommitted changes (at commit ${JSON.parse(stampText).commit}), so no commit reproduces what this publish would ship. Commit, rebuild, and publish that.`,
+      }[provenance.refusal];
+      fail(`${why ? why() : `refused: ${provenance.refusal}.`} To publish it anyway, run this script by hand with --allow-unclean-build: the manifest then records forced: true.`);
+    }
+    const { build } = provenance;
+    if (build.forced) {
+      console.warn(`[ota-publish] WARNING: publishing an unclean build (--allow-unclean-build): commit ${build.commit ?? 'unknown'}, dirty ${build.dirty ?? 'unknown'}. The manifest records forced: true.`);
+    } else {
+      console.log(`[ota-publish] Built from commit ${build.commit} (clean).`);
+    }
+
     console.log(`[ota-publish] Hashing ${path.relative(repoRoot, distDir)}...`);
     const files = await buildManifestFiles(distDir);
     const fileCount = Object.keys(files).length;
@@ -253,7 +288,7 @@ async function main() {
     const zipHash = createHash('sha256').update(zip).digest('hex');
     console.log(`[ota-publish] Bundle zip: ${zip.length} bytes, sha256 ${zipHash}.`);
 
-    const manifest = createManifest({ name, version, engineApi, files, bundleZip: { hash: zipHash, size: zip.length } });
+    const manifest = createManifest({ name, version, engineApi, files, bundleZip: { hash: zipHash, size: zip.length }, build });
     const manifestErrors = validateManifest(manifest);
     if (manifestErrors.length) fail(`Built an invalid manifest:\n  ${manifestErrors.join('\n  ')}`);
 
@@ -336,9 +371,8 @@ async function main() {
 
       const bundlePrefix = `${bucket}/bundles/${name}/${version}`;
       console.log(`[ota-publish] Uploading ${fileCount} content-addressed files to ${bundlePrefix}/files/ ...`);
-      // Deliberately NO --delete-unmatched-destination-objects: this bucket path
-      // accumulates every version ever published; deleting would strand clients
-      // still fetching an older manifest's hashes.
+      // Deliberately NO --delete-unmatched-destination-objects: this is the new version's own
+      // prefix, and old versions are removed only by the bounded prune after release.json (#836).
       execSync(`gcloud storage rsync --recursive ${q(stageDir)} ${q(`${bundlePrefix}/files`)}`, { stdio: 'inherit' });
       execSync(`gcloud storage objects update ${q(`${bundlePrefix}/files/**`)} --cache-control="public, max-age=31536000, immutable"`, { stdio: 'inherit' });
 
@@ -492,8 +526,41 @@ async function main() {
         }
       }
     }
+
+    // Retention (#836): only AFTER release.json points at the new version, so the version being
+    // published is both the newest and the live one when the plan is taken. A failure here is a loud
+    // warning, not a failed publish: the release is already live, and the next publish prunes again.
+    // What is kept and why that strands no device: ota/pruneBundle.mjs.
+    // The version this publish just made live must still be fetchable. A concurrent prune (another
+    // publish's, or ota-prune.mjs by hand) can delete a RETRIED old version's objects in the gap before its
+    // manifest is refreshed — the one race pruneBundle.mjs's grace window does not close (see
+    // PRUNE_GRACE_MS). Rare, and fleet-wide when it happens, so not left to a device to discover. The
+    // manifest and the zip are what a device cannot do without; `files/` is not probed, because a missing
+    // delta file already falls back to the whole zip on the device (#556).
+    for (const object of ['manifest.json', 'bundle.zip']) {
+      const objectPath = `${bucket}/bundles/${name}/${version}/${object}`;
+      try {
+        execSync(`gcloud storage objects describe ${q(objectPath)} --format="value(generation)"`, { stdio: ['ignore', 'pipe', 'pipe'] });
+      } catch (e) {
+        const stderr = e?.stderr?.toString() ?? '';
+        if (isGcloudObjectNotFoundError(stderr)) { // real text, measured: `…manifest.json not found: 404.`
+          fail(`release.json now points ${name} at ${version}, but ${objectPath} is GONE — a concurrent prune deleted it mid-publish. Every device will fail to fetch this version. Publish ${name} again now (a new version string).`);
+        }
+        console.warn(`[ota-publish] WARNING: could not confirm ${objectPath} survived the publish: ${stderr || e.message}`);
+      }
+    }
+
+    const prune = pruneBundleVersions({ bucket, name, keep: preflight.retainVersions });
+    if (prune.ok) {
+      const { plan } = prune;
+      console.log(`[ota-publish] Retention: kept ${plan.keep.length} version(s) of ${name} (newest ${preflight.retainVersions} + live), deleted ${prune.removed.length}${prune.removed.length ? `: ${prune.removed.join(', ')}` : ''}.`);
+      if (plan.incomplete.length) console.log(`[ota-publish] Retention: left alone, no manifest.json: ${plan.incomplete.join(', ')}`);
+    } else {
+      console.warn(`[ota-publish] WARNING: the release is live, but pruning old versions failed: ${prune.error}${prune.removed.length ? ` (deleted before the failure: ${prune.removed.join(', ')})` : ''}. The next publish prunes again, or run engine/scripts/ota-prune.mjs.`);
+    }
   } finally {
     buildClaim.release();
+    distClaim?.release();
   }
 }
 

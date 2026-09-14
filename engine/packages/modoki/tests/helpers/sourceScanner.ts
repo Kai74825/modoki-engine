@@ -14,7 +14,7 @@
  * A block-comment OPENER sitting inside a LINE comment opens a phantom block that runs to the
  * next real terminator, and everything between is DELETED. That is not hypothetical: it was found
  * live in `games/court/runtime/systems.ts` (#411, fixed in `90d1dfc5d`/`2ef648a2d`) and never swept
- * out of the engine, where `runtime/rendering/Scene3D.tsx:28` writes the glob `runtime/**` in a
+ * out of the engine, where `runtime/rendering/Scene3D.tsx`'s comment on its `rawNow` import writes the glob `runtime/**` in a
  * line comment and blinds `determinismGuard.test.ts` to **82 lines including 22 import
  * statements**. Mutation-proved both directions: a `performance.now()` planted inside that window
  * left the guard green; the same line outside it failed. The comment explaining the determinism
@@ -287,6 +287,33 @@ export function assertScanIsSane(
  * scanner is the one to reach for on anything else (shader text, a sliced function body).
  */
 export function stripCommentsAndStrings(src: string, label: string): string {
+  const out = stripComments(src).split('');
+  forEachStringToken(src, label, 'blanking them with a character scanner is what this function exists to avoid', (node, sf) => {
+    // `getStart` skips leading trivia; the span is the literal including its own delimiters.
+    for (let i = node.getStart(sf); i < node.getEnd(); i++) {
+      if (out[i] !== '\n') out[i] = ' ';
+    }
+  });
+  return out.join('');
+}
+
+/** The literal tokens `stripCommentsAndStrings` blanks and `stringTokens` returns. Deliberately NOT
+ *  the whole `FirstLiteralToken..LastTemplateToken` range — that starts at `NumericLiteral`, and a
+ *  bare-hex sweep is exactly the caller this exists for. `JsxText` is absent for the same reason. */
+const STRING_TOKEN_KINDS: ReadonlySet<ts.SyntaxKind> = new Set([
+  ts.SyntaxKind.StringLiteral,
+  ts.SyntaxKind.NoSubstitutionTemplateLiteral,
+  ts.SyntaxKind.TemplateHead,
+  ts.SyntaxKind.TemplateMiddle,
+  ts.SyntaxKind.TemplateTail,
+]);
+
+/** Parse `src` and call `each` for every `STRING_TOKEN_KINDS` token, in source order. The ONE place
+ *  both string-token consumers locate literals, so blanking them and reading them cannot disagree
+ *  about what a literal is. Throws on a parse failure — `why` says what the caller would get wrong. */
+function forEachStringToken(
+  src: string, label: string, why: string, each: (node: ts.Node, sf: ts.SourceFile) => void,
+): void {
   const sf = ts.createSourceFile(
     label,
     src,
@@ -296,33 +323,42 @@ export function stripCommentsAndStrings(src: string, label: string): string {
   );
   const parsed = sf as ts.SourceFile & { parseDiagnostics?: readonly ts.Diagnostic[] };
   if ((parsed.parseDiagnostics?.length ?? 0) > 0) {
-    throw new Error(`${label}: did not parse, so its string literals cannot be located — `
-      + 'blanking them with a character scanner is what this function exists to avoid');
+    throw new Error(`${label}: did not parse, so its string literals cannot be located — ${why}`);
   }
-  const out = stripComments(src).split('');
   const visit = (node: ts.Node): void => {
     const kids = node.getChildren(sf);
     if (kids.length > 0) { for (const k of kids) visit(k); return; }
-    if (!STRING_TOKEN_KINDS.has(node.kind)) return;
-    // `getStart` skips leading trivia; the span is the literal including its own delimiters.
-    for (let i = node.getStart(sf); i < node.getEnd(); i++) {
-      if (out[i] !== '\n') out[i] = ' ';
-    }
+    if (STRING_TOKEN_KINDS.has(node.kind)) each(node, sf);
   };
   visit(sf);
-  return out.join('');
 }
 
-/** The literal tokens `stripCommentsAndStrings` blanks. Deliberately NOT the whole
- *  `FirstLiteralToken..LastTemplateToken` range — that starts at `NumericLiteral`, and a bare-hex
- *  sweep is exactly the caller this exists for. `JsxText` is absent for the same reason. */
-const STRING_TOKEN_KINDS: ReadonlySet<ts.SyntaxKind> = new Set([
-  ts.SyntaxKind.StringLiteral,
-  ts.SyntaxKind.NoSubstitutionTemplateLiteral,
-  ts.SyntaxKind.TemplateHead,
-  ts.SyntaxKind.TemplateMiddle,
-  ts.SyntaxKind.TemplateTail,
-]);
+/** One string or template token: its COOKED text — escapes resolved, so `'\n'` holds a real newline
+ *  and `'\t\t'` a real tab run — and the 1-based line its opening delimiter sits on. */
+export interface StringToken {
+  text: string;
+  line: number;
+}
+
+/**
+ * Every string and template token in `src`, located by the TypeScript parser — the token set
+ * `stripCommentsAndStrings` blanks, handed back instead of hidden, for a guard that inspects what a
+ * literal SAYS (#841's whitespace-collapse scan). A template with substitutions yields one token per
+ * static part, so `` `a  ${x}  b` `` is two tokens, each carrying its own run.
+ *
+ * Pass it `readScannedSource(abs).code`: comment stripping is length-preserving, so lines still line
+ * up, and a literal quoted inside a comment is not reported as code.
+ */
+export function stringTokens(src: string, label: string): StringToken[] {
+  const out: StringToken[] = [];
+  forEachStringToken(src, label, 'a guard reading them would silently skip what it could not place', (node, sf) => {
+    out.push({
+      text: (node as ts.LiteralLikeNode).text,
+      line: sf.getLineAndCharacterOfPosition(node.getStart(sf)).line + 1,
+    });
+  });
+  return out;
+}
 
 /** One damaged token, as `<label>:<line>  <raw> became <stripped>`. */
 export type DamagedToken = string;
@@ -497,7 +533,7 @@ export function stripHashComments(src: string): string {
       // because length and line parity both still hold.
       // What it costs: a `#` INSIDE a genuinely multi-line quoted string is now blanked. Measured
       // across all 35 tracked .sh/.yml files, exactly one such case exists today —
-      // `scripts/publish-engine-oss.sh:351`, inside a multi-line `node -e '…'` — and no guard
+      // `scripts/publish-engine-oss.sh`'s Team-ID check (a), inside its multi-line `node -e '…'` — and no guard
       // scans that file. All 13 `engine/scripts/**.sh` strip byte-identically old vs new.
       // Getting both right needs a real shell/YAML parser, which this is not.
       if (c === '\n') { quote = null; out += c; i += 1; continue; }
@@ -517,6 +553,103 @@ export function stripHashComments(src: string): string {
     i += 1;
   }
   return out;
+}
+
+/** One shell COMMAND LINE as the shell reads it: the physical lines a backslash-newline joins. */
+export interface ShellLogicalLine {
+  /** The joined text, each backslash-newline removed as the shell removes it. */
+  text: string;
+  /** 1-based physical line the logical line STARTS on — what a failure message should cite. */
+  line: number;
+}
+
+/**
+ * Shell source split into LOGICAL lines — for a guard that asks a question of one command (#1179).
+ *
+ * A formatter, or a human with a long `node "$PATHS" kill "${APP:?…}" 2>/dev/null || true`, wraps a
+ * command with `\` at the end of a line, and a per-PHYSICAL-line guard then sees half of it: the
+ * redirect that must be on the call is on the next line, and the call fails for the wrong reason or —
+ * the direction that matters — a required token on the continuation line vouches for nothing, while a
+ * forbidden one there is never read.
+ *
+ * Pass it `readScannedSource(abs).code` (comments blanked, line-preserving), so a `\` at the end of a
+ * comment is already gone.
+ *
+ * ⚠️ **Only a backslash-newline joins — deliberately not `&&`, `||`, `|` or a quote left open at the end
+ * of a line**, although the shell continues the command across all of those. Each of them either
+ * separates two COMMANDS (`a &&` ⏎ `b` is two), where joining would let the next command vouch for
+ * this one — the neighbour defect this exists to remove — or, for an open quote, cannot be told from a
+ * heredoc body's apostrophe without a real shell parser, and a wrong join swallows every line up to the
+ * next quote in the file. A `\` inside single quotes is literal and joins nothing; an escaped `\\` at
+ * the end joins nothing either.
+ *
+ * ⚠️ **A CRLF line ending is read as its line.** A checkout with `core.autocrlf=true` (the `win` clone)
+ * ends every line with a backslash and then a CR, which no backslash-at-the-end test sees — so every
+ * join silently fell back to physical lines on Windows only (#1179 P7 review). The CR is dropped from
+ * the returned text.
+ *
+ * ⚠️ **Known limit:** a heredoc body line ending in `\` is joined to the next body line, as in any
+ * `<<EOF` (unquoted) heredoc the shell itself would also join; a `<<'EOF'` body would not be.
+ */
+export function shellLogicalLines(code: string): ShellLogicalLine[] {
+  const out: ShellLogicalLine[] = [];
+  const physical = code.split('\n');
+  let text: string | null = null;
+  let start = 0;
+  let quote: '"' | "'" | null = null;
+  physical.forEach((withCr, i) => {
+    const l = withCr.endsWith('\r') ? withCr.slice(0, -1) : withCr;
+    if (text === null) { text = ''; start = i + 1; quote = null; }
+    let joins = false;
+    for (let j = 0; j < l.length; j += 1) {
+      const c = l[j];
+      if (quote === "'") { if (c === "'") quote = null; continue; }
+      if (c === '\\') {
+        if (j === l.length - 1) joins = true;
+        j += 1;
+        continue;
+      }
+      if (quote === '"') { if (c === '"') quote = null; } else if (c === '"' || c === "'") quote = c;
+    }
+    if (joins) { text += l.slice(0, -1); return; }
+    out.push({ text: text + l, line: start });
+    text = null;
+  });
+  if (text !== null) out.push({ text, line: start });
+  return out;
+}
+
+/**
+ * Whether position `index` of one shell COMMAND LINE (a `shellLogicalLines` entry) sits inside a command
+ * substitution — `$( … )` or backticks — read from the START of the line, so a separator inside the
+ * substitution (`$(cd x && node … )`) does not hide the `$(` that opened it (#1179 P7 review).
+ *
+ * A context stack, because quoting nests the way the shell nests it: inside `"…"` an apostrophe is
+ * literal but `$(` and backticks still open a substitution (`"can't: $("$BIN")"` — a flat single-quote
+ * flag read that apostrophe as opening a string and skipped the `$(`, #1179 final review); inside `'…'`
+ * nothing opens; a plain `(` is its own level, so its `)` does not close a substitution.
+ *
+ * ⚠️ An approximation, stated: a substitution opened on an EARLIER physical line without a backslash is
+ * not seen (`shellLogicalLines` does not join it); arithmetic `$(( … ))` reads as a substitution (the
+ * conservative direction); and ANSI-C `$'…\'…'`, a `case` pattern's `)` and a process substitution
+ * `<( … )` are not modelled.
+ */
+export function insideShellSubstitution(text: string, index: number): boolean {
+  const stack: Array<'sub' | 'tick' | 'dq' | 'sq' | 'paren'> = [];
+  const top = (): string | undefined => stack[stack.length - 1];
+  for (let i = 0; i < index && i < text.length; i += 1) {
+    const c = text[i];
+    if (top() === 'sq') { if (c === "'") stack.pop(); continue; }
+    if (c === '\\') { i += 1; continue; }
+    if (c === '$' && text[i + 1] === '(') { stack.push('sub'); i += 1; continue; }
+    if (c === '`') { if (top() === 'tick') stack.pop(); else stack.push('tick'); continue; }
+    if (top() === 'dq') { if (c === '"') stack.pop(); continue; }
+    if (c === '"') stack.push('dq');
+    else if (c === "'") stack.push('sq');
+    else if (c === '(') stack.push('paren');
+    else if (c === ')' && (top() === 'sub' || top() === 'paren')) stack.pop();
+  }
+  return stack.includes('sub') || stack.includes('tick');
 }
 
 /** The comment syntaxes `readScannedSource` knows how to blank. */
@@ -622,4 +755,40 @@ export function readScannedSource(absPath: string, opts: ReadScannedOptions = {}
       : stripComments(raw, { regexLiterals: language === 'js' });
   assertScanIsSane(raw, code, label, opts.sentinels);
   return { raw, code, path: absPath };
+}
+
+/**
+ * Would `readScannedSource` strip this path by its extension, or refuse it? For a guard that builds
+ * its corpus from "every file the scanner can read", so the corpus and the read cannot disagree.
+ */
+export function scanLanguageOf(filePath: string): ScanLanguage | undefined {
+  return LANGUAGE_BY_EXT.get(path.extname(filePath).toLowerCase());
+}
+
+/**
+ * ⚠️ **The COMMENTS of a file and nothing else: the inverse of `.code` (#1186).**
+ *
+ * For a guard whose subject IS comment prose (`sourceCommentCitations`: a comment pointing at a file by LINE
+ * NUMBER rots exactly as a doc citation does). It is derived from the strip rather than from a second scanner,
+ * because every stripper here blanks comment characters and nothing else, length- and
+ * line-preserving. So a character that differs between `raw` and `code` is a comment character.
+ * Everything else (code, and string CONTENT, which the strip keeps) becomes a space, and newlines
+ * stay, so a line count taken over this text is still the real file's line number.
+ *
+ * ⚠️ **Hand it a STRIPPED read.** A `comments: 'include'` read has `code === raw`, and the result is
+ * then all blank, which looks exactly like a file with no comments. A guard using this must assert
+ * its corpus yields comment text at all, or that mistake is a silent pass.
+ */
+export function commentText(scanned: Pick<ScannedSource, 'raw' | 'code' | 'path'>): string {
+  const { raw, code } = scanned;
+  if (raw.length !== code.length) {
+    throw new Error(`${path.basename(scanned.path)}: commentText needs a length-preserving strip `
+      + `(raw ${raw.length} vs code ${code.length}); without it no character can be attributed`);
+  }
+  let out = '';
+  for (let i = 0; i < raw.length; i++) {
+    const c = raw[i];
+    out += c === '\n' ? '\n' : c !== code[i] ? c : ' ';
+  }
+  return out;
 }

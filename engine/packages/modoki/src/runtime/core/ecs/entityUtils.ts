@@ -1,7 +1,7 @@
 /** Entity utilities — read/write traits, query entities, delete.
  *  Pure runtime functions with no undo or Three.js dependency. */
 
-import type { Trait, TraitRecord, ExtractSchema, TraitValue } from 'koota';
+import type { Entity, Trait, TraitRecord, ExtractSchema, TraitValue } from 'koota';
 import { getCurrentWorld, findEntityById, destroyEntity, setStructureCallback } from './world';
 import { getAllTraits, getTraitByName, transformName, type TraitMeta } from './traitRegistry';
 import { EntityAttributes } from '../traits/EntityAttributes';
@@ -15,6 +15,8 @@ import { compareSiblings } from './entityOrder';
 // that only needs the dirty signal (e.g. `loaders/assetManifest.ts`) doesn't have to import
 // this file's `setStructureCallback` wiring below just to reach it.
 import { addDirtyListener, fireDirtyListeners } from '../renderDirty';
+import { notifyListeners } from '../notifyListeners';
+import { emptyDocMap } from '../docKeys';
 export { addDirtyListener, fireDirtyListeners };
 
 // Structure-dirty subscriber set — notifies Hierarchy, Console, etc. when
@@ -55,7 +57,7 @@ export function getStructureVersion(): number { return _structureVersion; }
 /** Notify all structure-dirty subscribers. */
 export function markStructureDirty() {
   _structureVersion++;
-  for (const fn of _structureListeners) fn();
+  notifyListeners(_structureListeners, 'entityStructure', []);
 }
 // Wire world.ts registerEntity → markStructureDirty (avoids circular import)
 setStructureCallback(markStructureDirty);
@@ -86,7 +88,7 @@ function warnFallbackCapped(entityId: number) {
 
 /** Find an entity by ID. O(1) via entity index, with fallback scan for
  *  entities not registered via registerEntity (e.g. in tests). */
-export function findEntity(entityId: number) {
+export function findEntity(entityId: number): Entity | null {
   const fromIndex = findEntityById(entityId);
   if (fromIndex) return fromIndex;
 
@@ -156,7 +158,11 @@ export function readTraitDataFull(entityId: number, meta: TraitMeta): Record<str
   const data = entity.get(meta.trait) as Record<string, unknown>;
   const schema = (meta.trait as { schema?: unknown }).schema;
   const keys = schema && typeof schema === 'object' ? Object.keys(schema) : Object.keys(data);
-  const result: Record<string, unknown> = {};
+  // `emptyDocMap()` (#986). The AoS fallback on the line above enumerates `Object.keys(data)` — a
+  // live trait object populated from scene JSON — so these keys are document-derived on the NORMAL
+  // path, not only in some edge case, and this bag is handed to the Inspector and the component
+  // clipboard.
+  const result: Record<string, unknown> = emptyDocMap();
   for (const key of keys) result[key] = data[key];
   return result;
 }
@@ -173,7 +179,9 @@ export function cloneTraitValues(values: Record<string, unknown>): Record<string
   try {
     return structuredClone(values);
   } catch {
-    const out: Record<string, unknown> = {};
+    // `emptyDocMap()` (#986) — the same key space as readTraitDataFull's result, which is what
+    // this usually clones.
+    const out: Record<string, unknown> = emptyDocMap();
     for (const [k, v] of Object.entries(values)) {
       try { out[k] = structuredClone(v); } catch { out[k] = v; }
     }
@@ -343,11 +351,11 @@ export function getAllEntities(): EntityInfo[] {
 
   // Primary pass: query EntityAttributes (all visible entities have it).
   // This avoids iterating all 20+ traits just to discover entities.
-  const entitiesToProcess: { id: number; entity: any }[] = [];
+  const entitiesToProcess: { id: number; entity: Entity }[] = [];
   if (attrMeta) {
     const q = safeQuery(attrMeta.trait);
     if (q) {
-      q.updateEach((_: any, entity: any) => {
+      q.updateEach((_: any, entity: Entity) => {
         const id = entity.id();
         seen.add(id);
         entitiesToProcess.push({ id, entity });
@@ -371,33 +379,10 @@ export function getAllEntities(): EntityInfo[] {
 
   for (const { id, entity } of entitiesToProcess) {
     const entityHas = (t: any) => { try { return entity.has(t); } catch { return false; } };
-
-    // Single pass: collect trait names, detect role/resource, find name — all at once
-    const traitNames: string[] = [];
-    let name = '';
-    let nameFound = false;
-    let isResource = false;
-    let cameraFound = false;
-    let firstStringFieldName = '';
-
-    for (const m of allTraits) {
-      if (!entityHas(m.trait)) continue;
-      traitNames.push(m.name);
-
-      if (m.role === 'camera') cameraFound = true;
-      if (m.category === 'resource') isResource = true;
-
-      // Look for a string field fallback name (only from components)
-      if (!firstStringFieldName && m.category === 'component' && m.name !== 'Name') {
-        const data = entity.get(m.trait) as Record<string, unknown>;
-        for (const [key, hint] of Object.entries(m.fields)) {
-          if (hint.type === 'string' && !hint.readOnly && data[key]) {
-            firstStringFieldName = String(data[key]);
-            break;
-          }
-        }
-      }
-    }
+    const scan = scanEntityTraits(entity, allTraits);
+    const { traitNames } = scan;
+    const isResource = scan.resourceTraitName !== undefined;
+    let attrName: unknown;
 
     // Read EntityAttributes (parentId, sortOrder, name, layer) — single get
     let parentId = 0;
@@ -410,7 +395,7 @@ export function getAllEntities(): EntityInfo[] {
       const attr = entity.get(attrMeta.trait) as Record<string, unknown>;
       parentId = (attr.parentId as number) || 0;
       sortOrder = (attr.sortOrder as number) || 0;
-      if (attr.name) { name = String(attr.name); nameFound = true; }
+      attrName = attr.name;
       // Accept ONLY the three real layers; everything else stays undefined. This is not
       // just an '' → undefined narrowing — `attr` is unknown-typed data out of
       // hot-reloadable scene JSON, so it also rejects junk (a hand-edited "layer": "3D"),
@@ -425,20 +410,74 @@ export function getAllEntities(): EntityInfo[] {
     // (a Renderable2D entity stuck at '3d', a Renderable3DPrimitive at ''). F8.
     layer = deriveLayer(traitNames, layer);
 
-    // Name resolution priority: EntityAttributes.name > camera role > resource name > string field
-    if (!nameFound) {
-      if (cameraFound) { name = 'Game Camera'; }
-      else if (isResource) {
-        const resMeta = allTraits.find(m => m.category === 'resource' && entityHas(m.trait));
-        name = resMeta ? `${resMeta.name} (resource)` : `Entity ${id}`;
-      }
-      else if (firstStringFieldName) { name = firstStringFieldName; }
-      else { name = `Entity ${id}`; }
-    }
-
+    const name = pickEntityName(attrName, scan) ?? `Entity ${id}`;
     entities.push({ id, name: transformName(name), traits: traitNames, parentId, sortOrder, layer, guid, isResource, editorFolder, sourceScene });
   }
   return dropParkedEntries(entities);
+}
+
+interface EntityTraitScan {
+  traitNames: string[];
+  cameraFound: boolean;
+  /** The first registered resource trait the entity carries, in registry order. */
+  resourceTraitName: string | undefined;
+  firstStringFieldName: string;
+}
+
+/** One pass over the registered traits: names, camera role, resource, and the first
+ *  non-empty editable string field of a component — the inputs name resolution needs. */
+function scanEntityTraits(entity: any, allTraits: readonly TraitMeta[]): EntityTraitScan {
+  const entityHas = (t: any) => { try { return entity.has(t); } catch { return false; } };
+  const scan: EntityTraitScan = { traitNames: [], cameraFound: false, resourceTraitName: undefined, firstStringFieldName: '' };
+  for (const m of allTraits) {
+    if (!entityHas(m.trait)) continue;
+    scan.traitNames.push(m.name);
+
+    if (m.role === 'camera') scan.cameraFound = true;
+    if (m.category === 'resource' && scan.resourceTraitName === undefined) scan.resourceTraitName = m.name;
+
+    // Look for a string field fallback name (only from components)
+    if (!scan.firstStringFieldName && m.category === 'component' && m.name !== 'Name') {
+      const data = entity.get(m.trait) as Record<string, unknown>;
+      for (const [key, hint] of Object.entries(m.fields)) {
+        if (hint.type === 'string' && !hint.readOnly && data[key]) {
+          scan.firstStringFieldName = String(data[key]);
+          break;
+        }
+      }
+    }
+  }
+  return scan;
+}
+
+/** Name resolution priority: EntityAttributes.name > camera role > resource name > string
+ *  field. `undefined` when none applies — each caller picks its own last-resort fallback. */
+function pickEntityName(attrName: unknown, scan: EntityTraitScan): string | undefined {
+  if (attrName) return String(attrName);
+  if (scan.cameraFound) return 'Game Camera';
+  if (scan.resourceTraitName !== undefined) return `${scan.resourceTraitName} (resource)`;
+  if (scan.firstStringFieldName) return scan.firstStringFieldName;
+  return undefined;
+}
+
+/**
+ * The name the Hierarchy shows for an entity, for text a person or agent reads later — an undo
+ * label, a log line. Resolved exactly as {@link getAllEntities} resolves it, so the two cannot
+ * disagree about a named entity.
+ *
+ * ⚠️ The name lives on the `EntityAttributes` TRAIT, never on the koota handle: `findEntity`'s
+ * result is untyped, so `findEntity(id)?.name` compiles and is always `undefined` (#1138).
+ *
+ * The last-resort fallback differs from the Hierarchy's on purpose: text that outlives the
+ * moment names the entity by its GUID, because a runtime id is reassigned on every scene
+ * hot-reload and would name a different entity by the time it is read.
+ */
+export function entityDisplayName(entityId: number): string {
+  const entity = findEntity(entityId);
+  if (!entity) return `Entity ${entityId}`;
+  const attr = entity.has(EntityAttributes) ? entity.get(EntityAttributes) : undefined;
+  const name = pickEntityName(attr?.name, scanEntityTraits(entity, getAllTraits()));
+  return transformName(name ?? (attr?.guid ? `Entity ${attr.guid}` : `Entity ${entityId}`));
 }
 
 /**

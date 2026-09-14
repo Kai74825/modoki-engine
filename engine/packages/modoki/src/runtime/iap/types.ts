@@ -138,4 +138,29 @@ export interface PurchaseResult {
   readonly transactionId?: string;
   /** Present only when `outcome === 'failed'` — for logs, never for display verbatim. */
   readonly error?: string;
+  /** WHICH cancel this was, when the platform could say. The complete set of values, pinned by
+   *  `capacitor-modoki-iap/test-vectors/iap-classification-vectors.json` and replayed by both
+   *  native legs plus `iapCancelVocabulary.test.ts`:
+   *
+   *  - `'storekit.result.userCancelled'` — StoreKit RETURNED `.userCancelled` outright.
+   *  - `'storekit.userCancelled'` — StoreKit THREW it; `classify()`'s string for the same intent.
+   *  - `'SKErrorDomain:2'` — a StoreKit 1 `paymentCancelled` surfacing through the SK2 API.
+   *  - `'play.userCanceled'` — Android, reported as a response code rather than a thrown error.
+   *
+   *  Absent when the backend offered no reason.
+   *
+   *  ⚠️ **An `'ASDErrorDomain:…'`/`'AMSErrorDomain:…'` string never appears HERE**, though this doc
+   *  used to say it did. Those faults are not cancellations, so they take the FAILED path and their
+   *  identity arrives as `error` / `storeError` instead. When such a fault UNDERLIES a StoreKit
+   *  cancel, the reason is still `'storekit.userCancelled'` and the ASD/AMS identity lives one
+   *  level down in the detail chain — which is exactly why #946 needed `detail` as well as this
+   *  field, and why reading this string alone cannot answer "was it really Apple?".
+   *
+   *  ⚠️ **Diagnostic only — it must never change what the player is told or which analytics event
+   *  fires** (#946). A cancel stays `purchase_cancelled` and never `purchase_failed`; that split is
+   *  about the funnel, not about the error identity. This field exists because a purchase the
+   *  player CONFIRMED came back `cancelled` and nothing recorded could say whether Apple cancelled
+   *  it or an ASD/AMS fault was misclassified as one — the two need opposite responses, and until
+   *  this field there was no way to tell them apart on the NEXT occurrence either. */
+  readonly cancelReason?: string;
 }

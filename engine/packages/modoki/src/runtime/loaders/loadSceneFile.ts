@@ -1,6 +1,6 @@
 /** Load a scene JSON file into an ECS world. Shared between editor and runtime. */
 
-import { type World } from 'koota';
+import { type Entity, type World } from 'koota';
 import { getCurrentWorld, spawnEntity, indexEntityGuid, findEntityById, findEntityByGuid } from '../core/ecs/world';
 import { getAllTraits, getTraitByName } from '../core/ecs/traitRegistry';
 import { loadModelTemplates, getCachedPrefab } from './meshTemplateCache';
@@ -8,7 +8,12 @@ import { isGuid, isExternalUrl, resolveRef, getAssetType, deriveGuid, newGuid, g
 import { parseEntryPrefabs } from '../traits/UIEntries';
 import { markUIDirty } from '../ui/uiTreeStore';
 import { markOverride, clearOverrideMarks, clearAllOverrideMarks } from './overrideMarks';
+import { emptyDocMap, hasDocKey } from '../core/docKeys';
 import { isPersistentTraitField } from '../core/ecs/traitSchema';
+import {
+  mergeOverrideMaps, descendNestedOverrides, mergeNestedOverridePaths, foldTraitOverride,
+  type NestedOverridePaths,
+} from './prefabOverrides';
 import { SCENE_FORMAT_VERSION } from '../core/version';
 import { classifyFormatVersion } from '../core/formatVersion';
 import { REF_FIELDS_BY_TRAIT } from './sceneValidation';
@@ -102,7 +107,7 @@ export interface LoadSceneOptions {
   /** Fetch a prefab JSON file given its path. Returns null if not found. */
   fetchPrefab: (path: string) => Promise<object | null>;
   /** Called after all entities are spawned (runtime: registerEntity, editor: undo tracking) */
-  onEntitySpawned?: (entity: any, oldId: number) => void;
+  onEntitySpawned?: (entity: Entity, oldId: number) => void;
   /** Whether to preload model templates from ModelSource entities */
   loadModels?: boolean;
   /** Called to re-instantiate a prefab instance. The caller handles prefab fetch + entity creation.
@@ -145,7 +150,8 @@ export interface LoadSceneOptions {
    *  every chain + carry call. Left `true` by default so every other caller (tests,
    *  and any future single-scene caller) keeps byte-identical behaviour — per-entity
    *  hygiene against id reuse is independent of this flag and always runs
-   *  (`clearOverrideMarks(entity.id())` on each fresh spawn, below). */
+   *  (`clearOverrideMarks(entity)` on each fresh spawn, below — still needed with the packed key,
+   *  because koota's 8-bit generation wraps; see overrideMarks.ts). */
   clearMarks?: boolean;
 }
 
@@ -441,7 +447,7 @@ export function applyOverridesByLocalToEcs(
       if (meta.category === 'tag') {
         // Added-tag override: the instance carries a tag the prefab lacks here.
         if (!entity.has(meta.trait)) entity.add(meta.trait);
-        markOverride(ecsId, traitName, '');
+        markOverride(entity as unknown as Entity, traitName, '');
         continue;
       }
       // Accept any field the trait PERSISTS — its koota schema, not the meta.fields
@@ -453,92 +459,39 @@ export function applyOverridesByLocalToEcs(
       // them here AND left them unmarked, which made the next save delete them.
       // A field the schema does not declare is still skipped — the genuinely
       // renamed/stale case. See runtime/core/ecs/traitSchema.ts.
-      const known: Record<string, unknown> = {};
-      for (const [field, value] of Object.entries(fields)) {
-        if (!isPersistentTraitField(meta, field)) {
-          console.debug(`[loadSceneFile] override skipped: unknown field ${traitName}.${field}`);
-          continue;
-        }
-        known[field] = value;
-        // Seed an explicit mark from the file's override map: this field is a
-        // recorded override and must survive serialize even if it later coincides
-        // with the prefab base. See overrideMarks.ts.
-        markOverride(ecsId, traitName, field);
+      //
+      // The merge itself is `foldTraitOverride`, shared with `effectivePrefabRootTraits` (#1031) so
+      // the validator's and the pool's model of a prefab root cannot drift from what spawns here.
+      const has = entity.has(meta.trait);
+      const { merged, accepted, rejected } = foldTraitOverride(
+        has ? entity.get(meta.trait) as Record<string, unknown> : undefined,
+        fields,
+        (field) => isPersistentTraitField(meta, field),
+      );
+      for (const field of rejected) {
+        console.debug(`[loadSceneFile] override skipped: unknown field ${traitName}.${field}`);
       }
-      if (!entity.has(meta.trait)) {
+      // Seed an explicit mark from the file's override map: each accepted field is a
+      // recorded override and must survive serialize even if it later coincides
+      // with the prefab base. See overrideMarks.ts.
+      for (const field of accepted) markOverride(entity as unknown as Entity, traitName, field);
+      if (!has) {
         // Added-trait override: the instance carries a trait the prefab lacks at
         // this localId. Add the whole trait rather than dropping it on the floor.
-        entity.add((meta.trait as (d: Record<string, unknown>) => unknown)(known));
+        entity.add((meta.trait as (d: Record<string, unknown>) => unknown)(merged));
       } else {
-        const current = entity.get(meta.trait) as Record<string, unknown>;
-        entity.set(meta.trait, { ...current, ...known });
+        entity.set(meta.trait, merged);
       }
     }
   }
 }
 
-/** Deep-merge two per-localId override maps (localId → trait → field → value).
- *  `b` wins on conflicts. Used to overlay a scene's nested-instance overrides on
- *  top of a prefab row's own overrides. Neither input is mutated. */
-export function mergeOverrideMaps(
-  a: Record<number, Record<string, Record<string, unknown>>> | undefined,
-  b: Record<number, Record<string, Record<string, unknown>>>,
-): Record<number, Record<string, Record<string, unknown>>> {
-  const out: Record<number, Record<string, Record<string, unknown>>> = {};
-  for (const [lid, traits] of Object.entries(a ?? {})) {
-    out[Number(lid)] = {};
-    for (const [t, fields] of Object.entries(traits)) out[Number(lid)][t] = { ...fields };
-  }
-  for (const [lid, traits] of Object.entries(b)) {
-    const k = Number(lid);
-    out[k] ??= {};
-    for (const [t, fields] of Object.entries(traits)) out[k][t] = { ...(out[k][t] ?? {}), ...fields };
-  }
-  return out;
-}
-
-/** Path-keyed nested overrides — lets an OUTER layer (scene or ancestor prefab)
- *  override a member nested at ANY depth, with the outermost layer winning. Each
- *  key is a dot-joined chain of nested-prefab row localIds from the addressing
- *  instance down to the target instance; the value is that target instance's
- *  per-localId override map. `"3"` overrides the instance at row 3; `"3.5"` reaches
- *  the instance at row 5 nested inside it. A single-segment key is the legacy
- *  one-level form, so older scene files remain valid unchanged. */
-export type NestedOverridePaths = Record<string, Record<number, Record<string, Record<string, unknown>>>>;
-
-/** Split path-keyed overrides at one expansion step (nested row `rowLocalId`):
- *  `direct` is the override map for that child instance's OWN members (the exact
- *  key `rowLocalId`); `forward` re-keys every deeper path (`rowLocalId.…`) with the
- *  leading segment stripped, to thread into the child's own expansion. */
-export function descendNestedOverrides(
-  paths: NestedOverridePaths | undefined,
-  rowLocalId: number,
-): { direct?: Record<number, Record<string, Record<string, unknown>>>; forward?: NestedOverridePaths } {
-  if (!paths) return {};
-  const prefix = String(rowLocalId);
-  let direct: Record<number, Record<string, Record<string, unknown>>> | undefined;
-  let forward: NestedOverridePaths | undefined;
-  for (const [key, map] of Object.entries(paths)) {
-    if (key === prefix) direct = map;
-    else if (key.startsWith(prefix + '.')) (forward ??= {})[key.slice(prefix.length + 1)] = map;
-  }
-  return { direct, forward };
-}
-
-/** Merge two path-keyed override maps; `b` (the outer layer) wins per field. Used
- *  to overlay forwarded outer overrides on a prefab row's own deep overrides so the
- *  outermost layer wins at every depth. Neither input is mutated. */
-export function mergeNestedOverridePaths(
-  a: NestedOverridePaths | undefined,
-  b: NestedOverridePaths | undefined,
-): NestedOverridePaths | undefined {
-  if (!a) return b;
-  if (!b) return a;
-  const out: NestedOverridePaths = {};
-  for (const [k, m] of Object.entries(a)) out[k] = m;
-  for (const [k, m] of Object.entries(b)) out[k] = out[k] ? mergeOverrideMaps(out[k], m) : m;
-  return out;
-}
+// The override-map helpers live in `prefabOverrides.ts` (#1031), so `sceneValidation.ts` — which
+// this file imports, and which runs in Node with no trait registry — can compose a prefab's
+// effective root with the SAME rules this spawner uses. Re-exported so their existing importers
+// (`editor/scene/prefab.ts`, `editor/scene/serialize.ts`) are unchanged.
+export { mergeOverrideMaps, descendNestedOverrides, mergeNestedOverridePaths };
+export type { NestedOverridePaths };
 
 /** Structural overrides applied on top of a freshly-instantiated prefab. */
 export interface InstanceStructureData {
@@ -929,7 +882,7 @@ export function instantiatePrefabIntoWorld(
     }
     if (traitArgs.length > 0) {
       const entity = spawnEntity(world, ...traitArgs as Parameters<typeof world.spawn>);
-      clearOverrideMarks(entity.id()); // fresh member — drop stale marks on a reused id
+      clearOverrideMarks(entity); // the 8-bit generation wraps — see overrideMarks.ts
       const localId = entry.localId ?? 0;
       if (localId) localToEcs.set(localId, entity.id());
       ownMemberIds.push(entity.id());
@@ -1245,7 +1198,8 @@ export function collectResourceRefsFromEntities(
     // AnimationLibrary — shared cross-model clips (P6), an ARRAY of .animset.json's.
     // Each animset's `source` GLB holds the actual clips; listing the animset keeps
     // both the animset file AND (via the tree-shaker's animset→source follow) the clip
-    // GLB in the build. The source GLB is loaded lazily by the render sync.
+    // GLB in the build. The source GLB is not listed here; `SceneManager`'s animset acquire
+    // loads it under the scene once the set is parsed (#1162).
     const animLib = entry.traits['AnimationLibrary'] as Record<string, unknown> | undefined;
     if (animLib && typeof animLib !== 'boolean') {
       const animSets = animLib.animSets;
@@ -1415,7 +1369,13 @@ export function collectResourceRefsFromEntities(
       // fontFamily FIELD ITSELF — a real atlas fetch + GPU upload, on every scene load, for a
       // game whose font is DOM-only. Skipping by FIELD is what actually holds: the registry
       // owns those fields, the sweep owns the rest (#231).
-      const registryFields = REF_FIELDS_BY_TRAIT[traitName];
+      // ⚠️ `hasDocKey`, NOT a raw index (#993). `traitName` comes from the scene/prefab JSON and
+      // `REF_FIELDS_BY_TRAIT` is a code-declared literal, so a trait named `constructor` returns
+      // the inherited FUNCTION — and `registryFields?.includes(field)` on the next line is a
+      // TypeError, i.e. a crash on the load path for EVERY scene and prefab.
+      const registryFields = hasDocKey(REF_FIELDS_BY_TRAIT, traitName)
+        ? REF_FIELDS_BY_TRAIT[traitName]
+        : undefined;
       for (const [field, value] of Object.entries(bag as Record<string, unknown>)) {
         if (registryFields?.includes(field)) continue;
         // One level of array unwrap, to also catch an AnimationLibrary-shaped guid
@@ -1530,7 +1490,7 @@ export async function loadSceneFile(data: SceneData, options: LoadSceneOptions):
   const world = options.world ?? getCurrentWorld();
   const allTraits = getAllTraits();
   const idMap = new Map<number, number>();
-  const spawnedByEntryId = new Map<number, any>(); // entry.id → spawned handle (for pass 2)
+  const spawnedByEntryId = new Map<number, Entity>(); // entry.id → spawned handle (for pass 2)
 
   // First pass: spawn all entities
   for (const entry of data.entities) {
@@ -1737,7 +1697,9 @@ export async function loadSceneFile(data: SceneData, options: LoadSceneOptions):
       // PrefabInstance (managed by the spawn), Transform (in rootTf), and
       // EntityAttributes (name/parentId come from the prefab + placement — applying
       // it wholesale would clobber the spawned root with the placeholder's file ids).
-      const rootExtraTraits: Record<string, unknown> = {};
+      // `emptyDocMap()` (#986) — `name` is a trait name straight out of the scene file, and this
+      // bag is then applied to the spawned prefab root, so a lost key is a lost authored trait.
+      const rootExtraTraits: Record<string, unknown> = emptyDocMap();
       for (const [name, data] of Object.entries(entry.traits)) {
         if (name === 'PrefabInstance' || name === 'Transform' || name === 'EntityAttributes') continue;
         rootExtraTraits[name] = data;

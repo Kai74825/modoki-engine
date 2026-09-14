@@ -4,6 +4,8 @@
  *  pixiShaderBuilder.ts` needs these with no network dependency — `loaders/shaderSchema.ts`
  *  keeps only `fetchShaderManifest` (the actual network fetch) and re-exports everything here. */
 
+import { emptyDocMap, hasDocKey } from './docKeys';
+
 export type ShaderParamType = 'float' | 'color' | 'bool' | 'vec2' | 'vec3' | 'vec4' | 'texture';
 
 /** The known param types — used to surface a typo'd `type` at manifest-load time
@@ -68,9 +70,9 @@ export function shaderManifestPathForBody(bodyPath: string): string | null {
   // change", which an earlier version of this comment said and which is false. At least four other
   // places hard-code the pair independently, and the tree-shaker one is load-bearing (it is what
   // keeps a body file in a production build at all):
-  //   engine/plugins/asset-tree-shaker.ts (:87 kept-extensions, :117 classifier, :886 sibling walk)
-  //   engine/plugins/backend/staticAssets.ts (:44 MIME)
-  //   engine/packages/modoki/src/editor/panels/assetUndo.ts (:31 TEXT_ASSET_EXTS)
+  //   engine/plugins/asset-tree-shaker.ts (`TYPEABLE_EXTS` and the kept extensions, `classify`, `processShader`'s sibling walk)
+  //   engine/plugins/backend/staticAssets.ts (`MIME_TYPES`)
+  //   engine/packages/modoki/src/editor/panels/assetUndo.ts (`TEXT_ASSET_EXTS`)
   // Those cannot import this constant (plugin/runtime split), so a third extension is a sweep.
   const lower = bodyPath.toLowerCase();
   for (const ext of SHADER_BODY_EXTS) {
@@ -114,7 +116,11 @@ export function coerceParamValue(param: ShaderParam, value: unknown): unknown {
       // An asset ref (guid or path) to an image, or '' when unset.
       return typeof v === 'string' ? v : (typeof fallback === 'string' ? fallback : '');
     default: {
-      const n = VEC_COMPONENTS[param.type];
+      // ⚠️ `hasDocKey` (#993). `param.type` comes from the `.shader.json` and `VEC_COMPONENTS`
+      // is a code-declared literal, so a `type` of `valueOf` returns the inherited FUNCTION and
+      // `new Array(fn)` builds a one-element array holding it — a uniform shipping a function.
+      // 0 components is the honest answer for a type this table does not know.
+      const n = hasDocKey(VEC_COMPONENTS, param.type) ? VEC_COMPONENTS[param.type] : 0;
       if (Array.isArray(v) && v.length === n) return v;
       if (Array.isArray(fallback) && fallback.length === n) return fallback;
       return new Array(n).fill(0);
@@ -130,9 +136,20 @@ export function mergeParamDefaults(
   schema: ShaderParamSchema,
   values: Record<string, unknown> | undefined,
 ): Record<string, unknown> {
-  const out: Record<string, unknown> = {};
+  // `emptyDocMap()` for the bag we build, `hasDocKey` for the one handed in (#986): `key` is a
+  // manifest-declared uniform name and `values` is the material's stored params from JSON, so
+  // `values['constructor']` reads a FUNCTION rather than `undefined`.
+  //
+  // ⚠️ **This pair is DEFENCE, not a fix for an observable defect — do not write a test claiming
+  // otherwise.** Mutation-checked 2026-09-09: reverting either half changes NO output, because
+  // `coerceParamValue` type-checks every branch (`typeof v === 'number'`, `Array.isArray(v)`) and
+  // falls back to the schema default, so a function is sanitised to exactly what the correct read
+  // produces. Two tests were written for it and both stayed green with the fix reverted; they were
+  // deleted rather than banked. It stops being unobservable the moment `coerceParamValue` grows a
+  // pass-through branch, which is why it is kept.
+  const out: Record<string, unknown> = emptyDocMap();
   for (const [key, param] of Object.entries(schema)) {
-    out[key] = coerceParamValue(param, values?.[key]);
+    out[key] = coerceParamValue(param, values && hasDocKey(values, key) ? values[key] : undefined);
   }
   return out;
 }

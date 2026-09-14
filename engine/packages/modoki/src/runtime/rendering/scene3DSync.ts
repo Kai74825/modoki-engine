@@ -5,13 +5,14 @@ import { decomposeTrs } from '../core/ecs/decomposeTrs';
 import { beginBootSpan, endBootSpan, bootSpanAsync } from '../core/bootTimeline';
 import { noteGpuContextCreated } from '../core/gpuContextTracking';
 import { installGlProgramReleaseHatch } from './glProgramRelease';
-import type { World } from 'koota';
+import type { World, Entity } from 'koota';
 // See SceneView.tsx for the rationale on the published-entry import.
 import type { WebGPURenderer } from 'three/webgpu';
 import { Transform, Renderable3D, Renderable3DPrimitive, Camera, CameraFrame, Tint, isMaterialInstanced, SkinnedModel, SkinnedMeshRenderer, SkeletalAnimator, AnimationLibrary, BoneAttachment, Bone, Animator, SkinnedSprite2D, Billboard3D, FlatSprite3D, Text3D, TextAnimation } from '../traits';
 import { layoutText, type TextQuad } from './text/layoutText';
+import { textCodepoints } from './text/textCodepoints';
 import { buildTextGeometryByPage, buildTextPositionsByPage, buildTextColorsByPage, canWriteTextPositionsInPlace } from './text/textMesh';
-import { applyTextAnimation, isTextAnimating, isColorEffect, type TextAnimParams } from './text/textAnimate';
+import { applyTextAnimation, isTextAnimating, isColorEffect, textAnimElapsed, type TextAnimParams } from './text/textAnimate';
 import { makeMtsdfMaterial, updateMtsdfStyle, canReuseMtsdfMaterial, type MtsdfStyle } from './text/mtsdfShader';
 import { getFontTexture } from './text/fontTextureThree';
 import { ensureFontLoaded, getLoadedFont } from '../loaders/fontAtlasLoader';
@@ -63,6 +64,7 @@ import { resolveAnimSetParams, ANIMSET_DEFAULTS, getAnimSet } from '../loaders/a
 import { clone as cloneSkeleton, retargetClip } from 'three/examples/jsm/utils/SkeletonUtils.js';
 import { resolveRef } from '../loaders/assetManifest';
 import { onWorldSwap, findEntityByGuid, peekCurrentWorld } from '../core/ecs/world';
+import { EntityTable } from '../core/ecs/entityTable';
 import { emit, entityRef } from '../core/journal';
 import { getVisualDelta, getTime } from '../core/getTime';
 import { getPlayState } from '../core/playState';
@@ -1303,6 +1305,10 @@ export interface SkinnedEntry {
  *  reads; this entry just holds the THREE objects that present them in 3D. Lives in
  *  RenderState (not the trait) so the traits stay pure data. */
 export interface BillboardEntry {
+  /** The packed entity (`entity.valueOf()`) that last reconciled this entry — re-stamped on every
+   *  visit, so a same-rig respawn on a dead entity's index hands the entry over. Read by the
+   *  screen-bounds provider to refuse a dead owner's group before the next sweep (#1197). */
+  owner: number;
   /** Rig GUID this entry was built from — a rig swap rebuilds it. */
   rigRef: string;
   /** Topology signature (part count + each part's texture/frame/vertex count). A
@@ -1338,6 +1344,12 @@ export interface BillboardEntry {
 
 export interface RenderState {
   ecsObjects: Map<number, THREE.Object3D>;
+  /** The packed entity (`entity.valueOf()`) each `ecsObjects` entry was built for (#868). The
+   *  rebuild gates below compare only mesh kind/size/material, so a same-shape respawn on a dead
+   *  entity's index kept its THREE object — and whatever had been written onto it (MaterialInstance
+   *  uniform overrides in `userData`, a bound prop-override clone). A mismatch removes the object
+   *  through the same path as the end-of-pass reap, so every parallel map drops together. */
+  ecsOwners: Map<number, number>;
   ecsSprites: Map<number, string>;
   ecsMaterials: Map<number, string>;
   ecsColors: Map<number, number>;
@@ -1358,8 +1370,12 @@ export interface RenderState {
   /** Materials THIS surface minted inline (a primitive's default material) — the only ones it may
    *  dispose. See the note at the top of this module for why it is not module-global. */
   ownedMaterials: Set<THREE.Material>;
-  /** SkinnedModel entities — clone + mixer per entity id. */
-  skinned: Map<number, SkinnedEntry>;
+  /** SkinnedModel entities — clone + mixer per entity, generation-stamped (#868): a same-model rig
+   *  respawned on a dead one's index between two frames used to keep its entry — the running
+   *  AnimationMixer clock and clip, a suppressed -start, and mixer listeners closed over the
+   *  dead rig entity. `'owner-clears'`: Scene3D and SceneView call `disposeRenderState` on every
+   *  world swap. Dispose tears the clone down and drops its `skinnedShadowFlags` row with it. */
+  skinned: EntityTable<SkinnedEntry>;
   /** SkinnedSprite2D + Billboard3D entities — camera-facing mesh per entity id. */
   billboards: Map<number, BillboardEntry>;
   /** Text3D entities — SDF text mesh per entity id (separate from ecsObjects: its
@@ -1376,17 +1392,23 @@ export interface RenderState {
 /** Create a fresh RenderState with empty maps/sets. Pass emitLifecycle=true for the
  *  primary (game/runtime) surface so animation lifecycle events are journaled once. */
 export function createRenderState(emitLifecycle = false): RenderState {
+  const skinnedShadowFlags = new Map<number, string>();
   return {
     ecsObjects: new Map(),
+    ecsOwners: new Map(),
     ecsSprites: new Map(),
     ecsMaterials: new Map(),
     ecsColors: new Map(),
     ecsSizes: new Map(),
     ecsShadowFlags: new Map(),
-    skinnedShadowFlags: new Map(),
+    skinnedShadowFlags,
     ownsGeometry: new Set(),
     ownedMaterials: new Set(),
-    skinned: new Map(),
+    skinned: new EntityTable<SkinnedEntry>({
+      label: 'scene3DSync.skinned',
+      worldSwap: 'owner-clears',
+      dispose: (entry, id) => { disposeSkinnedEntry(entry); skinnedShadowFlags.delete(id); },
+    }),
     billboards: new Map(),
     textMeshes: new Map(),
     emitLifecycle,
@@ -1400,10 +1422,10 @@ export function createRenderState(emitLifecycle = false): RenderState {
  *  every entity removal / model-ref swap / scene swap / re-import). Does NOT
  *  dispose geometry/materials — those ARE shared with the cached prototype
  *  (riggedModelCache owns their disposal on last scene release). */
-function disposeSkinnedEntry(entry: SkinnedEntry, scene: THREE.Scene): void {
+function disposeSkinnedEntry(entry: SkinnedEntry): void {
   entry.mixer.stopAllAction();
   entry.mixer.uncacheRoot(entry.root as THREE.Object3D);
-  scene.remove(entry.root);
+  entry.root.removeFromParent();
   entry.root.traverse((o) => {
     const sm = o as THREE.SkinnedMesh;
     if (sm.isSkinnedMesh) sm.skeleton?.dispose();
@@ -1473,6 +1495,7 @@ export function attachInvalidationListener(state: RenderState, scene: THREE.Scen
         scene.remove(obj);
       }
       state.ecsObjects.delete(id);
+      state.ecsOwners.delete(id);
       state.ecsSprites.delete(id);
       state.ecsMaterials.delete(id);
       state.ecsShadowFlags.delete(id);
@@ -1488,12 +1511,7 @@ export function attachInvalidationListener(state: RenderState, scene: THREE.Scen
       const p = resolveRef(entry.modelRef);
       if (p && targets.has(p)) skinnedToEvict.push(id);
     }
-    for (const id of skinnedToEvict) {
-      const entry = state.skinned.get(id);
-      if (entry) disposeSkinnedEntry(entry, scene);
-      state.skinned.delete(id);
-      state.skinnedShadowFlags.delete(id);
-    }
+    for (const id of skinnedToEvict) state.skinned.deleteId(id); // disposes, and drops its shadow-flags row
   });
 }
 
@@ -1531,13 +1549,13 @@ export function disposeRenderState(state: RenderState, scene: THREE.Scene) {
       }
     }
   }
-  for (const entry of state.skinned.values()) disposeSkinnedEntry(entry, scene);
   state.skinned.clear();
   for (const [, entry] of state.billboards) disposeBillboardEntry(entry, scene);
   state.billboards.clear();
   for (const [, entry] of state.textMeshes) disposeTextMeshEntry(entry, scene);
   state.textMeshes.clear();
   state.ecsObjects.clear();
+  state.ecsOwners.clear();
   state.ecsSprites.clear();
   state.ecsMaterials.clear();
   state.ecsColors.clear();
@@ -2034,7 +2052,9 @@ export function syncNodeMaterials(
 function syncSkinnedMeshRenderers(world: World, state: RenderState): void {
   world.query(SkinnedMeshRenderer).updateEach(([r], entity) => {
     const parentId = entity.has(EntityAttributes) ? entity.get(EntityAttributes)!.parentId : 0;
-    const entry = parentId ? state.skinned.get(parentId) : undefined;
+    // `peekId`: this runs after `syncSkinnedModels`' endPass, so every entry left was stamped for a
+    // live entity this pass — and a renderer has only its parent's id.
+    const entry = parentId ? state.skinned.peekId(parentId) : undefined;
     if (!entry) return; // rig not built yet, or renderer not a child of a rig root
     const node = entry.nodes.get(r.node);
     if (!node) return; // stale node name (model re-imported with different meshes)
@@ -2157,18 +2177,17 @@ export interface LibraryMergeDeps {
 // lazyAcquireRiggedModel (the field NAME, matching the scene-scoped acquire it defaults
 // to, #747 and #749's adversarial review): an AnimationLibrary's animSet source GLB has
 // no manifest/resources entry of its own (SCALAR_RESOURCE_TYPE_BY_FIELD only covers
-// SkinnedModel.model), so this is its ONLY acquire path — it now rides the current
-// scene's release instead of pinning forever under LAZY_OWNER. The field used to be
+// SkinnedModel.model). Since #1162 `SceneManager`'s animset acquire loads it under the
+// loading scene before the swap, so for a scene-listed library this is the FALLBACK — the
+// path a code-spawned rig takes — and it rides the current scene's release instead of
+// pinning forever under LAZY_OWNER. The field used to be
 // named `ensureRiggedModelLoaded` after the real (session-pinning) function it was
 // carrying at the time; that name outlived the swap to the scene-scoped default, so a
 // future caller wiring its own deps would naturally reach for `ensureRiggedModelLoaded`
 // by name and silently reinstate the pin #747 removed — renamed to close that trap.
-// Known, accepted cost: on a scene swap the model is released with the outgoing scene
-// and re-fetched by the next frame's render sync (a frame of pop-in), instead of staying
-// resident. Only one authored scene uses AnimationLibrary today
-// (games/3d-test/runtime/assets/scenes/skinned-test.scene.json); acquiring animSet
-// sources transitively at scene load is the documented follow-up if that pop-in ever
-// matters.
+// The pop-in this path used to cost on every cold load and swap (measured 3-4 frames on
+// games/3d-test skinned-test) is what the scene-load acquire removed: docs/scene-loading.md
+// § "Preloaded, not owned".
 const DEFAULT_LIBRARY_DEPS: LibraryMergeDeps = { getAnimSet, getRiggedModel, lazyAcquireRiggedModel, retargetClip };
 
 /** P6 — merge an `AnimationLibrary`'s clips into a rig's mixer: own clips ∪
@@ -2181,6 +2200,8 @@ const DEFAULT_LIBRARY_DEPS: LibraryMergeDeps = { getAnimSet, getRiggedModel, laz
  *  `entry.libraryMerged` so its clips bind exactly once. Records each library
  *  clip's param source in `entry.clipParamSource` so `driveAnimator` plays it
  *  with the LIBRARY animset's per-clip params. Exported for unit tests. */
+// ⚠️ KEEP IN SYNC with `skeletalClipRoster` (animation/switchableClips.ts), which re-derives the clip
+// names this merge makes playable so `engine.playClip` can refuse an unknown one (#1129).
 export function mergeAnimationLibrary(
   entry: SkinnedEntry,
   lib: AnimationLibraryValue | undefined,
@@ -2261,6 +2282,7 @@ function actionNorm(action?: THREE.AnimationAction): number {
 export function syncSkinnedModels(world: World, scene: THREE.Scene, state: RenderState, callbacks?: SyncCallbacks) {
   const { skinned } = state;
   _activeSkinnedIds.clear();
+  skinned.beginPass();
   // Real Play advances mixers normally — drop any leftover timeline scrub-preview seeks so a
   // rig that was scrubbed before pressing Play doesn't stay pinned to the scrubbed frame.
   if (getPlayState() === 'playing') clearSkeletalSeeks();
@@ -2269,7 +2291,10 @@ export function syncSkinnedModels(world: World, scene: THREE.Scene, state: Rende
     if (!sm.isVisible || deactivatedEntities.has(entity.id())) return;
     const id = entity.id();
 
-    let entry = skinned.get(id);
+    // `touch` first: a live entity evicts a dead rig's entry at its index BEFORE anything below is
+    // built or stamped, so that eviction cannot delete rows (skinnedShadowFlags) the build just wrote.
+    skinned.touch(entity);
+    let entry = skinned.get(entity);
 
     // P6 — shared clip library on this root (own ∪ library clips). The effective
     // sources are the AnimationLibrary's animSets PLUS the SkeletalAnimator's own
@@ -2283,11 +2308,9 @@ export function syncSkinnedModels(world: World, scene: THREE.Scene, state: Rende
     // Model ref OR library set changed → rebuild from the new prototype (a removed
     // library clip must leave the mixer, which a partial merge can't undo).
     if (entry && (entry.modelRef !== sm.model || entry.libraryKey !== libKey)) {
-      disposeSkinnedEntry(entry, scene);
-      skinned.delete(id);
-      // A fresh clone is about to be built below, defaulting to no shadow (see the scene.add(root)
-      // comment) — force the next shadow-flags check to re-apply rather than reading a stale key.
-      state.skinnedShadowFlags.delete(id);
+      // Disposes the clone and drops its shadow-flags row: a fresh clone is about to be built below,
+      // defaulting to no shadow (see the scene.add(root) comment), so the next check must re-apply.
+      skinned.delete(entity);
       entry = undefined;
     }
 
@@ -2353,10 +2376,11 @@ export function syncSkinnedModels(world: World, scene: THREE.Scene, state: Rende
         nodes: buildNodes(root),
         clipParamSource: new Map(), libraryMerged: new Set(), libraryKey: libKey,
       };
-      skinned.set(id, entry);
+      skinned.set(entity, entry);
     }
 
     if (!entry) return;
+    skinned.touch(entity);
     _activeSkinnedIds.add(id);
 
     // Live-edit path: the clone above already got its shadow flags at creation — this only
@@ -2384,7 +2408,7 @@ export function syncSkinnedModels(world: World, scene: THREE.Scene, state: Rende
     // instead of advancing/crossfading it. Bypasses driveAnimator entirely (so the authored
     // SkeletalAnimator.clip isn't fought and no @anim-start fires during a scrub); Play clears
     // seeks (above) and falls through to driveAnimator.
-    const seek = getPlayState() !== 'playing' ? getSkeletalSeek(id) : undefined;
+    const seek = getPlayState() !== 'playing' ? getSkeletalSeek(entity) : undefined;
     if (seek) {
       blendSkeletal(entry, seek);
     } else if (anim) {
@@ -2412,12 +2436,7 @@ export function syncSkinnedModels(world: World, scene: THREE.Scene, state: Rende
   });
 
   // Reap entries for entities that vanished (deleted / deactivated / model cleared).
-  for (const [id, entry] of skinned) {
-    if (_activeSkinnedIds.has(id)) continue;
-    disposeSkinnedEntry(entry, scene);
-    skinned.delete(id);
-    state.skinnedShadowFlags.delete(id);
-  }
+  skinned.endPass();
 
   // Apply per-mesh materials + visibility from child SkinnedMeshRenderer entities.
   // After the reap so a renderer never binds into a just-disposed entry.
@@ -2437,7 +2456,7 @@ export function syncSkinnedModels(world: World, scene: THREE.Scene, state: Rende
   const dt = mixerAdvanceDelta(world);
   if (dt > 0) {
     for (const id of _activeSkinnedIds) {
-      skinned.get(id)!.mixer.update(dt);
+      skinned.peekId(id)!.mixer.update(dt);
       // NOTE: bone world matrices are refreshed by the renderer's own
       // updateMatrixWorld before draw. A forced refresh is needed ONLY so
       // syncBoneAttachments can read posed bones pre-render — so it's done there,
@@ -2453,7 +2472,7 @@ export function syncSkinnedModels(world: World, scene: THREE.Scene, state: Rende
   // fields are runtimeOnly, so this never touches the serialized scene.
   const playing = getPlayState() === 'playing';
   world.query(SkeletalAnimator).updateEach(([sa], entity) => {
-    const entry = skinned.get(entity.id());
+    const entry = skinned.get(entity);
     if (!entry) {
       // No live rig (deactivated, model cleared, or reaped this frame) — report
       // "not playing" instead of leaving the last live values stale.
@@ -2505,8 +2524,7 @@ export function syncBoneAttachments(world: World, _scene: THREE.Scene, state: Re
     // frame — the old path was O(N_entities) on the first attachment every frame
     // even though only the handful of attachment targets are needed. (rendering-3d F4)
     const targetEntity = findEntityByGuid(att.target, world);
-    const targetId = targetEntity?.id();
-    const entry = targetId != null ? skinned.get(targetId) : undefined;
+    const entry = targetEntity ? skinned.get(targetEntity) : undefined;
     const bone = entry?.bones.get(att.bone);
     if (!entry || !bone) return;
 
@@ -2612,10 +2630,10 @@ const _identityTf = { x: 0, y: 0, z: 0, rx: 0, ry: 0, rz: 0, sx: 1, sy: 1, sz: 1
 /** Walk up `parentId` from a `Bone` entity to the nearest ancestor that carries a
  *  `SkinnedModel` (i.e. has a render entry) → that rig's `SkinnedEntry`. The bone
  *  hierarchy lives under the model root, Unity-style. Depth-capped against cycles. */
-function resolveBoneRig(id: number, skinned: Map<number, SkinnedEntry>): SkinnedEntry | undefined {
+function resolveBoneRig(id: number, skinned: EntityTable<SkinnedEntry>): SkinnedEntry | undefined {
   let cur = id;
   for (let i = 0; i < 128; i++) {
-    const entry = skinned.get(cur);
+    const entry = skinned.peekId(cur); // ids from the bone parent map, read after syncSkinnedModels' endPass
     if (entry) return entry;
     const parent = _boneParentMap.get(cur);
     if (parent === undefined || parent === 0) return undefined;
@@ -2646,7 +2664,7 @@ function isUnderBone(id: number): boolean {
  *  `Animator.time` ONLY (idempotent), because read-back has since overwritten the
  *  bone Transforms with the clip pose. An Animator NOT inside a rig resolves no rig
  *  and is left to `animationSystem` alone. Returns true if any animator posed. */
-function applyBoneAnimators(world: World, skinned: Map<number, SkinnedEntry>): boolean {
+function applyBoneAnimators(world: World, skinned: EntityTable<SkinnedEntry>): boolean {
   const pending: {
     rootId: number; clip: AnimationClipDef; t: number;
     from?: { clip: AnimationClipDef; time: number }; w: number;
@@ -2890,11 +2908,12 @@ export function syncRenderables(world: World, scene: THREE.Scene, state: RenderS
     const id = entity.id();
     _activeRenderIds.add(id);
 
-    let obj = ecsObjects.get(id);
+    let obj = ownedEcsObject(state, scene, entity, callbacks);
 
     if (obj && ecsSprites.get(id) !== rend.mesh) {
       scene.remove(obj);
       ecsObjects.delete(id);
+      state.ecsOwners.delete(id);
       ecsSprites.delete(id);
       ownsGeometry.delete(id);
       // A fresh THREE object is about to be built below, defaulting to no shadow — force the
@@ -2916,6 +2935,7 @@ export function syncRenderables(world: World, scene: THREE.Scene, state: RenderS
         }
         scene.add(lodObj);
         ecsObjects.set(id, lodObj);
+        state.ecsOwners.set(id, entity.valueOf());
         ecsSprites.set(id, rend.mesh);
         obj = lodObj;
       } else {
@@ -2925,6 +2945,7 @@ export function syncRenderables(world: World, scene: THREE.Scene, state: RenderS
           const mesh = new THREE.Mesh(template.geometry, material);
           scene.add(mesh);
           ecsObjects.set(id, mesh);
+          state.ecsOwners.set(id, entity.valueOf());
           ecsSprites.set(id, rend.mesh);
           obj = mesh;
         }
@@ -2981,7 +3002,7 @@ export function syncRenderables(world: World, scene: THREE.Scene, state: RenderS
     const id = entity.id();
     _activeRenderIds.add(id);
 
-    let obj = ecsObjects.get(id);
+    let obj = ownedEcsObject(state, scene, entity, callbacks);
 
     // Recreate when the shape kind OR size changed. The primitive's geometry
     // is baked in createPrimitiveMesh, so a size change can't be applied via
@@ -3024,6 +3045,7 @@ export function syncRenderables(world: World, scene: THREE.Scene, state: RenderS
         retireDerivedMaterial(discardedMat, () => discardedMat.dispose());
       }
       ecsObjects.delete(id);
+      state.ecsOwners.delete(id);
       ecsSprites.delete(id);
       ecsColors.delete(id);
       ecsMaterials.delete(id);
@@ -3063,6 +3085,7 @@ export function syncRenderables(world: World, scene: THREE.Scene, state: RenderS
       }
       scene.add(obj);
       ecsObjects.set(id, obj);
+      state.ecsOwners.set(id, entity.valueOf());
       ecsSprites.set(id, rend.mesh);
       ecsColors.set(id, rend.color);
       // Record the ref only once it is SETTLED (#479) — recording an unresolved ref here is the
@@ -3118,30 +3141,53 @@ export function syncRenderables(world: World, scene: THREE.Scene, state: RenderS
   });
 
   for (const [id, obj] of ecsObjects) {
-    if (!_activeRenderIds.has(id)) {
-      callbacks?.onMeshRemoved?.(id, obj);
-      scene.remove(obj);
-      if (ownsGeometry.has(id) && (obj as THREE.Mesh).geometry) {
-        (obj as THREE.Mesh).geometry.dispose();
-      }
-      // Dispose material only if owned (created inline for this entity). Route through
-      // materialTargetsOf so a LOD object's owned materials (on its child meshes, not
-      // LOD.material which is undefined) are reaped too — mirrors syncMaterial. (F11)
-      for (const target of materialTargetsOf(obj)) {
-        const mat = target.material as THREE.Material;
-        if (mat && state.ownedMaterials.has(mat)) {
-          state.ownedMaterials.delete(mat);
-          mat.dispose();
-        }
-      }
-      ecsObjects.delete(id);
-      ecsSprites.delete(id);
-      ecsColors.delete(id);
-      ecsMaterials.delete(id);
-      ecsShadowFlags.delete(id);
-      ownsGeometry.delete(id);
+    if (!_activeRenderIds.has(id)) removeEcsObject(state, scene, id, obj, callbacks);
+  }
+}
+
+/** Remove one `ecsObjects` entry and every parallel map row for its id: the end-of-pass reap for a
+ *  vanished entity, and the owner-mismatch eviction for a recycled index (#868). */
+function removeEcsObject(state: RenderState, scene: THREE.Scene, id: number, obj: THREE.Object3D, callbacks?: SyncCallbacks): void {
+  callbacks?.onMeshRemoved?.(id, obj);
+  scene.remove(obj);
+  if (state.ownsGeometry.has(id) && (obj as THREE.Mesh).geometry) {
+    (obj as THREE.Mesh).geometry.dispose();
+  }
+  // Dispose material only if owned (created inline for this entity). Route through
+  // materialTargetsOf so a LOD object's owned materials (on its child meshes, not
+  // LOD.material which is undefined) are reaped too — mirrors syncMaterial. (F11)
+  for (const target of materialTargetsOf(obj)) {
+    const mat = target.material as THREE.Material;
+    if (mat && state.ownedMaterials.has(mat)) {
+      state.ownedMaterials.delete(mat);
+      mat.dispose();
     }
   }
+  state.ecsObjects.delete(id);
+  state.ecsOwners.delete(id);
+  state.ecsSprites.delete(id);
+  state.ecsColors.delete(id);
+  state.ecsMaterials.delete(id);
+  state.ecsShadowFlags.delete(id);
+  state.ownsGeometry.delete(id);
+}
+
+/** The kept object at `entity`'s index, or `undefined` after evicting one built for a DIFFERENT
+ *  entity (#868). Every `ecsObjects.set` in this module stamps `ecsOwners` beside it, so an owner row
+ *  never outlives its object; an object with no stamp at all is adopted, which only a caller that
+ *  seeds `ecsObjects` directly (a test harness) produces. */
+function ownedEcsObject(state: RenderState, scene: THREE.Scene, entity: Entity, callbacks?: SyncCallbacks): THREE.Object3D | undefined {
+  const id = entity.id();
+  const packed = entity.valueOf();
+  const obj = state.ecsObjects.get(id);
+  if (!obj) return undefined;
+  const owner = state.ecsOwners.get(id);
+  if (owner === undefined) { state.ecsOwners.set(id, packed); return obj; } // adopt
+  if (owner !== packed) {
+    removeEcsObject(state, scene, id, obj, callbacks);
+    return undefined;
+  }
+  return obj;
 }
 
 // ── Billboarded 2D skinned sprites (2.5D) ───────────────────────────────
@@ -3251,6 +3297,7 @@ async function loadBillboardPage(url: string): Promise<THREE.Texture> {
 
 /** Create the THREE objects for one billboarded rig and kick off texture loads. */
 function buildBillboardEntry(
+  owner: number,
   ss: { rig: string; color: number; opacity: number },
   opt: { mode: 'cylindrical' | 'spherical' | 'flat'; alphaTest: number },
   buf: NonNullable<ReturnType<typeof getSkin2DBuffer>>,
@@ -3260,7 +3307,7 @@ function buildBillboardEntry(
   const flip = new THREE.Group();
   group.add(flip);
   const entry: BillboardEntry = {
-    rigRef: ss.rig, sig: billboardSig(buf.parts), mode: opt.mode, group, flip,
+    owner, rigRef: ss.rig, sig: billboardSig(buf.parts), mode: opt.mode, group, flip,
     meshes: [], orders: [], textures: [], deformVersion: -1, disposed: false,
   };
   // Load each distinct page URL once and share across the parts that use it.
@@ -3312,12 +3359,13 @@ interface SpriteMode3D {
 /** Build/update one SkinnedSprite2D's 3D entry (billboard OR flat) from `skin2DBuffers`.
  *  Camera-INDEPENDENT — `orientBillboards` does the per-frame facing / render-order. */
 function syncSkinnedSprite3D(
-  scene: THREE.Scene, state: RenderState, id: number,
+  scene: THREE.Scene, state: RenderState, entity: Entity,
   tf: { x: number; y: number; z: number; rx: number; ry: number; rz: number; sx: number; sy: number; sz: number },
   ss: { rig: string; color: number; opacity: number; flipX: boolean; flipY: boolean; isVisible: boolean },
   opt: SpriteMode3D, callbacks?: SyncCallbacks,
 ): void {
   const { billboards } = state;
+  const id = entity.id();
   const buf = getSkin2DBuffer(id);
   if (!buf || !buf.parts.length) return; // rig not deformed yet — skin2DSystem retries next frame
   _billboardActive.add(id);
@@ -3327,7 +3375,8 @@ function syncSkinnedSprite3D(
   if (entry && (entry.rigRef !== ss.rig || entry.sig !== sig)) {
     disposeBillboardEntry(entry, scene); billboards.delete(id); entry = undefined;
   }
-  if (!entry) { entry = buildBillboardEntry(ss, opt, buf, scene); billboards.set(id, entry); }
+  if (!entry) { entry = buildBillboardEntry(entity.valueOf(), ss, opt, buf, scene); billboards.set(id, entry); }
+  entry.owner = entity.valueOf();
   entry.mode = opt.mode;
 
   // Cheap per-frame sync of the things that change without a topology rebuild:
@@ -3390,11 +3439,11 @@ export function syncBillboardSprites(world: World, scene: THREE.Scene, state: Re
   const { billboards } = state;
   _billboardActive.clear();
   world.query(Transform, SkinnedSprite2D, Billboard3D).updateEach(([tf, ss, bb], entity) => {
-    syncSkinnedSprite3D(scene, state, entity.id(), tf, ss,
+    syncSkinnedSprite3D(scene, state, entity, tf, ss,
       { mode: bb.mode, alphaTest: bb.alphaTest, pixelsPerUnit: bb.pixelsPerUnit, anchor: bb.anchor }, callbacks);
   });
   world.query(Transform, SkinnedSprite2D, FlatSprite3D).updateEach(([tf, ss, fs], entity) => {
-    syncSkinnedSprite3D(scene, state, entity.id(), tf, ss,
+    syncSkinnedSprite3D(scene, state, entity, tf, ss,
       { mode: 'flat', alphaTest: fs.alphaTest, pixelsPerUnit: fs.pixelsPerUnit, anchor: 'center' }, callbacks);
   });
 
@@ -3479,6 +3528,11 @@ export function orientBillboards(state: RenderState, camera: THREE.Camera) {
  */
 // ── Text3D (SDF text meshes) ──────────────────────────────
 interface TextMeshEntry {
+  /** The packed entity (`entity.valueOf()`) that last reconciled this entry — re-stamped on every
+   *  visit (a same-text respawn on a dead entity's index keeps the entry, so a build-time stamp would
+   *  go stale). Read by the screen-bounds provider (#1197). Not `animOwner`: that one is stamped
+   *  only while a text animation runs. */
+  owner: number;
   /** Container carrying the entity transform + billboard rotation; holds one child
    *  mesh per atlas PAGE the text touches (dynamic CJK spills across pages, each mesh
    *  bound to that page's texture). Baked / single-page text has exactly one child. */
@@ -3515,6 +3569,8 @@ interface TextMeshEntry {
   /** The effect that was active last frame — a change restarts animStart so a one-shot
    *  fade/typewriter intro replays when the effect is switched mid-Play. */
   animEffect?: string;
+  /** The packed entity the animation clock last ran for — see `textAnimElapsed` (#868). */
+  animOwner?: number;
 }
 const _activeText = new Set<number>();
 
@@ -3597,11 +3653,6 @@ function textStyle(t: {
   };
 }
 
-function codepointsOf(text: string): number[] {
-  const out: number[] = [];
-  for (const ch of text) out.push(ch.codePointAt(0)!);
-  return out;
-}
 
 function positionsTo3D(p2: Float32Array): Float32Array {
   const n = p2.length / 2;
@@ -3628,6 +3679,7 @@ export function syncText3D(world: World, scene: THREE.Scene, state: RenderState,
     if (t.font && sceneId !== undefined) ensureFontLoaded(sceneId, t.font);
     const provider = t.font ? getLoadedFont(t.font) : undefined;
     let entry = textMeshes.get(id);
+    if (entry) entry.owner = entity.valueOf();
 
     if (!provider) { if (entry) entry.group.visible = false; return; }
     // Page 0 texture readiness gates the whole entity (a baked atlas still loading, or
@@ -3642,13 +3694,13 @@ export function syncText3D(world: World, scene: THREE.Scene, state: RenderState,
     const atlasKey = [t.font, provider.atlasVersion, getTextDirtyVersion(t.font)].join('|');
 
     if (!entry || entry.hash !== hash) {
-      provider.ensureGlyphs(codepointsOf(t.text));
+      provider.ensureGlyphs(textCodepoints(t.text));
       const layout = layoutText(provider, t.text, {
         fontSize: t.fontSize, maxWidth: t.maxWidth, align: t.align as 'left' | 'center' | 'right',
         lineSpacing: t.lineSpacing, letterSpacing: t.letterSpacing,
       });
       if (!entry) {
-        entry = { group: new THREE.Group(), pages: new Map(), hash, fontId: t.font, billboard: !!t.billboard };
+        entry = { owner: entity.valueOf(), group: new THREE.Group(), pages: new Map(), hash, fontId: t.font, billboard: !!t.billboard };
         scene.add(entry.group);
         textMeshes.set(id, entry);
       }
@@ -3663,7 +3715,7 @@ export function syncText3D(world: World, scene: THREE.Scene, state: RenderState,
         const hasTrueSdf = provider.atlas.type !== 'msdf';
         const pagePositions = buildTextPositionsByPage(layout.quads, { yUp: true });
         // Page-ascending, matching `buildTextPositionsByPage`'s sort — `canWriteTextPositionsInPlace`
-        // compares index-for-index (textMesh.ts:180-189). `entry.pages` is itself built in
+        // compares index-for-index (textMesh.ts's canWriteTextPositionsInPlace). `entry.pages` is itself built in
         // ascending order (the rebuild loop below walks `buildTextGeometryByPage`'s sorted
         // output), so its insertion order already matches; sorted explicitly anyway since that
         // invariant lives in a different code path than this one.
@@ -3697,11 +3749,11 @@ export function syncText3D(world: World, scene: THREE.Scene, state: RenderState,
           // because it mints new geometry AND a new `aTextColor` buffer, both at base state.
           // This fast path writes base POSITIONS only and leaves the colour buffer untouched, so
           // clearing `wasColored` would strand an animated colour with nothing left to restore it
-          // (`Scene2D.tsx:2219-2228` documents the identical reasoning for the 2D twin).
+          // (`Scene2D.tsx`'s renderFrame text fast-path `wasMotion`/`wasColored` note documents the identical reasoning for the 2D twin).
           //
           // #752 landed 2D-ONLY, and rightly so: `makeMtsdfMaterial` takes no `fontSize`
-          // (mtsdfShader.ts:76-84) — 3D derives `screenPxRange` IN-GRAPH from `fwidth`
-          // (mtsdfShader.ts:138-140), the same per-fragment derivative Scene2D's Pixi shader uses
+          // (mtsdfShader.ts's makeMtsdfMaterial signature) — 3D derives `screenPxRange` IN-GRAPH from `fwidth`
+          // (inside makeMtsdfMaterial), the same per-fragment derivative Scene2D's Pixi shader uses
           // whenever it's available (mtsdfPixiShader.ts's `#else` arm is the no-derivatives
           // FALLBACK #752 actually fixed). So 3D is structurally immune to the bug #752 fixed —
           // there is no CPU-computed screenPxRange here to go stale — and `updateMtsdfStyle`
@@ -3795,11 +3847,8 @@ export function syncText3D(world: World, scene: THREE.Scene, state: RenderState,
     const colored = animActive && isColorEffect(anim!.effect);
     if ((motion || colored || entry.wasMotion || entry.wasColored) && entry.baseQuads) {
       const now = getTime(world)?.smoothedElapsed ?? 0;
-      // Restart at t=0 on (re)activation OR an effect switch (effect isn't in the mesh
-      // hash, so switching mid-Play keeps the stale start → one-shot intros would skip).
-      if (animActive && ((!entry.wasMotion && !entry.wasColored) || entry.animEffect !== anim!.effect)) entry.animStart = now;
-      entry.animEffect = animActive ? anim!.effect : undefined;
-      const tsec = animActive ? now - (entry.animStart ?? now) : 0;
+      // Restarts on (re)activation, an effect switch, or a different entity on this index (#868).
+      const tsec = textAnimElapsed(entry, animActive, anim?.effect, entity.valueOf(), now);
       const quads = animActive ? applyTextAnimation(entry.baseQuads, anim!, tsec, t.fontSize) : entry.baseQuads;
       if (motion || entry.wasMotion) { updateTextPagePositions3D(entry, quads); entry.wasMotion = motion; }
       if (colored || entry.wasColored) { updateTextPageColors3D(entry, quads); entry.wasColored = colored; }
@@ -3904,7 +3953,7 @@ function prepPrewarmMesh(mesh: THREE.Mesh): void {
 /** Whether three will draw this material in TWO side-pinned passes rather than one double-sided
  *  pass. Mirrors the condition in three's `Renderer.renderObject` EXACTLY — the prewarm has to
  *  make the same decision three does, and a paraphrase of it would be the drift this whole
- *  function exists to prevent (r184, Renderer.js:3452):
+ *  function exists to prevent (r184, Renderer.renderObject's transparent DoubleSide split):
  *
  *  ```js
  *  if ( material.transparent === true && material.side === DoubleSide && material.forceSinglePass === false ) {
@@ -4246,9 +4295,32 @@ async function prewarmShadersForWorldInner(
   // module-global per-frame answer that `syncLights` reads, and the prewarm runs against the
   // STAGING world while the OLD one is still rendering frames — arming it here would decide the
   // outgoing scene's shadows from the incoming scene's lights for the length of the load.
+  //
+  // ⚠️ **Both this and the light mirror below are SKIPPED under a post-FX stack (#324a).** Under a
+  // stack the only thing this pass builds is the F4 placeholder, and #324b established that
+  // NOTHING downstream can cache-hit it — the live compile runs in the stack's own render context
+  // and shares zero node-builder states with `ctx 0`. So the lights are not here to make a variant
+  // the render will reuse (they cannot); the build's whole remaining job is to be a normal
+  // material compiled first (the TSL race) and to absorb the one-time NodeBuilder premium, and
+  // MEASURED 2026-09-10 on `demos/postfx-demo`, three paired runs, neither needs them:
+  //
+  //   arm            F4 build (ctx 0)   live compile (ctx 4)   ctx4 builds
+  //   lights mirrored    19.5 ms            138.3 ms               106
+  //   no lights           8.8 ms            137.9 ms               106
+  //
+  // The premium still transfers (the first ctx-4 build stays ~9 ms either way, versus ~19 ms
+  // unprimed), the live compile does not get more expensive, the call count is identical, and the
+  // scene renders the same 36 draw calls with no LightsNode warning and no `OutputType` error. So
+  // the mirror was costing ~55% of the one build this pass still makes, for nothing.
+  //
+  // ⚠️ It stays ON for the no-stack path, where it is load-bearing for the reason below: there the
+  // placeholders ARE compiled in the render's own context and ARE cache-hit by the first frame, so
+  // a missing `ShadowNode` means the first frame rebuilds the lot. Do not "simplify" this to an
+  // unconditional skip.
+  const mirrorLights = !willUseStack;
   const prewarmCasters: ShadowCaster[] = [];
   const maxShadowCasters = getActiveTierOverrides().maxShadowCasters;
-  if (maxShadowCasters > 0) {
+  if (mirrorLights && maxShadowCasters > 0) {
     world.query(Light).forEach((entity) => {
       if (deactivatedEntities.has(entity.id())) return;
       const l = entity.get(Light);
@@ -4261,8 +4333,19 @@ async function prewarmShadersForWorldInner(
   const keptCasters = keptShadowCasters(prewarmCasters, maxShadowCasters);
   const prewarmCasterAllowed = (id: number) => keptCasters === null || keptCasters.has(id);
 
-  // Mirror the staging world's lights so compileAsync produces the correct
-  // shader variants (otherwise Three.js's LightsNode warns + skips compile).
+  // Mirror the staging world's lights so compileAsync produces the correct shader variants
+  // (otherwise Three.js's LightsNode warns + skips compile).
+  //
+  // ⚠️ That parenthetical is about a scene carrying LIT PLACEHOLDER MESHES — it is not a reason
+  // the F4-only path needs lights, and reading it as one is why the skip below looks riskier than
+  // it is. Measured on the stack path: no warning, no `OutputType` error, same 36 draw calls.
+  //
+  // ⚠️ **The FOG mirror above is the same shape of waste under a stack and is deliberately NOT
+  // gated** (close-out sweep). Two reasons, both honest: no project pairs `Fog` with a post-FX
+  // trait today (`games/3d-test` has fog and no stack), so the case is unreachable; and unlike the
+  // lights, nothing has measured whether fog contributes to the one-time NodeBuilder premium that
+  // the F4 build exists to absorb. Gate it when a project makes it reachable AND the measurement
+  // says it is free — not before.
   //
   // ⚠️ `castShadow` is mirrored with the SAME tier gate the real render applies (#238). A
   // shadow-casting light puts a `ShadowNode` in every lit material's node graph, so a prewarm
@@ -4270,7 +4353,7 @@ async function prewarmShadersForWorldInner(
   // and the first frame then builds the real set synchronously, which is the stall. Measured on
   // the A23: 8 of forest-camp's pipelines were built twice, the second time at ~150 ms each.
   // Same reasoning as the environment mirror above: model the scene the tier will actually draw.
-  world.query(Light).updateEach(([light]: [{ lightType: string; color: number; intensity: number; distance: number; angle: number; penumbra: number; castShadow: boolean }], entity) => {
+  if (mirrorLights) world.query(Light).updateEach(([light]: [{ lightType: string; color: number; intensity: number; distance: number; angle: number; penumbra: number; castShadow: boolean }], entity) => {
     if (deactivatedEntities.has(entity.id())) return;
     const l = createLightFromTrait(light);
     if (l) {

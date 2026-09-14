@@ -2,6 +2,7 @@
 
 import React, { lazy, Suspense } from 'react';
 import type { UINodeData } from './useUIEntities';
+import { uiNodeKey } from './uiNodeKey';
 import { applyBindings } from './bindings';
 import { resolveTemplate, evalVisibility } from './bindingResolver';
 
@@ -31,8 +32,9 @@ import { shrinkWrapAlign, uiTextAnimation, ensureUITextAnimStyles } from './uiTe
 import { useFocusStore } from './focusManager';
 import { isTouchDevice } from '../core/formFactor';
 import { TOUCH_ATTR, TOUCH_OPACITY_ATTR } from '../traits/TouchControl';
+import { isViewportLengthUnit, viewportUnitVar } from '../traits/uiLength';
 import { UI_PAINT_ATTR } from './uiPaintMarker';
-import { UI_PRESS_ORIGIN_ATTR, pressBelongsTo, clearPressOrigin } from './pressOrigin';
+import { UI_PRESS_ORIGIN_ATTR, UI_TAP_ZONE_ATTR, pressBelongsTo, clearPressOrigin } from './pressOrigin';
 import { scrollViewStyle, writeScrollState, clearScrollRequest, pendingScrollTo, readScrollMeasurement, readPreciseBoxSize } from './scrollViewDom';
 import { scrollByEntry } from './scrollApi';
 import { useScrollAnchoring } from './scrollAnchor';
@@ -221,7 +223,7 @@ const AutoFitText = React.memo(function AutoFitText(
     // the fitted font size is written, so it never reaches paint (this whole function runs inside
     // `useLayoutEffect`, before the browser paints).
     // ⚠️ In a `flexDirection: 'row'` parent this width is the item's MAIN size, so the default
-    // `flexShrink: 1` (UIElement.ts:31) is free to shrink it back below `max-content` — which
+    // `flexShrink: 1` (the UIElement default) is free to shrink it back below `max-content` — which
     // would collapse `naturalPx` to `availablePx`, make the fit conclude "it fits", and leave
     // autoFitText SILENTLY INERT. It does not, and the reason is not this line: a flex item's
     // default `min-width: auto` floors shrinking at min-content, and the `white-space: nowrap`
@@ -409,19 +411,15 @@ const AutoFitText = React.memo(function AutoFitText(
 });
 
 /** Convert a numeric value + unit string to a CSS value. Returns undefined if value is 0/falsy.
- *  Viewport units (vw/vh/vmin/vmax) use CSS custom properties set by UIRenderer so they
- *  resolve relative to the UI container, not the browser window. This is critical for the
- *  editor's simulated device viewport. */
+ *  Viewport units use CSS custom properties set by UIRenderer so they resolve relative to the UI
+ *  container, not the browser window. This is critical for the editor's simulated device viewport.
+ *  The variable's NAME comes from `viewportUnitVar` — the same rule UIRenderer publishes with — so
+ *  a reader cannot ask for a variable nobody sets (#1064). */
 export function cssVal(value: number, unit: string): string | number | undefined {
   if (!value) return undefined;
-  switch (unit) {
-    case '%':    return `${value}%`;
-    case 'vw':   return `calc(${value} * var(--ui-vw, 1vw))`;
-    case 'vh':   return `calc(${value} * var(--ui-vh, 1vh))`;
-    case 'vmin': return `calc(${value} * var(--ui-vmin, 1vmin))`;
-    case 'vmax': return `calc(${value} * var(--ui-vmax, 1vmax))`;
-    default:     return value; // px
-  }
+  if (unit === '%') return `${value}%`;
+  if (isViewportLengthUnit(unit)) return `calc(${value} * var(${viewportUnitVar(unit)}, 1${unit}))`;
+  return value; // px
 }
 
 /** Warn ONCE per entity that a UIToggle can never move: it carries no binding on an
@@ -465,6 +463,64 @@ function warnInertScrollView(key: string, overflow: string): void {
   if (_inertScrollViews.has(key)) return;
   _inertScrollViews.add(key);
   console.warn(`[UIScrollView] ${key} has UIElement.overflow: '${overflow}', which establishes no scroll container — so the scroll view does nothing: the box does not scroll, scrollTo moves it nowhere, and snap/overscroll have nothing to apply to. Whether the box scrolls at all is UIElement.overflow's call, deliberately: set it to 'scroll' for a draggable view, or 'hidden' for one driven only by scrollToEntry/buttons.`);
+}
+
+/** `cssVal` for a context that needs a LENGTH STRING rather than a style value: it returns a bare
+ *  number for `px` (React appends the unit when assigning to a style property, but a value being
+ *  interpolated into a `max()` expression has nobody to do that for it). Returns '' for 0/falsy,
+ *  matching `cssVal`'s undefined. */
+function cssLen(value: number, unit: string): string {
+  const v = cssVal(value, unit);
+  return v === undefined ? '' : typeof v === 'number' ? `${v}px` : v;
+}
+
+/** Warn ONCE per entity that `UIElement.minTapSize` is authored but clipped away (#948). Same
+ *  shape and same reason as `warnDeadToggle` / `warnInertScrollView` above: the expander is a
+ *  CHILD, so an element that clips its own overflow cuts the enlarged tap zone back to the box and
+ *  the field does nothing — inert, and indistinguishable from not-wired-yet without being told.
+ *
+ *  ⚠️ Cannot trip on existing content: `minTapSize` is new in #948 and defaults to 0, so the
+ *  corpus authoring BOTH halves of this combination is empty by construction. */
+const _clippedTapZones = new Set<string>();
+// Cleared on world swap for the entity-id-fallback reason spelled out over `_deadToggles`.
+onWorldSwap(() => _clippedTapZones.clear());
+
+function warnClippedTapZone(key: string, overflow: string): void {
+  if (_clippedTapZones.has(key)) return;
+  _clippedTapZones.add(key);
+  console.warn(`[UIElement] ${key} authors minTapSize but also overflow: '${overflow}', which clips the tap zone back to the element's own box — so minTapSize does nothing here. The enlarged zone is a child element, and this element's clip cuts it off. Either set overflow to 'visible', or move minTapSize onto an unclipped ancestor that carries the click binding.`);
+}
+
+/** Warn ONCE per entity that `minTapSize` is authored on an element type that cannot HOST the
+ *  expander (#948 close-out). Same shape and reason as the three warns above.
+ *
+ *  ⚠️ Distinct from the clipped case: that one is fixable by the author (drop the clip), this one
+ *  is not — an `<input>` is a void element and a `UIToggle` owns its inner layout.
+ *
+ *  ⚠️ **The remedy this used to print was UNFOLLOWABLE on the controls it fires for** (#1025). It
+ *  said "wrap it in a div that carries the click binding" — and every under-floor `input`/`range`/
+ *  `UIToggle` in the repo binds `change`, not `click`, so there is no click binding to carry. A
+ *  wrapper made that way still fails `takesClick` and gets no expander either, which is the same
+ *  silence one level out.
+ *
+ *  The message now splits by what the control actually is, because the right answer differs:
+ *  a **`range`** needs no expander at all (it hit-tests its whole authored box while the platform
+ *  draws the track at a fixed thickness — so grow `height`), while a **`UIToggle`** draws its knob
+ *  off the track height and so does need the two boxes separated. `docs/ui-system.md` § "Tap zones"
+ *  carries the measurement. */
+const _unhostableTapZones = new Set<string>();
+// Cleared on world swap for the entity-id-fallback reason spelled out over `_deadToggles`.
+onWorldSwap(() => _unhostableTapZones.clear());
+
+function warnUnhostableTapZone(key: string, kind: string): void {
+  if (_unhostableTapZones.has(key)) return;
+  _unhostableTapZones.add(key);
+  // `range`/`input` grow correctly in place; a toggle does not, so it is the one that needs a
+  // wrapper — and the wrapper needs a CLICK binding of its own, not the control's `change` one.
+  const remedy = kind === 'UIToggle'
+    ? 'A UIToggle draws its knob off its track height, so growing it fattens the switch: wrap it in a div that carries its OWN click binding and author minTapSize there. ⚠️ Moving the toggle\'s `change` binding to the wrapper does NOT work — a wrapper with no click binding gets no tap zone either.'
+    : `An <input>/<input type=range> hit-tests its WHOLE authored box while the platform draws its track at a fixed thickness, so author a larger height/width on this element directly — minTapSize is not the field for it.`;
+  console.warn(`[UIElement] ${key} authors minTapSize but renders as '${kind}', which cannot hold the tap zone — so minTapSize does nothing here. The enlarged zone is a child element, and an <input>/<input type=range> is a void element while a UIToggle owns its own inner layout. ${remedy}`);
 }
 
 /** Warn ONCE per entity that authored `text` is dropped because this element type never renders
@@ -608,8 +664,8 @@ interface UINodeProps {
    *  ⚠️ It must be the INHERITED value, not the scene default: a modal root authoring its own
    *  `fontFamily` makes those two differ, and handing the input the scene default would render it
    *  in a different typeface from the labels beside it. `''` when nothing up the chain authored a
-   *  font, which is what keeps the repo's two existing `<input>`s (`games/chess`,
-   *  `games/llm-test`, neither authoring one) on the UA font exactly as before. */
+   *  font, which is what kept the repo's only two `<input>`s at the time (chess and llm-test,
+   *  neither authoring one; both deleted in #1191) on the UA font exactly as before. */
   inheritedFontFamily?: string;
 }
 
@@ -799,10 +855,10 @@ function UINodeInner({ node, storeState, onSelectEntity, renderCanvas2D, uiVisua
   // `UISettings` default every `div` sibling gets for free through `UIRenderer`'s container
   // (#803, one element type over from the container fix). Gated to input/range ONLY: a `div`
   // already inherits correctly and must be left alone, and using `'inherit'` unconditionally
-  // here was rejected — `games/chess` and `games/llm-test` author the repo's only two
-  // `<input>`s and neither authors a scene font, so an unconditional `inherit` would visibly
-  // change both from the platform's form font to `body`'s `system-ui` for a change neither
-  // game asked for. Gating on `inheritedFontFamily` being non-empty keeps them byte-identical.
+  // here was rejected — the repo's only two `<input>`s at the time (chess and llm-test, since
+  // deleted in #1191) authored no scene font, so an unconditional `inherit` would have visibly
+  // changed both from the platform's form font to `body`'s `system-ui` for a change neither
+  // game asked for. Gating on `inheritedFontFamily` being non-empty keeps such inputs byte-identical.
   else if (inheritedFontFamily && (node.elementType === 'input' || node.elementType === 'range')) {
     style.fontFamily = inheritedFontFamily;
   }
@@ -1238,6 +1294,117 @@ function UINodeInner({ node, storeState, onSelectEntity, renderCanvas2D, uiVisua
   // authoring surface, so it is what distinguishes them — the running game wins, because
   // that is the picture the human is judging. Without this the last host to tick won, which
   // was the Scene panel ("the video plays only on Scene view, not on the game view").
+  // ── Tap zone (#948) ──
+  // `UIElement.minTapSize` raises the area that RECEIVES a tap without touching the area that
+  // DRAWS. A finger needs ~44pt; an icon control's artwork is routinely half that, and every
+  // other field on the trait moves the two boxes together (see the trait's own doc for the
+  // measurement that killed `padding` and `minWidth`/`minHeight` as alternatives).
+  //
+  // ⚠️ `takesClick`, not `minTapSize > 0` alone. An enlarged zone on a node that handles no click
+  // would start swallowing taps meant for whatever is behind it — so a node that would not have
+  // handled the tap anyway gets no expander, and the field is documented as inert there.
+  //
+  // ⚠️ `zIndex: -1` is what stops it covering this element's OWN text and children. A negative
+  // z-index child paints after its stacking context's background but BEFORE its in-flow content,
+  // so inside the box the real content still wins the hit test. `isolation: 'isolate'` below pins
+  // it into this element's own stacking context so it cannot fall behind an ancestor instead; the
+  // nine-slice layer a few hundred lines up uses exactly this pair for the same reason.
+  //
+  // ⚠️ **It does NOT protect SIBLINGS, and an earlier version of this comment claimed it did**
+  // ("outside the box, where nothing else is" — false: outside the box is exactly where siblings
+  // are). `isolation` puts the expander at the PARENT's z-order among its siblings, so an expander
+  // overhanging a sibling that paints lower will take presses inside the overlap. That is inherent
+  // to growing a hit area in place, not a bug in this implementation — but it makes minTapSize an
+  // AUTHORING decision about a specific layout, not a value that is safe everywhere. Author it on
+  // a control with clearance; a control packed against an interactive neighbour needs the spacing
+  // fixed instead. Caught in #948's close-out review, on `LevelPagePrev`/`LevelPageNext`, whose
+  // 48px zones overhang the scrollable `LevelScroll` beneath them by `24 - 0.028*viewportHeight` px.
+  //
+  // ⚠️ **OBSERVED, not merely computed** (#973, 2026-09-09). Driven with `document.elementsFromPoint`
+  // on the live DOM: at 375x667 a press in the bottom 5.78px of two of the five visible level tiles
+  // resolved to the ARROW, and `DailyMonthNext` took a 4.50 x 5.40px corner of `DailyClose` — a
+  // dialog's only way out. Also measured **2.03px and still stealing at 360x800**, so this is not
+  // an iPhone-8-only effect; clean at 430x932. Fixed by authored clearance (`marginTop` on both
+  // pager rows), NOT by lowering the number — 44 would still overlap by ~3.3px, because the defect
+  // is the adjacency.
+  //
+  // ⚠️ **Two things that make a static check of this UNSOUND, both learned the hard way in #973:**
+  // paint order is half the mechanism (a neighbour LATER in tree order paints above the zone and
+  // wins the press, so `BrushFlyoutClose`'s downward overhang is harmless), and an anchored host is
+  // not in the flow at all (`ChipFlyoutClose` carries a `UIAnchor`, so its authored `marginTop` is
+  // INERT — live ECS `marginTop: 6`, computed DOM `margin-top: 0px`). A scene-JSON model that
+  // ignores either is wrong in both directions. Verify a new `minTapSize` with the probe, not by
+  // reading the scene.
+  //
+  // The press-origin gate (#664) needs no change for the ordinary case: `pressBelongsTo` resolves a
+  // press through `closest('[data-press-origin]')`, and the expander is a DESCENDANT of the marked
+  // element, so a press landing on it already resolves to this node.
+  //
+  // ⚠️ **#977 CHANGED the overlap case, and the paragraph above about siblings is now the DESIGN
+  // rather than the caveat.** The expander is stamped `data-tap-zone`, and `pressOrigin.ts` hands a
+  // press that landed on it to whatever real control was underneath — so a zone now LOSES to
+  // anything that would have handled the press itself, and still wins over decoration and empty
+  // space. A zone overhanging a decorative sibling is unaffected, which is the normal use.
+  // ⚠️ It fixes a TAP only. A finger-drag starting inside the overlap still does not reach a scroll
+  // container beneath it — the browser picks the scroll target at pointerdown, before any of this
+  // runs. Owner's call, 2026-09-09; see docs/ui-system.md.
+  const tapZone = cssLen(node.minTapSize, node.minTapSizeUnit);
+  let tapZoneLayer: React.ReactNode = null;
+  if (tapZone && takesClick) {
+    // ⚠️ **The THIRD inert case, and the one an author hits next.** The expander is a CHILD, so it
+    // can only exist on a node that renders a container. `input`/`range` render a VOID element
+    // (nothing can be nested inside an `<input>` at all) and `UIToggle` owns its own inner layout
+    // — all three return before the container branches below. Court has three of them under the
+    // floor already (`SettingsHapticsToggle`, `SettingsMusicSlider`, `SettingsSfxSlider`), so this
+    // is reachable, not theoretical. ⚠️ It must be checked BEFORE `style.isolation` is set: an
+    // inert field that still creates a stacking context would trap its descendants' `zIndex` for
+    // nothing, which is the hazard `registerTraits.ts`'s `scale` tooltip spells out.
+    const hosts = node.elementType === 'div' && !node.toggle;
+    if (!hosts) {
+      if (import.meta.env?.DEV) {
+        warnUnhostableTapZone(node.guid || `${node.entityId}:${node.generation}`,
+          node.toggle ? 'UIToggle' : node.elementType);
+      }
+    } else if (node.overflow === 'hidden' || node.overflow === 'scroll') {
+      if (import.meta.env?.DEV) {
+        warnClippedTapZone(node.guid || `${node.entityId}:${node.generation}`, node.overflow);
+      }
+    } else {
+      style.isolation = 'isolate';
+      tapZoneLayer = (
+        <div
+          aria-hidden
+          // #977 — the marker `pressOrigin.ts` reads. An expander sits at the PARENT's z-order among
+          // its SIBLINGS, so it takes presses inside any overlap; the press router uses this to hand
+          // such a press back to whatever would have handled it. Without the attribute the expander
+          // is indistinguishable from ordinary content and the rule cannot exist.
+          //
+          // ⚠️ **RUNTIME ONLY — `onSelectEntity` is the editor's authoring preview, and stamping it
+          // there BREAKS click-to-select.** `UIRenderer.tsx` deliberately skips installing the press
+          // tracker for that renderer, but the tracker GameView installs is registered on the
+          // document both of them share, so the marker alone is enough for a preview click to be
+          // redirected: the original is stopped at document capture (before SceneView's own capture
+          // listener and before React) and the synthetic click lands on the neighbour, selecting the
+          // wrong entity. ⚠️ The example first written here — `DailyClose`'s pad selecting
+          // `DailyHeader` — is FALSIFIED by the ancestor rule added in the same commit: that press
+          // resolves to `DailyRoot`, which contains the host, so it never redirects at all. The real
+          // case is a pad over an interactive SIBLING: `DailyMonthNext`'s pad over `DailyClose` (the
+          // pair #973 measured) would select `DailyClose` in the preview.
+          // The editor surface manipulates selection, not bindings, so it wants the pre-#977
+          // behaviour — the press resolves to the host and selects it. Caught in review.
+          {...(onSelectEntity ? undefined : { [UI_TAP_ZONE_ATTR]: '' })}
+          style={{
+            position: 'absolute', left: '50%', top: '50%', transform: 'translate(-50%, -50%)',
+            // `max()`, so a value SMALLER than the element is a no-op rather than a shrink —
+            // this is a minimum, and it must never take a tap area away.
+            width: `max(100%, ${tapZone})`, height: `max(100%, ${tapZone})`,
+            zIndex: -1,
+          }}
+        />
+      );
+    }
+  }
+
   const videoLayer = node.hasVideo && UIVideoMount && !uiVisualsHidden
     ? (
       <Suspense fallback={null}>
@@ -1672,11 +1839,12 @@ function UINodeInner({ node, storeState, onSelectEntity, renderCanvas2D, uiVisua
       // nothing recorded belongs to the panel), and the dialog dismisses. See pressOrigin.ts's
       // "⚠️ LIMIT" section — the gate only protects nodes carrying the marker.
       <div ref={attachScroll} style={style} onClick={handleClick} data-entity-id={node.entityId} {...touchAttrs} {...(takesClick ? { [UI_PRESS_ORIGIN_ATTR]: '' } : undefined)}>
+        {tapZoneLayer}
         {nineSliceLayer}
         {videoLayer}
         {canvas2DContent}
         {node.children.map(child => (
-          <UINode key={child.entityId} node={child} storeState={storeState} onSelectEntity={onSelectEntity} renderCanvas2D={renderCanvas2D} uiVisualsHidden={uiVisualsHidden} inheritedFontFamily={node.fontFamily || inheritedFontFamily} />
+          <UINode key={uiNodeKey(child)} node={child} storeState={storeState} onSelectEntity={onSelectEntity} renderCanvas2D={renderCanvas2D} uiVisualsHidden={uiVisualsHidden} inheritedFontFamily={node.fontFamily || inheritedFontFamily} />
         ))}
       </div>
     );
@@ -1733,11 +1901,12 @@ function UINodeInner({ node, storeState, onSelectEntity, renderCanvas2D, uiVisua
   return (
     // `takesClick`, not `isInteractive` — see the canvas2D return above for why (#728).
     <div ref={attachScroll} style={style} onClick={handleClick} data-entity-id={node.entityId} {...touchAttrs} {...(takesClick ? { [UI_PRESS_ORIGIN_ATTR]: '' } : undefined)}>
+      {tapZoneLayer}
       {nineSliceLayer}
       {videoLayer}
       {textContent}
       {node.children.map(child => (
-        <UINode key={child.entityId} node={child} storeState={storeState} onSelectEntity={onSelectEntity} renderCanvas2D={renderCanvas2D} uiVisualsHidden={uiVisualsHidden} inheritedFontFamily={node.fontFamily || inheritedFontFamily} />
+        <UINode key={uiNodeKey(child)} node={child} storeState={storeState} onSelectEntity={onSelectEntity} renderCanvas2D={renderCanvas2D} uiVisualsHidden={uiVisualsHidden} inheritedFontFamily={node.fontFamily || inheritedFontFamily} />
       ))}
     </div>
   );

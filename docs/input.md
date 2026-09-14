@@ -163,6 +163,15 @@ UI tree a second time inside SceneView's authoring preview, where a click manipu
 selection, not the running game, and must never claim its pointer. A game's own DOM chrome (like
 `rulesDialog.ts`) registers/unregisters manually around its own mount/unmount.
 
+**A HOST's ingestion scope (an allowlist beside the denylist, #1182).** Block roots suit a game,
+which owns the document. A host that embeds the game in its own UI does not own the document that
+way. Its chrome registers nothing, so every press on it would latch and `setPointerCapture` as the
+game's gesture. `setPointerIngestScope(fn)` (same module) lets the host say which targets are the
+game's. `pointerSource`'s pointerdown and wheel handlers and `gestureSource`'s pointerdown handler
+drop a rejected press before any latch or capture, silently (no `input.pointer.blocked`). It is null
+in a shipped game and fails open. The editor's policy is the Game panel's play area; see
+[editor-input.md](./editor-input.md) § "The pointer ingestion scope".
+
 **A stranded synthetic press, and why a real finger reclaims it (#299).** The primary-touch rule —
 the first pointer down owns the gesture, later pointers are ignored until it lifts — assumes the
 owning press eventually lifts. (This section is about `pointerSource` specifically; `gestureSource`
@@ -609,7 +618,7 @@ notice if those three calls were deleted.
 ## On-screen touch controls — the d-pad
 
 Until #297 the engine had **no touch locomotion of any kind**. Every game here was either
-drag/tap native by design (sling, space-invader, chess, court) or keyboard-only — and
+drag/tap native by design (sling, space-invader, court) or keyboard-only — and
 `demos/forest-camp`, the flagship demo published with real iOS + Android native, told players on
 an A23 "WASD to walk" and gave them no way to walk at all (Testboard `xlbhRT4PjuJaK9tLos49`).
 
@@ -760,6 +769,17 @@ swap is visible as itself. **Compare it for EQUALITY only**: it is an identity s
 measurement, so ordering or subtracting two values means nothing. It is 0 on a frame the source did
 not run (suppressed by the host gate, or no source registered) and never 0 while a pointer is live, so
 a consumer may read 0 as a discontinuity too.
+
+**Which set a tap went down in — `tapSetVersion`.** On the frame `tapped` is true it holds the
+`pointerSetVersion` from the moment the tap's finger went down (0 otherwise). A consumer that kept the
+version of a frame it sampled compares the two for equality: equal means a frame it sampled had this
+tap's finger down, alone; unequal means the press and the lift both fell between two samples. ⚠️ Equal
+does not mean that frame was the PRESS — the finger may already have moved. To hold state as of the
+press (a view, a hit target), record it on the FIRST frame a version appears and never re-take it for
+the same version. It exists so a consumer never has to reason "exactly one lift since
+my last frame" by subtracting versions — how far a lift, a land or a reset moves the stamp is not part
+of the contract. Wordweave's paid reveal resolves a tap through the crossword view it snapshotted on
+the first frame it sampled the tapping finger's set (#951).
 
 ⚠️ **Every mutation of `gestureSource`'s live list goes through `addPointer`/`removePointer`/
 `clearPointers`.** An inline `live.push` or `live.length = 0` would leave the version describing a set

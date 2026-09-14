@@ -31,6 +31,25 @@ data `layout-bounds` reports) rather than a second projection that could drift f
 Implementation: `engine/app/debug/entityResolve.ts` + the `resolve-entity-point` op, wired into the
 one `resolvePoint` seam in `engine/electron/inputRoutes.ts` so all five aimed routes get it at once.
 
+**Every bounds entry carries the entity it was drawn for, and a dead one is not measured** (#1197).
+Each provider walks a renderer cache keyed by entity id (3D `ecsObjects`/`skinned`/`billboards`/
+`textMeshes`/SceneView icon gizmos, 2D `Scene2DRenderer.slots`), and those are swept only on the
+renderer's NEXT pass — while koota hands a destroyed entity's index to the next spawn. Between the two,
+an id-only read returned the DEAD entity's rect under the newcomer's id, so an entity aim tapped where
+the dead entity had been. Measured on `games/3d-test` (2026-09-14): a `modoki_eval` that deleted a mesh,
+created an entity reclaiming its index and read `collectScreenBounds` in one task got the destroyed
+mesh's rect on BOTH `scene-view` and `game-3d`. The reachable windows are one JS task (an eval body;
+`uiFocusSystem`, which reads bounds inside the ECS tick before that frame's render sync) — a
+`modoki_batch` was measured to let a frame run between steps. So every source stamps the packed entity
+(`entity.valueOf()`) on each visit — `RenderState.ecsOwners`, the `skinned` `EntityTable`, an `owner`
+field on billboard/text/flame entries, SceneView's `gizmoOwners`, Scene2D's `activeIds` — and
+`isLiveOwner` (`runtime/rendering/entityScreenBounds.ts`) drops a missing or dead stamp. Inside the
+window the newcomer has no rect (the aim refuses) until the next pass measures it. The SceneView 3D
+picker (`pickAt`, the occlusion probe below) gathers from the same maps and applies the same check.
+⚠️ **A new bounds source must stamp on EVERY visit, not at build**: a same-kind respawn keeps the entry,
+so a build-time stamp names the dead entity forever and the newcomer is never measurable again —
+permanently worse than the one-frame bug. `boundsSourcesOf` is typed so a source cannot omit its owner.
+
 **A COVERED aim is refused, whichever resolvable form it took** (2026-08-19). `entity` and
 `selector` are one category — both resolved server-side inside the call — so both now answer
 `OCCLUDED` (400) naming the cover, with `allowOccluded:true` as the escape hatch. The selector path
@@ -39,6 +58,59 @@ used to press anyway and report `occluded:true` beside `ok:true`; that is the fa
 along, and the editor was the lone holdout. Raw `{x,y}` is exempt — a coordinate is what you asked
 for. One carve-out, about delivery rather than aim: `modoki_pointer`'s `move`/`up` go to whatever
 captured the press, so occlusion at the destination cannot stop them and is not checked.
+
+**⚠️ "Topmost element" is not the rule any more — the GESTURE decides** (#1016). The occlusion
+check used to ask `document.elementFromPoint` and treat anything that is not the target or its
+descendant as a cover. #977 broke that: a `UIElement.minTapSize` expander is stamped `data-tap-zone`
+and **loses** the press to real content underneath it, so a zone overhanging a neighbour left
+`modoki_tap` refusing an aim a human's finger reaches — and naming a bare anonymous `div` the caller
+could not act on. The aim surface now asks the runtime's own `resolveTapZoneVeto`, so the router and
+the agent cannot disagree about who gets the click.
+
+**Only a TAP gets that redirect**, and the carve-out is the whole design rather than a caveat.
+`AimGesture` (`app/debug/domPointContract.ts`) is a typed field on both point contracts, rides the
+existing IPC payload, and is a **required** parameter on `occlusionAt`/`aimProvenance` — no default,
+because a default is what lets the next call site silently inherit tap semantics.
+
+| gesture | routes | redirect? |
+|---|---|---|
+| `tap` | `modoki_tap`, `device_tap` — **primary button only** | **yes** — press and release at one point is what `pressOrigin.ts` redirects. A right/middle press fires `contextmenu`/`auxclick`, which `pressOrigin` does not listen for, so it is modelled as `press` |
+| `drag` | `modoki_drag` (`from`/`to`), `modoki_dnd`, `device_drag` | no — the release is elsewhere, so the zone really does take it |
+| `press` | `modoki_pointer` `down`/`move`/`up`, `device_pointer` | no — **not** because a press has no release (`down`+`up` at one point IS a click and the runtime does redirect it), but because the route resolves the aim at `down` time and cannot yet know whether an `up` or a `move` follows. Strict side by choice |
+| `hover`, `scroll` | `modoki_hover`, `modoki_scroll`, `device_hover`, `device_scroll` | no — no press at all |
+
+⚠️ **All THREE aim paths carry it, and the count matters** — each was missed in turn, and each
+miss left #1016 unfixed on a surface further from where anyone was looking:
+1. the **editor** routes, through `inputRoutes.ts`'s `resolvePoint`;
+2. the **synthetic device** routes, through `bridge.ts`'s `resolveAim`;
+3. the **trusted CDP/WDA** routes, through `deviceAim.ts`'s `resolveAimViaDevice`.
+
+⚠️ The third is the one that runs against the SHIPPED game on a real phone — the only place an
+authored `minTapSize` zone exists at all — and it is NOT reached by threading `bridge.ts`. Its
+`params` is the raw MCP payload, and `device_tap`'s schema is `{selector, x, y}` with no gesture
+field, so the route must SUPPLY one; forwarding `...params` carried nothing and every trusted aim
+fell to the strict answer. Fixing (2) without (3) fixed the fallback path — synthetic input, which
+already flags itself with a banner — and left the trusted path exactly as it was. `tap_handle`/`drag_handle` are NOT in this table: they resolve HANDLE
+geometry rather than a DOM point, and pass `press`. ⚠️ Not because handles are all canvas —
+`computeHandles` also carries the editor's DOM `[data-ui-id]` handles — but because those paint
+above the game viewport, so a game's tap zone cannot cover one. `tap_handle` IS click-shaped and
+refuses on this field, so if a chrome handle ever moves under game UI, that is where a stale
+refusal appears.
+
+⚠️ **Applying it to a drag would be worse than the bug it fixes.** `modoki_drag {from:{entity:'X'}}`
+under a neighbour's expander would stop being refused, be dispatched, begin the gesture on the
+ZONE'S HOST, and report success — `mcp-tool-conventions.md` §0's rank-1 failure. A fix that made the
+tap case right without the gesture split was written and reverted (`75ba25601`) for exactly that.
+
+⚠️ **A zone that legitimately KEEPS the press is still a refusal**, and it now says so usefully:
+*"the minTapSize tap zone of entity 31"* rather than `div in the "Game" panel`. The refusal was
+always correct; it was the naming that made it unactionable. It names the host by
+**`data-entity-id`** — the handle an agent already aims by — because that is the only identifier a
+shipping `UINode` host carries: no `id`, no `className`, no `data-ui-id`. An earlier draft used
+`describeElement` and this sentence promised *"of `#pager-next`"*, which was an artefact of a test
+fixture setting an `id` no real node has; production read *"of div"*, strictly less than the message
+it replaced. When the host names nothing at all it falls back to the panel context rather than
+announcing an anonymous owner.
 
 **`occlusionScope` — the honest half, and the part to actually read.** An entity aim reports how far
 the occlusion check could see, because `occluded:false` does not mean the same thing on every path:
@@ -306,6 +378,37 @@ position and acting on it. Precedence is `entity` → `selector` → `{x,y}`.
 inline-styled div soup, which is exactly why the curated path below addresses by stable id
 instead of CSS path.
 
+### `label` — the curated set, named the way a human reads it (#1153)
+
+Transcripts showed 213 `modoki_eval` calls finding a button by its visible text and calling
+`.click()`. That click is untrusted, bypasses hit-testing, and so skips the occlusion refusal. A
+`label` aim (plus an optional `within` CSS scope) replaces it. Four decisions shape it:
+
+- **Population = the chrome HANDLE set, not all text on the page.** `resolveLabel` in
+  `domResolve.ts` calls `collectHandles({editor:'chrome', label})`: the exact list
+  `modoki_handles {editor:'chrome', label}` returns, matched by the same `labelMatches`. So a
+  label an agent READ is a label it can AIM at. A text scrape would reach untagged elements too,
+  but a paragraph reading "Save" is not a Save button, and first-in-DOM would decide which one
+  got pressed.
+- **Only on-window candidates count.** A label that is off-window, zero-size, or scrolled out of
+  its container behind a visible twin cannot receive a press. Counting it would make ordinary
+  labels `AMBIGUOUS` over things nobody can see. A LONE scrolled-out match is still returned, so
+  the route's SCROLLED OUT refusal fires instead of a misleading `NOT_FOUND`.
+- **Whole label, case-insensitive, never a substring.** Substring matching would make "Save" hit
+  "Save All" and turn every short label into an ambiguity. A miss *suggests* labels that contain
+  the text; it never aims at them.
+- **It rides `resolvePoint`'s selector branch.** Occlusion, scrolled-out and layout-settling
+  diagnoses are the same code for both aims. `label` together with `selector` or `entity` is
+  refused `AMBIGUOUS`. The older `entity` → `selector` → `{x,y}` order is precedence only because
+  legacy calls sent both; nothing ever sent a label alongside another aim. `modoki_focus` resolves
+  a label through the same op and focuses the returned `uiId`.
+
+A label is the element's `data-ui-label`, else its text, else `title`/`aria-label`. A `<select>`
+or `<textarea>` skips its text, because a select's text is every option run together (the
+SceneView mode select labelled itself "3D2D"). The label is **uncapped at the provider** so a
+long one still matches its own full text; `computeHandles` caps it at 60 characters for the
+report only.
+
 ## Editor chrome as handle providers
 
 Surfaces an agent must drive carry a `data-ui-id="<panel>.<region>.<name>"` attribute. The test
@@ -329,6 +432,31 @@ The handle shape carries three fields that make chrome addressing robust:
 - **`rect`** (not just the center point) → overlap between handles is computable.
 - **`meta.disabled`** → a greyed-out Paste is reported as data, not left for the agent to infer
   from a pixel shade.
+- **`meta.value` / `meta.checked` / `meta.expanded`** (#1152) → read from the ELEMENT, not from
+  an attribute a component must remember to set. 314 evals read Inspector and dialog values by
+  walking the DOM, because `data-ui-state` is opt-in and a text field never opted in. A
+  `type=password` value is masked, because the report lands in a transcript. **Mixed is its own
+  answer (`meta.mixed`), not a value.** A differing multi-selection draws a checkbox as
+  `checked={false}` + `indeterminate`, and a text field as `value=''` behind the `----`
+  placeholder. Reading only `checked`/`value` reported a definite false and an "empty" field.
+  - **Checkboxes:** the DOM's `indeterminate` flag.
+  - **Everything else:** keyed on what every mixed control already RENDERS — an empty
+    input/textarea whose placeholder is `MIXED_PLACEHOLDER`, or a select whose selected option is.
+    The constant now lives in `runtime/rendering/mixedPlaceholder.ts` (a side-effect-free module: the
+    first home, `interactionHandles.ts`, runs `onWorldSwap` at load and broke four editor suites that
+    mock `core/ecs/world`), since the reader also
+    runs on device and must not import the editor.
+  - **Why not a per-producer marker:** the first fix used one (`data-ui-mixed` in `fields.tsx`),
+    and review found the Inspector's own `NumberField` and five texture selects render mixed
+    without it. `data-ui-mixed` remains only on `NumberField`'s range slider, which cannot show
+    a placeholder.
+  - **Producer test:** `tests/editor/mixedFieldHandles.test.tsx` renders the real components.
+- **Dock tabs** are tagged through FlexLayout's `onRenderTab`
+  (`editor/layoutTabTag.ts` → `layout.tab.<component>`, `kind:'tab'`, state selected/unselected).
+  FlexLayout puts no attributes on its tab BUTTON, so the tab's content span carries them, and a
+  press on it bubbles to the button. ⚠️ FlexLayout also renders every tab as a *stamp* inside
+  `.flexlayout__layout_tab_stamps` at y≈-9960, through the same hook. Measured live, every
+  `layout.tab.*` id came back twice, so `chromeHandles` skips that container (`RENDERED_COPY_CONTAINERS`).
 - **`meta.state`** (from an optional `data-ui-state` on the element) → the same argument for a
   control that has a CURRENT VALUE rather than just a pressed/not-pressed. A segmented
   Auto | On | Off row renders its active segment as a background colour, which is unreadable in a
@@ -632,6 +760,16 @@ supposedly already hardened against.
   common path rather than a corner. The MEASUREMENT is still the point: when text really does not
   land, the live cause is a field that reformats, truncates or rejects input as you type, and
   `valueAfter` names what it actually accepted.
+
+  ⚠️ **There are TWO causes, and the message now says which one** (#1081). The sentence above was
+  the only one offered, and it is false for the second: `sendInputEvent` takes an ACCELERATOR NAME
+  as its `keyCode`, so a character with no such name is never put on the wire and the FIELD never
+  sees it. A `\n` was exactly that — it inserted nothing while the refusal blamed the field, and
+  `submitKey:'Enter'` reported success having inserted nothing, because a bare keyDown/keyUp pair
+  carries no text for any spelling. Newline and tab are mapped to the spellings that do insert
+  (measured, Electron 43.2.0); any other control character is refused BY NAME as the tool's own
+  limit. When you read "reformats, truncates or rejects", the field really is the party that
+  refused it.
 - **`press_key`'s warning over-claimed.** It said a focused field "will swallow this key" on a
   press where `f` demonstrably framed the selection (camera `[12,15,20]` → `[-0.1,1.4,1.8]`).
 
@@ -679,6 +817,73 @@ gives `committed:true` (136 → 141 entities, `undoLabel: 'Instantiate "Cone"'`)
 really was accepted; some legitimate drops make no undoable edit (a file move writes to disk), so
 downgrading them would trade a false success for a false failure across drop targets nobody has
 enumerated. The warning says exactly what is known and no more.
+
+#### ⚠️ `committed` watches the STACK, not the scene-dirty counter (#1142, fixed 2026-09-13)
+
+Read the paragraph above carefully and it states the right criterion — *"not one undo entry pushed,
+which is the decisive part, since every real editor mutation pushes one."* The **wiring measured
+something else**, for over a year: it read `getEditVersion`, and that counter is not "did anything
+happen". It answers *"does the live world now differ from disk"* for the save baseline
+(`editor/scene/serialize.ts`), so `undoManager.pushAction` bumps it behind
+
+```ts
+// in BOTH `pushAction` and `runStep` (undo/redo) — undoManager.ts
+if (!action._isSelection && !action._isFileDirect) notifyEdited();
+```
+
+`_editVersion` therefore counts a **strict subset of the undo stack**, and every asset-panel edit is
+`_isFileDirect: true` — so EVERY drop onto a Skin/material/particle editor came back
+`committed:false` plus "the drop probably did nothing", on edits that had demonstrably landed and
+were undoable. Two QA cases carried a paragraph telling runners to ignore it.
+
+The probe now samples **three** counters (`EditWitness` in `app/debug/domDnd.ts`), because the
+editor genuinely has three answers and no two of them are the same question:
+
+| counter | what it sees | why it is needed |
+|---|---|---|
+| `getUndoVersion()` | every stack push, `_isFileDirect` included | catches a skin-bone reparent |
+| `getDirtyAssetsVersion()` | parked asset-document writes | catches an **atlas** member drop, which calls `persistAssetEdit` and pushes **no undo entry at all** (`AtlasAssetView.tsx`) — invisible to both other counters |
+| `getEditVersion()` | edits that count as unsaved SCENE work (everything not `_isSelection`/`_isFileDirect`) | no longer the verdict; kept as the DISCRIMINATOR behind the new `committedTo: 'scene' \| 'asset-document'` |
+
+`committed` is now "the stack **or** the registry moved". Measured live on `games/skin-test`
+(2026-09-13): a bone reparent gives `committed:true, committedTo:'asset-document'` with no warning,
+and `undoLabel` reads `rig2d reparent bone`; an atlas edit adds the atlas to `dirtyAssetPaths` while
+`undoLabel` does **not** change — which is exactly why the third counter exists.
+
+⚠️ **Do not "simplify" this by widening the `undoManager` guard instead.** That guard is correct:
+`hasUnsavedChanges()`, the title-bar dot and the scene-save baseline all read `_editVersion`, and
+making it count selection or file-direct actions would make a bare click read as unsaved work. The
+defect was the READER, not the guard.
+
+⚠️ **`committedTo:'scene'` means "bumped the save baseline", NOT "touched a scene entity".** An
+Assets **file move** pushes a plain undo action (`panels/assetUndo.ts` sets `_isFileDirect` on
+nothing), so it counts as scene work and is labelled `scene` while touching no entity. That is the
+counter being reported honestly, not a bug in the label — but do not read `scene` as "an entity
+changed".
+
+⚠️ **entity→Assets prefab-create is NOT an example of that**, though an earlier version of this
+paragraph said it was: `createPrefabFromEntity` → `tagEntityTreeAsInstance` writes a
+`PrefabInstance` trait to every node in the subtree, so `scene` is simply the correct label. Stated
+because the wrong version would have told an agent its entities were untouched when a trait had
+just been written to each of them.
+
+⚠️ **What still reaches the no-commit warning**, now that an asset-document drop does not. Both are
+real and neither is a defect in the probe:
+- a handler still running after `COMMIT_SETTLE_MS` (400 ms) — a prefab fetch with nested-prefab
+  preloading, or a Skin sprite drop's alpha-mask readback. ⚠️ **Not an OS-file import**: it is
+  gated on `dataTransfer.files.length`, and `performDomDnd` builds a bare `new DataTransfer()` that
+  only the page's own `dragstart` handler ever fills via `setData` — a synthetic drop cannot carry
+  a File, so that branch is unreachable from this tool at all;
+- a drop that records in **neither** place — the Project Settings path fields adopt the file
+  server-side and keep the value in dialog-local state, so no counter can see it.
+
+⚠️ Four known imprecisions in the other direction, each needing an unrelated event inside the same
+400 ms window: `getDirtyAssetsVersion()` bumps on park **and** flush/discard (a racing `save_all`);
+`getUndoVersion()` bumps for a `_isSelection` push (latent — no drop target's only effect is a
+selection today); it bumps from `clearHistory`/`truncateUndoTo`/`swapHistory`, so a scene
+hot-reload mid-window reads as a commit; and it bumps from `undo()`/`redo()` themselves, so a HUMAN
+pressing Cmd+Z mid-window does too — likelier than the third, and the list said "three" until a
+review counted them.
 - [x] Apply the same question to the **device twin** (`device_tap`/`device_drag`/`device_pointer`/
       `device_press_key`/`device_hover`/`device_scroll`/`device_type_text`) — it dispatched SYNTHETIC
       DOM events, never OS-level trusted input, a strictly weaker fidelity position than the editor

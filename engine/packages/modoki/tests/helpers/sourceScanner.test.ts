@@ -39,22 +39,27 @@
  * mutation is covered elsewhere.
  */
 
-import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { existsSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
+
 import { basename, dirname, join, relative } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import {
   assertEveryCodeTokenSurvives,
   assertScanIsSane,
+  commentText,
   findDamagedCodeTokens,
   readScannedSource,
+  scanLanguageOf,
   stripComments,
   stripCommentsAndStrings,
+  insideShellSubstitution,
+  shellLogicalLines,
   stripHashComments,
   stripSwiftComments,
 } from './sourceScanner';
 import { repoFiles } from '../../../../scripts/repoCorpus.mjs';
+import { makeScratchDir } from './scratchDir';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const RUNTIME = join(HERE, '../../src/runtime');
@@ -71,7 +76,7 @@ const brokenRegexStrip = (src: string): string =>
 describe('the scanner survives the constructs that broke its predecessors (#411, #418, #419)', () => {
   const cases: ReadonlyArray<{ what: string; src: string; ticket: string }> = [
     // ── #411: a block-comment opener inside a LINE comment ──────────────────────────────────────
-    // The defect this module was extracted for. `Scene3D.tsx:28` writes this exact glob in prose
+    // The defect this module was extracted for. `Scene3D.tsx`'s comment on its `rawNow` import writes this exact glob in prose
     // and it deleted 82 lines — 22 of them imports — from the determinism guard's view.
     { ticket: '#411', what: 'a `/*` glob written inside a line comment',
       src: '// a direct performance.now() in runtime/** fails the guard\nprobe(x);\n/* later */' },
@@ -328,7 +333,7 @@ describe('⚠️ the FORWARD guard: no file the engine guards scan is damaged by
   });
 
   it('the file that proved the old stripper defeats the determinism guard is intact', () => {
-    // ⚠️ The measured #419 case, pinned by name. `Scene3D.tsx:28`'s line comment writes the glob
+    // ⚠️ The measured #419 case, pinned by name. `Scene3D.tsx`'s line comment on its `rawNow` import writes the glob
     // `runtime/**`; under the regex stripper that opened a phantom block running to the next `*/`
     // and deleted 82 lines including 22 `import` statements, so a `performance.now()` planted
     // anywhere in that window left `determinismGuard.test.ts` green.
@@ -401,7 +406,7 @@ describe('readScannedSource is the one read, and REFUSES rather than falling bac
     return p;
   };
 
-  beforeEach(() => { dir = mkdtempSync(join(tmpdir(), 'scanned-')); });
+  beforeEach(() => { dir = makeScratchDir('scanned-'); });
   afterEach(() => { rmSync(dir, { recursive: true, force: true }); });
 
   it('strips by extension and hands back a code view aligned with raw', () => {
@@ -465,5 +470,130 @@ describe('readScannedSource is the one read, and REFUSES rather than falling bac
     const { code } = readScannedSource(p, { language: 'shell' });
     expect(code).toContain('run');
     expect(code).not.toContain('note');
+  });
+
+  it('scanLanguageOf answers exactly what readScannedSource would do with the extension', () => {
+    expect(scanLanguageOf('a/b.tsx')).toBe('js');
+    expect(scanLanguageOf('Plugin.JAVA')).toBe('braces');
+    expect(scanLanguageOf('notes.md')).toBeUndefined();
+    expect(() => readScannedSource(write('notes.md', 'x\n'))).toThrow(/no comment stripper/);
+  });
+});
+
+describe('commentText is the comments and nothing else (#1186)', () => {
+  let dir: string;
+  beforeEach(() => { dir = makeScratchDir('comments-'); });
+  afterEach(() => { rmSync(dir, { recursive: true, force: true }); });
+  const read = (name: string, body: string) => {
+    const p = join(dir, name);
+    writeFileSync(p, body, 'utf8');
+    return commentText(readScannedSource(p));
+  };
+
+  it('JS: keeps line and block comment prose, blanks code and string CONTENT, keeps line numbers', () => {
+    const text = read('a.ts', [
+      'const url = "see a.ts:12"; // cites b.ts:34',
+      '/* block',
+      '   c.ts:56 */ const x = `d.ts:78`;',
+      '',
+    ].join('\n'));
+    expect(text.length, 'length-preserving, so an offset is still a real offset').toBe(
+      'const url = "see a.ts:12"; // cites b.ts:34\n/* block\n   c.ts:56 */ const x = `d.ts:78`;\n'.length,
+    );
+    const lines = text.split('\n');
+    expect(lines[0]).toContain('b.ts:34');
+    expect(lines[0], 'a string is not a comment (owner ruling on #1186: comments only)').not.toContain('a.ts:12');
+    expect(lines[2]).toContain('c.ts:56');
+    expect(lines[2]).not.toContain('d.ts:78');
+    expect(lines[2]).not.toContain('const');
+  });
+
+  it('shell and Swift comments come through too, so the corpus is every language the scanner reads', () => {
+    expect(read('s.sh', 'echo "x.ts:9" # see y.ts:10\n')).toContain('y.ts:10');
+    expect(read('s.sh', 'echo "x.ts:9" # see y.ts:10\n')).not.toContain('x.ts:9');
+    expect(read('P.swift', 'let s = "q.swift:1" /* r.swift:22 */\n')).toContain('r.swift:22');
+  });
+
+  it("a comments:'include' read yields NO comment text, which is why a caller must assert it found some", () => {
+    const p = join(dir, 'b.ts');
+    writeFileSync(p, 'const a = 1; // b.ts:34\n', 'utf8');
+    expect(commentText(readScannedSource(p, { comments: 'include', reason: 'probe' })).trim()).toBe('');
+  });
+
+  it('refuses a view that is not length-aligned', () => {
+    expect(() => commentText({ raw: 'ab', code: 'a', path: 'x.ts' })).toThrow(/length-preserving/);
+  });
+});
+
+describe('shellLogicalLines — one COMMAND, however it is wrapped (#1179)', () => {
+  const logical = (src: string) => shellLogicalLines(src).map((l) => `${l.line}: ${l.text}`);
+
+  it('joins a backslash-newline, and cites the line the command starts on', () => {
+    expect(logical('echo a\nnode "$PATHS" kill "$APP" \\\n  2>/dev/null \\\n  || true\necho b')).toEqual([
+      '1: echo a',
+      '2: node "$PATHS" kill "$APP"   2>/dev/null   || true',
+      '5: echo b',
+    ]);
+  });
+
+  it('does NOT join across &&, ||, a pipe, or a quote left open — each would let the next command vouch', () => {
+    expect(logical('a &&\nb 2>/dev/null\nc |\nd\necho "open\nx"')).toEqual([
+      '1: a &&', '2: b 2>/dev/null', '3: c |', '4: d', '5: echo "open', '6: x"',
+    ]);
+  });
+
+  it('a backslash inside single quotes, or an escaped backslash, ends nothing', () => {
+    expect(logical("echo 'a\\\\'\nnext\necho x\\\\\\\\\nnext2\necho \"q\\\\\"\nnext3")).toEqual([
+      "1: echo 'a\\\\'", '2: next', '3: echo x\\\\\\\\', '4: next2', '5: echo "q\\\\"', '6: next3',
+    ]);
+  });
+
+  it('a single quote left open at the end of a line does not leak into the next command', () => {
+    // A heredoc body's apostrophe, or a broken line: the quote state resets per command, so the next
+    // command's own continuation still joins.
+    expect(logical("echo 'open\na \\\nb")).toEqual(["1: echo 'open", '2: a b']);
+    // …and a backslash at the end of a line INSIDE single quotes is literal: it joins nothing.
+    expect(logical("echo 'lit \\\nnext'")).toEqual(["1: echo 'lit \\", "2: next'"]);
+  });
+
+  it('a CRLF checkout joins the same commands an LF one does', () => {
+    expect(logical('a \\\r\n  b\r\nc\r\n')).toEqual(['1: a   b', '3: c', '4: ']);
+  });
+
+  it('an escaped quote does not open a string, and a trailing continuation at EOF is kept', () => {
+    expect(logical("echo \\' \\\nstill\nlast \\")).toEqual(["1: echo \\' still", '3: last ']);
+  });
+});
+describe('insideShellSubstitution — whether a position runs as a value, not a command (#1179 P7)', () => {
+  const at = (text: string, needle: string) => insideShellSubstitution(text, text.indexOf(needle));
+  it('counts $( and backticks from the start of the line, past separators inside them', () => {
+    expect([
+      at('R="$(cd "$REPO" && node kill 2>/dev/null || true)"', 'node'),
+      at('x=$(true; node kill)', 'node'),
+      at('x=`echo a | node kill`', 'node'),
+      at('echo "v: $("$BIN" --version)"', '"$BIN"'),
+      at('x=$($(pwd)/bin $BIN)', '$BIN'),
+      // A `)` with no open substitution (a `case` pattern) closes nothing.
+      at('case $k in a) R=$(node kill', 'node'),
+      // An apostrophe inside double quotes is literal; the `$(` after it still opens.
+      at('echo "[smoke] can\'t start: $("$BIN" --version)"', '"$BIN"'),
+      at('echo "it\'s"; X=$("$BIN")', '"$BIN")'),
+      // A plain `(` inside a substitution is its own level: its `)` does not close the substitution.
+      at('X=$(f (a) "$BIN")', '"$BIN"'),
+      // A `)` inside a double-quoted string INSIDE a substitution closes nothing.
+      at('X=$(echo ":)"; node kill 2>/dev/null)', 'node'),
+      // A backtick substitution inside double quotes still opens.
+      at('echo "v: `"$BIN" --version`"', '"$BIN"'),
+    ]).toEqual([true, true, true, true, true, true, true, true, true, true, true]);
+  });
+  it('a closed substitution, a single-quoted $( and an escaped backtick are not', () => {
+    expect([
+      at('OUT=$(node x) node kill', 'node kill'),
+      at("echo '$(' node kill", 'node kill'),
+      // A `$(` inside single quotes INSIDE a substitution opens nothing; the substitution closes.
+      at("X=$(sed 's/$(/x/' f); node kill", 'node kill'),
+      at('echo \\` node kill', 'node kill'),
+      at('node kill', 'node'),
+    ]).toEqual([false, false, false, false, false]);
   });
 });

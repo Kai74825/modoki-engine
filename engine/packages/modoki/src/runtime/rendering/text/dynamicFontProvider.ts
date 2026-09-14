@@ -18,6 +18,7 @@
  *  and draw one mesh per page a text string touches.
  */
 
+import { notifyListeners } from '../../core/notifyListeners';
 import type { FontProvider } from './fontProvider';
 import type { Glyph, FontMetrics, AtlasInfo, GlyphAtlas } from './glyphAtlas';
 import { kerningKey } from './glyphAtlas';
@@ -392,7 +393,7 @@ export class DynamicFontProvider implements FontProvider {
       // succeeded stays resolved.
       //
       // ⚠️ BOUNDED, and the bound is the point — same rule as the scratch-overflow path below
-      // (~:424), whose comment already rejects the unbounded shape. `ensureGlyphs` runs per
+      // (generateChunk's scratch-overflow re-queue), whose comment already rejects the unbounded shape. `ensureGlyphs` runs per
       // FRAME for any text whose layout hash changes every frame (a countdown, a score, a
       // typewriter reveal), so an unconditional un-stick turns a PERMANENTLY failing font
       // (a .ttf 404 after an OTA swap) into request → fail → delete → re-request at fetch
@@ -408,16 +409,22 @@ export class DynamicFontProvider implements FontProvider {
         for (const cp of batch) this.requested.delete(cp);
         // #635: the un-stick above is a promise this batch gets ANOTHER lap, but for STATIC
         // text (a label whose string never changes — "TAP TO START") no lap ever arrives on
-        // its own. Both production `ensureGlyphs` call sites are gated on a layout hash whose
+        // its own. ⚠️ There are THREE production `ensureGlyphs` call sites since #1038, not two:
+        // `measureText2D` added one, and unlike the two renderers it is NOT gated on a layout hash
+        // — a caller measuring the same string every frame calls through every frame. That is
+        // bounded and cheap (a resident-glyph `ensureGlyphs` is N set lookups plus an LRU touch,
+        // and the whole measure costs ~0.84 us), and it makes the static-label case STRICTLY
+        // better here rather than worse: an ungated caller supplies exactly the extra lap this
+        // comment says never arrives. The two RENDERER call sites are gated on a layout hash whose
         // only provider-controlled inputs (`atlasVersion`, `markTextDirty()`) move ONLY on the
-        // success path below (~:496-497) — a failed flush never touches either, so a static
+        // success path at generateChunk's tail — a failed flush never touches either, so a static
         // label's hash never changes and `ensureGlyphs` is never called again for it. Text
         // whose hash moves every frame (a countdown, a score) recovers by accident, which is
         // why this survived: the un-stick alone is sufficient there, but not here. Arm a timer
         // to re-queue the batch ourselves instead of waiting on a caller that will never come.
         //
         // Deliberately NOT re-added to `pending` here — this catch runs inside `flush()`,
-        // whose tail (~:394, now further down) is `if (this.pending.size) void this.flush()`;
+        // whose tail is `if (this.pending.size) void this.flush()`;
         // re-queueing into `pending` from here would re-enter `flush()` immediately and turn
         // the bounded retry `MAX_FLUSH_RETRIES` exists for into a per-frame storm. The re-queue
         // happens only inside the TIMER callback, on its own backoff schedule.
@@ -665,7 +672,7 @@ export class DynamicFontProvider implements FontProvider {
     this.disposed = true;
     this.cancelFlushRetry(); // #635: an armed retry must not fire into a disposed provider.
     // Renderer-attached per-page GPU textures clean up via their addDisposable hooks.
-    for (const fn of this.disposables) { try { fn(); } catch { /* ignore */ } }
+    notifyListeners(this.disposables, 'dynamicFontProvider:dispose', []);
     this.disposables = [];
     this.glyphMap.clear();
     this.kern.clear();

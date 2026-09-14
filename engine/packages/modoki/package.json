@@ -10,13 +10,28 @@
     "./runtime/rendering/tierBoot": "./src/runtime/rendering/tierBoot.ts",
     "./runtime/rendering/Game": "./src/runtime/rendering/Game.tsx",
     "./runtime/debug": "./src/runtime/debug/index.ts",
+    "./runtime/core/formatVersion": "./src/runtime/core/formatVersion.ts",
+    "./runtime/core/docKeys": "./src/runtime/core/docKeys.ts",
     "./runtime/core/liveness": "./src/runtime/core/liveness.ts",
     "./runtime/core/abandonment": "./src/runtime/core/abandonment.ts",
+    "./runtime/core/notifyListeners": "./src/runtime/core/notifyListeners.ts",
     "./runtime/core/consoleRing": "./src/runtime/core/consoleRing.ts",
+    "./runtime/core/errorText": "./src/runtime/core/errorText.ts",
+    "./runtime/core/jsonSafe": "./src/runtime/core/jsonSafe.ts",
+    "./runtime/core/dailyCalendar": "./src/runtime/core/dailyCalendar.ts",
+    "./runtime/core/loginBonus": "./src/runtime/core/loginBonus.ts",
     "./editor": "./src/editor/index.ts",
     "./editor/rendering": "./src/editor/rendering/index.ts",
     "./three": "./src/three/index.ts",
-    "./testing": "./tests/helpers/sourceScanner.ts"
+    "./testing": "./tests/helpers/sourceScanner.ts",
+    "./testing/tapTargetFloor": "./tests/helpers/tapTargetFloor.ts",
+    "./testing/authoredTextBudget": "./tests/helpers/authoredTextBudget.ts",
+    "./testing/fontMetrics": "./tests/helpers/fontMetrics.ts",
+    "./testing/prefabInstances": "./tests/helpers/prefabInstances.ts",
+    "./testing/exemptionLedger": "./tests/helpers/exemptionLedger.ts",
+    "./testing/sourceAst": "./tests/helpers/sourceAst.ts",
+    "./testing/inOrder": "./tests/helpers/inOrder.ts",
+    "./testing/scratchDir": "./tests/helpers/scratchDir.ts"
   },
   "scripts": {
     "test": "vitest run",
@@ -26,12 +41,12 @@
   "peerDependencies": {
     "koota": ">=0.1.0",
     "react": ">=19.0.0",
-    "three": ">=0.183.0",
+    "three": ">=0.183.0 <0.185.0",
     "zustand": ">=5.0.0"
   },
   "devDependencies": {
     "typescript": "~6.0.3",
-    "vitest": "^4.1.0"
+    "vitest": "^4.1.11"
   },
   "dependencies": {
     "@dimforge/rapier2d-compat": "^0.19.3",

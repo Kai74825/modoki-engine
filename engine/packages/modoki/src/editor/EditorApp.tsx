@@ -3,14 +3,17 @@
 import './EditorApp.css';
 import { backendFetch } from './backend/editorBackend';
 import { useRef, useState, useCallback, useEffect, useMemo, useSyncExternalStore } from 'react';
-import { Layout, Model, TabNode, Actions, DockLocation } from 'flexlayout-react';
+import { Layout, Model, TabNode, Actions, DockLocation, type ITabRenderValues } from 'flexlayout-react';
+import { layoutTabTagAttrs } from './layoutTabTag';
 import 'flexlayout-react/style/dark.css';
 
 import { PanelFocusHost } from './input/PanelFocusHost';
-import { register } from './input/keymap';
+import { register, registerBindings } from './input/keymap';
 import { useHmrEpoch } from './input/hmrEpoch';
 import { installKeymapDispatcher } from './input/dispatcher';
 import { setInputGate } from '../runtime/input/inputSources';
+import { setPointerIngestScope } from '../runtime/core/pointerBlockers';
+import { isGamePointerTarget } from './input/gamePointerScope';
 import { calibratePresentationScale } from '../runtime/input/presentationScale';
 import { forwardZoomWheel } from './input/zoomWheel';
 import SceneView from './panels/SceneView';
@@ -35,10 +38,11 @@ import OtaKeysDialog from './panels/OtaKeysDialog';
 import PanelErrorBoundary from './panels/PanelErrorBoundary';
 import { runSaveAll, toastForSave } from './scene/saveCommand';
 import { enterPlay, pausePlay } from './scene/playMode';
-import { getPlayState, setPlayState, onPlayStateChange } from '../runtime/core/playState';
+import { getPlayState, setPlayState, getRunMode, onRunModeChange } from '../runtime/core/playState';
 import { useEditorStore } from './store/editorStore';
 import { setActionCallback } from './undo/entityActions';
-import { pushAction, undo, redo, canUndo, canRedo, undoLabel, redoLabel, subscribeUndo, getUndoVersion } from './undo/undoManager';
+import { pushAction, canUndo, canRedo, undoLabel, redoLabel, subscribeUndo, getUndoVersion, undoRefusedReason } from './undo/undoManager';
+import { runUndoCommand } from './undo/undoCommand';
 
 import { getGameViewComponent, getCustomPanels, getExtraMenus, getExtraMenusVersion, subscribeExtraMenus, getProjectSettings } from './createEditor';
 import { dockPanel, toDockLocation } from './panelDock';
@@ -87,7 +91,7 @@ function resetLayout() {
 // ── Menu definitions ────────────────────────────────────
 
 import MenuBar, { type BarMenuItem } from './components/MenuBar';
-import { buildMenuSpec } from './menuSpec';
+import { buildMenuSpec, handleMenuAction } from './menuSpec';
 
 // ── Main Editor ─────────────────────────────────────────
 
@@ -278,7 +282,7 @@ export default function EditorApp() {
   // fires instead, per plan A.8), which would swallow the explanatory toast the user
   // needs. These commands always CLAIM their chord and then explain themselves.
   useEffect(() => {
-    const offs = [
+    const offBindings = registerBindings(() => [
       register({
         id: 'app.saveAll',
         keys: 'mod+s',
@@ -320,36 +324,25 @@ export default function EditorApp() {
           else void enterPlay();
         },
       }),
-      // Undo/redo edit the AUTHORED scene; during Play/Pause the live world is a throwaway
-      // snapshot that reverts on Stop, so undoing then would rewrite history against temporary
-      // state. Disabled until Stopped — same rule as Save above.
+      // Undo/redo edit the AUTHORED scene; during Play/Pause, and for a scene edit inside a
+      // scrub/preview envelope, the live world is a throwaway snapshot that reverts on Stop/Exit.
+      // The refusal itself lives in `undoStep` (`undoRefusedReason`, #1148 — this used to read
+      // `getPlayState()`, which calls a preview 'stopped'), and `runUndoCommand` toasts it.
       register({
         id: 'app.undo',
         keys: 'mod+z',
         scope: 'app-chord',
         menu: { path: 'Edit/Undo' },
-        run: () => {
-          if (getPlayState() !== 'stopped') {
-            useEditorStore.getState().showToast('Stop the game to undo — disabled during Play.', 'warn');
-            return;
-          }
-          void undo();
-        },
+        run: () => { void runUndoCommand('undo'); },
       }),
       register({
         id: 'app.redo',
         keys: 'mod+shift+z',
         scope: 'app-chord',
         menu: { path: 'Edit/Redo' },
-        run: () => {
-          if (getPlayState() !== 'stopped') {
-            useEditorStore.getState().showToast('Stop the game to undo — disabled during Play.', 'warn');
-            return;
-          }
-          void redo();
-        },
+        run: () => { void runUndoCommand('redo'); },
       }),
-    ];
+    ]);
     const offDispatch = installKeymapDispatcher();
 
     // Focus scoping for the RUNNING GAME (plan P5.1). While an editor panel other than
@@ -367,11 +360,16 @@ export default function EditorApp() {
       const p = useEditorStore.getState().focusedPanel;
       return p !== null && p !== 'game';
     });
+    // The gate above decides what the game READS each frame; it cannot stop a press on a panel from
+    // being LATCHED and pointer-captured by the game at press time, before any frame samples. This
+    // scope does that: only a press inside the Game panel's play area starts a game gesture (#1182).
+    setPointerIngestScope(isGamePointerTarget);
 
     return () => {
       setInputGate(null);
+      setPointerIngestScope(null);
       offDispatch();
-      for (const off of offs) off();
+      offBindings();
     };
     // See input/hmrEpoch.ts — 0 in production, so this stays a mount-once effect there.
   }, [hmrEpoch]);
@@ -622,15 +620,25 @@ export default function EditorApp() {
     );
   }, []);
 
+  // Tag each dock tab for the agent surface (#1152/#1153) — see layoutTabTag.ts for why the
+  // CONTENT is wrapped rather than the button.
+  const onRenderTab = useCallback((node: TabNode, renderValues: ITabRenderValues) => {
+    const attrs = layoutTabTagAttrs(node);
+    if (attrs) renderValues.content = <span {...attrs}>{renderValues.content}</span>;
+  }, []);
+
   const model = modelRef.current;
 
   // Reactive undo/redo state for the Edit menu — bumps only when the stacks
   // actually change, so the menu memo below doesn't recompute every render. (F3)
   const undoVersion = useSyncExternalStore(subscribeUndo, getUndoVersion, getUndoVersion);
-  // Reactive play state so the Edit menu's Undo/Redo enabled state recomputes on
-  // Play/Stop transitions (undo is disabled while Playing — see the Cmd+Z guard).
-  const playState = useSyncExternalStore(onPlayStateChange, getPlayState, getPlayState);
-  const canEdit = playState === 'stopped';
+  // Reactive RUN MODE so the Edit menu's Undo/Redo enabled state recomputes on every Play/Stop AND
+  // scrub/preview transition. ⚠️ Not `onPlayStateChange`: that fires only when the 3-value shim
+  // changes, and entering a preview does not change it (#1148). `undoRefusedReason` is the same
+  // predicate `undo()` itself refuses on, so the menu cannot offer what the command will refuse. It
+  // reads the entry on TOP of each stack (a clip edit is allowed inside a preview, a scene edit is
+  // not), which the memo also recomputes on — `undoVersion` bumps on every stack change.
+  const runMode = useSyncExternalStore(onRunModeChange, getRunMode, getRunMode);
   // Host-owned menus (Build) can be REPLACED after boot — the device pickers are filled from an
   // async listing that must not block editor start. Bump → rebuild the tree AND re-push the
   // Electron spec, or the OS menu keeps the boot-time labels forever.
@@ -642,6 +650,7 @@ export default function EditorApp() {
   // `menu-structure` send on most renders (toasts, import progress, nonces). (F3)
   const { menus, menuSpecJson, menuActionMap } = useMemo(() => {
     void undoVersion; // dep: undo labels/enabled are read via canUndo()/undoLabel() below
+    void runMode;     // dep: Undo/Redo enabled is read via undoRefusedReason() below, which reads the run mode imperatively
     void extraMenusVersion; // dep: getExtraMenus() below is a module registry, read imperatively
     const menus: Record<string, BarMenuItem[]> = {
     File: [
@@ -663,8 +672,8 @@ export default function EditorApp() {
       } },
     ],
     Edit: [
-      { label: canUndo() ? `Undo ${undoLabel()}` : 'Undo', shortcut: 'Cmd+Z', disabled: !canEdit || !canUndo(), action: undo },
-      { label: canRedo() ? `Redo ${redoLabel()}` : 'Redo', shortcut: 'Cmd+Shift+Z', disabled: !canEdit || !canRedo(), action: redo },
+      { label: canUndo() ? `Undo ${undoLabel()}` : 'Undo', shortcut: 'Cmd+Z', disabled: undoRefusedReason('undo') !== null || !canUndo(), action: () => { void runUndoCommand('undo'); } },
+      { label: canRedo() ? `Redo ${redoLabel()}` : 'Redo', shortcut: 'Cmd+Shift+Z', disabled: undoRefusedReason('redo') !== null || !canRedo(), action: () => { void runUndoCommand('redo'); } },
     ],
     Assets: [
       { label: 'Clean Up Unused Assets…', action: () => useEditorStore.getState().openCleanupAssets() },
@@ -703,7 +712,7 @@ export default function EditorApp() {
     // label, not just its position).
     const { menuSpec, menuActionMap } = buildMenuSpec(menus);
     return { menus, menuSpecJson: JSON.stringify(menuSpec), menuActionMap };
-  }, [layoutName, undoVersion, extraMenusVersion, canEdit, handleSaveLayout, handleSaveLayoutAs, showPanel, isPanelVisible, layoutVersion]);
+  }, [layoutName, undoVersion, extraMenusVersion, runMode, handleSaveLayout, handleSaveLayoutAs, showPanel, isPanelVisible, layoutVersion]);
 
   // Keep the click-relay's action map current with the latest memoized spec.
   menuActionRef.current = menuActionMap;
@@ -715,12 +724,15 @@ export default function EditorApp() {
   useEffect(() => {
     if (!electronBridge) return;
     return electronBridge.on('menu-action', (id) => {
-      const action = menuActionRef.current[id as string];
       // A miss means the click came from a menu that has since been rebuilt (see the id scheme
-      // above) — doing nothing is correct, but it must not be SILENT: to the user their click
-      // simply did not work, and this line is the only evidence of why.
-      if (!action) { console.warn(`[editor] ignoring a menu click for "${id}" — the menu was rebuilt since it was opened; reopen it and click again`); return; }
-      action();
+      // above) — doing nothing is correct, but it must not be SILENT. It WAS: the only evidence
+      // was a console.warn, which the user cannot see, so their click just did not work. Same
+      // mechanism as #1032 (`family/refusal-not-surfaced`); the decision lives in menuSpec.ts
+      // so it can be tested.
+      handleMenuAction(menuActionRef.current, id as string, {
+        showToast: (message, kind) => useEditorStore.getState().showToast(message, kind),
+        warn: (message) => console.warn(message),
+      });
     });
   }, []);
   // Cmd/Ctrl+wheel → whole-app UI zoom (VS Code–style). Forward the intent to main,
@@ -769,6 +781,7 @@ export default function EditorApp() {
         <Layout
           model={model}
           factory={factory}
+          onRenderTab={onRenderTab}
           onModelChange={onModelChange}
         />
       </div>

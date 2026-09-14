@@ -23,12 +23,41 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 const createdWorlds: any[] = [];
 function trackWorld<T>(w: T): T { createdWorlds.push(w); return w; }
 
+/**
+ * Re-import redirect for the `resolveSprite` mock: `ref` → the url it resolves to NOW.
+ *
+ * ⚠️ **This exists because the harness mocks the resolver, so it cannot exercise
+ * `withCacheBust` itself** — the URL derivation is stubbed out (see `mockDeps`). What the
+ * tests below cover is the CONSUMER half of #1022: given that a re-import moves the resolved
+ * url (which `textureResolver.test.ts` pins on the real code), does a LIVE sprite actually
+ * drop the old texture and bind the new one? That question is `Scene2D`'s alone, and the two
+ * existing invalidation tests cannot answer it because both despawn the sprite first.
+ *
+ * Set by a test, read by the mock, cleared here — a leaked entry would silently redirect a
+ * later test's sprite.
+ */
+const spriteUrlRedirects = new Map<string, string>();
+
 beforeEach(() => {
   vi.resetModules();
 });
 afterEach(() => {
+  spriteUrlRedirects.clear();
   for (const w of createdWorlds) { try { w.destroy(); } catch { /* already disposed */ } }
   createdWorlds.length = 0;
+  // ⚠️ **Several tests here spy `console.warn` and do not restore it** (#1110 close-out finding
+  // F4). `vi.spyOn` on an already-spied method hands back the EXISTING spy with its calls still
+  // attached, so a leaked spy makes the NEXT `[Scene2D]`-warning test count its predecessor's
+  // warnings as its own — the prune test below really did expect 2 where it wanted 1. Restoring
+  // per-test fixed one direction only: the tests were then correct because of their ORDER, and
+  // inserting or reordering one would recreate it. This closes it for the file.
+  vi.restoreAllMocks();
+  // ⚠️ **The restore above is otherwise unfalsifiable** — deleting it turns nothing red, which is
+  // precisely the bug's nature (a leaked spy only hurts the NEXT test that spies the same method).
+  // Measured both ways: with this probe, deleting the restore turns 8+ tests red; keeping both is
+  // 117/117 green.
+  expect(vi.isMockFunction(console.warn), 'a console.warn spy leaked past the file afterEach — the '
+    + 'next test to spy it would inherit these calls').toBe(false);
 });
 
 // ── PixiJS mock ────────────────────────────────────────────────────────────
@@ -286,10 +315,15 @@ function mockDeps() {
     // A 'vid:' ref stands in for a video-asset GUID: a Sprite slot that skips the
     // still-image pipeline entirely (no resolve, no Assets.load, no url retain).
     isVideoRef: (ref: string) => typeof ref === 'string' && ref.startsWith('vid:'),
+    // All three consult `spriteUrlRedirects` first, and consistently — a ref that resolves to a
+    // url must also BE an image path, or `imageMode` is false and the sprite branch is never
+    // reached at all (which is not a failure any assertion about the texture can read).
     isImagePath: (ref: string) =>
-      typeof ref === 'string' && (ref.startsWith('sheet:') || ref.startsWith('img:') || ref.startsWith('http') || ref.startsWith('/')),
+      typeof ref === 'string' && (spriteUrlRedirects.has(ref) || ref.startsWith('sheet:') || ref.startsWith('img:') || ref.startsWith('http') || ref.startsWith('/')),
     resolveImageUrl: (ref: string) => {
       if (typeof ref !== 'string') return undefined;
+      const redirected = spriteUrlRedirects.get(ref);
+      if (redirected) return redirected;
       if (ref.startsWith('sheet:')) return 'http://t/sheet.png';
       if (ref.startsWith('img:')) return ref.slice(4);
       if (ref.startsWith('http') || ref.startsWith('/')) return ref;
@@ -301,6 +335,11 @@ function mockDeps() {
       // the sprite-sheet animation case the in-place frame-swap path targets.
       const m = /^sheet:(\d+)$/.exec(ref);
       if (m) { const i = +m[1]; return { url: 'http://t/sheet.png', frame: { x: i * 10, y: 0, w: 10, h: 10 }, pivot: null, sheetW: 100, sheetH: 10 }; }
+      // #1022: a re-import moves the resolved url (the real `withCacheBust` appends `?v=<hash>`)
+      // WITHOUT the ref changing — the one thing a ref-shaped stub cannot express. Consulted
+      // first so a GUID ref, which none of the prefix rules below match, resolves through it.
+      const redirected = spriteUrlRedirects.get(ref);
+      if (redirected) return { url: redirected, frame: null, pivot: null, sheetW: null, sheetH: null };
       let url: string | undefined;
       if (ref.startsWith('img:')) url = ref.slice(4);
       else if (ref.startsWith('http') || ref.startsWith('/')) url = ref;
@@ -344,6 +383,16 @@ function spawnCanvas(world: any, traits: any, sortOrder = 0) {
     traits.Canvas2D({ referenceWidth: 1080, referenceHeight: 1920, scaleMode: 'fitH' }),
     traits.EntityAttributes({ name: 'canvas', parentId: 0, sortOrder, layer: 'ui' }),
   );
+}
+
+/** #1053 — make the NEXT release frame an AUTHORING one. The runtime, and so this harness, defaults to
+ *  Play, where a scene-slot release PARKS its texture; the tests about the immediate free release with
+ *  Play stopped, as an editing session does. A stopped renderer idle-skips its frame unless something
+ *  dirtied it, hence the mark — call this again before each further release frame. */
+async function releaseAsAuthoring(scene2d: { markScene2DDirty(): void }) {
+  const { setPlayState } = await import('../../src/runtime/core/playState');
+  setPlayState('stopped');
+  scene2d.markScene2DDirty();
 }
 
 // Spawn a Renderable2D child parented to a canvas.
@@ -1422,6 +1471,7 @@ describe('Scene2D.renderFrame', () => {
       await new Promise((r) => setTimeout(r, 0)); // let a (should-be-absent) deferred unload elapse
       expect(pixi.Assets.__unloaded).not.toContain('http://t/noise.png'); // held while resident
 
+      await releaseAsAuthoring(scene2d);
       child.destroy();
       scene2d.markScene2DDirty();
       scene2d.renderFrame();
@@ -1495,6 +1545,7 @@ describe('Scene2D.renderFrame', () => {
       expect((pool.getSlot(canvas.id())!.container.children[0] as any).shader.extraTextures.uReveal).toBe(a);
 
       // Swap the override ref → matSig's extraSig changes → rebuild binds b, releases a to 0.
+      await releaseAsAuthoring(scene2d);
       child.set(traits.MaterialInstance, { overrides: [{ target: 'uReveal', kind: 'texture', ref: 'http://t/b.png' }] });
       scene2d.markScene2DDirty();
       scene2d.renderFrame();
@@ -1513,6 +1564,7 @@ describe('Scene2D.renderFrame', () => {
       const child = spawnChild(world, traits, canvas.id(), { sprite: 'http://t/hero.png', material: 'matGuid' });
 
       scene2d.renderFrame();
+      await releaseAsAuthoring(scene2d);
       child.destroy();
       scene2d.renderFrame();
       await new Promise((r) => setTimeout(r, 0)); // let the deferred unload elapse
@@ -1551,6 +1603,7 @@ describe('Scene2D.renderFrame', () => {
       scene2d.renderFrame();
       const wrapper = (pool.getSlot(canvas.id())!.container.children[0] as any).texture;
 
+      await releaseAsAuthoring(scene2d);
       child.destroy();
       scene2d.renderFrame();
       await new Promise((r) => setTimeout(r, 0)); // let the deferred unload elapse
@@ -1588,6 +1641,7 @@ describe('Scene2D.renderFrame', () => {
     const child = spawnChild(world, traits, canvas.id(), { sprite: 'http://t/a.png' });
 
     scene2d.renderFrame();
+    await releaseAsAuthoring(scene2d);
     child.set(traits.Renderable2D, { ...child.get(traits.Renderable2D), sprite: 'http://t/b.png' });
     scene2d.renderFrame();
     await new Promise((r) => setTimeout(r, 0)); // let the deferred unload elapse
@@ -1682,6 +1736,7 @@ describe('Scene2D.renderFrame', () => {
     const obj = pool.getSlot(canvas.id())!.container.children[0] as any;
     expect(obj.kind).toBe('sprite');
 
+    await releaseAsAuthoring(scene2d);
     child.destroy();
     scene2d.renderFrame();
     await new Promise((r) => setTimeout(r, 0)); // let the deferred unload elapse
@@ -1703,6 +1758,7 @@ describe('Scene2D.renderFrame', () => {
     const child = spawnChild(world, traits, canvas.id(), { sprite: 'img:/a.png' }); // ref 'img:/a.png' → url '/a.png'
 
     scene2d.renderFrame();
+    await releaseAsAuthoring(scene2d);
     child.destroy();
     scene2d.renderFrame();
     await new Promise((r) => setTimeout(r, 0)); // let the deferred unload elapse
@@ -1724,6 +1780,7 @@ describe('Scene2D.renderFrame', () => {
     scene2d.renderFrame();
     const obj = pool.getSlot(canvas.id())!.container.children[0] as any;
 
+    await releaseAsAuthoring(scene2d);
     canvas.destroy();          // remove the CANVAS but keep its child entity
     scene2d.renderFrame();
     await new Promise((r) => setTimeout(r, 0)); // let the deferred unload elapse
@@ -1780,6 +1837,7 @@ describe('Scene2D.renderFrame', () => {
       // b still uses it → must NOT be unloaded yet.
       expect(pixi.Assets.__unloaded).not.toContain('http://t/shared.png');
 
+      await releaseAsAuthoring(scene2d);
       b.destroy();
       scene2d.renderFrame();
       await new Promise((r) => setTimeout(r, 0)); // let the deferred unload elapse
@@ -1795,6 +1853,7 @@ describe('Scene2D.renderFrame', () => {
       const b = spawnChild(world, traits, canvas.id(), { sprite: 'http://t/shared.png' });
 
       scene2d.renderFrame();
+      await releaseAsAuthoring(scene2d);
       a.destroy(); b.destroy();
       scene2d.renderFrame();                       // both released → unloaded once, map cleared
       await new Promise((r) => setTimeout(r, 0)); // let the deferred unload elapse
@@ -1887,6 +1946,65 @@ describe('Scene2D.renderFrame', () => {
   // tested mechanism never fire in production. This drives it through the REAL frame path
   // (spawn → renderFrame → destroy → renderFrame → respawn → renderFrame), not a direct
   // `orphan2D.prune(...)` call, so it also proves the frame loop calls it with the right set.
+  it('⭐ warns about the orphan and NOT its correctly-parented sibling — the false-positive control',
+    async () => {
+      // ⚠️ **Nothing in this suite could fail on a false positive before this** (#1110 review).
+      // Every runtime-path orphan test spawns ONLY orphans — `spawnOrphan` below is `parentId: 0`
+      // in all of them — so they prove the warning FIRES and say nothing about whether it fires on
+      // healthy entities. The one positive control that exists is on the pure `findUnrenderable2D`
+      // helper, which is a different code path from `noteOrphan2D`.
+      //
+      // That gap is why #1110 took a live probe to resolve: the issue reported ~20 warnings on
+      // entities that were visibly on screen and there was no test that could say whether the
+      // check was wrong. (It was not — those entities really were parented to the world root, in a
+      // boot world that was then discarded. But the suite could not rule the other way out.)
+      //
+      // A warning that fires on a healthy scene is worse than the bug it detects: the grace window
+      // is 1 frame and it warns once per entity, so a false positive would be permanent and the
+      // whole log gets tuned out.
+      const { traits, scene2d, world } = await setup();
+      // ⚠️ Restored in a `finally`. `vi.spyOn` on an already-spied method hands back the EXISTING
+      // spy with its calls still on it, so leaking this one made the neighbouring prune test count
+      // this test's warning as its own and expect 2 where it wanted 1. Found exactly that way.
+      const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+      try {
+        const orphanWarns = () => warnSpy.mock.calls
+          .filter((c) => typeof c[0] === 'string' && c[0].startsWith('[Scene2D]'))
+          .map((c) => String(c[0]));
+
+        const canvas = spawnCanvas(world, traits);
+        const sprite = (parentId: number) => world.spawn(
+          traits.Transform({}),
+          traits.Renderable2D({ sprite: 'square', color: 0xffffff, width: 10, height: 10 }),
+          traits.EntityAttributes({ name: 'sprite', parentId, sortOrder: 0, layer: '2d', guid: '' }),
+        );
+
+        // Both spawned in the same frame, so the only thing separating them is the parent.
+        const drawnId = sprite(canvas.id()).id();
+        const orphanId = sprite(0).id();
+        scene2d.renderFrame();
+
+        // ⚠️ Identified by ID, not by name: `setup()` registers EntityAttributes with `fields: {}`,
+        // so `readTraitData` returns `{}` and every warning reads `"entity <id>" (id:<id>)`
+        // regardless of the authored name (the prune test below re-registers the trait with real
+        // field hints precisely because it needs guid identities; this one does not). The id is
+        // exactly as discriminating and needs none of that setup.
+        const warns = orphanWarns();
+        expect(warns, 'exactly one of the two is unrenderable').toHaveLength(1);
+        expect(warns[0], 'and it is the orphan').toContain(`id:${orphanId}`);
+        expect(warns[0], 'the parented one must never be named').not.toContain(`id:${drawnId}`);
+
+        // Held across further frames: the check warns once per entity, so a false positive would
+        // not show up as a repeat — it would show up here, as the healthy entity finally being
+        // named.
+        scene2d.renderFrame();
+        scene2d.renderFrame();
+        expect(orphanWarns(), 'still just the orphan, three frames in').toHaveLength(1);
+      } finally {
+        warnSpy.mockRestore();
+      }
+    });
+
   it('forgets a dead orphaned entity through the real renderFrame path, unblocking its recycled id (prune wiring)', async () => {
     const { traits, scene2d, world, registerTrait } = await setup();
     // The harness registers EntityAttributes with `fields: {}` (setup() above), so
@@ -1940,6 +2058,47 @@ describe('Scene2D.renderFrame', () => {
     expect(orphanWarnCount()).toBe(1);
   });
 
+  // #868: the prune above only forgets an id that is absent from the live set. A destroy and a
+  // same-index spawn landing BETWEEN two frames leave the index live the whole time, so the dead
+  // orphan's count and (for a guid-less one) its `id:` warned key were inherited by the newcomer.
+  describe('#868 — an orphan respawned on a dead orphan\'s index between two frames', () => {
+    const run = async (guids: [string, string]) => {
+      const { traits, scene2d, world, registerTrait } = await setup();
+      const { inferFields } = await import('../../src/runtime/core/ecs/traitRegistry');
+      registerTrait({ name: 'EntityAttributes', trait: traits.EntityAttributes, category: 'component', fields: inferFields(traits.EntityAttributes) });
+      const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+      try {
+        const orphanWarnCount = () => warnSpy.mock.calls.filter((c) => typeof c[0] === 'string' && c[0].startsWith('[Scene2D]')).length;
+        const spawnOrphan = (guid: string) => world.spawn(
+          traits.Transform({}),
+          traits.Renderable2D({ sprite: 'square', color: 0xffffff, width: 10, height: 10 }),
+          traits.EntityAttributes({ name: 'orphan', parentId: 0, sortOrder: 0, layer: '2d', guid }),
+        );
+        const a = spawnOrphan(guids[0]);
+        scene2d.renderFrame();
+        expect(orphanWarnCount()).toBe(1);
+
+        a.destroy();
+        const b = spawnOrphan(guids[1]); // no frame in between
+        expect(b.id()).toBe(a.id());
+        expect(b.valueOf()).not.toBe(a.valueOf());
+
+        scene2d.renderFrame();
+        return orphanWarnCount();
+      } finally {
+        warnSpy.mockRestore();
+      }
+    };
+
+    it('warns for the newcomer (guid-keyed: the frame count must not be inherited)', async () => {
+      expect(await run(['dead-guid', 'new-guid'])).toBe(2);
+    });
+
+    it('warns for the newcomer (guid-less: the `id:` warned key must not be inherited either)', async () => {
+      expect(await run(['', ''])).toBe(2);
+    });
+  });
+
   // Adversarial review of #590 (docs/ios-gpu-memory.md): `liveEntityIds` was
   // built ONLY from `world.query(attrMeta.trait)` (EntityAttributes), but `noteOrphan2D` is
   // reachable from the Renderable2D/SkinnedSprite2D/Text2D passes for entities that have NO
@@ -1951,7 +2110,7 @@ describe('Scene2D.renderFrame', () => {
   // ORPHAN_2D_WARN_FRAMES===1 that reset is invisible in the warn COUNT (both a reset-to-1 and a
   // real accumulation land on "warn once"), so this asserts the tracker's internal counter
   // directly — the only way to see whether it survives the prune or gets wiped every frame.
-  it("keeps a live no-EntityAttributes orphan's frame count across a prune (liveEntityIds completeness)", async () => {
+  it("keeps a live no-EntityAttributes orphan's frame count across a prune (liveEntities completeness)", async () => {
     const { traits, scene2d, world } = await setup();
     vi.spyOn(console, 'warn').mockImplementation(() => {});
 
@@ -1960,18 +2119,17 @@ describe('Scene2D.renderFrame', () => {
       traits.Renderable2D({ sprite: 'square', color: 0xffffff, width: 10, height: 10 }),
       // Deliberately NO traits.EntityAttributes(...) — this is the gap.
     );
-    const id = orphan.id();
 
     scene2d.renderFrame();
     scene2d.renderFrame();
     scene2d.renderFrame();
 
-    // Without the fix, `prune()` deletes this id's count every frame (it's absent from
-    // `liveEntityIds`), so `note()` restarts at 1 each time and the counter is stuck at 1 after 3
-    // frames. With `liveEntityIds` also covering every `Transform`-bearing entity, the count
-    // accumulates normally.
+    // Without the fix, `prune()` deletes this entity's count every frame (it's absent from
+    // `liveEntities`), so `note()` restarts at 1 each time and the counter is stuck at 1 after 3
+    // frames. With `liveEntities` also covering every `Transform`-bearing entity, the count
+    // accumulates normally. The tracker is keyed by the packed entity (#868).
     const frames = (scene2d.defaultRenderer as any).orphan2D.frames as Map<number, number>;
-    expect(frames.get(id), 'a still-live orphan must not be pruned out from under itself').toBe(3);
+    expect(frames.get(orphan.valueOf()), 'a still-live orphan must not be pruned out from under itself').toBe(3);
   });
 
   it('tears down all slots and releases the pool on world swap', async () => {
@@ -2103,6 +2261,39 @@ describe('Scene2D.renderFrame', () => {
       scene2d.renderFrame(); // frame 4
       expect(render).toHaveBeenCalledTimes(1);
     });
+
+    // #1141 sibling, observed live: a sprite swap rebuilt a material's Shader with its default
+    // uniform, the driver wrote the authored value on the NEXT frame and marked the entity — and the
+    // stopped renderer's idle skip returned before the scan that reads that mark, so the Game view
+    // kept the default-uniform frame until an unrelated trait write woke it.
+    it('redraws a material entity the driver marked, even while stopped and nothing else is dirty', async () => {
+      const { traits, pool, scene2d, world, matReady } = await setup();
+      const { setPlayState } = await import('../../src/runtime/core/playState');
+      const broker = await import('../../src/runtime/rendering/sprite2DMaterialBroker');
+      matReady.add('matGuid');
+      const canvas = spawnCanvas(world, traits);
+      const child = spawnChild(world, traits, canvas.id(), { sprite: 'square', material: 'matGuid' });
+
+      scene2d.renderFrame(); // frame 1: allocates the slot; its Application init is async
+      const slot = pool.getSlot(canvas.id())!;
+      await slot.ready;
+      slot.canvas.width = 320; // renderAll skips an unsized (1x1) slot
+      slot.canvas.height = 480;
+      const render = (slot.app as any).renderer.render as ReturnType<typeof vi.fn>;
+      scene2d.markScene2DDirty();
+      scene2d.renderFrame(); // frame 2: a real render with the material mesh built
+      expect(render).toHaveBeenCalledTimes(1);
+
+      setPlayState('stopped');
+      render.mockClear();
+      scene2d.renderFrame(); // frame 3: stopped and clean — the idle skip is still allowed to skip
+      expect(render).not.toHaveBeenCalled();
+
+      broker.markEntity2DMaterialDirty(child.id(), child.generation()); // the driver's new uniform value
+      scene2d.renderFrame(); // frame 4
+      expect(render).toHaveBeenCalledTimes(1);
+      broker.clearEntity2DMaterialDirty();
+    });
   });
 });
 
@@ -2156,6 +2347,7 @@ describe('panel texture holds veto the shared unload (#701)', () => {
 
     scene2d.retainPanelTexture('http://t/panel-c.png');
 
+    await releaseAsAuthoring(scene2d);
     child.destroy();
     scene2d.renderFrame(); // scene drops its hold (deferred)
     scene2d.releasePanelTexture('http://t/panel-c.png'); // panel drops its last hold too
@@ -2321,6 +2513,411 @@ describe('Scene2DRenderer instancing', () => {
     await new Promise((r) => setTimeout(r, 0)); // let the deferred unload elapse
     expect(pixi.Assets.__unloaded).toContain('/a.png');
   });
+
+  // #1000 — sprite-texture RETENTION across a play/stop swap.
+  // MEASURED before the fix (dev editor, WebGPU, pixi 8.20.1): every play/stop cycle destroyed each
+  // runtime-spawned sprite's TextureSource and re-decoded it on the next play — games/court's
+  // `king.png` uid 5 -> 11, games/wordweave's UASTC `cell-washi.ktx2` uid 13 -> 16 — each destroy
+  // emitting ~2 `[BindGroup] … destroyed while still bound` warnings per live renderer.
+  //
+  // ⚠️ Both tests need TWO live renderers, and that is the point rather than set-dressing: with one
+  // renderer the swap runs `unloadAllSpriteTextures` (the `liveRenderers <= 1` gate) and unloads
+  // wholesale, so a single-renderer version of this test would pass against the unfixed code too.
+  // That is the axis this pair separates — see docs/falsifiable-tests.md.
+  it('a same-scene world swap (play/stop) RETAINS the sprite texture instead of destroying it (#1000)', async () => {
+    const { pixi, traits, scene2d, pool, world, worldReg, newWorld } = await setup({ start: true }); // live=1
+    pixi.Assets.__seed('/board.png', { width: 64, height: 64, source: { style: {} } });
+    const editorPool = new pool.Canvas2DPool();
+    const editorRenderer = new scene2d.Scene2DRenderer({ pool: editorPool, primary: false });
+    editorRenderer.start(); // live=2 → the wholesale sweep is skipped, so the per-slot path decides
+
+    const canvas = spawnCanvas(world, traits);
+    spawnChild(world, traits, canvas.id(), { sprite: 'img:/board.png' });
+    scene2d.renderFrame();        // primary retains (count 1)
+    editorRenderer.renderFrame(); // editor retains (count 2)
+
+    // play/stop is a world swap that KEEPS the same scene: every renderer tears down every slot, so
+    // the refcount reaches 0 with nothing holding it. Pre-fix that destroyed the source.
+    worldReg.setCurrentWorld(newWorld());
+    await new Promise((r) => setTimeout(r, 0)); // let the deferred release fire
+
+    expect(pixi.Assets.__unloaded).not.toContain('/board.png');
+    // Still decoded is the half that MATTERS — it is what makes the next play free rather than a
+    // re-decode. Asserting only "not unloaded" would pass on a texture that was evicted some other way.
+    expect(pixi.Assets.cache.has('/board.png')).toBe(true);
+
+    editorRenderer.stop();
+    scene2d.stopScene2D();
+  });
+
+  it('a retained texture IS freed once the last renderer stops — retention is not a leak (#1000)', async () => {
+    // The other side of the trade: #1000 must not buy a quieter console with a pinned allocation.
+    const { pixi, traits, scene2d, pool, world, worldReg, newWorld } = await setup({ start: true }); // live=1
+    pixi.Assets.__seed('/board2.png', { width: 64, height: 64, source: { style: {} } });
+    const editorPool = new pool.Canvas2DPool();
+    const editorRenderer = new scene2d.Scene2DRenderer({ pool: editorPool, primary: false });
+    editorRenderer.start(); // live=2
+
+    const canvas = spawnCanvas(world, traits);
+    spawnChild(world, traits, canvas.id(), { sprite: 'img:/board2.png' });
+    scene2d.renderFrame();
+    editorRenderer.renderFrame();
+
+    worldReg.setCurrentWorld(newWorld());          // parked, not destroyed
+    await new Promise((r) => setTimeout(r, 0));
+    expect(pixi.Assets.__unloaded).not.toContain('/board2.png');
+
+    editorRenderer.stop();   // live=1 — still not the last one out
+    await new Promise((r) => setTimeout(r, 0));
+    expect(pixi.Assets.__unloaded).not.toContain('/board2.png');
+
+    scene2d.stopScene2D();   // live=0 → the F3 net purges the parked set
+    await new Promise((r) => setTimeout(r, 0));
+    expect(pixi.Assets.__unloaded).toContain('/board2.png');
+  });
+
+  // ⚠️ THE CASE THE TWO TESTS ABOVE CANNOT SEE, and the reason #1000 survived three attempted fixes.
+  // Both of those run TWO renderers, which skips the `liveRenderers <= 1` wholesale sweep — so they
+  // were green while a ONE-renderer session still destroyed everything on stop. And one renderer is
+  // not exotic: it is simply a session with the SceneView panel closed, which is how games/court was
+  // set up. Measured: court 3 destroys + 12 warnings, wordweave (SceneView open, 2 renderers) 0 + 0
+  // on the SAME build. The axis here is the renderer count, so this test pins it directly.
+  //
+  // A scene must be identifiable for retention to apply at all — an unknown scene deliberately falls
+  // back to sweeping — so `getCurrent` is spied, narrowly, to model "a project with a scene open".
+  // Spying one method rather than mocking the module keeps the real onWorldSwap wiring intact; a
+  // wholesale mock of the scene manager would make this test unable to fail (docs/falsifiable-tests.md).
+  it('a same-scene swap with ONE live renderer also retains — the wholesale sweep must not fire (#1000)', async () => {
+    const { pixi, traits, scene2d, world, worldReg, newWorld } = await setup({ start: true }); // live=1, alone
+    const { sceneManager } = await import('../../src/runtime/scene/SceneManager');
+    const spy = vi.spyOn(sceneManager, 'getCurrent')
+      .mockReturnValue({ id: 's1' as never, path: '/assets/scenes/main.scene.json', state: 'loaded' as never });
+    try {
+      pixi.Assets.__seed('/solo.png', { width: 32, height: 32, source: { style: {} } });
+      const canvas = spawnCanvas(world, traits);
+      spawnChild(world, traits, canvas.id(), { sprite: 'img:/solo.png' });
+      scene2d.renderFrame();
+
+      // First swap records the scene; the retention decision is made from the SECOND onwards.
+      worldReg.setCurrentWorld(newWorld());
+      await new Promise((r) => setTimeout(r, 0));
+
+      const canvas2 = spawnCanvas(world, traits);
+      spawnChild(world, traits, canvas2.id(), { sprite: 'img:/solo.png' });
+      scene2d.renderFrame();
+      const unloadsBefore = pixi.Assets.__unloaded.filter((u: string) => u === '/solo.png').length;
+
+      // Same scene, one renderer: pre-fix the sweep fired here and destroyed it.
+      worldReg.setCurrentWorld(newWorld());
+      await new Promise((r) => setTimeout(r, 0));
+
+      expect(pixi.Assets.__unloaded.filter((u: string) => u === '/solo.png').length).toBe(unloadsBefore);
+      expect(pixi.Assets.cache.has('/solo.png')).toBe(true);
+    } finally {
+      spy.mockRestore();
+      scene2d.stopScene2D();
+    }
+  });
+
+  it('a swap that CHANGES scene still sweeps, one renderer — retention must not outlive its scene (#1000)', async () => {
+    // The other half: the guard must actually discriminate. Without this, a guard stuck on "never
+    // changed" would pass the test above and silently pin every scene's textures for the session —
+    // which is the mirror of the real defect, where it was stuck on "always changed".
+    const { pixi, traits, scene2d, world, worldReg, newWorld } = await setup({ start: true }); // live=1
+    const { sceneManager } = await import('../../src/runtime/scene/SceneManager');
+    let path = '/assets/scenes/a.scene.json';
+    const spy = vi.spyOn(sceneManager, 'getCurrent')
+      .mockImplementation(() => ({ id: 's' as never, path, state: 'loaded' as never }));
+    try {
+      pixi.Assets.__seed('/sceneA.png', { width: 32, height: 32, source: { style: {} } });
+      const canvas = spawnCanvas(world, traits);
+      spawnChild(world, traits, canvas.id(), { sprite: 'img:/sceneA.png' });
+      scene2d.renderFrame();
+
+      worldReg.setCurrentWorld(newWorld());   // records scene A
+      await new Promise((r) => setTimeout(r, 0));
+
+      const canvas2 = spawnCanvas(world, traits);
+      spawnChild(world, traits, canvas2.id(), { sprite: 'img:/sceneA.png' });
+      scene2d.renderFrame();
+
+      path = '/assets/scenes/b.scene.json';   // a GENUINE scene change
+      worldReg.setCurrentWorld(newWorld());
+      await new Promise((r) => setTimeout(r, 0));
+
+      expect(pixi.Assets.__unloaded).toContain('/sceneA.png');
+    } finally {
+      spy.mockRestore();
+      scene2d.stopScene2D();
+    }
+  });
+
+  // ⚠️ The gap that let #1000's own fix ship the same bug twice. With TWO renderers the
+  // `liveRenderers <= 1` wholesale sweep is skipped, so the ONLY thing that can free a parked texture
+  // on a scene change is `parkRetainedSpriteTexture`'s own purge — and that purge read the scene via a
+  // different accessor than the swap guard did (`getCurrentBaseScene()`, undefined outside a scene
+  // chain), so it could never fire. Every other test here passed throughout. This one is the axis:
+  // multi-renderer AND a scene change.
+  it('a scene change frees the parked set even with TWO renderers, where the sweep does not run (#1000)', async () => {
+    const { pixi, traits, scene2d, pool, world, worldReg, newWorld } = await setup({ start: true }); // live=1
+    const { sceneManager } = await import('../../src/runtime/scene/SceneManager');
+    let path = '/assets/scenes/a.scene.json';
+    const spy = vi.spyOn(sceneManager, 'getCurrent')
+      .mockImplementation(() => ({ id: 's' as never, path, state: 'loaded' as never }));
+    const editorPool = new pool.Canvas2DPool();
+    const editorRenderer = new scene2d.Scene2DRenderer({ pool: editorPool, primary: false });
+    editorRenderer.start(); // live=2 → the wholesale sweep is skipped from here on
+    try {
+      pixi.Assets.__seed('/parked.png', { width: 32, height: 32, source: { style: {} } });
+      const canvas = spawnCanvas(world, traits);
+      spawnChild(world, traits, canvas.id(), { sprite: 'img:/parked.png' });
+      scene2d.renderFrame();
+      editorRenderer.renderFrame();
+
+      // Same-scene swap → parked, not destroyed (the retention working as intended).
+      // ⚠️ Spawn into the world that is CURRENT after each swap, not the original `world` — a swap
+      // promotes a NEW world, so spawning into the old one renders nothing and the test would pass
+      // vacuously by never parking anything under the second scene at all.
+      const w2 = newWorld();
+      worldReg.setCurrentWorld(w2);
+      await new Promise((r) => setTimeout(r, 0));
+      expect(pixi.Assets.__unloaded).not.toContain('/parked.png');
+
+      // Now a GENUINE scene change. Nothing re-retains /parked.png, and the sweep is skipped at
+      // liveRenderers=2, so the parked set's own purge is the ONLY mechanism left — and it must fire.
+      path = '/assets/scenes/b.scene.json';
+      pixi.Assets.__seed('/other.png', { width: 8, height: 8, source: { style: {} } });
+      const canvas2 = spawnCanvas(w2, traits);
+      spawnChild(w2, traits, canvas2.id(), { sprite: 'img:/other.png' });
+      scene2d.renderFrame();
+      editorRenderer.renderFrame();
+      worldReg.setCurrentWorld(newWorld());   // releasing /other.png parks under scene B, evicting A's set
+      await new Promise((r) => setTimeout(r, 0));
+
+      expect(pixi.Assets.__unloaded).toContain('/parked.png');
+    } finally {
+      spy.mockRestore();
+      editorRenderer.stop();
+      scene2d.stopScene2D();
+    }
+  });
+
+  // ⚠️ A RENDERER-COUNT TRANSITION, which nothing else here exercises — every other test holds the
+  // count fixed. `swapChangedScene()` is the only writer of the scene record, and it used to sit behind
+  // `liveRenderers <= 1 &&`, so JS short-circuited it away for every swap that happened while a second
+  // renderer was live. `liveRenderers` flips 1<->2 on a SceneView mode-dropdown click, so the gap is
+  // ordinary usage, and the record came back stale on the other side of it.
+  it('keeps the scene record maintained across a renderer-count change, so the F3 net still fires (#1000)', async () => {
+    const { pixi, traits, scene2d, pool, world, worldReg, newWorld } = await setup({ start: true }); // live=1
+    const { sceneManager } = await import('../../src/runtime/scene/SceneManager');
+    let path = '/assets/scenes/a.scene.json';
+    const spy = vi.spyOn(sceneManager, 'getCurrent')
+      .mockImplementation(() => ({ id: 's' as never, path, state: 'loaded' as never }));
+    const editorPool = new pool.Canvas2DPool();
+    const editorRenderer = new scene2d.Scene2DRenderer({ pool: editorPool, primary: false });
+    try {
+      pixi.Assets.__seed('/gap.png', { width: 16, height: 16, source: { style: {} } });
+
+      // Phase 1 — TWO renderers live. Pre-fix every swap here recorded nothing.
+      editorRenderer.start(); // live=2
+      const w2 = newWorld();
+      worldReg.setCurrentWorld(w2);
+      await new Promise((r) => setTimeout(r, 0));
+
+      // Phase 2 — back to ONE renderer, holding a texture under scene A.
+      editorRenderer.stop(); // live=1
+      const canvas = spawnCanvas(w2, traits);
+      spawnChild(w2, traits, canvas.id(), { sprite: 'img:/gap.png' });
+      scene2d.renderFrame();
+
+      // Phase 3 — a GENUINE scene change with one renderer, which is exactly when the F3 net must run.
+      // Pre-fix the record was `undefined` (never written during phase 1), so the guard reported
+      // "unchanged" and the net was skipped while the refcount map was fully populated.
+      path = '/assets/scenes/b.scene.json';
+      worldReg.setCurrentWorld(newWorld());
+      await new Promise((r) => setTimeout(r, 0));
+
+      expect(pixi.Assets.__unloaded).toContain('/gap.png');
+    } finally {
+      spy.mockRestore();
+      scene2d.stopScene2D();
+    }
+  });
+
+  // Retention must not make a RE-IMPORT invisible (#1000). Before parking, a single-renderer play/stop
+  // ran the wholesale sweep and the next Play re-fetched; parking removed that flush, so re-importing a
+  // sprite and pressing Play would keep showing the old bytes.
+  //
+  // ⚠️ This comment used to add "`withCacheBust` cannot cover it — it is a no-op unless PROD, i.e.
+  // inert exactly where re-import happens." That gate is GONE (#1022): the bust now applies in dev,
+  // so a re-import moves the url. This test still earns its place — it pins the PARKED path, which
+  // is a different route to the same symptom and is what #1000 actually fixed — but it is no longer
+  // the only thing standing between a re-import and stale bytes.
+  it('a texture invalidation purges the parked set, so a re-import is not served stale (#1000)', async () => {
+    const { pixi, traits, scene2d, pool, world, worldReg, newWorld } = await setup({ start: true }); // live=1
+    const { emitAssetInvalidated } = await import('../../src/runtime/core/assetInvalidation');
+    const { sceneManager } = await import('../../src/runtime/scene/SceneManager');
+    const spy = vi.spyOn(sceneManager, 'getCurrent')
+      .mockReturnValue({ id: 's' as never, path: '/assets/scenes/main.scene.json', state: 'loaded' as never });
+    const editorPool = new pool.Canvas2DPool();
+    const editorRenderer = new scene2d.Scene2DRenderer({ pool: editorPool, primary: false });
+    editorRenderer.start(); // live=2 → the wholesale sweep is skipped, so the texture really is PARKED
+    try {
+      pixi.Assets.__seed('/reimported.png', { width: 32, height: 32, source: { style: {} } });
+      const canvas = spawnCanvas(world, traits);
+      spawnChild(world, traits, canvas.id(), { sprite: 'img:/reimported.png' });
+      scene2d.renderFrame();
+      editorRenderer.renderFrame();
+
+      worldReg.setCurrentWorld(newWorld());          // same scene → parked, not destroyed
+      await new Promise((r) => setTimeout(r, 0));
+      expect(pixi.Assets.__unloaded).not.toContain('/reimported.png');
+
+      emitAssetInvalidated('texture', '/assets/textures/reimported.png');
+      expect(pixi.Assets.__unloaded).toContain('/reimported.png');
+    } finally {
+      spy.mockRestore();
+      editorRenderer.stop();
+      scene2d.stopScene2D();
+    }
+  });
+
+  it('an invalidation of a NON-texture kind leaves the parked set alone (#1000)', async () => {
+    // The listener filters on kind; without that filter a model or audio re-import would throw away
+    // every parked sprite texture, quietly undoing the retention this change exists to provide.
+    const { pixi, traits, scene2d, pool, world, worldReg, newWorld } = await setup({ start: true });
+    const { emitAssetInvalidated } = await import('../../src/runtime/core/assetInvalidation');
+    const { sceneManager } = await import('../../src/runtime/scene/SceneManager');
+    const spy = vi.spyOn(sceneManager, 'getCurrent')
+      .mockReturnValue({ id: 's' as never, path: '/assets/scenes/main.scene.json', state: 'loaded' as never });
+    const editorPool = new pool.Canvas2DPool();
+    const editorRenderer = new scene2d.Scene2DRenderer({ pool: editorPool, primary: false });
+    editorRenderer.start();
+    try {
+      pixi.Assets.__seed('/kept.png', { width: 32, height: 32, source: { style: {} } });
+      const canvas = spawnCanvas(world, traits);
+      spawnChild(world, traits, canvas.id(), { sprite: 'img:/kept.png' });
+      scene2d.renderFrame();
+      editorRenderer.renderFrame();
+      worldReg.setCurrentWorld(newWorld());
+      await new Promise((r) => setTimeout(r, 0));
+
+      emitAssetInvalidated('model', '/assets/models/thing.glb');
+      expect(pixi.Assets.__unloaded).not.toContain('/kept.png');
+    } finally {
+      spy.mockRestore();
+      editorRenderer.stop();
+      scene2d.stopScene2D();
+    }
+  });
+
+  /**
+   * #1022 — the LIVE-sprite half, which neither test above can reach.
+   *
+   * Both #1000 tests despawn the sprite first (`setCurrentWorld(newWorld())`), so they assert the
+   * PARKED case only: `releaseRetainedSpriteTextures` iterates `retainedSpriteTextures`, and the
+   * `spriteTextureRefs > 0` guard makes that set disjoint from anything a live sprite holds. A
+   * texture still bound to a drawing sprite was untouched by #1000 and is what #1022 filed.
+   *
+   * ⚠️ **This pins the ASSUMPTION the fix rests on, not the fix itself.** The fix is in
+   * `withCacheBust` (`assetUrl.ts`), which this harness stubs out — so `textureResolver.test.ts`
+   * owns the "does a re-import move the url?" half, and this owns "given the url moved, does a live
+   * sprite actually let go of the old texture?". Splitting it that way is deliberate: asserting the
+   * fix here would be asserting the mock.
+   *
+   * ⚠️ **Measured consequence, stated so nobody mistakes this pair for #1022's safety net: BOTH
+   * tests below stay GREEN under a full revert of #1022** (restore the `PROD` gate → only
+   * `textureResolver.test.ts` reds). What reds them is dropping `displaySlot.builtEpoch !==
+   * spriteEpoch` from `needResolve` (`Scene2D.tsx`'s slot sync) — the epoch TRIGGER, which predates
+   * #1022 and which they therefore pin twice over. The whole evidentiary weight for the fix
+   * itself sits on `textureResolver.test.ts`; these two guard the consumer behaviour it relies on.
+   * The harness cannot do better — it stubs the resolver, so the real url derivation is not
+   * reachable from here at all.
+   */
+  it('a live sprite drops the old texture and binds the new one when a re-import moves the url (#1022)', async () => {
+    const { pixi, traits, pool, scene2d, world } = await setup();
+    // The REAL manifest, not a stub: `getSpriteEpoch` is what makes the renderer re-consult the
+    // resolver at all (`Scene2D.tsx`'s `needResolve`), and it reads `_spriteEpochByTexture`, which
+    // `registerAsset` bumps only when the content hash actually moves. Driving the real thing is
+    // what keeps this test honest about the TRIGGER; only the url derivation is stubbed.
+    const manifest = await import('../../src/runtime/loaders/assetManifest');
+    const GUID = '11111111-1111-4111-8111-111111111111';
+    const PATH = '/assets/textures/hero.png';
+    manifest.registerAsset(GUID, PATH, 'texture', undefined, undefined, 'hash-before');
+
+    const before = { width: 32, height: 32, source: { style: {} } };
+    const after = { width: 64, height: 64, source: { style: {} } };
+    pixi.Assets.__seed('/hero.png?v=hash-before', before);
+    spriteUrlRedirects.set(GUID, '/hero.png?v=hash-before');
+    const canvas = spawnCanvas(world, traits);
+    spawnChild(world, traits, canvas.id(), { sprite: GUID });
+
+    scene2d.renderFrame();
+    expect((pool.getSlot(canvas.id())!.container.children[0] as any).texture).toBe(before);
+
+    // The re-import: same scene, same ref, same live sprite. New bytes → new hash → the manifest
+    // bumps the epoch (so the renderer looks again) AND the url moves (so it fetches again).
+    // Before #1022's fix the second half did not happen in dev: the renderer looked, found the
+    // identical url, and the retain-before-release bridge held the stale source.
+    pixi.Assets.__seed('/hero.png?v=hash-after', after);
+    manifest.registerAsset(GUID, PATH, 'texture', undefined, undefined, 'hash-after');
+    spriteUrlRedirects.set(GUID, '/hero.png?v=hash-after');
+    await releaseAsAuthoring(scene2d);   // a re-import is an authoring act — during Play the old url would park (#1053)
+    scene2d.markScene2DDirty();
+    scene2d.renderFrame();
+    await new Promise((r) => setTimeout(r, 0));   // let the deferred unload elapse
+
+    const kids = pool.getSlot(canvas.id())!.container.children as any[];
+    expect(kids).toHaveLength(1);
+    expect(kids[0].texture).toBe(after);                                   // re-bound, not stale
+    expect(pixi.Assets.__unloaded).toContain('/hero.png?v=hash-before');   // old one let go
+  });
+
+  /**
+   * The complement, and the reason #1022's fix is at the URL rather than keyed on the epoch: a
+   * RE-SLICE bumps the same epoch with the SAME bytes, and must NOT cost a re-download. Without
+   * this, "evict whenever the epoch moved" reads as a simpler fix than the one taken. It is not —
+   * it would re-download on every sprite-sheet re-slice.
+   *
+   * ⚠️ **What holds the texture here is NOT the retain-before-release bridge, and an earlier
+   * version of this comment said it was.** Mutation-checked: disabling the bridge outright
+   * (`if (false && …)` on `renderFrame`'s retain-before-release `bridgeUrl` block) leaves this test GREEN. The actual protection is
+   * `deferUnload`'s `setTimeout(0)` — `disposeSlot` schedules the unload, `makeSprite` re-retains
+   * the same url later in the SAME frame, and `retainSpriteTexture` clears the pending timer
+   * before it can fire. The bridge is a second belt on a path that already holds.
+   *
+   * So this test is falsifiable on the TRIGGER, not on the bridge: dropping
+   * `displaySlot.builtEpoch !== spriteEpoch` from `renderFrame`'s `needResolve` reds it, because
+   * `resolved` then goes stale and the dispose is no longer balanced by a re-retain.
+   */
+  it('a re-slice bumps the epoch but keeps the texture, because the url did not move (#1022)', async () => {
+    const { pixi, traits, pool, scene2d, world } = await setup();
+    const manifest = await import('../../src/runtime/loaders/assetManifest');
+    const GUID = '22222222-2222-4222-8222-222222222222';
+    const PATH = '/assets/textures/sheet.png';
+    manifest.registerAsset(GUID, PATH, 'texture', undefined, undefined, 'hash-stable');
+
+    const tex = { width: 32, height: 32, source: { style: {} } };
+    pixi.Assets.__seed('/sheet.png?v=hash-stable', tex);
+    spriteUrlRedirects.set(GUID, '/sheet.png?v=hash-stable');
+    const canvas = spawnCanvas(world, traits);
+    spawnChild(world, traits, canvas.id(), { sprite: GUID });
+
+    scene2d.renderFrame();
+    const epochBefore = manifest.getSpriteEpoch(GUID);
+
+    // A re-slice: the sprite's frames change, the BYTES do not — so the epoch moves and the url
+    // (which carries the content hash) does not.
+    manifest.registerAsset(GUID, PATH, 'texture', undefined, undefined, 'hash-stable');
+    manifest.registerSprite('33333333-3333-4333-8333-333333333333', GUID, PATH,
+      { texture: GUID, rect: { x: 0, y: 0, w: 16, h: 16 } } as never);
+    expect(manifest.getSpriteEpoch(GUID)).toBeGreaterThan(epochBefore);   // the trigger really fired
+    scene2d.markScene2DDirty();
+    scene2d.renderFrame();
+    await new Promise((r) => setTimeout(r, 0));
+
+    expect(pixi.Assets.__unloaded).not.toContain('/sheet.png?v=hash-stable');
+  });
 });
 
 // Phase 4 (2D particle preview): the editor passes a per-frame particleDt PROVIDER. While it returns a
@@ -2328,6 +2925,127 @@ describe('Scene2DRenderer instancing', () => {
 // direct-write edits show live); while it returns undefined the frame is skipped as before. Runtime (no
 // provider) is unaffected. We observe the gate via a direct Transform write (which does NOT set the
 // external-dirty flag): it only lands when the frame actually runs.
+// ── #1053: a mid-scene release DURING PLAY parks its texture ─────────────────────────────────────
+// MEASURED before the fix (dev editor, games/court, WebGPU): three `court_load_level` calls added
+// +14, +46 and +40 `[BindGroup] … destroyed while still bound` warnings. Court despawns its board,
+// AWAITS the next level's fetch, then respawns the same art, so the one-macrotask unload deferral —
+// built for a SAME-task rebuild — had expired before anything re-retained, and every level load
+// destroyed and re-decoded the board. The owner chose retention during Play over a Court-only reorder.
+describe('a mid-scene release during Play parks the texture (#1053)', () => {
+  /** Two macrotasks with nothing re-retaining — the shape of Court's despawn → await fetch → respawn. */
+  const fetchGap = async () => {
+    await new Promise((r) => setTimeout(r, 0));
+    await new Promise((r) => setTimeout(r, 0));
+  };
+
+  it('despawn → async gap → respawn of the same art binds the SAME loaded texture: no destroy, no re-decode', async () => {
+    const { pixi, traits, pool, scene2d, world } = await setup();   // the runtime default: Play
+    const piece = { width: 64, height: 64, source: { style: {} } };
+    pixi.Assets.__seed('http://t/piece.png', piece);
+    const canvas = spawnCanvas(world, traits);
+    const board = spawnChild(world, traits, canvas.id(), { sprite: 'http://t/piece.png' });
+    scene2d.renderFrame();
+
+    board.destroy();
+    scene2d.renderFrame();
+    expect(pool.getSlot(canvas.id())!.container.children.length, 'precondition: the release frame ran').toBe(0);
+    await fetchGap();   // the deferral expires in here — pre-fix, this destroyed the source
+
+    expect(pixi.Assets.__unloaded).not.toContain('http://t/piece.png');
+    spawnChild(world, traits, canvas.id(), { sprite: 'http://t/piece.png' });
+    scene2d.renderFrame();
+    // Identity, not "not unloaded": a texture freed and reloaded would also end up bound, as a NEW object.
+    expect((pool.getSlot(canvas.id())!.container.children[0] as any).texture).toBe(piece);
+  });
+
+  it('a PAUSED Play still parks — pausing does not end the play session', async () => {
+    const { pixi, traits, pool, scene2d, world } = await setup();
+    const { setRunMode } = await import('../../src/runtime/core/playState');
+    pixi.Assets.__seed('http://t/paused.png', { width: 64, height: 64, source: { style: {} } });
+    const canvas = spawnCanvas(world, traits);
+    const child = spawnChild(world, traits, canvas.id(), { sprite: 'http://t/paused.png' });
+    scene2d.renderFrame();
+
+    setRunMode('playing', { advancing: false });
+    child.destroy();
+    scene2d.markScene2DDirty();   // a paused renderer idle-skips unless dirtied
+    scene2d.renderFrame();
+    expect(pool.getSlot(canvas.id())!.container.children.length, 'precondition: the release frame ran').toBe(0);
+    await fetchGap();
+
+    expect(pixi.Assets.__unloaded).not.toContain('http://t/paused.png');
+  });
+
+  it('with Play STOPPED the same release still frees at once — authoring must not pin what it touched', async () => {
+    const { pixi, traits, scene2d, world } = await setup();
+    pixi.Assets.__seed('http://t/authored.png', { width: 64, height: 64, source: { style: {} } });
+    const canvas = spawnCanvas(world, traits);
+    const child = spawnChild(world, traits, canvas.id(), { sprite: 'http://t/authored.png' });
+    scene2d.renderFrame();
+
+    await releaseAsAuthoring(scene2d);
+    child.destroy();
+    scene2d.renderFrame();
+    await fetchGap();
+
+    expect(pixi.Assets.__unloaded).toContain('http://t/authored.png');
+  });
+
+  it('a PANEL hold dropped during Play still frees — play retention is for scene slots only', async () => {
+    const { pixi, scene2d } = await setup();
+    pixi.Assets.__seed('http://t/preview.png', { width: 8, height: 8, source: { style: {} } });
+    scene2d.retainPanelTexture('http://t/preview.png');
+    scene2d.releasePanelTexture('http://t/preview.png');
+    await fetchGap();
+
+    expect(pixi.Assets.__unloaded).toContain('http://t/preview.png');
+  });
+
+  it('a texture parked during Play is freed by a genuine scene change — retention is bounded by the scene', async () => {
+    const { pixi, traits, scene2d, worldReg, newWorld } = await setup({ start: true }); // live=1, a shipped game's shape
+    const { sceneManager } = await import('../../src/runtime/scene/SceneManager');
+    let path = '/assets/scenes/a.scene.json';
+    const spy = vi.spyOn(sceneManager, 'getCurrent')
+      .mockImplementation(() => ({ id: 's' as never, path, state: 'loaded' as never }));
+    try {
+      pixi.Assets.__seed('/level-art.png', { width: 32, height: 32, source: { style: {} } });
+      const w1 = newWorld();
+      worldReg.setCurrentWorld(w1);   // the first swap records scene A
+      const canvas = spawnCanvas(w1, traits);
+      const board = spawnChild(w1, traits, canvas.id(), { sprite: 'img:/level-art.png' });
+      scene2d.renderFrame();
+      board.destroy();
+      scene2d.renderFrame();
+      await fetchGap();
+      expect(pixi.Assets.__unloaded, 'precondition: parked during Play, not freed').not.toContain('/level-art.png');
+
+      path = '/assets/scenes/b.scene.json';
+      worldReg.setCurrentWorld(newWorld());
+
+      expect(pixi.Assets.__unloaded).toContain('/level-art.png');
+    } finally {
+      spy.mockRestore();
+      scene2d.stopScene2D();
+    }
+  });
+
+  it('a texture parked during Play is freed when the last renderer stops', async () => {
+    const { pixi, traits, scene2d, world } = await setup({ start: true });
+    pixi.Assets.__seed('http://t/tail.png', { width: 16, height: 16, source: { style: {} } });
+    const canvas = spawnCanvas(world, traits);
+    const child = spawnChild(world, traits, canvas.id(), { sprite: 'http://t/tail.png' });
+    scene2d.renderFrame();
+    child.destroy();
+    scene2d.renderFrame();
+    await fetchGap();
+    expect(pixi.Assets.__unloaded, 'precondition: parked during Play, not freed').not.toContain('http://t/tail.png');
+
+    scene2d.stopScene2D();   // live=0
+
+    expect(pixi.Assets.__unloaded).toContain('http://t/tail.png');
+  });
+});
+
 describe('Scene2DRenderer 2D-particle-preview render gate (Phase 4)', () => {
   it('a preview provider keeps renderFrame alive while stopped; undefined skips as before', async () => {
     const { traits, scene2d, pool, world } = await setup();
@@ -2657,7 +3375,7 @@ describe('Text2D shader reclaim (#690/#696)', () => {
       makeMtsdfPixiShader: (texture: any, atlas: any, style: any, fontSize: any) => ({
         id: ++shaderSeq,
         // `mtsdfUniforms.uniforms.uScreenPxRange` mirrors the real shader's fontSize-derived
-        // uniform (mtsdfPixiShader.ts:502) — a #749 fast-path test asserts THIS gets updated
+        // uniform (`updateMtsdfPixiMetrics` in mtsdfPixiShader.ts) — a #749 fast-path test asserts THIS gets updated
         // on a fontSize-only edit. A mock without it would let that assertion pass vacuously
         // (see #698's scar: `makePixiShaderInstance` mocked with no `resources` once made a
         // uniform-write assertion pass whether or not the write actually happened).
@@ -2732,6 +3450,22 @@ describe('Text2D shader reclaim (#690/#696)', () => {
       traits.EntityAttributes({ name: 'text', parentId: canvasId, sortOrder, layer: '2d' }),
     );
   }
+
+  // #1197 — the text pass's `activeIds` stamp is what `bounds2DProvider` checks between passes.
+  it('stamps the text entity as its slot\'s owner, and the provider drops it once that entity dies (#1197)', async () => {
+    const { traits, world, scene2d, fontLoader, renderer } = await setupText();
+    fontLoader.__setProvider(makeFontProvider());
+    const canvas = spawnCanvas(world, traits);
+    const text = spawnText(world, traits, canvas.id());
+    scene2d.renderFrame();
+    expect(renderer.slots.get(text.id())?.kind).toBe('text'); // premise: the text path built the slot
+    expect(renderer.activeIds.get(text.id())).toBe(text.valueOf());
+    expect(renderer.bounds2DProvider(new Set([text.id()])).map((b: { id: number }) => b.id)).toEqual([text.id()]);
+    const id = text.id();
+    text.destroy();
+    expect(world.spawn().id()).toBe(id); // premise: the index was reclaimed
+    expect(renderer.bounds2DProvider(new Set([id]))).toEqual([]);
+  });
 
   it('reuses the SAME shader across a layout rebuild, on a NEW Mesh', async () => {
     const { traits, world, scene2d, fontLoader, renderer } = await setupText();
@@ -2922,4 +3656,35 @@ describe('Text2D shader reclaim (#690/#696)', () => {
       expect(geo2).not.toBe(geo1); // full rebuild, NOT the fast path's in-place write
     });
   });
+});
+
+/** #1197 — `bounds2DProvider` refuses a slot whose `activeIds` owner is dead. The unit cases in
+ *  `scene2DBoundsSurface.test.ts` seed `activeIds` by hand; these drive the REAL pass, so a stamp site
+ *  that writes the wrong value (or none) drops every rect of that kind and goes red here. Text is
+ *  covered in the text describe above; the skinned-mesh site has no fixture in this harness. */
+describe('Scene2D.renderFrame — activeIds owner stamps feed the bounds provider (#1197)', () => {
+  const kinds = [
+    { name: 'sprite pass (a primitive)', rend: { sprite: 'square' }, kind: 'graphics', ready: false },
+    { name: 'material pass', rend: { sprite: 'square', material: 'matGuid' }, kind: 'material', ready: true },
+  ];
+  for (const k of kinds) {
+    it(`${k.name}: the slot's owner is the entity, and a dead owner's slot is not reported`, async () => {
+      const { traits, scene2d, world, matReady } = await setup();
+      if (k.ready) matReady.add('matGuid');
+      const renderer = (scene2d as unknown as { defaultRenderer: any }).defaultRenderer;
+      const canvas = spawnCanvas(world, traits);
+      const child = spawnChild(world, traits, canvas.id(), k.rend);
+      scene2d.renderFrame();
+
+      const id = child.id();
+      expect(renderer.slots.get(id)?.kind).toBe(k.kind); // premise: this pass built the slot
+      expect(renderer.activeIds.get(id)).toBe(child.valueOf());
+      expect(renderer.bounds2DProvider(new Set([id])).map((b: { id: number }) => b.id)).toEqual([id]);
+
+      child.destroy();
+      expect(world.spawn().id()).toBe(id); // premise: the index was reclaimed, no pass in between
+      expect(renderer.slots.has(id)).toBe(true); // the dead slot is still there — the window
+      expect(renderer.bounds2DProvider(new Set([id]))).toEqual([]);
+    });
+  }
 });

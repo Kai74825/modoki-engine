@@ -1,8 +1,11 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest'
+import { expectInOrder } from '@modoki/engine/testing/inOrder'
 import fs from 'node:fs'
-import os from 'node:os'
 import path from 'node:path'
-import { detect, resolve, withToolOnPath, npmSpawnSpec, detectAdb, preflight, guide, install, INSTALLABLE, TOOL_IDS, toolchainStatus, gltfTransformInvocation, gltfpackInvocation, parseJavaMajor, javaMajorFromVersion, resetToolchainCache, systemToolchainAllowed, readToolchainSettings, writeToolchainSettings, isInstallable, cocoapodsEnv, isToolStale, versionMatchesPin, PINNED_TOOL_VERSIONS, PINNED_SHARP_OVERRIDE, planSharpOverride, uninstall, uninstallAll, shouldSweepProcesses, ffmpegToolBin, ffprobeToolBin, npmToolBin, needsWinShell, spawnable, whichSync, type DetectResult } from '../../toolchain'
+import { detect, resolve, withToolOnPath, npmSpawnSpec, detectAdb, preflight, guide, install, INSTALLABLE, TOOL_IDS, toolchainStatus, gltfTransformInvocation, gltfpackInvocation, parseJavaMajor, javaMajorFromVersion, resetToolchainCache, systemToolchainAllowed, readToolchainSettings, writeToolchainSettings, isInstallable, cocoapodsEnv, isToolStale, versionMatchesPin, PINNED_TOOL_VERSIONS, PINNED_SHARP_OVERRIDE, planSharpOverride, uninstall, uninstallAll, toolOwnedDirs, shouldSweepProcesses, winSweepCommand, sweepAlt, ffmpegToolBin, ffprobeToolBin, npmToolBin, needsWinShell, spawnable, whichSync, type DetectResult } from '../../toolchain'
+import { makeDirLink } from '../helpers/linkFixture';
+import { TOOLCHAIN_OWNED_ENTRIES } from '../../scripts/toolchainRoot.mjs';
+import { makeScratchDir } from '@modoki/engine/testing/scratchDir';
 
 /**
  * Guards the shared toolchain resolver (engine/toolchain) — Phase A of the toolchain-layer plan.
@@ -84,7 +87,7 @@ describe('toolchain resolve() — env override + PATH injection', () => {
   })
 
   it('captures a version banner the tool wrote to STDERR (toktx --version does this, exit 0)', () => {
-    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-stderr-ver-'))
+    const dir = makeScratchDir('modoki-stderr-ver-')
     const bin = path.join(dir, process.platform === 'win32' ? 'toktx.cmd' : 'toktx')
     writeStderrExecStub(bin, 'toktx v4.4.2')
     process.env.MODOKI_TOKTX = bin
@@ -139,7 +142,7 @@ describe('toolchain npmSpawnSpec() — the swappable npm seam', () => {
 
 describe('toolchain whichSync() — PATH resolution (the Windows PATHEXT fix)', () => {
   let dir: string
-  beforeEach(() => { dir = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-which-')) })
+  beforeEach(() => { dir = makeScratchDir('modoki-which-') })
   afterEach(() => fs.rmSync(dir, { recursive: true, force: true }))
 
   // The bug this exists for: npm on PATH is `npm.cmd` (+ a `npm` BASH script Windows can't run).
@@ -200,7 +203,7 @@ describe('toolchain detect() — android-sdk (directory tool, the unified probe)
   let savedDir: string | undefined
 
   beforeEach(() => {
-    tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-sdk-'))
+    tmp = makeScratchDir('modoki-sdk-')
     savedHome = process.env.ANDROID_HOME
     savedRoot = process.env.ANDROID_SDK_ROOT
     // These probes are about the SYSTEM sources, so run as a DEV editor (no toolchain dir). A dev
@@ -396,7 +399,7 @@ describe('toolchain guide() / install() verbs', () => {
 
   it('cocoapodsEnv() is null until CocoaPods is provisioned (no crash when absent)', () => {
     const saved = process.env.MODOKI_TOOLCHAIN_DIR
-    process.env.MODOKI_TOOLCHAIN_DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-cp-'))
+    process.env.MODOKI_TOOLCHAIN_DIR = makeScratchDir('modoki-cp-')
     try {
       expect(cocoapodsEnv()).toBeNull() // no ruby/ + cocoapods-gems/ provisioned yet
     } finally {
@@ -420,7 +423,7 @@ describe('toolchain guide() / install() verbs', () => {
 
   it('detect(gltf-transform-cli) finds a userData-installed CLI via MODOKI_TOOLCHAIN_DIR', () => {
     const saved = process.env.MODOKI_TOOLCHAIN_DIR
-    const tc = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-tc-'))
+    const tc = makeScratchDir('modoki-tc-')
     // npmToolBin picks the platform-correct shim (.cmd on Windows) — the exact path the code resolves.
     const bin = npmToolBin(tc, 'gltf-transform')
     writeExecStub(bin, '4.0.0') // answers --version so the binary probe passes
@@ -442,7 +445,7 @@ describe('toolchain guide() / install() verbs', () => {
   it('detect(gltfpack) finds a userData-installed CLI via MODOKI_TOOLCHAIN_DIR (probes -v)', () => {
     const saved = process.env.MODOKI_TOOLCHAIN_DIR
     const savedPath = process.env.PATH
-    const tc = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-tc-'))
+    const tc = makeScratchDir('modoki-tc-')
     const bin = npmToolBin(tc, 'gltfpack') // platform-correct shim (.cmd on Windows)
     writeExecStub(bin, 'gltfpack 1.2') // gltfpack answers `-v` with its version on stdout, exit 0
     process.env.MODOKI_TOOLCHAIN_DIR = tc
@@ -470,7 +473,7 @@ describe('toolchain guide() / install() verbs', () => {
   it.skipIf(process.platform === 'win32')('detect(ffmpeg) finds the in-package binary (no .bin symlink) via MODOKI_TOOLCHAIN_DIR', () => {
     const saved = process.env.MODOKI_TOOLCHAIN_DIR
     const savedPath = process.env.PATH
-    const tc = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-tc-'))
+    const tc = makeScratchDir('modoki-tc-')
     // ffmpeg-static keeps the binary at the package ROOT, not node_modules/.bin.
     const bin = path.join(tc, 'npm-tools', 'node_modules', 'ffmpeg-static', 'ffmpeg')
     fs.mkdirSync(path.dirname(bin), { recursive: true })
@@ -534,7 +537,7 @@ describe('toolchain guide() / install() verbs', () => {
   it.skipIf(process.platform === 'win32')('detect(ffprobe) resolves the per-platform @ffprobe-installer sub-package binary', () => {
     const saved = process.env.MODOKI_TOOLCHAIN_DIR
     const savedPath = process.env.PATH
-    const tc = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-tc-'))
+    const tc = makeScratchDir('modoki-tc-')
     const bin = path.join(tc, 'npm-tools', 'node_modules', '@ffprobe-installer', `${process.platform}-${process.arch}`, 'ffprobe')
     fs.mkdirSync(path.dirname(bin), { recursive: true })
     fs.writeFileSync(bin, '#!/bin/sh\necho "ffprobe version n4.4.1"\n')
@@ -564,8 +567,8 @@ describe('toolchain guide() / install() verbs', () => {
     const saved = process.env.MODOKI_TOOLCHAIN_DIR
     const savedPath = process.env.PATH
     const savedAllow = process.env.MODOKI_ALLOW_SYSTEM_TOOLCHAIN
-    const tc = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-tc-')) // no settings.json → bundled-only
-    const binDir = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-sysbin-'))
+    const tc = makeScratchDir('modoki-tc-') // no settings.json → bundled-only
+    const binDir = makeScratchDir('modoki-sysbin-')
     const sys = path.join(binDir, 'gltf-transform')
     fs.writeFileSync(sys, '#!/bin/sh\necho 4.0.0\n') // a system gltf-transform on PATH
     fs.chmodSync(sys, 0o755)
@@ -681,7 +684,7 @@ describe('toolchain model-CLI invocation seam (E-3.5)', () => {
   })
 
   it('gltfTransformInvocation prefers a userData install (packaged editor)', () => {
-    const tc = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-inv-'))
+    const tc = makeScratchDir('modoki-inv-')
     const bin = npmToolBin(tc, 'gltf-transform') // platform-correct shim (.cmd on Windows)
     writeExecStub(bin, '4.4.1')
     process.env.MODOKI_TOOLCHAIN_DIR = tc
@@ -748,7 +751,7 @@ describe('toolchain — bundled-vs-system SDK preference (systemToolchainAllowed
     savedTcDir = process.env.MODOKI_TOOLCHAIN_DIR
     savedAllowEnv = process.env.MODOKI_ALLOW_SYSTEM_TOOLCHAIN
     delete process.env.MODOKI_ALLOW_SYSTEM_TOOLCHAIN
-    tcDir = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-tc-'))
+    tcDir = makeScratchDir('modoki-tc-')
   })
   afterEach(() => {
     if (savedTcDir === undefined) delete process.env.MODOKI_TOOLCHAIN_DIR
@@ -785,8 +788,8 @@ describe('toolchain — bundled-vs-system SDK preference (systemToolchainAllowed
   // with either one silently drove the build off a system SDK despite "bundled-only".
   it('bundled-only IGNORES a system JAVA_HOME / ANDROID_HOME (env is a SYSTEM source)', () => {
     process.env.MODOKI_TOOLCHAIN_DIR = tcDir // no settings.json → bundled-only
-    const sdk = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-sysdk-'))
-    const jdk = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-sysjdk-'))
+    const sdk = makeScratchDir('modoki-sysdk-')
+    const jdk = makeScratchDir('modoki-sysjdk-')
     fs.mkdirSync(path.join(sdk, 'platform-tools'))
     fs.mkdirSync(path.join(jdk, 'bin'), { recursive: true })
     fs.writeFileSync(path.join(jdk, 'bin', process.platform === 'win32' ? 'java.exe' : 'java'), '')
@@ -815,7 +818,7 @@ describe('toolchain — bundled-vs-system SDK preference (systemToolchainAllowed
   it('OUR provisioned SDK outranks a system ANDROID_HOME even with system tools allowed', () => {
     process.env.MODOKI_TOOLCHAIN_DIR = tcDir
     process.env.MODOKI_ALLOW_SYSTEM_TOOLCHAIN = '1'
-    const sys = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-sysdk-'))
+    const sys = makeScratchDir('modoki-sysdk-')
     fs.mkdirSync(path.join(sys, 'platform-tools'))
     fs.mkdirSync(path.join(tcDir, 'android-sdk', 'platform-tools'), { recursive: true })
     const saved = process.env.ANDROID_HOME
@@ -938,7 +941,7 @@ describe('toolchain — pinned CLI/gem tool versions + staleness (bump → reins
     // process. A real machine that installed before this pin existed has a package.json on disk
     // missing `overrides.sharp` — that's the evidence this check looks for, so it self-heals on the
     // next status probe rather than requiring the user to know to click "Reinstall".
-    const tc = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-tc-sharp-'))
+    const tc = makeScratchDir('modoki-tc-sharp-')
     process.env.MODOKI_TOOLCHAIN_DIR = tc
     const npmToolsDir = path.join(tc, 'npm-tools')
     fs.mkdirSync(npmToolsDir, { recursive: true })
@@ -955,7 +958,7 @@ describe('toolchain — pinned CLI/gem tool versions + staleness (bump → reins
   })
 
   it('does NOT flag stale for a sharp-override reason when npm-tools/package.json is simply ABSENT (nothing installed here yet)', () => {
-    const tc = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-tc-nosharp-'))
+    const tc = makeScratchDir('modoki-tc-nosharp-')
     process.env.MODOKI_TOOLCHAIN_DIR = tc
     const pin = PINNED_TOOL_VERSIONS['gltf-transform-cli']!
     const d: DetectResult = {
@@ -966,7 +969,7 @@ describe('toolchain — pinned CLI/gem tool versions + staleness (bump → reins
   })
 
   it('does NOT flag stale once npm-tools/package.json already carries the pinned sharp override', () => {
-    const tc = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-tc-sharp-ok-'))
+    const tc = makeScratchDir('modoki-tc-sharp-ok-')
     process.env.MODOKI_TOOLCHAIN_DIR = tc
     const npmToolsDir = path.join(tc, 'npm-tools')
     fs.mkdirSync(npmToolsDir, { recursive: true })
@@ -992,7 +995,7 @@ describe('toolchain — pinned CLI/gem tool versions + staleness (bump → reins
 describe('toolchain — uninstall / uninstallAll (remove provisioned tools)', () => {
   let root: string
   let tc: string
-  beforeEach(() => { root = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-un-')); tc = path.join(root, 'toolchain'); fs.mkdirSync(tc) })
+  beforeEach(() => { root = makeScratchDir('modoki-un-'); tc = path.join(root, 'toolchain'); fs.mkdirSync(tc) })
   afterEach(() => fs.rmSync(root, { recursive: true, force: true }))
 
   it("uninstall('java') removes <toolchain>/jdk", async () => {
@@ -1050,7 +1053,7 @@ describe('toolchain — uninstall / uninstallAll (remove provisioned tools)', ()
       const target = path.join(root, 'elsewhere')
       fs.mkdirSync(target, { recursive: true })
       fs.mkdirSync(path.join(tc, 'ruby'), { recursive: true })
-      fs.symlinkSync(target, path.join(tc, 'ruby', 'link'), 'junction')
+      makeDirLink(target, path.join(tc, 'ruby', 'link'))
       expect(shouldSweepProcesses(path.join(tc, 'ruby'), 'win32')).toBe(true)
     })
 
@@ -1062,11 +1065,299 @@ describe('toolchain — uninstall / uninstallAll (remove provisioned tools)', ()
     })
   })
 
-  it('uninstallAll REFUSES a path not named "toolchain" (safety guard)', () => {
-    const notTc = path.join(root, 'important-stuff')
-    fs.mkdirSync(notTc)
-    expect(() => uninstallAll(notTc)).toThrow(/refusing/i)
-    expect(fs.existsSync(notTc)).toBe(true) // untouched
+  // #1005 — the guard used to be `basename(dir) !== 'toolchain'`, which asks about the NAME where
+  // the property it needs is the CONTENTS. It was wrong in BOTH directions: it rejected every
+  // legitimate `MODOKI_TOOLCHAIN_DIR` whose basename differs (the reported symptom — measured on the
+  // `win` clone, whose override is named `modoki-toolchain`), and it ACCEPTED any unrelated
+  // directory that happened to be named `toolchain`.
+  //
+  // ⚠️ The obvious replacement — `samePath(dir, process.env.MODOKI_TOOLCHAIN_DIR)` — is VACUOUS and
+  // was deliberately not taken: the only production caller (`editorBackendRouter.ts`'s
+  // `/api/toolchain/uninstall`) sets `tc = process.env.MODOKI_TOOLCHAIN_DIR`, so that check compares
+  // the value with itself and can never fail. What the guard is left protecting, once
+  // `forceRemoveDir`'s boundary walk has taken links/mounts/drive-roots (#883/#990/#1004), is
+  // exactly one case: an ordinary, self-contained directory that is not a toolchain. So it asks
+  // about the contents.
+  describe('uninstallAll guards by CONTENTS, not by name (#1005)', () => {
+    const ownedLayout = (dir: string) => {
+      fs.mkdirSync(path.join(dir, 'node'), { recursive: true })
+      fs.mkdirSync(path.join(dir, 'jdk'), { recursive: true })
+      fs.mkdirSync(path.join(dir, 'npm-tools'), { recursive: true })
+      fs.writeFileSync(path.join(dir, 'settings.json'), '{}')
+    }
+
+    // ⚠️ THE ACCEPT SIDE — the symptom this issue actually reports. Proving a guard REJECTS never
+    // proves it ACCEPTS, and the old guard passed every rejection test in this file while being
+    // completely dead for the one configuration the owner actually runs.
+    it('ACCEPTS a toolchain root whose basename is not "toolchain" (the reported symptom)', () => {
+      const override = path.join(root, 'modoki-toolchain') // the `win` clone's actual shape
+      ownedLayout(override)
+      expect(() => uninstallAll(override)).not.toThrow()
+      expect(fs.existsSync(override)).toBe(false)
+    })
+
+    it('REFUSES a directory that is not a toolchain, and NAMES what it found', () => {
+      const home = path.join(root, 'home-ish')
+      fs.mkdirSync(path.join(home, 'Documents'), { recursive: true })
+      fs.mkdirSync(path.join(home, 'node'), { recursive: true }) // one owned entry is not enough
+      expect(() => uninstallAll(home)).toThrow(/Documents/)
+      expect(fs.existsSync(path.join(home, 'Documents'))).toBe(true) // untouched
+    })
+
+    // The direction the OLD guard got backwards: it passed this, because the name matched.
+    it('REFUSES a dir NAMED "toolchain" that holds foreign entries', () => {
+      const decoy = path.join(root, 'toolchain-decoy', 'toolchain')
+      fs.mkdirSync(path.join(decoy, 'Pictures'), { recursive: true })
+      expect(() => uninstallAll(decoy)).toThrow(/Pictures/)
+      expect(fs.existsSync(path.join(decoy, 'Pictures'))).toBe(true)
+    })
+
+    it('accepts an EMPTY dir — nothing to orphan, and uninstallAll is idempotent', () => {
+      const empty = path.join(root, 'empty-tc')
+      fs.mkdirSync(empty)
+      expect(() => uninstallAll(empty)).not.toThrow()
+    })
+
+    // OS bookkeeping files are not "foreign" — a toolchain root that Explorer or Finder has looked
+    // at must not become un-removable.
+    it('ignores OS junk (.DS_Store / Thumbs.db / desktop.ini)', () => {
+      const tcj = path.join(root, 'tc-junk')
+      ownedLayout(tcj)
+      for (const f of ['.DS_Store', 'Thumbs.db', 'desktop.ini']) fs.writeFileSync(path.join(tcj, f), 'x')
+      expect(() => uninstallAll(tcj)).not.toThrow()
+      expect(fs.existsSync(tcj)).toBe(false)
+    })
+
+    // ⚠️ **The mirror, guarded by DERIVATION rather than by a literal** (#1005). The owned-entry set
+    // lives in `scripts/toolchainRoot.mjs` because `clean-packaged-cache.mjs` is plain-node `.mjs`
+    // and cannot import this typed map; that makes it a second place naming the same directories.
+    // This does NOT compare two hand-written lists — it enumerates `TOOL_IDS` and calls the REAL
+    // `toolOwnedDirs`, so adding a tool with a new top-level dir turns this red. Without it the
+    // drift is SILENT and lands the worst way round: the guard starts refusing a real toolchain
+    // root, i.e. it re-creates exactly the defect it was written to fix.
+    it('TOOLCHAIN_OWNED_ENTRIES covers every dir toolOwnedDirs can return, for every TOOL_ID', () => {
+      const fromTs = new Set(
+        TOOL_IDS.flatMap((id) => toolOwnedDirs(id, path.join(root, 'tc'))).map((d) => path.basename(d)),
+      )
+      expect(fromTs.size).toBeGreaterThan(0) // the enumeration itself must not be empty
+      const missing = [...fromTs].filter((n) => !TOOLCHAIN_OWNED_ENTRIES.has(n))
+      expect(missing).toEqual([])
+    })
+
+    // The two entries no `toolOwnedDirs` row returns, so the check above cannot see them. Both are
+    // DERIVED from a real code path, not typed in here.
+    //
+    // ⚠️ The npm-tools half was previously `basename(dirname(npmToolBin(...)))`, which lands on
+    // `.bin` — so it asserted `has('.bin') === false`, trivially true and about nothing, and the
+    // literal `'npm-tools'` beside it was the only thing named. NOTHING made it fail: renaming
+    // `npmToolsDir` to `npm-cli` left both assertions green while every real toolchain root grew an
+    // unowned `npm-cli` entry, so `uninstallAll` would refuse a genuine root — #1005 re-created,
+    // silently, by the test written to prevent exactly that. Caught by close-out review.
+    // `npmToolBin` is `<tc>/npm-tools/node_modules/.bin/<name>`, so it takes THREE dirnames.
+    it('also covers npm-tools and settings.json, which no ToolId owns', () => {
+      const tcRoot = path.join(root, 'tc')
+      const npmToolsFromRealPath = path.basename(
+        path.dirname(path.dirname(path.dirname(npmToolBin(tcRoot, 'gltfpack')))),
+      )
+      expect(npmToolsFromRealPath).not.toBe('.bin') // the bug this replaces, pinned
+      expect(TOOLCHAIN_OWNED_ENTRIES.has(npmToolsFromRealPath)).toBe(true)
+
+      // settings.json: drive the real writer and read back where it landed.
+      const tcs = path.join(root, 'tc-settings')
+      fs.mkdirSync(tcs, { recursive: true })
+      const prev = process.env.MODOKI_TOOLCHAIN_DIR
+      process.env.MODOKI_TOOLCHAIN_DIR = tcs
+      try {
+        writeToolchainSettings({ allowSystemToolchain: true })
+        const written = fs.readdirSync(tcs)
+        expect(written).toContain('settings.json')
+        for (const n of written) expect(TOOLCHAIN_OWNED_ENTRIES.has(n)).toBe(true)
+      } finally {
+        if (prev === undefined) delete process.env.MODOKI_TOOLCHAIN_DIR
+        else process.env.MODOKI_TOOLCHAIN_DIR = prev
+        resetToolchainCache()
+      }
+    })
+  })
+
+  // #1004 — forceRemoveDir had NO link pre-flight, so a junctioned tool dir was unlinked, the
+  // payload orphaned, and the route returned {ok:true}. #883 fixed this mechanism in
+  // clean-packaged-cache.mjs and NOWHERE ELSE, which is exactly how it survived here.
+  //
+  // ⚠️ Every case asserts the PAYLOAD, not just the throw. A test that only checks for a rejection
+  // passes just as happily on a version that throws AFTER deleting — which is the failure being
+  // fixed, and the assertion that separates the two is `payload survives`.
+  describe('uninstall REFUSES rather than orphaning a junctioned payload (#1004)', () => {
+    const payloadIn = (base: string) => {
+      const payload = path.join(base, 'PAYLOAD')
+      fs.mkdirSync(payload, { recursive: true })
+      fs.writeFileSync(path.join(payload, 'big.bin'), 'x'.repeat(512))
+      return payload
+    }
+
+    it("uninstall('android-sdk') refuses when <toolchain>/android-sdk is a link OUT of the tree", async () => {
+      const payload = payloadIn(root)
+      makeDirLink(payload, path.join(tc, 'android-sdk'))
+      await expect(uninstall('android-sdk', { toolchainDir: tc })).rejects.toThrow(/not self-contained/i)
+      expect(fs.existsSync(path.join(payload, 'big.bin'))).toBe(true)
+      expect(fs.existsSync(path.join(tc, 'android-sdk'))).toBe(true) // the link is left ALONE
+    })
+
+    it('uninstallAll refuses when the toolchain dir ITSELF is a link — the CONTENTS guard passes it', () => {
+      // ⚠️ Two guards, in order, and this case exists to prove the SECOND one fires. The contents
+      // guard (#1005) runs first and is satisfied here — `readdir` follows the link, so it sees the
+      // target's toolchain-shaped layout and says yes. The link is then caught by `forceRemoveDir`'s
+      // boundary walk, which asks the different question: would a recursive delete misreport?
+      //
+      // ⚠️ **The payload MUST be toolchain-shaped, and this test is how we learned it.** It used to
+      // be a bare `<payload>/big.bin`, which the contents guard correctly calls a foreign entry — so
+      // the moment #1005 landed, this case reddened with the WRONG refusal and stopped exercising
+      // #1004's link mechanism at all. A flat payload silently converts this into a test of the
+      // other guard. (Title updated too: it used to say "the basename guard passes it", naming a
+      // guard that no longer exists.)
+      const base = makeScratchDir('modoki-un2-')
+      try {
+        const payload = path.join(base, 'PAYLOAD')
+        fs.mkdirSync(path.join(payload, 'node'), { recursive: true })
+        fs.writeFileSync(path.join(payload, 'node', 'big.bin'), 'x'.repeat(512))
+        const link = path.join(base, 'toolchain')
+        makeDirLink(payload, link)
+        expect(() => uninstallAll(link)).toThrow(/not self-contained/i)
+        expect(fs.existsSync(path.join(payload, 'node', 'big.bin'))).toBe(true)
+      } finally { fs.rmSync(base, { recursive: true, force: true }) }
+    })
+
+    it("refuses on a link NESTED below the tool dir, not just the tool dir itself (#990's axis)", async () => {
+      const payload = payloadIn(root)
+      fs.mkdirSync(path.join(tc, 'jdk', '21.0.11+10'), { recursive: true })
+      makeDirLink(payload, path.join(tc, 'jdk', '21.0.11+10', 'lib'))
+      await expect(uninstall('java', { toolchainDir: tc })).rejects.toThrow(/not self-contained/i)
+      expect(fs.existsSync(path.join(payload, 'big.bin'))).toBe(true)
+    })
+
+    // ⚠️ **The ACCEPT side, and it is the half that keeps this usable.** A guard that refuses
+    // everything is not this guard: npm's `node_modules/.bin` shims are symlinks pointing INSIDE
+    // the tree on POSIX, and the toolchain installs npm tools into MODOKI_TOOLCHAIN_DIR — so a
+    // predicate that refused on any nested link would refuse every POSIX uninstall. Without this
+    // case, that regression lands green.
+    it('does NOT refuse a link pointing INSIDE the tree — the npm .bin shim shape', async () => {
+      fs.mkdirSync(path.join(tc, 'jdk', 'real'), { recursive: true })
+      fs.writeFileSync(path.join(tc, 'jdk', 'real', 'tool'), 'x')
+      makeDirLink(path.join(tc, 'jdk', 'real'), path.join(tc, 'jdk', 'shim'))
+      await uninstall('java', { toolchainDir: tc })
+      expect(fs.existsSync(path.join(tc, 'jdk'))).toBe(false) // it really was removed
+    })
+
+    it('does NOT refuse an ordinary real tree — the plain accept side', async () => {
+      fs.mkdirSync(path.join(tc, 'jdk', '21.0.11+10', 'bin'), { recursive: true })
+      fs.writeFileSync(path.join(tc, 'jdk', '21.0.11+10', 'bin', 'java'), 'x')
+      await uninstall('java', { toolchainDir: tc })
+      expect(fs.existsSync(path.join(tc, 'jdk'))).toBe(false)
+    })
+  })
+
+  // #988 — the sweep's scope clause. Pure string, so this runs on every host; the defect is
+  // Windows-only but the logic is not.
+  describe('winSweepCommand — a PREFIX test, not a wildcard, and no quoted path (#988)', () => {
+    /** What the emitted command will actually compare against — decoded back out of the base64 the
+     *  command carries. Asserting on the DECODED value rather than on a quoted substring is the
+     *  point: there is no quoted substring any more, and a test that looked for one would have to
+     *  be deleted the moment the encoding changed rather than telling us the behaviour changed. */
+    const dirsIn = (cmd: string) =>
+      [...cmd.matchAll(/FromBase64String\('([^']*)'\)/g)].map((m) => Buffer.from(m[1], 'base64').toString('utf16le'))
+
+    it('uses StartsWith/OrdinalIgnoreCase and never -like', () => {
+      const cmd = winSweepCommand('C:\\tools\\jdk')
+      expect(cmd).toContain('.StartsWith(')
+      expect(cmd).toContain('OrdinalIgnoreCase')
+      expect(cmd).not.toContain('-like')
+    })
+
+    // ⚠️ The measured case. `-like` reads `[1]` as a character class and matches NOTHING, so the
+    // sweep silently kills nothing and the rmSync then fails on the lock it existed to clear.
+    // Asserting the bracket survives VERBATIM is what pins the operator choice.
+    it('carries a bracketed path through verbatim — the shape -like silently dropped', () => {
+      expect(dirsIn(winSweepCommand('E:\\dev-temp\\a[1]b'))).toEqual(['E:\\dev-temp\\a[1]b\\'])
+    })
+
+    it('appends a trailing separator so a SIBLING prefix does not match', () => {
+      // Without it `…\jdk` also matches `…\jdk-old`.
+      expect(dirsIn(winSweepCommand('C:\\tools\\jdk'))).toEqual(['C:\\tools\\jdk\\'])
+    })
+
+    // ⚠️ **The quote cases, and the second one is why the encoding exists.** Windows PowerShell
+    // treats U+2018/U+2019/U+201A as single-quote delimiters too, so an escaper that doubles only
+    // ASCII `'` lets a path break out of the literal and the command fails to PARSE — throwing into
+    // forceRemoveDir's best-effort catch, so the sweep silently kills nothing. That is the identical
+    // end state as the -like bug, one character over. The previous test doubled the ASCII quote and
+    // asserted the doubling, which READ as covering this and did not.
+    it.each([
+      ['ASCII apostrophe', "C:\\it's\\jdk"],
+      ['U+2019 right single quote', 'C:\\it\u2019s\\jdk'],
+      ['U+2018 left single quote', 'C:\\it\u2018s\\jdk'],
+      ['U+201A single low quote', 'C:\\it\u201As\\jdk'],
+      ['a double quote', 'C:\\say "hi"\\jdk'],
+      ['a backtick and a $', 'C:\\a`b$c\\jdk'],
+    ])('carries %s through without any quote reaching the command text', (_label, dir) => {
+      const cmd = winSweepCommand(dir)
+      expect(dirsIn(cmd)).toEqual([dir + '\\'])
+      // The command's only quotes are the ones wrapping base64, which cannot contain a quote.
+      for (const ch of ["\u2018", "\u2019", "\u201A", '"', '`']) expect(cmd).not.toContain(ch)
+    })
+
+    it('emits ONE clause when there is no second spelling — never an empty side (#69)', () => {
+      const cmd = winSweepCommand('C:\\tools\\jdk', null)
+      expect(cmd.match(/StartsWith\(/g)).toHaveLength(1)
+      expect(cmd).not.toContain(' -or ')
+    })
+
+    it('ORs in the second spelling when there is one', () => {
+      const cmd = winSweepCommand('C:\\link\\jdk', 'D:\\real\\jdk')
+      expect(cmd.match(/StartsWith\(/g)).toHaveLength(2)
+      expect(cmd).toContain(' -or ')
+      expect(dirsIn(cmd)).toEqual(['C:\\link\\jdk\\', 'D:\\real\\jdk\\'])
+    })
+
+    // ⚠️ The decode is hoisted OUT of the Where-Object block, which runs once per process.
+    it('declares the directories before the pipeline, not inside the filter', () => {
+      const cmd = winSweepCommand('C:\\tools\\jdk')
+      expectInOrder(cmd, ['$d0 =', 'Where-Object'], 'winSweepCommand')
+      expect(cmd.slice(cmd.indexOf('Where-Object'))).not.toContain('FromBase64String')
+    })
+  })
+
+  // #958 row 3's scar, made falsifiable. The alternate was once recomputed at a layer that SKIPPED
+  // this guard, and a junction targeting `C:\` then produced `StartsWith('C:\')` — every process on
+  // the drive. It was an inline pair of lines, which is precisely why nothing could pin it.
+  describe('sweepAlt — the second spelling, width-guarded (#958 row 3)', () => {
+    it('is null when the path does not resolve to a different spelling', () => {
+      const real = makeScratchDir('modoki-alt-')
+      try { expect(sweepAlt(fs.realpathSync.native(real))).toBeNull() }
+      finally { fs.rmSync(real, { recursive: true, force: true }) }
+    })
+
+    it('is null for a path that does not exist — nothing to reap, so no second pattern', () => {
+      expect(sweepAlt(path.join(root, 'no-such-dir'))).toBeNull()
+    })
+
+    // The load-bearing case. A LINK long enough to pass any naive length check, whose TARGET is
+    // implausibly short — the exact asymmetry that produced StartsWith('C:\').
+    it('REFUSES an implausibly short target even when the argument is long', () => {
+      const shortTarget = process.platform === 'win32' ? 'C:\\' : '/'
+      const link = path.join(root, 'a-comfortably-long-link-name-here')
+      makeDirLink(shortTarget, link)
+      expect(sweepAlt(link)).toBeNull()
+    })
+
+    // ⚠️ The ACCEPT side: proving it rejects a short target says nothing about whether it ever
+    // returns one, and a `sweepAlt` that returned null always would pass every case above.
+    it('DOES return a plausible second spelling — the accept side', () => {
+      const target = path.join(root, 'a-real-and-suitably-long-target')
+      fs.mkdirSync(target, { recursive: true })
+      const link = path.join(root, 'the-link')
+      makeDirLink(target, link)
+      expect(sweepAlt(link)).toBe(fs.realpathSync.native(target))
+    })
   })
 })
 
@@ -1075,7 +1366,7 @@ describe('toolchain — detect(npm) resolves a PROVISIONED Node (Core shows pres
   let savedNode: string | undefined, savedCli: string | undefined
   beforeEach(() => {
     savedNode = process.env.MODOKI_NODE; savedCli = process.env.MODOKI_NPM_CLI
-    dir = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-npm-'))
+    dir = makeScratchDir('modoki-npm-')
     resetToolchainCache()
   })
   afterEach(() => {

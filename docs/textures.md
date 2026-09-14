@@ -204,6 +204,39 @@ committed sidecars with a stale `modelCache.hash` are cleaned up by
 `.meta.json` through the real read/write functions; `engine/tests/assets/
 metaSidecarChurn.test.ts` guards against a regression re-introducing one.
 
+### A cold-cache bake that 404s in milliseconds is not a cache miss
+
+**Symptom, from when the Forest Camp demo arrived from the `win` clone:** on a clone with an empty
+`.cache/`, GLB-extracted materials rendered flat white and the HDR sky was flat blue. Every missing
+variant 404'd. "Re-import all" fixed it every time.
+
+**The theory that fit the symptom and was wrong:** a cold cache that auto-heal did not fully cover.
+Three observations killed it. A single isolated `curl` to a missing variant still 404'd in about
+6 ms with no bake attempted. `/api/reimport` sent to the **Vite** origin failed on the first request
+after a clean boot. A process audit found no stale servers. Nothing was racing.
+
+**The mechanism:** the plugin graph loads through Vite's runner-based SSR pipeline. There, `ssrTransform` rewrites
+**every** `import(...)`, including `import('sharp')`, into a call through a module runner that can
+close independently of the server. After that, each rewritten import throws `Vite module runner has
+been closed.`, and `autoBakeThenServe`, which never throws by design, reports it as a plain 404.
+Re-import "fixed" it only because that request goes to the **Electron backend**, whose own SSR
+loader (`engine/electron/ssrLoader.ts`) never shares the dev server's runner. The button routed
+around the bug; it never fixed a cache.
+
+**The fix:** `nativeDynamicImport` (`engine/plugins/native-dynamic-import.ts`) hides the `import()`
+from Vite's parser. Its docblock holds the full reasoning: the two runtime contexts, why
+`/* @vite-ignore */` does not help, and the `VITEST` branch. Every bare `import()` of an npm package
+in the bake plugins goes through it: `texture-convert.ts`, `env-convert.ts`, `reimport-atlas.ts` and
+`model-convert.ts`. **`ctx.ssrLoadModule` was deliberately left alone.** It compiles project
+TS/JSX, which a native import cannot. A postprocessor bake that fails this way falls back to the raw
+source GLB, which is visible, so it is lower severity. Pinned by
+`engine/tests/plugins/nativeDynamicImport.test.ts`.
+
+**Accepted cost:** a cold cache now does the real work on first request: HDR downscale, GLB bakes and
+`toktx` per texture variant. That can outlast an MCP call's timeout, though the bake still
+completes. It happens once per cache wipe, and before the fix a cold cache gave an instant, wrong
+answer instead.
+
 ### Reproducible is not the same as up to date (#161)
 
 `textureCache.hash` being pure buys nothing if the committed value was written under *different*
@@ -342,6 +375,71 @@ project-root-then-editor fallback) and copied into `dist/pixi-ktx/` at build tim
 by `shipPixiKtxTranscoder()` in `vite-asset-scanner.ts` — mirroring how the
 three.js Basis transcoder is provided at `/basis/` for the 3D KTX2 path.
 
+### The dev URL carries the content hash (#1022)
+
+**`withCacheBust` appends `?v=<hash>` whenever the manifest knows a hash — in DEV as well as in
+production.** It used to be gated on `import.meta.env.PROD`, and that gate was #1022.
+
+The gate's original reasoning was about *fetching*: the query exists to defeat immutable browser/CDN
+caching, and the Vite dev server needs no such help. That is true and it is not the whole job. **The
+URL is also the IDENTITY every downstream cache keys on**, and freezing it in dev froze all of them:
+
+- PixiJS `Assets` keys on the resolved URL verbatim (`Scene2D.tsx`'s `makeSprite`), so a re-imported
+  sprite hit a cache HIT and bound the pre-import `TextureSource`.
+- `Scene2D`'s slot sync re-consults the resolver only when the sprite ref or the **sprite epoch**
+  changed. A re-import does bump the epoch, so the renderer *did* look again — and found the same
+  URL, concluded nothing had changed, and rebuilt onto the same stale source.
+- The three.js `texCache` has the same key shape, mitigated there by instance-keyed retirement
+  (§ "Invalidation must never DESTROY a texture something still binds").
+
+⚠️ **The hash is what separates a re-import from a re-slice, and that is why the fix belongs at the
+URL rather than in an eviction pass at each consumer.** Both bump the sprite epoch, so an
+epoch-keyed fix cannot tell them apart and would force a re-download on every sprite-sheet re-slice.
+The hash moves only when the bytes move:
+
+| operation | hash | URL | result |
+|---|---|---|---|
+| re-import (new bytes) | moves | moves | fresh fetch, stale source released on the ordinary path |
+| re-slice (new frames, same bytes) | same | same | shared `TextureSource` correctly reused |
+
+`blob:`/`data:` URLs are still exempt — they are already unique, and a query suffix breaks blob-URL
+lookup (matched by UUID, not query). A hashless manifest entry is exempt too, so nothing ever
+resolves to a literal `?v=undefined`.
+
+⚠️ **A query suffix is safe for parser selection.** PixiJS v8 picks a texture `loadParser` by
+extension via `path.extname`, which strips both `?query` and `#hash`; the repo's own KTX2 detectors
+are written `/\.ktx2(\?|$)/` for the same reason. Production has always shipped these URLs, so this
+is a widening of an exercised path, not a new one.
+
+⚠️ **This is NOT texture-only — `withCacheBust` is the single appender for EVERY hashed asset URL
+in the engine**, and removing its `PROD` arm moved all of them at once. Derive the list rather than
+trusting this table: `grep -rn 'withCacheBust(' engine/packages/modoki/src engine/app engine/plugins`.
+At the time of writing it returns 14 call sites across:
+
+| kind | resolver | what a dev re-import now does |
+|---|---|---|
+| texture | `resolveTextureVariantUrl` | new Pixi `Assets` + `texCache` key |
+| environment | `resolveEnvVariantUrl` | new HDR/UltraHDR key |
+| atlas page | `resolveAtlasPageUrl` | new page key, so a re-pack is seen |
+| model | `modelGlbUrl` | new `meshTemplateCache` key (incl. LOD paths) |
+| font | `fontUrls` / `doLoadFont` | new `FontFace` source, so the reload is a real refetch |
+| audio | `resolveAudioUrl` | new buffer/stream url |
+| video | `resolveVideoUrl` | new element source |
+| editor preview | `FontAssetView`'s atlas preview | agrees with `fontUrls` instead of drifting |
+
+⚠️ **A count in prose goes stale the moment someone adds a consumer — this table has been wrong
+once already**, listing four kinds on the day the same change rewrote the video consumer and added
+the editor one. That breadth is the point of the helper — it exists so the scheme cannot drift
+between them — but it means a change here is never local. Four tests across three subsystems pinned the old dev behaviour
+and had to be re-stated; one of them (`fontLoader.test.ts`'s re-import case) had counted loads keyed
+by the *shared* url, an assertion that only worked **because** the url did not move.
+
+⚠️ **The old url's cache entry is not evicted by this** — it is superseded, not removed, so a long
+authoring session that re-imports the same asset repeatedly accumulates one dead entry per re-import
+until the scene-scoped release runs (§ "Resource Management" in the root `CLAUDE.md`). Bounded by
+re-imports per scene rather than by time, and untouched by this change either way: before it, the
+stale entry was not merely retained but actively *served*.
+
 ## Texture LOD by quality tier (#212)
 
 Textures are 67% of a shipped build (measured on `demos/postfx-demo`: 21.8 MB of KTX2 in a
@@ -471,11 +569,14 @@ holder.** Invalidation must do three things and no more:
    `meshTemplateCache.disposeMaterial` when the material rebuilds, which is what makes the
    texture and material invalidations order-independent instead of implicitly coupled.
 
-⚠️ **Retirement is keyed by TEXTURE INSTANCE, never by cache key.** A re-load after
-invalidation builds a new entry under the *same* key — the URL is unchanged in dev, since the
-`?v=` cache-bust only moves when the content hash does — so a key-keyed map lets a stale release
-decrement the NEW entry and destroy a texture that is in use, trading one use-after-free for
-another. `releaseTexture3D` also refuses to decrement an entry whose `texture` is not the
+⚠️ **Retirement is keyed by TEXTURE INSTANCE, never by cache key.** A re-load after invalidation can
+build a new entry under the *same* key — the `?v=` cache-bust moves only when the content hash does,
+so any invalidation that is not a byte change (a re-slice, a retype) re-resolves to the identical
+URL — and a key-keyed map would then let a stale release decrement the NEW entry and destroy a
+texture that is in use, trading one use-after-free for another. ⚠️ This passage used to justify the
+rule with "the URL is unchanged **in dev**", which was a statement about the `PROD` gate on
+`withCacheBust` rather than about the hash; that gate is gone (#1022, § "The dev URL carries the
+content hash") and the rule is unaffected, because it never depended on the environment. `releaseTexture3D` also refuses to decrement an entry whose `texture` is not the
 instance being released, for the same reason.
 
 `getSharedTextureStats` and `disposeAllSharedTextures` both account for retired entries: the
@@ -705,6 +806,36 @@ scraping the log.
   dead ref for a different invariant violation. `assetRefIntegrity.test.ts` now models the same
   exclusion; it used to add the derived guid unconditionally, which made the guard vouch for
   precisely the dead ref it exists to catch.
+- **The INVERSE is not a dead ref, and mistaking it for one costs reverts.** A raw *texture* guid
+  in `Renderable2D.sprite` / `UIElement.imageSrc` **renders correctly**: `resolveSprite` tries the
+  atlas redirect, then a `'sprite'` manifest entry, then falls through to
+  `resolveTextureVariantUrl(ref,'2d')` — which a texture guid satisfies. It is a **build/packing**
+  invariant, not a render one — nothing on screen will ever tell you.
+
+  ⚠️ **And `assetRefIntegrity.test.ts` only sees refs authored in a SCENE or prefab**
+  (`Renderable2D.sprite` / `UIElement.imageSrc` in the JSON). A guid that lives on a game's CONFIG
+  trait and becomes a sprite ref at spawn time is invisible to it, and to every other engine gate —
+  `games/wordweave` shipped exactly that shape and `npm run verify` stayed green with a raw texture
+  guid in it. A game that routes sprite refs through code owes itself a game-local guard;
+  `games/court/tests/pieceSprites.test.ts` and `games/wordweave/tests/cellSprites.test.ts` are the
+  two worked examples.
+
+  ⚠️ **It does NOT drop the asset from the production build.** This bullet claimed exactly that
+  when first written (2026-09-09) and it was wrong: `engine/plugins/asset-tree-shaker.ts` indexes every
+  asset's OWN guid with `origin:'own'` BEFORE the texture branch, so a texture-guid ref resolves
+  and the texture is kept. The derived sprite guid is mapped as well, a few lines later, so both
+  spellings keep the file. What a texture-guid ref actually costs is:
+  - **the FRAME RECT.** A sliced sprite resolves through its parent texture's whole image, so
+    sliced/atlassed art silently draws the entire sheet. This is the consequence Court documented
+    in #51 and the one most likely to bite.
+  - **atlas packing.** A packed member's sprite guid is redirected to the ATLAS file
+    (see that file's `atlasMemberOverrides`) precisely so the now-redundant source texture can be shaken out — and a texture-guid ref is
+    exactly the "some OTHER ref" that keeps it, so the build ships the atlas page *and* the source.
+
+  ⚠️ **A red `assetRefIntegrity` is not an explanation for a rendering failure you are looking at.**
+  Reading it as one cost #1000 three wrong diagnoses and two reverts of a correctly-wired feature.
+  And an *unresolvable* sprite ref is not a crash either — `Scene2D.tsx`'s build loop is
+  `if (!resolved) return;`, so the renderable is silently skipped.
 - **The IMPORT DEFAULT is `3d`, so a freshly imported PNG has no sprite either — and that is
   the surprising half** (#293). The bullet above is about a *sliced* texture; this one is about
   doing nothing at all. `DEFAULT_TEXTURE_SETTINGS.format` is `ktx2-uastc`, and

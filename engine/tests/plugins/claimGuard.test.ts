@@ -15,9 +15,9 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { spawnSync } from 'node:child_process';
 import fs from 'node:fs';
-import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { makeScratchDir } from '@modoki/engine/testing/scratchDir';
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..', '..');
 const guard = path.join(repoRoot, 'engine/scripts/claim-guard.mjs');
@@ -28,8 +28,8 @@ let home: string;
 let clone: string;
 
 beforeEach(() => {
-  home = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-guard-home-'));
-  clone = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-guard-clone-'));
+  home = makeScratchDir('modoki-guard-home-');
+  clone = makeScratchDir('modoki-guard-clone-');
 });
 
 afterEach(() => {
@@ -44,7 +44,7 @@ interface GuardResult {
   reason: string;
 }
 
-function runGuard(command: string, opts: { cwd?: string } = {}): GuardResult {
+function runGuard(command: string, opts: { cwd?: string; env?: Record<string, string> } = {}): GuardResult {
   const payload = JSON.stringify({
     session_id: 'test',
     hook_event_name: 'PreToolUse',
@@ -61,6 +61,7 @@ function runGuard(command: string, opts: { cwd?: string } = {}): GuardResult {
       // The harness sets this in a real session and the guard prefers it. Pin it to the test's
       // clone so the result does not depend on whether the suite itself was launched by Claude.
       CLAUDE_PROJECT_DIR: opts.cwd ?? clone,
+      ...opts.env,
     },
   });
   const out = (res.stdout ?? '').trim();
@@ -195,6 +196,107 @@ describe('claim-guard — false positives that make a guard get routed around', 
   it('does not refuse a simulator build', () => {
     const r = runGuard("xcodebuild -destination 'platform=iOS Simulator,name=iPhone 15' -scheme App build");
     expect(r.decision).toBeNull();
+  });
+});
+
+/** #1083 — a wrapper the classifier could not re-parse reached the phone unchecked.
+ *
+ *  `parseDeviceCommand` returned the all-empty result for it, and this hook's `!targets.tools.length`
+ *  branch reads that as "nothing to arbitrate" and ALLOWS — so a heredoc payload, an `env -S`, a
+ *  substitution or an unmodelled launcher walked straight past the guard. Measured with one
+ *  destructive control wrapped 24 ways: 18 ran unchecked. The parser now reports `opaque`, and the
+ *  refusal polarity is the owner's call (2026-09-12). */
+describe('claim-guard — a wrapper it cannot re-parse (#1083)', () => {
+  // An UNTERMINATED heredoc — the strip swallows to the end of the string, so nothing downstream can
+  // see the command that follows. (A `bash -c "cat <<EOF … EOF … adb …"` is no longer the example: a
+  // heredoc opener inside quotes is skipped now, so that one parses fully and is refused by NAME,
+  // which is the better outcome wherever it is reachable.)
+  const HIDDEN = `cat <<EOF\nx\n${INSTALL}`;
+
+  it('refuses it, in the deny SHAPE the harness acts on', () => {
+    // Shape, not just output: Claude Code treats malformed hook output as non-blocking, so a guard
+    // that prints the wrong thing fails OPEN and "it printed something" proves nothing.
+    const r = runGuard(HIDDEN);
+    expect(r.decision?.permissionDecision).toBe('deny');
+    expect(r.status).toBe(0);
+  });
+
+  it('refuses with NO claim in the file at all — it cannot tell which phone, so there is nothing to look up', () => {
+    // Every other refusal here consults the claims file first. This one cannot, and that is exactly
+    // why it refuses: an unreadable command aimed at a phone is the case the guard exists for.
+    const r = runGuard(HIDDEN);
+    expect(r.reason).toMatch(/re-parse/);
+  });
+
+  it('names a remedy rather than only saying no', () => {
+    expect(runGuard(HIDDEN).reason).toMatch(/device:run/);
+  });
+
+  it('a wrapped command it CAN read is arbitrated normally, by holder — not blanket-refused', () => {
+    // The difference between this and a blunt "unreadable, refuse": re-parsing from the device CLI's
+    // own token classifies the command exactly, so the refusal still names who holds the phone.
+    writeClaim(foreignClaim('adb:RFTESTSERIAL1'));
+    const r = runGuard(`timeout 30 ${INSTALL}`);
+    expect(r.decision?.permissionDecision).toBe('deny');
+    expect(r.reason).toMatch(/held by another clone/);
+    expect(r.reason).not.toMatch(/re-parse/);
+  });
+
+  it('leaves the accept side alone', () => {
+    for (const cmd of ['echo adb', 'sudo -u adb whoami', 'git status', 'node /usr/local/sh/tool.mjs']) {
+      expect(runGuard(cmd).decision, cmd).toBeNull();
+    }
+  });
+});
+
+/** #1078 — `devicectl --device` (or `-d`) may name a phone by its CoreDevice identifier, ECID, serial number
+ *  or name, while every claim is keyed by UDID. The guard compared the raw string, so a sibling's
+ *  `ios:<udid>` claim was invisible to such a command, and this clone's own claim did not cover it. The
+ *  devicectl listing is a fixture, and every id is invented. */
+describe('claim-guard — one iPhone, several devicectl ids (#1078)', () => {
+  const UDID = '00008150-TESTTESTTESTTEST';
+  const IDENTIFIER = 'C0DEC0DE-0000-4000-8000-00000000000A';
+  const launch = (flag: string, id: string) => `xcrun devicectl device process launch ${flag} ${id} com.example.app`;
+  let env: Record<string, string>;
+
+  beforeEach(() => {
+    const file = path.join(home, 'devicectl.json');
+    fs.writeFileSync(file, JSON.stringify({
+      result: { devices: [{ identifier: IDENTIFIER, hardwareProperties: { udid: UDID, platform: 'iOS' }, deviceProperties: { name: 'Test iPad' } }] },
+    }));
+    env = { MODOKI_DEVICECTL_JSON_FIXTURE: file };
+  });
+
+  it('refuses a command naming the CoreDevice identifier of a phone a sibling holds by UDID', () => {
+    writeClaim(foreignClaim(`ios:${UDID}`, { label: 'Test iPad' }));
+    const r = runGuard(launch('--device', IDENTIFIER), { env });
+    expect(r.decision?.permissionDecision).toBe('deny');
+    expect(r.reason).toContain('modoki-ai2');
+  });
+
+  it('allows it when THIS clone holds the phone by UDID — the refusal the hub hit', () => {
+    writeClaim({ ...foreignClaim(`ios:${UDID}`), clone, branch: 'work-ai3' });
+    expect(runGuard(launch('--device', IDENTIFIER), { env }).decision).toBeNull();
+  });
+
+  it('reads -d, devicectl\'s short flag, the same way', () => {
+    writeClaim(foreignClaim(`ios:${UDID}`));
+    const r = runGuard(launch('-d', IDENTIFIER), { env });
+    expect(r.decision?.permissionDecision).toBe('deny');
+    expect(r.reason).toContain('modoki-ai2');
+  });
+
+  it('still honors a claim a sibling took under the identifier spelling itself', () => {
+    writeClaim(foreignClaim(`ios:${IDENTIFIER}`));
+    const r = runGuard(launch('--device', IDENTIFIER), { env });
+    expect(r.decision?.permissionDecision).toBe('deny');
+    expect(r.reason).toContain('modoki-ai2');
+  });
+
+  it('refuses an unclaimed phone with a claim hint naming the UDID key', () => {
+    const r = runGuard(launch('--device', IDENTIFIER), { env });
+    expect(r.decision?.permissionDecision).toBe('deny');
+    expect(r.reason).toContain(`npm run device:claim ios:${UDID}`);
   });
 });
 

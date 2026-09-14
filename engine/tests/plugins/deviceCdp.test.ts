@@ -6,6 +6,7 @@
  *  receiving a trusted touch) is out of scope for this file — see the plan doc. */
 
 import { describe, it, expect, vi } from 'vitest';
+import { found } from '@modoki/engine/testing/inOrder';
 import { aimAsResolved } from '../../plugins/backend/deviceAim';
 import {
   NO_SESSION_REASON,
@@ -171,7 +172,7 @@ describe('synthFallbackBanner — a fallback must be impossible to skim past', (
     // Position is the entire point — assert it, or a later refactor can quietly move it to the end
     // and reintroduce exactly the problem this replaced.
     const banner = synthFallbackBanner(NO_SESSION_REASON);
-    expect(banner.indexOf('SYNTHETIC INPUT (NOT TRUSTED)')).toBeLessThan(8);
+    expect(found(banner.indexOf('SYNTHETIC INPUT (NOT TRUSTED)'), 'the SYNTHETIC INPUT warning')).toBeLessThan(8);
   });
 });
 
@@ -544,5 +545,62 @@ describe('aimAsResolved — the trusted reply does not claim a verified hit (#49
 
   it('wraps rather than replaces, so the label stays greppable', () => {
     expect(aimAsResolved('x').startsWith('x')).toBe(true);
+  });
+});
+
+/** #1016 — the TRUSTED route must supply the gesture, because nothing upstream does.
+ *
+ *  ⚠️ **This is the third aim path to be found unwired, and the one that matters most.**
+ *  `resolveAimViaDevice` forwards `{...params}`, and `params` is the RAW MCP payload — `device_tap`'s
+ *  schema is `{selector, x, y}` with no gesture field. So the gesture cannot arrive from the caller
+ *  and the ROUTE has to name it. Until it did, `handleResolveAim` saw `undefined` on every
+ *  production call and fell to the strict reading, leaving #1016's original symptom live on the
+ *  surface that drives a real phone — while the synthetic fallback, which already flags itself
+ *  with a banner, was the only path that carried one.
+ *
+ *  The assertion is deliberately about **what goes on the wire**, for the same reason
+ *  `bridgeAimGesture.test.ts` exists: the resolver's behaviour is covered elsewhere, and testing it
+ *  again here would leave the wiring unasserted, which is precisely how this went missing twice. */
+describe('#1016 — the trusted CDP route names its gesture on the wire', () => {
+  /** Capture the `resolve-aim` payloads, answering in the STRING shape the real transport uses. */
+  function capturingProxy() {
+    const sent: Array<Record<string, unknown>> = [];
+    const proxy: CdpRouteDeps['proxy'] = async (method, params) => {
+      if (method === 'resolve-aim') sent.push((params ?? {}) as Record<string, unknown>);
+      return JSON.stringify({ x: 1, y: 2, label: 'css(1,2)' });
+    };
+    return { sent, proxy };
+  }
+
+  const session = { send: async () => ({}) } as unknown as DeviceCdpSession;
+  const gestures = (sent: Array<Record<string, unknown>>) => sent.map((p) => p.gesture);
+
+  it('tap sends `tap` — the only click-shaped gesture, and the only one the gap affected', async () => {
+    const { sent, proxy } = capturingProxy();
+    await tryDeviceCdpInput('tap', { selector: '[data-entity-id="42"]' }, depsWithSession(session, proxy));
+    expect(gestures(sent)).toEqual(['tap']);
+  });
+
+  it('drag sends `drag` for both endpoints', async () => {
+    const { sent, proxy } = capturingProxy();
+    await tryDeviceCdpInput('drag', { fromSelector: '#a', toSelector: '#b' }, depsWithSession(session, proxy));
+    expect(gestures(sent)).toEqual(['drag', 'drag']);
+  });
+
+  it('hover sends `hover` and scroll sends `scroll`', async () => {
+    const { sent, proxy } = capturingProxy();
+    await tryDeviceCdpInput('hover', { selector: '#a' }, depsWithSession(session, proxy));
+    await tryDeviceCdpInput('scroll', { selector: '#a', dy: 10 }, depsWithSession(session, proxy));
+    expect(gestures(sent)).toEqual(['hover', 'scroll']);
+  });
+
+  it('the gesture is not read from the caller payload — the tool schema has no such field', async () => {
+    // A caller cannot smuggle one in: `device_tap` exposes no `gesture`, so a value appearing in
+    // `params` is not something the surface accepts, and the ROUTE's choice must win. Pinned
+    // because "forward `...params` and hope" is exactly what shipped and did nothing.
+    const { sent, proxy } = capturingProxy();
+    await tryDeviceCdpInput('drag', { fromSelector: '#a', toSelector: '#b', gesture: 'tap' },
+      depsWithSession(session, proxy));
+    expect(gestures(sent), 'a drag stays a drag').toEqual(['drag', 'drag']);
   });
 });

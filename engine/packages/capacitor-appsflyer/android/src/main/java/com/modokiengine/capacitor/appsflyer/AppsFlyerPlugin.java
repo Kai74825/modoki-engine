@@ -129,16 +129,42 @@ public class AppsFlyerPlugin extends Plugin {
         // it reaches registerSessionReadyListener — a repeat call here, minutes apart across a
         // reload, would register a second listener sequentially rather than race the first one.
         if (sStarted) {
+            // #721 second marker, mirrored from the iOS port so one grep still covers both. It is
+            // iOS that needed it -- there the FIRED line did not print on a cold boot and the
+            // device log cannot see the WebView console, so "start() was never called" and "the
+            // listener never fired" looked identical. Android answered on the first run (FIRED
+            // printed, measured on an A23 2026-09-10) and does not need these to answer #721; it
+            // carries them so the two ports keep the same observable surface.
+            Log.i(TAG, "start() SHORT-CIRCUITED by hasStarted (#721)");
             JSObject alreadyStarted = new JSObject();
             alreadyStarted.put("ok", true);
             call.resolve(alreadyStarted);
             return;
         }
         sStarted = true;
+        Log.i(TAG, "start() ENTERED — will register sessionReady listener (#721)");
 
         AppsFlyerLib.getInstance().registerSessionReadyListener(new SessionReadyListener() {
             @Override
             public void onSessionReady() {
+                // ── #721: the ONE observation that tells the two hypotheses apart ──
+                //
+                // start() does not call the SDK's start() directly — it registers this listener,
+                // whose BODY does. So #654's decisive result ("a second start() produces no SDK
+                // log line and no server row") is predicted equally by "the SDK ignores a second
+                // start" and by "our second listener never fires", and #654's instrument could
+                // not separate them. This line can: if it prints, the body ran.
+                //
+                // ⚠️ It does NOT need the guard-disabled second-start arm to be useful. On an
+                // ORDINARY cold boot it already answers half the question — if this prints, the
+                // listener fires when a foreground transition exists, which is exactly what a
+                // mid-session re-registration lacks (see sStarted's own comment: AppsFlyer's
+                // readiness evaluation follows onBecameForeground), and hypothesis (2) is where
+                // the evidence points. If it NEVER prints, this plugin calls
+                // AppsFlyerLib.start() on no path at all — a bigger finding than #721 expects.
+                //
+                // Same message text as the iOS port so one grep covers both.
+                Log.i(TAG, "sessionReady listener FIRED — calling AppsFlyerLib.start() (#721)");
                 AppsFlyerLib.getInstance().start();
             }
         });

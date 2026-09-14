@@ -11,7 +11,7 @@ import {
 import { importModel } from '../scene/modelImport';
 import { needsGLBConversion, convertSourceToGLB } from '../scene/convertToGLB';
 import { readMetaPreferringPark } from '../scene/pendingMeta';
-import { useEditorStore } from '../store/editorStore';
+import { useEditorStore, type SelectedAsset } from '../store/editorStore';
 import { pushAction } from '../undo/undoManager';
 import { makePrefabInstantiateAction } from '../undo/prefabInstantiateUndo';
 import { ASSET_ROOT_RE, firstAssetRoot } from './assetRoots';
@@ -26,8 +26,9 @@ import {
   deletionPathsFor, planRename,
 } from './assetOps';
 import { resolveClickSelection, dragPathsFor } from './assetSelection';
+import { createStoreSelectionTracker, revealKeysFor } from './assetReveal';
 import {
-  isTextAsset, makeDeleteUndo, makeDuplicateUndo, logBindingChanges,
+  isTextAsset, makeDeleteUndo, makeDuplicateUndo,
   makeRenameUndo, makeEmptyFolderDeleteUndo, makeNewFolderUndo, makeFolderRenameUndo,
   makePasteUndo, makeFilesDropUndo, makeModelImportUndo, makeFileImportUndo,
   type Snapshot, type DeleteResult, type DupResult, type PasteMove, type DropMove,
@@ -240,8 +241,9 @@ async function importModelWithMeta(assetPath: string, assetName: string, onDone?
 
 // ─── Asset row (shared between views) ────────────────────────────────
 
-// `logBindingChanges` moved to assetUndo.ts (#308) so the undo/redo builders there can share
-// it without importing this file.
+// Repair notes are logged by `applyAssetPathMoves` itself (#898) — the pass that produces
+// them. They used to be logged here, which stopped working when #867 moved the repair to
+// `/api/move-file`: that pass runs first, so the panel's call had nothing left to report.
 //
 // A folder-relative `moveFile(from, toFolder)` used to live here, deriving the destination and
 // re-checking "onto itself" / "into its own descendant" itself. #867 extracted those decisions
@@ -622,8 +624,21 @@ export default function Assets() {
     return firstFromEntries(assets) ?? '/';
   }, [assets, selected]);
 
-  const selectAsset = useEditorStore((s) => s.selectAsset);
-  const setSelectedAssets = useEditorStore((s) => s.setSelectedAssets);
+  // Every selection this panel publishes is marked as its OWN, so the store-sync effect below does not
+  // react to it as an external request (`createStoreSelectionTracker`). Wrapping the two actions here,
+  // rather than marking at each call site, is what keeps a future call site covered.
+  const selectionTrackerRef = useRef<ReturnType<typeof createStoreSelectionTracker> | null>(null);
+  selectionTrackerRef.current ??= createStoreSelectionTracker();
+  const storeSelectAsset = useEditorStore((s) => s.selectAsset);
+  const storeSetSelectedAssets = useEditorStore((s) => s.setSelectedAssets);
+  const selectAsset = useCallback((a: SelectedAsset | null) => {
+    selectionTrackerRef.current!.markOwn([a]);
+    storeSelectAsset(a);
+  }, [storeSelectAsset]);
+  const setSelectedAssets = useCallback((list: SelectedAsset[], primary?: SelectedAsset | null) => {
+    selectionTrackerRef.current!.markOwn([...list, primary]);
+    storeSetSelectedAssets(list, primary);
+  }, [storeSetSelectedAssets]);
   const selectedAsset = useEditorStore((s) => s.selectedAsset);
   const assetsVersion = useEditorStore((s) => s.assetsVersion);
   const setImportStatus = useEditorStore((s) => s.setImportStatus);
@@ -719,35 +734,34 @@ export default function Assets() {
   // can actually handle instead of a hardcoded client constant. (F9.)
   useEffect(() => { void refreshHandlerTypes(); }, []);
 
-  // Sync local selection with store (e.g., when clicking an asset directly)
+  // Sync local selection with store (e.g., when clicking an asset directly). Which reactions a
+  // store change earns — and why expand needs the row to be absent — is `createStoreSelectionTracker`.
   useEffect(() => {
     // Store cleared the asset selection (e.g., user selected an entity) — drop local too
     if (!selectedAsset && selected !== null) {
       setSelected(null);
       setSelection(new Set());
       anchorRef.current = null;
-      return;
     }
-    if (selectedAsset && selectedAsset.path !== selected) {
+    const plan = selectionTrackerRef.current!.next(selectedAsset, selected,
+      (path) => !!document.querySelector(`[data-asset-path="${CSS.escape(path)}"]`));
+    if (!selectedAsset) return;
+    if (plan.syncLocal) {
       setSelected(selectedAsset.path);
       // External (single) selection — collapse the multi-select to just it.
       setSelection(new Set([selectedAsset.path]));
       anchorRef.current = selectedAsset.path;
+    }
+    if (plan.expand) {
       setExpanded((prev) => {
+        const keys = revealKeysFor(selectedAsset);
+        if (keys.every((k) => prev.has(k))) return prev;
         const next = new Set(prev);
-        // Category view: expand the asset's type group
-        next.add(selectedAsset.type);
-        // Folder view: expand all ancestor folders so the asset is visible
-        const lastSlash = selectedAsset.path.lastIndexOf('/');
-        if (lastSlash > 0) {
-          const parts = selectedAsset.path.substring(0, lastSlash).split('/').filter(Boolean);
-          for (let i = 1; i <= parts.length; i++) {
-            next.add('/' + parts.slice(0, i).join('/'));
-          }
-        }
-        next.add('/'); // root folder
+        for (const k of keys) next.add(k);
         return next;
       });
+    }
+    if (plan.scroll) {
       // Double rAF: wait for React to commit expanded state before scrolling
       requestAnimationFrame(() => requestAnimationFrame(() => {
         const el = document.querySelector(`[data-asset-path="${CSS.escape(selectedAsset.path)}"]`);
@@ -1069,7 +1083,7 @@ export default function Assets() {
     // generated file that a model delete drags along also unbinds — and, since #884, so that a
     // file the OS refused does NOT: unbinding an editor from a file still on disk is the wrong
     // direction, which is the same call the route makes for its own half of this repair.
-    logBindingChanges(unbindDeletedAssetEditors(outcome.went));
+    unbindDeletedAssetEditors(outcome.went);
     console.log(`[Assets] Moved ${del.trashed} file(s) to trash`);
     // `del.missing` is threaded into the undo so a later restore can tell a sidecar that was
     // never on disk from a file it failed to bring back (#291). `del.failed` joins it for the
@@ -1141,7 +1155,7 @@ export default function Assets() {
     // ⚠️ This is also ONE move site of several. `pasteClipboard`'s cut branch, `handleFilesDrop`
     // and `makeRenameUndo` all move files and never re-point the Inspector at all — see the
     // move-repair class issue #867. Ordering here does not make the selection correct there.
-    logBindingChanges(applyAssetPathMoves([{ from: asset.path, to: toPath, name: safe }]));
+    applyAssetPathMoves([{ from: asset.path, to: toPath, name: safe }]);
     if (selected === asset.path) { setSelected(toPath); selectAsset({ path: toPath, type: asset.type, name: safe }); }
     refresh();
 
@@ -1207,7 +1221,7 @@ export default function Assets() {
     // editor bound to an asset inside would otherwise autosave the file back and RECREATE
     // the folder along with it (#186).
     // remapCurrentFolder runs from inside applyAssetPathMoves now — see its comment.
-    logBindingChanges(applyAssetPathMoves([{ from: folderPath, to: null, prefix: true }]));
+    applyAssetPathMoves([{ from: folderPath, to: null, prefix: true }]);
     clearSelection();
     refresh();
     if (results.length > 0) {
@@ -1268,7 +1282,7 @@ export default function Assets() {
     if (op === 'cut') setClipboard(null);
     // A CUT moves the file, so a bound editor must follow it (#186). A copy/paste creates a
     // NEW file and leaves the original where it is, so nothing bound has moved.
-    if (op === 'cut') logBindingChanges(applyAssetPathMoves(done.map(({ from, to }) => ({ from, to }))));
+    if (op === 'cut') applyAssetPathMoves(done.map(({ from, to }) => ({ from, to })));
     refresh();
     // Builder in assetUndo.ts (#308) — as in handleRename, only the moves that actually
     // landed may repoint a binding, and every skipped item is now reported as one message
@@ -1325,7 +1339,7 @@ export default function Assets() {
     // The same prefix remap the two lines above do for folder state, for an open editor
     // bound to an asset INSIDE the renamed folder (#186) — every one of them just moved.
     // remapCurrentFolder runs from inside applyAssetPathMoves now — see its comment.
-    logBindingChanges(applyAssetPathMoves([{ from: oldPath, to: newPath, prefix: true }]));
+    applyAssetPathMoves([{ from: oldPath, to: newPath, prefix: true }]);
     clearSelection();
     refresh();
     // Builder in assetUndo.ts (#308) — was the worst site: setPendingFolders ran
@@ -1554,7 +1568,7 @@ export default function Assets() {
     // Drag-drop into a folder is a MOVE like any other, so a bound editor must follow it
     // (#186). This site uses `moveFile` (folder-target) rather than `moveFileTo`
     // (explicit-path) — which is exactly why the first sweep for this bug missed it.
-    logBindingChanges(applyAssetPathMoves(moves));
+    applyAssetPathMoves(moves);
     refresh();
 
     // Builder in assetUndo.ts (#308) — same skip-every-item shape as pasteClipboard's cut

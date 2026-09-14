@@ -138,10 +138,19 @@ public class AppsFlyerPlugin: CAPPlugin, CAPBridgedPlugin, AppsFlyerLibDelegate 
         // method runs — see hasStarted's own comment for why a second call must never reach
         // registerSessionReadyListener a second time.
         guard !AppsFlyerPlugin.hasStarted else {
+            // #721 second marker. Measured on an iPad mini 5 / iOS 26.6.1 (2026-09-10): the FIRED
+            // line below did NOT print on a cold boot, while the Android port's did. That is only
+            // a finding if start() was actually CALLED -- an absent FIRED line is predicted just
+            // as well by "the JS never got here", and the iOS device log cannot see the WebView
+            // console the way Android's Capacitor/Console does, so the JS side is invisible from
+            // the one instrument this measurement has. These four markers (SHORT-CIRCUITED /
+            // ENTERED / REGISTERED / FIRED) are what separate those states.
+            NSLog("[AppsFlyerCap] start() SHORT-CIRCUITED by hasStarted (#721)")
             call.resolve(["ok": true])
             return
         }
         AppsFlyerPlugin.hasStarted = true
+        NSLog("[AppsFlyerCap] start() ENTERED — will register sessionReady listener (#721)")
 
         // v7: the SDK never calls start() itself, and start() should run once it reports
         // readiness (config set, cold/warm-launch deeplink resolution settled behind a
@@ -167,7 +176,31 @@ public class AppsFlyerPlugin: CAPPlugin, CAPBridgedPlugin, AppsFlyerLibDelegate 
         // `didFinishLaunching` and that the block is "always dispatched on the main queue", so
         // main is where the registration was always meant to happen.
         DispatchQueue.main.async {
+            // Separately from ENTERED above: this one runs on the MAIN queue, one hop later. If
+            // ENTERED prints and this does not, the hop itself is what did not happen.
+            NSLog("[AppsFlyerCap] registering sessionReady listener NOW (#721)")
             AppsFlyerLib.shared().registerSessionReadyListener {
+                // ── #721: the ONE observation that tells the two hypotheses apart ──
+                //
+                // `start()` does not call the SDK's `start()` directly — it registers this listener,
+                // whose BODY does. So #654's decisive result ("a second start() produces no SDK log
+                // line and no server row") is predicted equally by "the SDK ignores a second start"
+                // and by "our second listener never fires", and #654's instrument could not
+                // separate them. This line can: if it prints, the body ran.
+                //
+                // ⚠️ It does NOT need the guard-disabled second-start arm to be useful. On an
+                // ORDINARY cold boot it already answers half the question — if this prints, the
+                // listener mechanism works when a foreground transition exists, which is exactly
+                // what a mid-session re-registration lacks (the Android port's `hasStarted` comment
+                // records that AppsFlyer's readiness evaluation follows `onBecameForeground`), and
+                // hypothesis (2) is where the evidence points. If it NEVER prints, this plugin
+                // calls `AppsFlyerLib.start()` on no path at all, which is a bigger finding than
+                // #721 anticipates and wants its own issue.
+                //
+                // Same message text as the Android port so one grep covers both. `NSLog` rather
+                // than `print` because this must survive into the device log that
+                // `device_native_logs` reads; the plugin had no logging idiom before this.
+                NSLog("[AppsFlyerCap] sessionReady listener FIRED — calling AppsFlyerLib.start() (#721)")
                 AppsFlyerLib.shared().start()
             }
         }

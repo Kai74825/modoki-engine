@@ -79,10 +79,18 @@ Bone2D Transforms ──► skin2DSystem ──► skin2DBuffers ──► Scene
   visible }`. A single-part (v1) rig has exactly one part; a multi-part (v2) rig has
   several sharing the one skeleton, drawn back-to-front by `order`. The clean seam
   between the ECS deform system and the renderers — `version` bumps only when ANY
-  part's deformed positions change, so idle rigs cost the renderer nothing;
+  part's deformed positions change, so idle rigs cost the renderer nothing. ⚠️ Every `version`
+  comes from ONE module-wide counter, never a per-buffer count from 0: a renderer keeps the last
+  version it uploaded on its own slot, which outlives a rebuild, and re-uploads only when the two
+  differ — so per-buffer counting put every rebuild back at 1, and a second Skin-editor weight
+  stroke with no pose change never reached the screen (#1141, observed live). Consumers compare
+  for inequality only; never assume a value;
   `bindMinY`/`bindMaxY` are the bind-pose vertical extent (measured once, stable across
   animation) the 2.5D billboard uses to anchor feet. Both the runtime GameView and the
-  editor SceneView read this same buffer.
+  editor SceneView read this same buffer. ⚠️ The id is koota's RECYCLED index and renderers read
+  between skin passes, so `skin2DSystem` deletes a root's buffer the moment it is destroyed
+  (despawn eviction, #868 — `docs/engine-concepts.md` § Entity); a respawn on that index reads "no
+  buffer" until the next pass rebuilds it, never the dead rig's mesh.
 - **`rig2dMath`** (`runtime/skinning/rig2dMath.ts`) — pure 2×3 affine core
   (compose/mul/invert/apply), `deriveBindMatrices` (inverse-bind), `skinVertex2D`
   (LBS). No imports, unit-tested in isolation.
@@ -112,7 +120,11 @@ array for that part's bind-pose vertex order.
   first" step would race. Instead each write stamps the buffer with the current global
   epoch; a part not re-written within an epoch reads back as no-deform (auto-expiry on
   clip switch), and a global-monotonic `version` lets `skin2DSystem` detect a deform
-  change even when the bone pose itself is static.
+  change even when the bone pose itself is static. ⚠️ **The epoch is not identity**: it only
+  advances when animation runs, so while paused or stopped an entry stays current indefinitely.
+  An entity's entries are therefore deleted the moment it is destroyed (despawn eviction, #868) —
+  without that, an editor delete + duplicate of a skinned rig baked the dead rig's offsets into the
+  new one for the whole pause.
 - **`runtime/animation/deform2DSystem.ts`** (`applyClipDeform`) — samples deform tracks
   from the SAME sites `applyClipAtTime` samples scalar tracks from (the runtime
   `animationSystem` loop and the editor scrub), so a deform track always sees the same

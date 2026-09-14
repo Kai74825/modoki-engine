@@ -28,9 +28,13 @@ import os from 'node:os';
 import path from 'node:path';
 import { promisify } from 'node:util';
 import { claimDevice, iosDeviceId, releaseDevice } from './deviceClaims';
+import { createTeardownToken } from '../../packages/modoki/src/runtime/core/liveness';
 import { wdaBaseDir, detect as detectTool } from '../../toolchain';
 import { listGoIosUdids, goIosDeviceInfo } from './goIosDevice';
 import { findXctestrun, wdaDerivedDataDir } from '../../toolchain/wdaProvision';
+import { randomUUID } from 'node:crypto';
+import { modokiStateDir } from './deviceStateDir';
+import { reapDeps } from './iosUsbForward';
 
 /** One iOS device `xcodebuild` could target. `connected` = a live tunnel right now.
  *
@@ -69,9 +73,31 @@ export interface IosDevice {
  *     own connection). Filtering on it rejected a perfectly reachable phone and reported "no iOS
  *     device is connected" with the device sitting right there. So every paired iOS device is a
  *     candidate, and `connected` only breaks ties. */
+/** The iOS device listing, plus the sources that could not answer (#1096). */
+export interface IosDeviceListing {
+  devices: IosDevice[];
+  /** Human-readable, one per source that FAILED. Empty when every source answered — including when
+   *  a source is simply not installed, which is absent rather than unknown. */
+  unavailable: string[];
+}
+
 export function parseIosDevices(devicectlJson: string): IosDevice[] {
+  return parseIosDevicesResult(devicectlJson).devices;
+}
+
+/** {@link parseIosDevices} plus WHETHER the document could be read at all (#1096).
+ *
+ *  `[]` used to mean both "this Mac has no paired iPhone" and "the JSON did not parse", and
+ *  `resolveIosDevice` turns the empty list into the definite claim *"no iOS device is paired with
+ *  this Mac"* — which `ensureWdaRunning` then LATCHES into `lastFailure` for the rest of the lease.
+ *  This module's own `devicectlOutPath` docblock already described that consequence: a torn read
+ *  makes trusted iOS input look degraded for the session, exactly like an unplugged phone.
+ *
+ *  `malformed` is only ever true for a document that EXISTS and will not parse. An absent one is
+ *  the caller's `listDevices()` throwing, which is a different case and stays the caller's. */
+export function parseIosDevicesResult(devicectlJson: string): { devices: IosDevice[]; malformed: boolean } {
   let parsed: unknown;
-  try { parsed = JSON.parse(devicectlJson); } catch { return []; }
+  try { parsed = JSON.parse(devicectlJson); } catch { return { devices: [], malformed: true }; }
   const devices = (parsed as { result?: { devices?: unknown[] } })?.result?.devices ?? [];
   const out: IosDevice[] = [];
   for (const raw of devices) {
@@ -93,7 +119,7 @@ export function parseIosDevices(devicectlJson: string): IosDevice[] {
       });
     }
   }
-  return out;
+  return { devices: out, malformed: false };
 }
 
 /** Pull iOS devices out of `xcrun xctrace list devices` — the LEGACY listing, and the only one
@@ -245,10 +271,11 @@ export const wdaLauncherExec = {
    *  source, so an Xcode without `xctrace` must leave the devicectl path working exactly as
    *  before, not break device selection outright. Bounded like every other exec here. */
   async listLegacyDevices(): Promise<string> {
-    try {
-      const { stdout } = await execFileAsync('xcrun', XCTRACE_ARGV, { timeout: 20000, encoding: 'utf8' });
-      return stdout;
-    } catch { return ''; }
+    // #1096: the catch that used to turn a failure into `''` moved to `computeIosDeviceListing`,
+    // which RECORDS it. The guarantee this docblock promises is unchanged — the caller still keeps
+    // going — but "xctrace broke" is no longer spelled the same as "xctrace listed nothing".
+    const { stdout } = await execFileAsync('xcrun', XCTRACE_ARGV, { timeout: 20000, encoding: 'utf8' });
+    return stdout;
   },
   /** THE THIRD SOURCE (#ca0A0LZ4knjvVNzclLRl) — what go-ios can reach, asked of go-ios.
    *
@@ -268,11 +295,14 @@ export const wdaLauncherExec = {
    *  polls every 2.5 s would be a surprising network fetch on a UI refresh. If go-ios is not
    *  already here this returns [] and the listing is exactly what it was before. */
   async listGoIosUdids(): Promise<string[]> {
-    try {
-      const found = detectTool('go-ios');
-      if (!found.present || !found.command) return [];
-      return await listGoIosUdids(found.command);
-    } catch { return []; }
+    // ⚠️ The two cases are NOT the same and no longer read the same (#1096). go-ios ABSENT is
+    // ordinary and stays a silent `[]` — this never provisions, per the note above. go-ios PRESENT
+    // and failing THROWS, for `computeIosDeviceListing` to record: that is the case that matters,
+    // because an iOS <=16 device is the one that NEEDS go-ios, and its row going missing is the
+    // exact "silently absent, with nothing saying why" this source was added to fix.
+    const found = detectTool('go-ios');
+    if (!found.present || !found.command) return [];
+    return await listGoIosUdids(found.command);
   },
   /** Name + product type for a device only go-ios can see, so its row reads like the others
    *  instead of as a bare UDID. Called ONLY for the devices the Apple listings missed — usually
@@ -311,10 +341,12 @@ export const wdaLauncherExec = {
       try { fs.rmSync(out, { force: true }); } catch { /* best-effort */ }
     }
   },
+  /** ⚠️ Mirrors the async twin (#1096): the failure THROWS for `ensureWdaRunning` to record, rather
+   *  than becoming an `''` that parses to "no legacy devices". This is the source that sees iOS <=16,
+   *  so swallowing it here is what made the iPhone 8 — the device that NEEDS this listing — come back
+   *  as "no iOS device is paired with this Mac", latched for the whole lease. */
   listLegacyDevicesSync(): string {
-    try {
-      return execFileSync('xcrun', XCTRACE_ARGV, { timeout: 20000, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] });
-    } catch { return ''; }
+    return execFileSync('xcrun', XCTRACE_ARGV, { timeout: 20000, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] });
   },
 };
 
@@ -335,8 +367,18 @@ export const wdaLauncherExec = {
  *
  *  macOS-only in practice — both commands are `xcrun`. The caller gates on the platform. */
 export async function listIosDevicesForSelection(): Promise<IosDevice[]> {
+  return (await listIosDevicesForSelectionResult()).devices;
+}
+
+/** {@link listIosDevicesForSelection} plus WHICH sources could not answer (#1096).
+ *
+ *  Three sources feed this listing and all three used to fail into the same `[]` the empty case
+ *  uses, so "no iPhone is paired with this Mac" and "every way of asking broke" were one answer.
+ *  `unavailable` is empty on the ordinary path — a source that is simply NOT INSTALLED is absent,
+ *  not unknown, and says nothing here. */
+export async function listIosDevicesForSelectionResult(): Promise<IosDeviceListing> {
   const now = Date.now();
-  if (iosListCache && now - iosListCache.at < IOS_LIST_TTL_MS) return iosListCache.devices;
+  if (iosListCache && now - iosListCache.at < IOS_LIST_TTL_MS) return iosListCache.listing;
   // COALESCE CONCURRENT MISSES onto one listing. The AI panel polls this every 2.5s while each
   // uncached call spawns up to four bounded subprocesses (devicectl 20s, xctrace 20s, and now
   // `ios list` + `ios info` at 10s each) — so a slow or wedged tool made every poll during that
@@ -347,12 +389,34 @@ export async function listIosDevicesForSelection(): Promise<IosDevice[]> {
   return iosListPending;
 }
 
-async function computeIosDeviceListing(now: number): Promise<IosDevice[]> {
+const failureText = (e: unknown): string => (e instanceof Error ? e.message : String(e)).split('\n')[0].slice(0, 200);
+
+async function computeIosDeviceListing(now: number): Promise<IosDeviceListing> {
+  // Every source's failure is collected rather than swallowed. NOT surfaced unconditionally: a
+  // consumer only reads it when the listing came back EMPTY, because that is the only time `[]`
+  // gets turned into a claim about the hardware.
+  const unavailable: string[] = [];
   let primary: IosDevice[] = [];
-  try { primary = parseIosDevices(await wdaLauncherExec.listDevices()); } catch { /* no Xcode / devicectl */ }
-  const appleListed = mergeIosDevices(primary, parseXctraceDevices(await wdaLauncherExec.listLegacyDevices()));
+  try {
+    const parsed = parseIosDevicesResult(await wdaLauncherExec.listDevices());
+    primary = parsed.devices;
+    if (parsed.malformed) unavailable.push('devicectl answered, but its JSON did not parse (a torn or interleaved read)');
+  } catch (e) {
+    // Covers both "no Xcode at all" and "devicectl broke". Recorded with the message rather than
+    // split here: the two are not reliably distinguishable from the error, and the message itself
+    // is what tells the reader which one it was.
+    unavailable.push(`devicectl could not be run (${failureText(e)})`);
+  }
+  let legacy = '';
+  try { legacy = await wdaLauncherExec.listLegacyDevices(); } catch (e) {
+    unavailable.push(`xctrace could not be run (${failureText(e)}) — the only listing that sees iOS 16 and older`);
+  }
+  const appleListed = mergeIosDevices(primary, parseXctraceDevices(legacy));
   // Ask go-ios for whatever Apple's two listings missed — see `wdaLauncherExec.listGoIosUdids`.
-  const goIosUdids = await wdaLauncherExec.listGoIosUdids();
+  let goIosUdids: string[] = [];
+  try { goIosUdids = await wdaLauncherExec.listGoIosUdids(); } catch (e) {
+    unavailable.push(`go-ios is installed but its device listing failed (${failureText(e)})`);
+  }
   const known = new Set(appleListed.map((d) => d.udid));
   // `new Set` because `ios list` can repeat a UDID — measured returning the iPhone 8 twice in one
   // call. `mergeGoIosDevices` dedupes the rows anyway; deduping HERE is what stops the duplicate
@@ -360,8 +424,9 @@ async function computeIosDeviceListing(now: number): Promise<IosDevice[]> {
   const missing = [...new Set(goIosUdids)].filter((u) => !known.has(u));
   const enriched = await Promise.all(missing.map(async (udid) => ({ udid, ...(await wdaLauncherExec.goIosInfo(udid)) })));
   const devices = mergeGoIosDevices(appleListed, enriched);
-  iosListCache = { at: now, devices };
-  return devices;
+  const listing = { devices, unavailable };
+  iosListCache = { at: now, listing };
+  return listing;
 }
 
 /** Briefly cached, because this is TWO `xcrun` shell-outs and the AI panel's device picker polls
@@ -373,9 +438,9 @@ async function computeIosDeviceListing(now: number): Promise<IosDevice[]> {
  *  the same "why isn't it listed" confusion this whole feature exists to remove. Ten seconds is
  *  below the threshold where a human re-checks, and four polls out of five now cost nothing. */
 const IOS_LIST_TTL_MS = 10_000;
-let iosListCache: { at: number; devices: IosDevice[] } | null = null;
+let iosListCache: { at: number; listing: IosDeviceListing } | null = null;
 /** The listing currently in flight, so concurrent misses share it — see `listIosDevicesForSelection`. */
-let iosListPending: Promise<IosDevice[]> | null = null;
+let iosListPending: Promise<IosDeviceListing> | null = null;
 
 /** Test seam — drop the cached listing so a test can change what `xcrun` reports. Also drops any
  *  IN-FLIGHT listing, or a test that swapped the exec seam would still be handed the previous
@@ -445,14 +510,26 @@ export interface IosDeviceChoice { device: IosDevice; unverified?: string }
  *  on the phone is redeployed. So the guess is kept and SAID: `unverified` carries the reason, the
  *  caller surfaces it, and the pin remains the way to make it certain. */
 export function resolveIosDevice(
-  devices: IosDevice[], env: NodeJS.ProcessEnv = process.env, lease?: LeaseHardware,
+  devices: IosDevice[], env: NodeJS.ProcessEnv = process.env, lease?: LeaseHardware, unavailable: string[] = [],
 ): IosDeviceChoice | { error: string } {
   const pinned = env.MODOKI_IOS_DEVICE_UDID?.trim();
   if (pinned) {
     const hit = devices.find((d) => d.udid === pinned);
     return hit ? { device: hit } : { error: `MODOKI_IOS_DEVICE_UDID=${pinned} matches none of this Mac's paired iOS devices` };
   }
-  if (devices.length === 0) return { error: 'no iOS device is paired with this Mac' };
+  // ⚠️ EMPTY is only "no iPhone is paired" when every source actually ANSWERED (#1096). This is the
+  // one line that turns `[]` into a claim about the hardware, and the claim is what the user is
+  // told and what `ensureWdaRunning` latches — so when a source broke, say THAT instead. The
+  // distinction is load-bearing: "no iOS device is paired" tells you to plug a phone in, which is
+  // useless and misleading advice when the phone is already plugged in and the listing is what broke.
+  if (devices.length === 0) {
+    return {
+      error: unavailable.length
+        ? `could not tell whether an iOS device is paired with this Mac — ${unavailable.join('; ')}. `
+          + 'This is NOT the same as "no phone is connected": a source that should have answered did not.'
+        : 'no iOS device is paired with this Mac',
+    };
+  }
 
   let pool = devices;
   let unverified: string | undefined;
@@ -520,6 +597,22 @@ let launchWarning: string | null = null;
 /** The machine-wide hardware claim this launch holds (#149), so `stopWda` hands back exactly what
  *  the launch took. Null when no agent is running. */
 let claimedUdid: string | null = null;
+/** (#1082) This module's identity as a claim HOLDER. A USB lease keys the same iPhone as
+ *  `ios:<udid>` in this same process, and the store used to release by `(deviceId, pid)` — which
+ *  cannot tell the two apart, so whichever released first handed back a phone the other was still
+ *  using. A single constant, not one token per launch: `wdaLauncher` keeps one agent in module
+ *  state, so this process is only ever ONE WDA holder. */
+const WDA_HOLDER = 'wda';
+/** The state dir holding this launch's pid record (#1077) — see `reapRecordedWdaAgent`. Null when none. */
+let recordDir: string | null = null;
+/** Invalidated by `stopWda`, i.e. by every ending of a lease. A launch captures it on entry and re-checks it
+ *  after each `await`: a launch still waiting on a probe, or in its poll loop, when the lease ends must not
+ *  claim, spawn, latch a failure or report on the NEXT lease. Found by #1077's close-out review and
+ *  reproduced: a tap mid-probe during a `device_connect` to another phone spawned onto the old one, under the
+ *  new lease. The shared teardown token, not a hand-rolled counter (#573, docs/async-lifetime.md). */
+const launchToken = createTeardownToken();
+const LEASE_ENDED_REASON = 'the device lease ended while WebDriverAgent was starting, so that launch was abandoned — '
+  + 'the next input op starts fresh';
 
 /** How much of the child's stderr to keep. Both bounds matter: a test runner can emit megabytes,
  *  and one line of it can itself be enormous. */
@@ -594,10 +687,113 @@ export function pickWdaFailureLine(lines: string[]): string | null {
 /** True when we have a live agent process we started. */
 export function isWdaProcessRunning(): boolean { return !!child && child.exitCode === null && !child.killed; }
 
-/** Stop the agent we started. Called when the lease drops (Decision 2: WDA is torn down with the
- *  lease, so disconnecting can never strand a signed agent running on the phone). */
-export function stopWda(): void {
+// ── An agent left running by an editor that died without stopping it (#1077) ─────────────────────────
+//
+// `stopWda` runs from `DeviceConnectionManager.disconnect()` and from the quit teardown, and neither runs
+// when the editor is ended by SIGTERM (`stop-editor.sh`), a crash or `kill -9`. The `xcodebuild` child is
+// not killed with the editor on macOS: it is re-parented and keeps a signed agent running on the phone.
+// MEASURED 2026-09-11 on the iPad mini 5, twice: after `npm run editor:stop` the agent kept running with
+// ppid 1. Its claim expires on pid liveness, so the phone then looks free to every clone while the agent
+// still runs. Two closures:
+//   - the per-clone pid record below, reaped by the next start of this clone's backend. This is the one
+//     that covers the Electron editor (measured: the orphan was killed on relaunch, its record removed,
+//     the dead pid's claims swept).
+//   - an `exit` hook, for a backend host that does run Node's `exit` event on its way out. It does NOT fire
+//     when the Electron editor takes a SIGTERM (measured: neither it nor the claims store's own hook ran).
+
+/** The pid record's file name inside the clone's state dir. */
+export const WDA_RECORD_FILE = 'wda-agent.json';
+
+interface WdaAgentRecord {
+  pid: number;
+  /** The `.xctestrun` the agent runs — what a recycled pid will not be running. */
+  xctestrun: string;
+  /** `ps -o lstart=` of the pid when it was recorded. The `.xctestrun` path sits under the machine-wide
+   *  toolchain dir, so ANOTHER clone's agent that reused the pid would pass the command check; its start time
+   *  does not (#1077's close-out review). Null when `ps` could not say — such a record is never reaped. */
+  startedAt: string | null;
+  /** The backend process that launched it. While it lives, the agent is not an orphan. */
+  owner: number;
+  /** WHICH load of this module inside `owner` — a pid alone cannot tell a live load from an abandoned one
+   *  (`iosUsbForward.ts`'s `OWNER_INSTANCE` has the measurement). */
+  instance: string;
+}
+
+const OWNER_INSTANCE = randomUUID();
+
+/** Where the record goes by default: the clone's state dir, or a per-worker temp dir under vitest — never
+ *  the repo's own `.modoki` from a test. The same interlock `claimsDir()` has, and for the same reason:
+ *  every `ensureWdaRunning` test launches a (fake) agent. */
+function defaultRecordDir(): string {
+  return process.env.VITEST ? path.join(os.tmpdir(), `modoki-wda-vitest-${process.pid}`) : modokiStateDir();
+}
+
+function recordWdaAgent(dir: string, rec: Omit<WdaAgentRecord, 'owner' | 'instance'>): void {
+  try {
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(path.join(dir, WDA_RECORD_FILE), JSON.stringify({ owner: process.pid, instance: OWNER_INSTANCE, ...rec }));
+  } catch { /* non-fatal: only the startup reap loses its evidence */ }
+}
+
+/** Drop the record — only if it still describes `pid`, so a newer agent's record survives. */
+function clearWdaRecord(dir: string | null, pid: number | undefined): void {
+  if (!dir) return;
+  const file = path.join(dir, WDA_RECORD_FILE);
+  try {
+    const rec = JSON.parse(fs.readFileSync(file, 'utf8')) as Partial<WdaAgentRecord>;
+    if (rec.pid === pid) fs.rmSync(file, { force: true });
+  } catch { /* no record */ }
+}
+
+/** The `exit` hook's body: kill the running agent. `child.kill()` is synchronous, the only kind of work an
+ *  `exit` handler can do. The record is KEPT on purpose, so a startup reap still finds an agent that did not
+ *  die of the signal. Exported for its test. */
+export function killWdaChildOnExit(): void {
   if (child && child.exitCode === null) { try { child.kill(); } catch { /* already gone */ } }
+}
+
+let exitHookInstalled = false;
+/** Registered lazily, on the first launch. `exit` only: a SIGTERM/SIGINT listener would suppress Node's
+ *  default terminate-on-signal behaviour — the trade `deviceClaimsStore.mjs` declines for the same reason. */
+function installWdaExitHook(): void {
+  if (exitHookInstalled) return;
+  exitHookInstalled = true;
+  process.on('exit', killWdaChildOnExit);
+}
+
+/** Kill the agent a previous run of THIS clone recorded, if that pid is still that agent and the backend
+ *  that launched it is gone. Called by `reclaimStaleDeviceStateAtStartup`; returns a log line when it
+ *  killed one. The ownership rule is `reapRecordedIosForward`'s: a LIVE owner — another process still
+ *  running, or this module load — keeps its agent and record. A pid whose command line is no longer
+ *  `test-without-building` with the recorded `.xctestrun` is a recycled pid, and is left alone. */
+export function reapRecordedWdaAgent(dir: string): string | null {
+  const file = path.join(dir, WDA_RECORD_FILE);
+  let rec: Partial<WdaAgentRecord>;
+  try { rec = JSON.parse(fs.readFileSync(file, 'utf8')) as Partial<WdaAgentRecord>; } catch { return null; }
+  const liveElsewhere = typeof rec.owner === 'number' && rec.owner !== process.pid && reapDeps.isAlive(rec.owner);
+  const liveHere = rec.owner === process.pid && rec.instance === OWNER_INSTANCE;
+  if (liveElsewhere || liveHere) return null;
+  try { fs.rmSync(file, { force: true }); } catch { /* */ }
+  if (typeof rec.pid !== 'number' || typeof rec.xctestrun !== 'string') return null;
+  const command = reapDeps.commandOf(rec.pid);
+  if (!command || !command.includes('test-without-building') || !command.includes(rec.xctestrun)) return null;
+  if (typeof rec.startedAt !== 'string' || reapDeps.startTimeOf(rec.pid) !== rec.startedAt) return null;
+  try { reapDeps.kill(rec.pid); } catch { return null; }
+  return `[device] reaped a WebDriverAgent (pid ${rec.pid}) left running on the phone by a previous run`;
+}
+
+/** Stop the agent we started (Decision 2: WDA is torn down with the lease — an ending that runs no teardown
+ *  at all is left to `reapRecordedWdaAgent`). Called by `DeviceConnectionManager.disconnect()` — which
+ *  an explicit Disconnect, a `device_connect` that supersedes the lease, and a USB forward dying mid-lease
+ *  all run through — and by `releaseDeviceResourcesOnExit` on quit. It used to be called only by the
+ *  Disconnect ROUTE, so a superseding connect left the agent and its `ios:<udid>` claim behind (#1077). */
+export function stopWda(): void {
+  launchToken.invalidateAll();
+  const stoppedPid = child?.pid;
+  if (child && child.exitCode === null) { try { child.kill(); } catch { /* already gone */ } }
+  // Stopped deliberately, so there is nothing left for a startup reap to find (#1077).
+  clearWdaRecord(recordDir, stoppedPid);
+  recordDir = null;
   child = null;
   launchStartedAt = null;
   lastFailure = null;
@@ -606,7 +802,11 @@ export function stopWda(): void {
   // by the next input op, and releasing the claim in between would let a sibling clone take the
   // device out from under a live session.
   if (claimedUdid) {
-    try { releaseDevice(claimedUdid); } catch { /* an unwritable claims file must never block a stop */ }
+    // (#1082) By HOLDER: a USB lease keys the same iPhone as `ios:<udid>` in this same process, and a
+    // release by `(deviceId, pid)` cannot tell the two apart — so this stop would hand back a phone
+    // the lease is still holding (and, the other way round, a stalled lease teardown would release
+    // the agent's claim).
+    try { releaseDevice(claimedUdid, { holder: WDA_HOLDER }); } catch { /* an unwritable claims file must never block a stop */ }
     claimedUdid = null;
   }
   // The warning describes the launch we just ended; carrying it into the NEXT one would attach a
@@ -625,6 +825,8 @@ export interface EnsureWdaRunningOpts {
   /** What the LEASED device says its own hardware is, so the launch can be tied to that phone
    *  rather than to whatever is plugged into this Mac (#146). Absent/null fields ⇒ unverified. */
   lease?: LeaseHardware;
+  /** Where the agent's pid record goes (#1077). Defaults to the clone's state dir; injected by tests. */
+  stateDir?: string;
   /** Injected for tests. */
   probe?: (url: string) => Promise<boolean>;
   spawnImpl?: typeof spawn;
@@ -684,6 +886,7 @@ async function defaultProbe(url: string): Promise<boolean> {
 export async function ensureWdaRunning(opts: EnsureWdaRunningOpts): Promise<{ running: boolean; reason?: string }> {
   const probe = opts.probe ?? defaultProbe;
   const statusUrl = `http://${opts.host}:${opts.port}/status`;
+  const launchLive = launchToken.capture();
 
   // Off macOS there is NOTHING to reach and nothing to start, so refuse FIRST — before spending a
   // network probe (#99).
@@ -709,6 +912,9 @@ export async function ensureWdaRunning(opts: EnsureWdaRunningOpts): Promise<{ ru
 
   // Already up — including a WDA someone started by hand, which must not be duplicated.
   if (await probe(statusUrl)) return { running: true };
+  // The lease ended while that probe was out: everything below claims, spawns or latches for a lease that is
+  // gone. Not latched itself — it describes this call, not the device.
+  if (!launchLive()) return { running: false, reason: LEASE_ENDED_REASON };
 
   // ⚠️ INVARIANT: from this guard down to `child = spawnFn(...)` there must be NO `await`. That
   // synchronous window is the ONLY thing making check-and-set atomic, which is what lets this
@@ -766,9 +972,22 @@ export async function ensureWdaRunning(opts: EnsureWdaRunningOpts): Promise<{ ru
   // A seam that is injectable only halfway is worse than none: it makes unit tests depend on which
   // phones happen to be plugged in.
   const legacyDefault = opts.listDevices ? () => '' : wdaLauncherExec.listLegacyDevicesSync;
-  const legacy = (opts.listLegacyDevices ?? legacyDefault)();
+  // #1096: EVERY source's failure is collected, exactly as the async path does it — a devicectl
+  // document that EXISTS and will not parse, and an xctrace that could not run at all. Both used to
+  // arrive as "no phone". `devicectlOutPath`'s own docblock names the consequence: the read can be
+  // torn or already unlinked, and `lastFailure` LATCHES whatever comes out of here for the rest of
+  // the lease, so a one-off file race read as "trusted iOS input is degraded" all session.
+  const unavailable: string[] = [];
+  // devicectl first, then xctrace — the SAME order as `computeIosDeviceListing`, so the two paths
+  // report one failure set in one order rather than reading as two different diagnoses.
+  const primary = parseIosDevicesResult(listing);
+  if (primary.malformed) unavailable.push('devicectl answered, but its JSON did not parse (a torn or interleaved read)');
+  let legacy = '';
+  try { legacy = (opts.listLegacyDevices ?? legacyDefault)(); } catch (e) {
+    unavailable.push(`xctrace could not be run (${describeExecFailure(e)}) — the only listing that sees iOS 16 and older`);
+  }
   const resolved = resolveIosDevice(
-    mergeIosDevices(parseIosDevices(listing), parseXctraceDevices(legacy)), process.env, opts.lease,
+    mergeIosDevices(primary.devices, parseXctraceDevices(legacy)), process.env, opts.lease, unavailable,
   );
   if ('error' in resolved) {
     lastFailure = `cannot start WebDriverAgent — ${resolved.error}`;
@@ -796,6 +1015,10 @@ export async function ensureWdaRunning(opts: EnsureWdaRunningOpts): Promise<{ ru
     deviceId: iosDeviceId(resolved.device.udid),
     label: resolved.device.name,
     purpose: 'running WebDriverAgent',
+    // (#1082) Name the holder: this module's claim can share a key with the lease's, inside one
+    // process, and the store cannot otherwise tell whose hold it is dropping. One token, not one
+    // per launch — `wdaLauncher` keeps a single agent in module state, so there is only ever one.
+    holder: WDA_HOLDER,
   });
   if (!claim.ok) {
     lastFailure = `cannot start WebDriverAgent — ${claim.message}`;
@@ -807,13 +1030,26 @@ export async function ensureWdaRunning(opts: EnsureWdaRunningOpts): Promise<{ ru
   // discarded — a test runner's log is not something an input op should stream — but stderr is
   // PIPED into a small ring buffer so a failure can name its own cause (#144, `captureStderr`).
   const spawnFn = opts.spawnImpl ?? spawn;
-  child = spawnFn('xcodebuild', [
+  const spawned = spawnFn('xcodebuild', [
     'test-without-building',
     '-xctestrun', xctestrun,
     '-destination', `id=${resolved.device.udid}`,
   ], { stdio: ['ignore', 'ignore', 'pipe'] });
-  captureStderr(child);
-  child.on('exit', () => { child = null; launchStartedAt = null; });
+  child = spawned;
+  captureStderr(spawned);
+  // Outlive-the-editor closures (#1077): record the pid for a startup reap, and kill the child from an
+  // `exit` hook. Both are synchronous, so the no-await invariant above is untouched.
+  const dir = opts.stateDir ?? defaultRecordDir();
+  if (typeof spawned.pid === 'number') {
+    recordWdaAgent(dir, { pid: spawned.pid, xctestrun, startedAt: reapDeps.startTimeOf(spawned.pid) });
+    recordDir = dir;
+  }
+  installWdaExitHook();
+  spawned.on('exit', () => {
+    clearWdaRecord(dir, spawned.pid);
+    // Only while it is still the current agent: a stopWda + relaunch may already have replaced it.
+    if (child === spawned) { child = null; launchStartedAt = null; }
+  });
   launchStartedAt = nowFn();
 
   // Poll rather than parse the log: readiness is a property of the SERVER, and `/status` answering
@@ -822,8 +1058,12 @@ export async function ensureWdaRunning(opts: EnsureWdaRunningOpts): Promise<{ ru
   const deadline = nowFn() + (opts.timeoutMs ?? DEFAULT_LAUNCH_TIMEOUT_MS);
   while (nowFn() < deadline) {
     await sleep(1000);
+    if (!launchLive()) return { running: false, reason: LEASE_ENDED_REASON };
     if (await probe(statusUrl)) return { running: true };
-    if (!child) break;   // the test process died — no point waiting out the clock
+    // `!child`, not `child !== spawned`: when THIS agent exited and another op has already relaunched, the new
+    // agent is the one worth waiting for. The identity check gave up on a healthy relaunch and reported the
+    // exit with the relaunch's wiped stderr (#1077's close-out re-review); a `stopWda` is the liveness return above.
+    if (!child) break;
   }
 
   // Do NOT latch this one: a timeout can be a slow first install, and a later call may well find it
@@ -868,7 +1108,9 @@ function withLaunchWarning(reason: string): string {
  *  message self-diagnosing without inventing a give-up policy: 20s reads as normal, 5 minutes reads
  *  as wedged, and the reader can tell which without knowing our timeouts. The escape hatch is named
  *  for the same reason — reconnecting the lease runs `stopWda()`, so there IS a way to start over,
- *  and a message that admits no way out invites someone to invent one. */
+ *  and a message that admits no way out invites someone to invent one. Any reconnect counts, including
+ *  a bare `device_connect` to the same device: `connect()` begins with `disconnect()`, which stops the
+ *  agent (#1077 — before that only the Disconnect route did, and this sentence was false). */
 function launchInProgressReason(nowMs: number): string {
   const secs = launchStartedAt === null ? 0 : Math.max(0, Math.round((nowMs - launchStartedAt) / 1000));
   return withLaunchWarning(
@@ -880,5 +1122,5 @@ function launchInProgressReason(nowMs: number): string {
 
 /** Test seam — forget any process handle and latched failure. */
 export function _resetWdaLauncherForTests(): void {
-  child = null; launchStartedAt = null; lastFailure = null; launchWarning = null; stderrTail = [];
+  child = null; launchStartedAt = null; lastFailure = null; launchWarning = null; stderrTail = []; recordDir = null;
 }

@@ -42,6 +42,9 @@ import net from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
 import fs from 'node:fs';
+// The ONE "same directory?" comparison (#869) — see engine/scripts/pathIdentity.mjs. This file
+// hand-rolled its own until #899; that module's header table lists it as one of the seven recipes.
+import { samePath } from '../scripts/pathIdentity.mjs';
 
 let child: ChildProcess | null = null;
 let currentRoot: string | null = null;
@@ -298,18 +301,15 @@ export function probeDevServerPort(url: string, timeoutMs = 1500): Promise<PortP
   });
 }
 
-/** Compare two filesystem paths for identity. Windows is case-insensitive and mixes
- *  separators (`C:\a\b` vs `C:/a/b` — the two sides of this comparison come from
- *  `path` and from JSON respectively), so a raw `===` would refuse to recognise our own
- *  install and turn every reclaim into a refusal. `platform` is injectable for tests, the
- *  same convention `needsWinTreeKill` uses. */
-export function samePath(a: string, b: string, platform: NodeJS.Platform = process.platform): boolean {
-  const norm = (p: string) => {
-    const s = p.replace(/[\\/]+/g, '/').replace(/\/+$/, '');
-    return platform === 'win32' ? s.toLowerCase() : s;
-  };
-  return norm(a) === norm(b);
-}
+/* `samePath` used to be hand-rolled HERE (#899). It collapsed separators, trimmed a trailing
+ * slash and folded case on **win32 only** — so on darwin a case-flipped spelling missed, and on
+ * NO platform was a symlink resolved. `classifyPortHolder` below compares a running dev server's
+ * self-reported `repoRoot` against ours with it, so a second spelling of THIS clone read as "a
+ * different install/clone": the port was refused instead of reclaimed, and the #190 stray-child
+ * branch below the comparison was never reached either, because the function had already returned.
+ *
+ * It is the SSOT's `samePath` now, imported above. Do not re-introduce a local one — this was the
+ * last of pathIdentity.mjs's seven listed recipes still standing. */
 
 export type PortVerdict =
   | { action: 'free' }
@@ -344,16 +344,30 @@ export function isProcessAlive(pid: number): boolean {
 export function classifyPortHolder(
   probe: PortProbe,
   self: { repoRoot: string; pid: number },
-  deps: { platform?: NodeJS.Platform; isAlive?: (pid: number) => boolean } = {},
+  deps: { isAlive?: (pid: number) => boolean } = {},
 ): PortVerdict {
-  const platform = deps.platform ?? process.platform;
   const isAlive = deps.isAlive ?? isProcessAlive;
   if (probe.state === 'empty') return { action: 'free' };
   if (probe.state === 'foreign') {
     return { action: 'refuse', why: 'a server that is not a Modoki dev server is already on this port' };
   }
   const { pid, ppid, projectRoot, repoRoot } = probe.identity;
-  if (!samePath(repoRoot, self.repoRoot, platform)) {
+  // ⚠️ `repoRoot` here is supplied by whatever answered the port, and `samePath` now WALKS it
+  // (one `realpathSync.native` per ancestor) where this used to be pure string work. It is bounded
+  // by `IDENTITY_MAX_BYTES`, so a hostile listener on the port can cost the editor a few thousand
+  // syscalls once at startup — an amplification, not a hole, and cheaper than the connection it
+  // already made. Noted rather than guarded; if it ever needs bounding, bound the SEGMENT COUNT.
+  // ⚠️ #899 WIDENED this comparison's case-fold from win32-ONLY to win32||darwin, because the SSOT
+  // folds on the platform default. That is correct for every ordinary volume — but on a
+  // case-SENSITIVE one (APFS can be formatted that way; `fsutil file setCaseSensitiveInfo` does it
+  // per-directory on Windows) two clone dirs differing ONLY by case now compare EQUAL here, and
+  // this is a KILL path: equal + the holder's editor dead ⇒ `reclaim` ⇒ `reclaimPort` kills that
+  // clone's dev server. `pathIdentity.mjs`'s polarity note names this caller as the example of an
+  // over-match that "would kill the wrong process"; #905 accepted the hazard, and this site was
+  // added to its enumeration afterwards rather than being part of the ruling. Narrow (it needs a
+  // case-sensitive volume AND two clones differing only by case AND a dead sibling editor), and
+  // recorded rather than hidden.
+  if (!samePath(repoRoot, self.repoRoot)) {
     return {
       action: 'refuse',
       why: `another Modoki editor is already on this port (pid ${pid}, editor ${repoRoot}, project ${projectRoot}) — it belongs to a different install/clone, so it will not be taken`,
@@ -530,7 +544,7 @@ export async function startDevServer(opts: { repoRoot: string; projectRoot: stri
   // launch). os.tmpdir() = /tmp on Unix, %LOCALAPPDATA%\Temp on Windows.
   // …and PER EDITOR, not one shared name. The temp dir is machine-wide, so a bare
   // `modoki-vite.log` is written by every clone's editor at once (opened 'a', so they
-  // interleave rather than truncate) — and line ~595 below hands that path to whoever is
+  // interleave rather than truncate) — and the `proc.on('exit')` handler below hands that path to whoever is
   // diagnosing a dead dev server, which is exactly when reading a sibling clone's output
   // costs the most. Key it on the pinned backend port, the same anchor the launcher's
   // editor log and the derived Vite/CDP ports use; fall back to the pid when the port is
@@ -585,7 +599,10 @@ export async function startDevServer(opts: { repoRoot: string; projectRoot: stri
   // whatever the module-level `child` happens to be by the time an async event fires.
   const proc = spawn(process.execPath, [viteEntry, '--config', 'engine/vite.config.ts', '--configLoader', 'runner', '--host', '127.0.0.1', '--port', port, '--strictPort'], {
     cwd: repoRoot,
-    env: { ...process.env, MODOKI_PROJECT: projectRoot, ELECTRON_RUN_AS_NODE: '1' },
+    // MODOKI_VITE_UNDER_ELECTRON: this child must not run the startup device reclaim — the lease lives in
+    // THIS process's backend (`VITE_UNDER_ELECTRON_ENV` in plugins/backend/deviceConnection.ts, #1065). A
+    // literal rather than an import: that module builds the device-connection singleton at load.
+    env: { ...process.env, MODOKI_PROJECT: projectRoot, ELECTRON_RUN_AS_NODE: '1', MODOKI_VITE_UNDER_ELECTRON: '1' },
     stdio: ['ignore', logFd, logFd],
   });
   child = proc;

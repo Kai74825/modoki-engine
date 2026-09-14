@@ -6,7 +6,6 @@
  *  the shared file. `electron` is mocked; fs is real, rooted at a temp dir. */
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import fs from 'node:fs';
-import os from 'node:os';
 import path from 'node:path';
 
 // app.getPath('appData') → <tmp>/appData ; app.getPath('userData') → <tmp>/userData.
@@ -16,9 +15,18 @@ vi.mock('electron', () => ({
   app: { getPath: (name: string) => path.join(root.dir, name) },
   dialog: { showOpenDialog: (...args: unknown[]) => showOpenDialog(...args) },
   Menu: { buildFromTemplate: () => ({}), setApplicationMenu: () => {} },
+  // The pickers resolve their own parent through mainDialog now (#1044). These tests drive them
+  // with no window, which is the parentless case they already asserted — but the mock has to
+  // OFFER the read, or it fails as a missing export rather than as "no window".
+  BrowserWindow: { getAllWindows: () => [] },
 }));
+// A module STUB, not coverage: with `getAllWindows()` returning [] the resolver's `.find()` never
+// runs, so this is never invoked. It exists so importing mainDialog does not drag the real splash
+// module in. The splash RULE is covered in mainDialog.test.ts, not here.
+vi.mock('../../electron/splash', () => ({ isSplashWindow: () => false }));
 
 import { getRecentProjects, addRecentProject, migrateLegacyRecents, setRecentsScope, chooseInitialProject, isUnderRepo, projectFolderKind, pickProjectFolder, pickNewProjectFolder } from '../../electron/projects';
+import { makeScratchDir } from '@modoki/engine/testing/scratchDir';
 
 const sharedFile = () => path.join(root.dir, 'appData', 'modoki-app', 'recent-projects.json');
 // The legacy DEV recents location is the literal appData/"Electron" dir — dev's userData
@@ -37,7 +45,7 @@ function mkProj(name: string): string {
 }
 
 beforeEach(() => {
-  root.dir = fs.mkdtempSync(path.join(os.tmpdir(), `modoki-recents-${counter++}-`));
+  root.dir = makeScratchDir(`modoki-recents-${counter++}-`);
   setRecentsScope(''); // reset to the unscoped (global) default; scoped tests opt in
 });
 
@@ -226,10 +234,10 @@ describe('chooseInitialProject — two-clone auto-open guard', () => {
   });
 
   it('MODOKI_PROJECT hard override always wins', () => {
-    const c = chooseInitialProject({ ...base, envProject: `${cloneB}/games/chess`, recents: [`${cloneA}/games/skin-test`] });
+    const c = chooseInitialProject({ ...base, envProject: `${cloneB}/games/puzzle`, recents: [`${cloneA}/games/skin-test`] });
     // The hard override is path.resolve'd by the code (absolutizes MODOKI_PROJECT) — on Windows
     // that stamps a drive + backslashes onto these POSIX fixtures, so resolve the expected too.
-    expect(c).toEqual({ kind: 'path', path: path.resolve(`${cloneB}/games/chess`) });
+    expect(c).toEqual({ kind: 'path', path: path.resolve(`${cloneB}/games/puzzle`) });
   });
 
   it('dev: reopens the most-recent recent UNDER this clone, skipping a sibling clone on top', () => {
@@ -250,8 +258,8 @@ describe('chooseInitialProject — two-clone auto-open guard', () => {
   });
 
   it('single-clone dev: unchanged — reopens the global most-recent (all recents are under repo)', () => {
-    const c = chooseInitialProject({ ...base, recents: [`${cloneB}/games/chess`, `${cloneB}/games/skin-test`] });
-    expect(c).toEqual({ kind: 'path', path: `${cloneB}/games/chess` });
+    const c = chooseInitialProject({ ...base, recents: [`${cloneB}/games/puzzle`, `${cloneB}/games/skin-test`] });
+    expect(c).toEqual({ kind: 'path', path: `${cloneB}/games/puzzle` });
   });
 
   it('packaged: skips the clone guard — reopens the global most-recent wherever it lives', () => {
@@ -265,7 +273,7 @@ describe('chooseInitialProject — two-clone auto-open guard', () => {
 });
 
 describe('projectFolderKind — first-run open-vs-scaffold decision', () => {
-  const mk = () => fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-pfk-'));
+  const mk = () => makeScratchDir('modoki-pfk-');
   const dirs: string[] = [];
   const fresh = () => { const d = mk(); dirs.push(d); return d; };
   afterEach(() => { for (const d of dirs.splice(0)) fs.rmSync(d, { recursive: true, force: true }); });

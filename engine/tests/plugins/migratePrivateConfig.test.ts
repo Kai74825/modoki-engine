@@ -12,7 +12,7 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { execFileSync, spawnSync } from 'child_process';
 import fs from 'fs';
 import path from 'path';
-import os from 'os';
+import { makeScratchDir } from '@modoki/engine/testing/scratchDir';
 
 const SCRIPT = path.resolve(__dirname, '../../scripts/migrate-private-config.mjs');
 const REAL_PROJECT_CONFIG_TS = path.resolve(__dirname, '../../project-config.ts');
@@ -20,7 +20,7 @@ const REAL_PROJECT_CONFIG_TS = path.resolve(__dirname, '../../project-config.ts'
 let tmpRepo: string;
 
 beforeEach(() => {
-  tmpRepo = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-migrate-private-'));
+  tmpRepo = makeScratchDir('modoki-migrate-private-');
   fs.mkdirSync(path.join(tmpRepo, 'engine'), { recursive: true });
   fs.copyFileSync(REAL_PROJECT_CONFIG_TS, path.join(tmpRepo, 'engine', 'project-config.ts'));
 });
@@ -158,5 +158,53 @@ describe('migrate-private-config', () => {
     const out = run();
     expect(out).toContain('Nothing to migrate');
     expect(fs.existsSync(path.join(dir, 'project.user.json'))).toBe(false);
+  });
+});
+
+/** #944 (swept in by #913's close-out § 1) — this script's tail prints *"Nothing to migrate —
+ *  every project is already clean"*, a positive claim about EVERY project, made having examined
+ *  none of them when discovery returns an empty list.
+ *
+ *  ⚠️ It matters more here than at the sibling sites. `CLAUDE.md` records that a fresh clone has
+ *  NO Team ID until this script runs, so a developer told "every project is already clean"
+ *  reasonably believes their private values were migrated out of the committed configs. Reporting
+ *  success over an empty scan is one way a committed private value survives into a public
+ *  snapshot — and `verify:publish` at the hub is the only thing downstream of it. */
+describe('migrate-private-config: an empty discovery is not "already clean" (#944)', () => {
+  it('REJECTS: a root on disk yielding zero projects is a discovery miss, and fails', () => {
+    fs.mkdirSync(path.join(tmpRepo, 'games'), { recursive: true });
+    const r = runAllowFail();
+    expect(r.status).not.toBe(0);
+    expect(r.out).toContain('ZERO projects');
+    expect(r.out).not.toContain('already clean');
+  });
+
+  it('ACCEPTS: a checkout with no project roots at all exits 0 without claiming cleanliness', () => {
+    // Load-bearing, and why the floor keys on the ROOTS rather than the project count:
+    // discoverProjects' docblock records that a checkout may legitimately ship neither
+    // ("the public OSS repo ships neither"). A blanket fatal would redden a correct tree.
+    const r = runAllowFail();
+    expect(r.status).toBe(0);
+    // ⚠️ Assert on the ROOT-NAMING half, not on "nothing to migrate": BOTH the honest line and the
+    // overclaiming tail contain that phrase, separated only by one capital letter, so a
+    // case-insensitive match — or simply capitalising the new sentence — would pass under both
+    // hypotheses. This substring appears in exactly one of them.
+    expect(r.out).toContain('directory under');
+    expect(r.out).not.toContain('ZERO projects');
+    // The property this case actually exists for, and the REJECTS sibling asserts it while this one
+    // did not: exiting 0 is necessary but not sufficient — the run must also not CLAIM the thing it
+    // never checked. A floor that printed the honest line and then fell through to the tail would
+    // satisfy every other assertion here.
+    expect(r.out).not.toContain('already clean');
+  });
+
+  it('ACCEPTS: a populated root still reaches the real verdict', () => {
+    // A regression anchor, and deliberately NOT credited with catching over-correction to
+    // blanket-fatal — the no-roots case above is what reddens for that. With a project present,
+    // only an implausible mutation reaches this one.
+    makeProject('games', 'clean-one', { appId: 'com.x.y', build: {} });
+    const r = runAllowFail();
+    expect(r.status).toBe(0);
+    expect(r.out).toContain('already clean');
   });
 });

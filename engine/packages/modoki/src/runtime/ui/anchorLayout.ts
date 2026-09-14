@@ -3,6 +3,7 @@
  *  UIAnchor positions to pixel coordinates within a viewport. */
 
 import type { AnchorMode } from '../traits/UIAnchor';
+import { VIEWPORT_UNIT_AXIS, isViewportLengthUnit } from '../traits/uiLength';
 
 /** Which anchor modes pin BOTH edges of an axis. Load-bearing beyond pivot: on a
  *  stretched axis an offset INSETS its own edge (the box shrinks) rather than shifting
@@ -44,6 +45,10 @@ export interface AnchorData {
    *  most callers build this from a trait where it is already resolved; note the TRAIT
    *  defaults to true, so an absent field in a scene JSON means ON. */
   safeArea?: boolean;
+  /** Pad the reserved edge bands (`--ui-reserve-top/bottom`) on top of the safe-area inset
+   *  (#1159). CSS-only: the padding arm insets CHILDREN, which the pixel path never models, so
+   *  `resolveAnchorRect` has nothing to mirror. */
+  clearsReservedEdges?: boolean;
 }
 
 /** Safe-area insets in logical px, for the pixel path. The CSS path gets the same four
@@ -52,30 +57,30 @@ export interface AnchorData {
  *  the element the browser actually drew. */
 export interface SafeAreaPx { top: number; right: number; bottom: number; left: number; }
 
-export const ZERO_INSETS: SafeAreaPx = { top: 0, right: 0, bottom: 0, left: 0 };
+/** Frozen because it is `resolveAnchorRect`'s DEFAULT ARGUMENT, so every call that omits insets
+ *  shares this one object by reference — a single `ZERO_INSETS.top = 68` anywhere would silently
+ *  inset every such call process-wide. Same reason `STRETCH_X`/`STRETCH_Y` below are `readonly`
+ *  and `devicePresets.NO_INSETS` is frozen; it matters more here since #963 put this on the
+ *  public barrel, where a game or demo can reach it. */
+export const ZERO_INSETS: Readonly<SafeAreaPx> = Object.freeze({ top: 0, right: 0, bottom: 0, left: 0 });
 
 /** Resolve a length (value + unit) to LOGICAL pixels. THE shared resolver for every
  *  pixel-space path (anchor offsets, Canvas2D sizing, SceneView).
  *   - `%`              → percent of `axisTotal` (the length's own axis)
- *   - `vw`/`vh`        → percent of the viewport width/height
- *   - `vmin`/`vmax`    → percent of the smaller/larger viewport axis
+ *   - a viewport unit  → percent of the viewport dimension `VIEWPORT_UNIT_AXIS` names for it
  *   - anything else    → treated as `px`
- *  vmin/vmax are computed from the LOGICAL device viewport (`vpW`/`vpH`) so they
- *  stay device-resolution-aware in both GameView and SceneView. Mirrors `cssVal`
- *  (UINode.tsx) and the anchor CSS emitter (anchorCss.ts) — keep all three in sync. */
+ *  Viewport units are computed from the LOGICAL device viewport (`vpW`/`vpH`) so they
+ *  stay device-resolution-aware in both GameView and SceneView. The CSS readers (`cssVal`,
+ *  anchorCss.ts) and the `--ui-*` publisher (UIRenderer.tsx) resolve through the same table, so
+ *  there is nothing here to keep in sync by hand (#1064). */
 export function resolveLengthPx(
   value: number, unit: string | undefined,
   axisTotal: number, vpW: number, vpH: number,
 ): number {
   if (!value) return 0;
-  switch (unit) {
-    case '%':    return axisTotal * value / 100;
-    case 'vw':   return vpW * value / 100;
-    case 'vh':   return vpH * value / 100;
-    case 'vmin': return Math.min(vpW, vpH) * value / 100;
-    case 'vmax': return Math.max(vpW, vpH) * value / 100;
-    default:     return value; // px
-  }
+  if (unit === '%') return axisTotal * value / 100;
+  if (isViewportLengthUnit(unit)) return VIEWPORT_UNIT_AXIS[unit](vpW, vpH) * value / 100;
+  return value; // px
 }
 
 /** Resolve a UIAnchor to a pixel rect within a viewport of size vpW×vpH.
@@ -88,7 +93,7 @@ export function resolveAnchorRect(
   w: number, h: number,
   vpW: number, vpH: number,
   anchor: AnchorData,
-  insets: SafeAreaPx = ZERO_INSETS,
+  insets: Readonly<SafeAreaPx> = ZERO_INSETS,
 ): { x: number; y: number; w: number; h: number } {
   let x = 0, y = 0, rw = w, rh = h;
 

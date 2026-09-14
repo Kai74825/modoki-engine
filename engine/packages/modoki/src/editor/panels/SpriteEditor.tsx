@@ -12,10 +12,12 @@
 import { useEffect, useLayoutEffect, useRef, useState, useCallback } from 'react';
 import { useOverlay } from '../input/useOverlayEscape';
 import { isTextEditable } from '../input/focusScope';
-import { register } from '../input/keymap';
+import { register, registerBindings } from '../input/keymap';
 import { useHmrEpoch } from '../input/hmrEpoch';
 import { useEditorStore } from '../store/editorStore';
 import { writeMetaOrWarn } from './assetViews/widgets';
+import { SaveRefusedNotice } from './AssetLoadRefusedBanner';
+import { saveRefusalMessage, saveRefusalConsoleMessage, type SaveRefusal } from './saveRefusal';
 import { readMetaPreferringPark, metaWrittenToDisk } from '../scene/pendingMeta';
 import {
   gridSlices, makeSlice, inferGridFromRects, DEFAULT_PIVOT,
@@ -28,14 +30,16 @@ import { markScene2DDirty } from '../../runtime/rendering/Scene2D';
 import { registerHandleProvider, clampHandleToOwner, type InteractionHandle } from '../../runtime/rendering/interactionHandles';
 import { createCoalescedEdit, type CoalescedEdit } from './coalescedEdit';
 import { BufferedNumberInput } from './fields';
+import { resizeSliceRect, moveSliceRect, type Handle } from './sliceDrag';
+import { useDragPointerCapture, pressIsOnScrollbar } from './dragPointerCapture';
 
 type DragMode =
   | { kind: 'none' }
   | { kind: 'create'; startX: number; startY: number }
-  | { kind: 'move'; guid: string; offX: number; offY: number }
-  | { kind: 'resize'; guid: string; handle: Handle; fixedX: number; fixedY: number };
+  | { kind: 'move'; guid: string; startRect: SpriteRect; press: { x: number; y: number } }
+  | { kind: 'resize'; guid: string; handle: Handle; startRect: SpriteRect; press: { x: number; y: number } };
 
-export type Handle = 'nw' | 'n' | 'ne' | 'e' | 'se' | 's' | 'sw' | 'w';
+export type { Handle };
 const HANDLES: Handle[] = ['nw', 'n', 'ne', 'e', 'se', 's', 'sw', 'w'];
 
 const DEFAULT_VIEWPORT_W = 720;
@@ -62,6 +66,15 @@ export function SpriteEditor({ path, name, onClose }: { path: string; name: stri
   const imgRef = useRef<HTMLImageElement | null>(null);
   const [imgDims, setImgDims] = useState<{ w: number; h: number } | null>(null);
   const [meta, setMeta] = useState<Record<string, unknown> | null>(null);
+  // #901: the reason the last Save did not write, shown IN the dialog. Cleared on every
+  // Save attempt so a stale reason can never sit under a later, different outcome.
+  const [saveRefusal, setSaveRefusal] = useState<SaveRefusal | null>(null);
+  // ⚠️ Clear it when the PATH changes, not only on the next Save. `Inspector.tsx` renders the
+  // asset views with no `key`, and an agent can re-open this modal on another texture
+  // (`TextureAssetView` does exactly that) — so the component survives the swap while
+  // `metaLoadedRef` resets and re-reads. Without this the dialog shows asset B under asset A's
+  // refusal, which is a notice describing work the human is no longer looking at.
+  useEffect(() => { setSaveRefusal(null); }, [path]);
   const [sprites, setSprites] = useState<SpriteSlice[]>([]);
   // Store-backed, not local `useState`: an agent needs a route to change which slice is
   // selected (`select-sprite-slice`), and `modoki_get_editor_state` needs to be able to report
@@ -451,12 +464,12 @@ export function SpriteEditor({ path, name, onClose }: { path: string; name: stri
         preventDefault: notTyping,
         run: () => { if (notTyping()) fn(); },
       });
-    const offs = [
+    const offBindings = registerBindings(() => [
       mk('spriteEditor.undo', 'mod+z', undo),
       mk('spriteEditor.redo', 'mod+shift+z', redo),
       mk('spriteEditor.redoY', 'mod+y', redo),
-    ];
-    return () => { for (const off of offs) off(); };
+    ]);
+    return offBindings;
   }, [undo, redo, overlayId, hmrEpoch]);
 
   // ── Mouse interaction ──
@@ -464,6 +477,8 @@ export function SpriteEditor({ path, name, onClose }: { path: string; name: stri
     const canvas = canvasRef.current;
     const scroll = scrollRef.current;
     if (!canvas || !imgDims) return;
+    // A press on the viewport's own scrollbar is scrolling, not an edit, and must not be captured.
+    if (scroll && pressIsOnScrollbar(scroll, e.clientX, e.clientY)) return;
     // Right button (or Alt-modified) = pan by scrolling the viewport, regardless of rect state.
     if ((e.button === 2 || e.altKey) && scroll) {
       e.preventDefault();
@@ -484,8 +499,9 @@ export function SpriteEditor({ path, name, onClose }: { path: string; name: stri
       for (const hd of HANDLES) {
         const hp = imgToScreen(...tuple(handlePos(sel.rect, hd)));
         if (Math.abs(hp.x - px) <= HANDLE_HIT && Math.abs(hp.y - py) <= HANDLE_HIT) {
-          const opp = handlePos(sel.rect, opposite(hd));
-          dragRef.current = { kind: 'resize', guid: sel.guid, handle: hd, fixedX: opp.x, fixedY: opp.y };
+          // The press point, not the handle's position: the edge moves by the pointer's travel
+          // from HERE, so where inside the grab tolerance the press landed changes nothing (#1176).
+          dragRef.current = { kind: 'resize', guid: sel.guid, handle: hd, startRect: { ...sel.rect }, press: screenToImg(px, py) };
           return;
         }
       }
@@ -496,7 +512,7 @@ export function SpriteEditor({ path, name, onClose }: { path: string; name: stri
       const s = sprites[i];
       if (ip.x >= s.rect.x && ip.x <= s.rect.x + s.rect.w && ip.y >= s.rect.y && ip.y <= s.rect.y + s.rect.h) {
         setSelected(s.guid);
-        dragRef.current = { kind: 'move', guid: s.guid, offX: ip.x - s.rect.x, offY: ip.y - s.rect.y };
+        dragRef.current = { kind: 'move', guid: s.guid, startRect: { ...s.rect }, press: ip };
         return;
       }
     }
@@ -526,14 +542,12 @@ export function SpriteEditor({ path, name, onClose }: { path: string; name: stri
     } else if (drag.kind === 'move') {
       setSprites((prev) => prev.map((s) => {
         if (s.guid !== drag.guid) return s;
-        const x = clamp(ix - drag.offX, 0, imgDims.w - s.rect.w);
-        const y = clamp(iy - drag.offY, 0, imgDims.h - s.rect.h);
-        return { ...s, rect: { ...s.rect, x: Math.round(x), y: Math.round(y) } };
+        return { ...s, rect: moveSliceRect(drag.startRect, drag.press, ip, imgDims) };
       }));
     } else if (drag.kind === 'resize') {
       setSprites((prev) => prev.map((s) => {
         if (s.guid !== drag.guid) return s;
-        return { ...s, rect: roundRect(rectFromPoints(drag.fixedX, drag.fixedY, ix, iy)) };
+        return { ...s, rect: resizeSliceRect(drag.startRect, drag.handle, drag.press, ip, imgDims) };
       }));
     }
   };
@@ -584,6 +598,18 @@ export function SpriteEditor({ path, name, onClose }: { path: string; name: stri
     }
   };
 
+  // #1176: the drag lives until its own release, wherever that lands. Ending it on leave kept an
+  // edge from ever being overshot onto the sheet boundary. Pointer events, not mouse events,
+  // also because `MouseEvent.clientX/Y` are integers: floored, they shaved right/bottom edges.
+  // The canvas props take the PRIMARY pointer only, so a SECOND TOUCH neither starts, moves nor
+  // ends the drag. `isPrimary` is per pointer type, so a pen landing during a mouse drag is still
+  // primary and is not filtered. Not observed live; no touch device here.
+  const captureDrag = useDragPointerCapture(
+    scrollRef,
+    () => panRef.current.active || dragRef.current.kind !== 'none',
+    onMouseUp,
+  );
+
   // ── Selected-sprite field edits ──
   const patchSelected = (patch: Partial<SpriteSlice> | { rect?: Partial<SpriteRect>; pivot?: Partial<SpriteSlice['pivot']> }) => {
     // These fields also commit per keystroke, so they coalesce too — an 8-character rename
@@ -610,6 +636,15 @@ export function SpriteEditor({ path, name, onClose }: { path: string; name: stri
 
   // ── Persist ──
   const save = async () => {
+    // ⚠️ Capture the path this attempt is FOR. `writeMetaOrWarn`'s POST now carries a renderer
+    // probe (up to 1500ms, two with discardUnsaved), and the Inspector renders these views with no
+    // `key` — so an agent re-opening this modal on another asset mid-flight would land THIS
+    // asset's refusal on THAT asset's dialog. The `[path]` effect above only clears a refusal left
+    // over from before the swap; this closes the other direction (close-out review 2).
+    const attemptPath = path;
+    // ⚠️ Clear FIRST, on every attempt — see NineSliceEditor.save for why a stale refusal standing
+    // under a later successful write is the same lie in the opposite direction.
+    setSaveRefusal(null);
     if (!imgDims) return;
     const clean = sprites.filter((s) => s.guid !== '__preview__' && s.rect.w > 0 && s.rect.h > 0);
     const textureGuid = typeof meta?.id === 'string' ? meta.id : undefined;
@@ -632,14 +667,26 @@ export function SpriteEditor({ path, name, onClose }: { path: string; name: stri
     // a transient 500 on a GET. Keeping the dialog open matches the failed-write branch below:
     // the edit is not thrown away for a reason that has nothing to do with the edit.
     if (!metaLoadedRef.current) {
-      console.error(`[SpriteEditor] refusing to save ${path} — its .meta.json was never read successfully, so writing now would replace it with a document missing its GUID. Close and reopen once the dev server responds.`);
+      // BOTH channels (#901) — the console keeps path + mechanism for a debugger, the notice
+      // carries consequence + remedy to the person looking at the dialog.
+      const refusal: SaveRefusal = { kind: 'meta-never-read' };
+      console.error(saveRefusalConsoleMessage(refusal, 'SpriteEditor', attemptPath));
+      // The console line is unconditional — it is the record, and it names its own path. Only the
+      // ON-SCREEN notice is dropped when the dialog has moved on, because that one would be read
+      // as describing whatever is showing now.
+      if (attemptPath === path) setSaveRefusal(refusal);
       return;
     }
     const persisted = await writeMetaOrWarn(path, nextMeta);
     if (!persisted) {
       // Keep the dialog open on a failed write — see the note in NineSliceEditor.save. A slice set
       // is far more work to re-author than a border, so losing it to a dev-server blip is worse.
-      console.error(`[SpriteEditor] save failed for ${path} — the dialog is staying open so the slices are not lost. See the /api/write-meta error above.`);
+      const refusal: SaveRefusal = { kind: 'write-failed' };
+      console.error(saveRefusalConsoleMessage(refusal, 'SpriteEditor', attemptPath));
+      // The console line is unconditional — it is the record, and it names its own path. Only the
+      // ON-SCREEN notice is dropped when the dialog has moved on, because that one would be read
+      // as describing whatever is showing now.
+      if (attemptPath === path) setSaveRefusal(refusal);
       return;
     }
     // #845 close-out: this write just committed whatever `readMetaPreferringPark` read at load
@@ -701,7 +748,8 @@ export function SpriteEditor({ path, name, onClose }: { path: string; name: stri
             </div>
             <div
               ref={scrollRef}
-              onMouseDown={onMouseDown} onMouseMove={onMouseMove} onMouseUp={onMouseUp} onMouseLeave={onMouseUp}
+              onPointerDown={(e) => { if (!e.isPrimary) return; onMouseDown(e); captureDrag(e.nativeEvent); }}
+              onPointerMove={(e) => { if (e.isPrimary) onMouseMove(e); }} onPointerUp={(e) => { if (e.isPrimary) onMouseUp(); }}
               onContextMenu={(e) => e.preventDefault()}
               style={{ flex: 1, minHeight: 0, overflow: 'auto', background: '#15151f', border: '1px solid #444' }}
             >
@@ -762,7 +810,13 @@ export function SpriteEditor({ path, name, onClose }: { path: string; name: stri
           </div>
         </div>
 
-        <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 8, marginTop: 10 }}>
+        <div style={{ display: 'flex', justifyContent: 'flex-end', alignItems: 'center', gap: 8, marginTop: 10 }}>
+          {/* #901: beside the Save button that did nothing. A slice set is the most expensive thing
+              in this editor to re-author, and a transient toast is exactly what someone mid-drag
+              in the slicer misses. */}
+          {saveRefusal && (
+            <SaveRefusedNotice uiId="spriteEditor.saveRefused" message={saveRefusalMessage(saveRefusal)} />
+          )}
           <button data-ui-id="spriteEditor.cancel" style={btn} onClick={onClose}>Cancel</button>
           <button data-ui-id="spriteEditor.save" style={{ ...btn, background: '#2ecc71', border: '1px solid #27ae60', color: '#fff' }} onClick={save}>Save</button>
         </div>
@@ -799,10 +853,6 @@ export function handlePos(r: SpriteRect, h: Handle): { x: number; y: number } {
     case 'sw': return { x: r.x, y: r.y + r.h };
     case 'w': return { x: r.x, y: midY };
   }
-}
-export function opposite(h: Handle): Handle {
-  const map: Record<Handle, Handle> = { nw: 'se', n: 's', ne: 'sw', e: 'w', se: 'nw', s: 'n', sw: 'ne', w: 'e' };
-  return map[h];
 }
 export function upsertPreview(prev: SpriteSlice[], guid: string, rect: SpriteRect): SpriteSlice[] {
   const rest = prev.filter((s) => s.guid !== guid);

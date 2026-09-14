@@ -80,6 +80,36 @@ under this project only. Promote it with `--scope project` if it should reach ev
 alike, so any paid tier covers it. It spends the same monthly credit balance as the web app — the
 OAuth approval screen states which credits it will spend. Free tier is 100 credits/month, no card.
 
+## 2a-bis. Corrections from the FIRST real generation run (measured 2026-09-09, `work-ai`, #914)
+
+Four mood-board images were generated through `generate_image_nano_lite` — the first assets this
+repo has actually produced through the service, so §2a's table stops being vendor-claimed here.
+
+- 🔴 **`resolution: "2K"` is REJECTED by the backend, despite being in the tool's own enum.** The
+  call returns `400 INVALID_ARGUMENT` ("Request contains an invalid argument") and credits are
+  refunded automatically. §2a's "5 credits flat, **any resolution**" is therefore wrong as written —
+  it is 5 credits flat at the resolutions that work. **Isolated properly**: the same prompt, title,
+  aspect ratio and `num_images` succeeded on the very next call with only `resolution` changed to
+  `1K`, so the failure is that argument and not the prompt. `0.5K`/`4K` are untested. The tool
+  description's "Recommended settings: resolution 1K" turns out to be load-bearing advice, not a
+  preference — follow it.
+- **Aspect ratio `16:9` and `num_images: 2` are both fine** (they were live in the failing calls too,
+  and survived the fix).
+- **Failure is only visible on `get_generation`.** The generating call returns
+  `{"status":"working","credits_spent":N}` exactly as a good one does, so **a fired-and-unpolled
+  generation reads as success**. Always poll.
+- **The tool list has DRIFTED since 2026-08-05** and §2a's table is stale in three ways:
+  `generate_meshy_6` is now **`generate_meshy_7`**, and three tools exist that the table does not
+  list — **`generate_p2`**, **`generate_material`**, **`material_from_image`**. Re-read the live
+  surface rather than the table before planning a 3D or material job.
+- **Connection gotcha, cost a session's time:** the §2 recipe's `--scope local` writes to whichever
+  Claude config root is active (set per launch by `CLAUDE_CONFIG_DIR`). An entry registered under
+  one Claude config root is **invisible** to a session started under another — `claude mcp list`
+  simply does not show the server. Re-add it with
+  `claude mcp add --transport http --scope user 3daistudio https://mcp.3daistudio.com/mcp`, which
+  lands in the ACTIVE dir, then authenticate with `/mcp`. The stored entry is only `{type, url}` —
+  the OAuth credential is not in the file, so nothing sensitive moves between config dirs.
+
 ## 2a. What the MCP surface ACTUALLY exposes (measured 2026-08-05, 22 tools)
 
 ⚠️ **The MCP surface is a SUBSET of the web app — plan against this list, not against §3/§4.**
@@ -153,6 +183,15 @@ Costs 3 credits (GPT Image 2) to 14 (Nano Banana Pro).
 **Also:** Sketch to Image, AI Pose Transfer, Image to Prompt (recover a prompt from an image),
 and video (Veo 3, Kling, Seedance).
 
+**Video, in more detail** ([vendor docs](https://docs.3daistudio.com/image-studio/video), paid tiers
+only — the public pricing page omits it; the owner confirmed it exists on 2026-08-03). Engines
+include Veo 3 Fast/Standard, Kling (with O1 frame-transition and Motion Control) and Lucy 14B, at
+40–200 credits per clip, in text-to-video, image-to-video, frame-transition and motion-transfer
+modes. ⚠️ **Clips are only 3–5 seconds** — fine for a looping screen or sprite, too short for a
+cutscene, so a longer sequence means stitching with ffmpeg or rendering in-engine with
+`modoki_render_sequence`. The docs state no resolution, aspect ratio, codec or audio behaviour;
+read those off a real generation.
+
 Output: JPEG, PNG or WebP. Typical cost 2–6 credits per generation.
 
 ## 4. The 3D half
@@ -190,6 +229,21 @@ road in, and the engine already imports GLB with LOD.)
 Studio is the tier gated to "all creative and production tools" and faster generation. Note the
 free tier's **download restriction on at least Character Sheet** — preview-only — so free is for
 evaluating, not for producing committed assets.
+
+### Licensing — why a PAID tier is what makes the output publishable
+
+From the vendor's terms ([AGB](https://www.3daistudio.com/AGB)); note the vendor is **3daistudio.com**,
+not the separately owned, similarly named `3d-ai.studio`:
+- **Paid tiers** grant a "transferable, and sublicensable" license to "copy, reproduce, distribute,
+  publicly perform or publicly display" the output — so shipping it in a public repo or a
+  `demos/<id>` snapshot is permitted. No attribution is required.
+- **The free tier** is "personal, non-transferable, non-sublicensable" — redistribution is
+  prohibited, so free-tier output must never be committed.
+- **Output may not be used to train or improve any ML/AI model.** That is why generated assets are
+  **not CC0**: we cannot grant downstream recipients a right we do not hold. A demo shipping them
+  needs its own provenance wording in `ATTRIBUTION.md`, not a copy of the CC0 line.
+- Output "may incorporate or be based upon third-party content, libraries, or open-source
+  components" — worth a per-asset glance before committing one.
 
 ## 6. What we would actually use it for in Court
 

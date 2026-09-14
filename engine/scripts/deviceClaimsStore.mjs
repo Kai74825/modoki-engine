@@ -73,6 +73,16 @@
  * asymmetry the readers implement: a match refuses, a mismatch allows, and an ABSENT model is
  * "cannot tell", never "different".
  *
+ * ── One phone, several `ios:` spellings — closed (#1078) ──
+ * A narrower gap lived INSIDE the `ios:` namespace. `devicectl --device` accepts a CoreDevice
+ * identifier, an ECID, a serial number or a name as well as the UDID, and a claim was keyed by whichever
+ * string the command passed, while every claim the editor takes is keyed by UDID. So a `devicectl`
+ * command naming the identifier neither saw a sibling's claim nor was covered by this clone's own. The
+ * guard's two edges now resolve an `ios:` id to its UDID first (`iosDeviceIdentity.mjs`): the hook and
+ * `device run` compare under the UDID (and the raw spelling), and `device claim` stores the UDID or
+ * refuses. This store stays a plain string map on purpose — resolving needs `xcrun`, and the editor's
+ * own writers already have the UDID in hand.
+ *
  * ── Implementation lives here, in a plain .mjs (#285) ──
  * This module is plain ESM JavaScript (not TypeScript) so a standalone Node CLI script — the
  * #285 claim guard that wraps raw `adb`/`xcodebuild`/`devicectl` calls outside the MCP surface —
@@ -102,8 +112,48 @@ import { canonicalPath, samePath } from './pathIdentity.mjs';
  *  directory those rules operate on, and only when no explicit one was given. */
 export function claimsDir() {
   if (process.env.MODOKI_HOME) return process.env.MODOKI_HOME;
-  if (process.env.VITEST) return path.join(os.tmpdir(), `modoki-claims-vitest-${process.pid}`);
+  if (process.env.VITEST) return vitestClaimsDir();
   return path.join(os.homedir(), '.modoki');
+}
+
+const VITEST_CLAIMS_PREFIX = 'modoki-claims-vitest-';
+
+/** The claims dir a process falls back to under vitest when `MODOKI_HOME` is unset: one per pid.
+ *  Nothing here removes it when the process is done, because a process cannot tell its last claim
+ *  from any other. Before #1117 this was the largest single leak in `os.tmpdir()`: 42,904 dirs on one
+ *  Mac. Three kinds of process make one, and `engine/tests/globalSetup.ts` reaps all three at
+ *  teardown (`reapVitestClaimsDirs`):
+ *  - a vitest WORKER. The default pool gives each test file a fresh one, so by teardown it is dead.
+ *  - the vitest MAIN process. The editor backend plugin's `configureServer` sweeps stale claims when
+ *    vitest builds its Vite server.
+ *  - a CHILD a test spawns (an OTA or build CLI). It inherits `VITEST` and falls back to its OWN pid.
+ *  A per-file `afterAll` removal existed for workers once, and was dropped as redundant. It was also
+ *  a hazard: a throw there skipped the scratch-dir cleanup queued behind it. */
+export function vitestClaimsDir(pid = process.pid) {
+  return path.join(os.tmpdir(), `${VITEST_CLAIMS_PREFIX}${pid}`);
+}
+
+/** Remove the vitest fallback claims dirs that belong to THIS run and nobody can still be using:
+ *  this process's own, plus any whose pid is dead and that were touched at or after `sinceMs`.
+ *  A LIVE pid is skipped, because another clone's vitest may run concurrently in the same
+ *  `os.tmpdir()`. Dirs from before `sinceMs` are skipped too, because historical debris is not this
+ *  run's to delete. Returns the removed paths. `alive` and `tmp` are injectable for the test. */
+export function reapVitestClaimsDirs({ sinceMs, alive = isPidAlive, tmp = os.tmpdir() }) {
+  const removed = [];
+  for (const name of fs.readdirSync(tmp)) {
+    const pid = name.startsWith(VITEST_CLAIMS_PREFIX) ? Number(name.slice(VITEST_CLAIMS_PREFIX.length)) : NaN;
+    if (!Number.isInteger(pid) || pid <= 0) continue;
+    const dir = path.join(tmp, name);
+    const own = pid === process.pid;
+    if (!own && (alive(pid) || mtimeMsOrNaN(dir) < sinceMs)) continue;
+    fs.rmSync(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+    removed.push(dir);
+  }
+  return removed;
+}
+
+function mtimeMsOrNaN(p) {
+  try { return fs.statSync(p).mtimeMs; } catch { return NaN; }
 }
 
 function claimsFile() {
@@ -357,6 +407,26 @@ function isSameHolder(existing, req) {
  *  must survive its (short-lived) process exiting, so it must never be revocable by some UNRELATED
  *  future process that happens to recycle that pid — `releaseAllForThisProcess` filters by pid, and
  *  a real pid there would let a totally different later process accidentally own/clear it. */
+/** (#1082) The holders registered on a claim, with `holder` added — the ONE place the set is built.
+ *
+ *  Why a set at all: this module deliberately treats a same-process re-claim as a refreshing no-op
+ *  success, because "the lease reconnects, the WDA launcher and an install all legitimately claim the
+ *  same phone within one session" (see `claimDevice` below) and making those coordinate amongst
+ *  themselves would put the arbitration back where this module took it from. That is right, and it
+ *  left `releaseDevice` unable to tell the two apart: it drops by `(deviceId, pid)`, so the FIRST
+ *  holder to let go handed back a phone the second was still using. A stalled USB teardown resuming
+ *  after a newer WDA launch did exactly that, releasing an agent's claim out from under it.
+ *
+ *  So a record carries WHO holds it, and the phone is free only when the last of them lets go. A
+ *  claim taken without a `holder` registers none and keeps today's whole-record behaviour — and an
+ *  unnamed refresh must never WIPE someone else's registration, which is why the previous set is
+ *  carried forward rather than replaced. */
+function mergeHolders(existing, holder) {
+  const prev = Array.isArray(existing?.holders) ? existing.holders.filter((h) => typeof h === 'string') : [];
+  if (!holder || prev.includes(holder)) return prev;
+  return [...prev, holder];
+}
+
 export function claimDevice(req, opts = {}) {
   const now = opts.now ?? Date.now();
   return withLock(() => {
@@ -365,6 +435,7 @@ export function claimDevice(req, opts = {}) {
     if (existing && !isSameHolder(existing, req)) {
       return { ok: false, held: existing, message: describeConflict(existing, now) };
     }
+    const holders = mergeHolders(existing, req.holder);
     const claim = {
       deviceId: req.deviceId,
       clone: req.clone ?? process.cwd(),
@@ -378,6 +449,9 @@ export function claimDevice(req, opts = {}) {
       ...(clampTtlMs(req.ttlMs) !== undefined ? { ttlMs: clampTtlMs(req.ttlMs) } : {}),
       ...(req.model ? { model: req.model } : {}),
       ...(req.osVersion ? { osVersion: req.osVersion } : {}),
+      // (#1082) Absent rather than empty when nobody named themselves, so a record written by a
+      // caller that passes no holder is byte-identical to what it was before this field existed.
+      ...(holders.length ? { holders } : {}),
     };
     writeClaims([...live.filter((c) => c.deviceId !== req.deviceId), claim]);
     // Only a pid-claim registers for the exit hook: an owner-claim's whole point is to outlive
@@ -403,13 +477,36 @@ export function claimDevice(req, opts = {}) {
 export function releaseDevice(deviceId, opts = {}) {
   withLock(() => {
     const all = readClaims();
-    const next = all
-      .filter((c) => !isStale(c, opts))
-      .filter((c) => !(c.deviceId === deviceId && (opts.owner ? c.owner === opts.owner : (c.pid === process.pid && !c.owner))));
-    // Write when anything went — our claim, or stale entries swept while we hold the lock. Compared
-    // against the file as READ, so a pure stale-sweep still persists rather than being discarded.
-    if (next.length !== all.length) writeClaims(next);
-    held.delete(deviceId);
+    let changed = false;
+    /** Does THIS process still hold the device after this release? Gates the exit-hook bookkeeping
+     *  below: forgetting a device another holder in this process is still using would leave its
+     *  claim behind at exit, which is the stale lock the TTL exists to paper over. */
+    let stillHeldHere = false;
+    const next = [];
+    for (const c of all) {
+      // Swept in the same write, since we hold the lock.
+      if (isStale(c, opts)) { changed = true; continue; }
+      const isMine = c.deviceId === deviceId
+        && (opts.owner ? c.owner === opts.owner : (c.pid === process.pid && !c.owner));
+      if (!isMine) { next.push(c); continue; }
+      // (#1082) Release by HOLDER when one is named: one process can hold a key through two
+      // independent holders (a lease and the WebDriverAgent launch), and `(deviceId, pid)` cannot
+      // tell them apart — so whichever let go first handed back a phone the other was still on.
+      // A record with no registered holders, or a release that names none, drops whole as before.
+      const others = mergeHolders(c, undefined).filter((h) => h !== opts.holder);
+      if (opts.holder && others.length) {
+        next.push({ ...c, holders: others });
+        changed = true;
+        stillHeldHere = true;
+        continue;
+      }
+      changed = true;   // the record itself goes
+    }
+    // Write when anything went — our claim, a holder off it, or stale entries swept while we hold
+    // the lock. A holder-narrowing edit leaves the LENGTH unchanged, so a length comparison (what
+    // this used to do) would silently discard it.
+    if (changed) writeClaims(next);
+    if (!stillHeldHere) held.delete(deviceId);
   });
 }
 

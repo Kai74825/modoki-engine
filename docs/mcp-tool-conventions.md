@@ -175,6 +175,18 @@ calls. Raw `{x,y}` is refused wherever a resolvable aim exists (`modoki_capture_
 legitimate exception: it *measures* a path).
 
 - `guid` is the only address that always works; `id` is reassigned on every scene reload.
+- **A reply reports `guid: null` for an entity that has no guid. It never reports `String(id)`**
+  (#1199). Runtime spawns have no guid, and neither does anything not yet saved or edited. The id
+  in `guid` looked addressable, and every guid-addressed op refused it: a guid-less entity is not in
+  the guid index. The refusal then told the caller to use guids. `liveGuidOf`
+  (`app/debug/liveLifecycle.ts`) is the one helper. Two shapes differ, because a bare element has
+  no `id` beside it: `contacts`/`overlaps` list a guid-less partner as `id:<n>`, and a `watch`
+  series reports `guid: null` plus `id`, with `id:<n>` as its internal key. A `watch read` with
+  `guids` therefore cannot select a guid-less series by its old id string. Select it with `name`.
+  `guids: ["id:<n>"]` also matches, but it is not an advertised form. A producer that hands out a guid should
+  **mint** one (the live `create-entity`, `newScene`'s starter set), not disguise the id. A
+  scene-state warning for null rows was tried and dropped: it fired on every read of a world with
+  runtime spawns.
 - A `name` matching several entities is **refused**, everywhere — live path, file path, and input
   aim alike. First-matching is never acceptable (this was measured: one of two `DUP_probe` entities
   moved, `{ok:true, changed:1}`).
@@ -316,8 +328,222 @@ Rules:
 - **"Could not look" is never reported as "nothing is there."** `ota_status` currently maps every
   gcloud failure — expired auth, no network, bucket typo — onto `release:null, note:'No release.json
   published yet'`. An unreachable source is `NOT_AVAILABLE_HERE`, not an answer.
+- **"I looked at a stale copy" is not "this is current"** — the READ half of the rule above (#889).
+  A route that computes an answer from files on disk while the renderer holds newer unsaved versions
+  must say so, in a TYPED field a guard can check for, not a warning string. It does not refuse: a
+  read that refuses is worse than one that caveats, and §8 covers work that would be *omitted*, which
+  a disclosed read does not omit. ⚠️ The field is ABSENT when clean — a disclosure present on every
+  call is one readers learn to skip. Mechanism: `docs/mcp-persistence.md` § "Disk is not the source
+  of truth while an editor is open".
 - **A no-op is a failure when the caller asked for a change.** `changed:0`, or a write whose keys
   the loader ignores, is `REFUSED_BY_OP` with the real field names — not `{ok:true, changed:1}` (V1).
+- **A STATE refusal is RETURNED with its code — it must never escape as a PLAIN throw** (#994;
+  `OpRefusal`, below, is the coded throw the bridge returns for you). This is
+  the emit-side half of "a refusal is not a transport failure" above, and without it that rule
+  cannot be kept: an op that throws has no way to name its code, because every relay route turns a
+  throw into a hard-coded **504** (a **500** on the Electron host), which the MCP client maps to
+  `NOT_AVAILABLE_HERE` — *"could not look: the route is absent"*. So `render-scene`'s plain
+  `Error('no scene renderer registered…')` told an agent to relaunch a perfectly healthy editor,
+  and told `test:mcp:live` a live route was a DEFECT. **The op is
+  the only layer that knows which failure this is**, so it returns `{ok:false, code, error,
+  options}` and the route relays it (`opRefusal`/`refusalStatus` in `editorBackendRouter.ts`).
+  **Or it throws `OpRefusal(code, message, {options})`** (`engine/app/debug/opRefusal.ts`, #1012):
+  the form for a helper buried under many callers (`requireLiveId`, `guardUnsaved`), which
+  `opReplyFor` turns into that same returned envelope. A plain `Error` is never a coded refusal.
+  ⚠️ **The editor has TWO relay transports, and both call `opReplyFor`.** The HMR relay answers
+  through `relayResponseFor`; the Electron IPC handler deliberately does not use it — IPC reaches
+  exactly one `webContents`, so there is no broadcast and no decline to count (`main.ts`'s
+  `requestRenderer` docblock) — so a conversion placed in only one of them is dead in
+  the other — the packaged editor. **The device TCP relay is a third, and it does NOT carry a code:**
+  `bridge.ts`'s `delegateToAgentOps` flattens any throw into the `Error: <msg>` string sentinel the
+  game-debug MCP flags, so an `OpRefusal` thrown by a RUNTIME op would lose its code there. None is
+  thrown by one today — every recoded site is an editor op, which never runs on a device — and
+  making the device channel carry §5 codes is a protocol change to that MCP, not an extra call to
+  `opReplyFor`. Four riders:
+  - **The discriminator is a code from the CLOSED set**, not `ok:false`. Dozens of ops report a bad
+    parameter as `{ok:false, reason}` at HTTP 200, where `isFailureBody` picks them up; only a
+    named code is a claim to know which §5 failure this is, and only that claim earns a status.
+  - **One code, one status.** `NO_RENDERER` → 503 everywhere; anything else the ops name is the op
+    answering, which is a 400 (`relayFailureStatus`'s own argument). The CODE is what the agent
+    reacts to — a body-supplied code beats the status-derived one (`codeFromBody`).
+  - **Classify structurally, never by message prefix.** The Electron capture path throws a
+    `CaptureUnavailableError` CLASS for exactly this reason; `relayFailureStatus`'s scar is what
+    string-matching an error costs — a bare word in one op's prose eventually collides with
+    another's.
+  - **Recode a refusal only where the sharper code is TRUE** (#1012). Of the 67 plain throws in
+    `agentEditorOps.ts`, about a dozen were: a stale entity or missing asset (`NOT_FOUND`), unsaved
+    work (`REQUIRES_SAVE`), a save where something landed (`PARTIAL` — decided from the landed
+    list, never from the prose), contradictory arguments (`AMBIGUOUS`). A missing parameter, a wrong
+    asset kind, a no-op and an internal failure are honestly `REFUSED_BY_OP` and stay plain throws —
+    and so does a loader whose `null` conflates *missing* with *malformed* (`getPrefabSource`),
+    where `NOT_FOUND` would be a guess stated as a fact.
+- ⚠️ **THE RELAY IS A BROADCAST, and it settles on the first AUTHORITATIVE reply — not the first
+  reply** (#1030). `ws.send` reaches every HMR client, so `modoki:request` runs in every open tab,
+  not only the editor's. A tab on the dev server's runtime route has no editor ops registered and
+  used to REJECT in about a millisecond, beating the editor tab (which has to do the actual work)
+  and settling the request on its behalf. Anything reading that rejection as *"no editor exists"*
+  then got a false negative about a live editor holding state: `applyMovesInRenderer` maps
+  `unknown agent op` to `{kind:'absent'}` and skipped the asset-path repair **silently** — no warn,
+  no `repairFailed` — while the editor's bindings, parked writes and Inspector selection still
+  keyed on the dead path (#186's symptom, reported as a clean move).
+
+  **A decline is not an answer.** A client answers `{declined: true}` for an op it has no handler
+  for (`relayResponseFor`, `agentBridge.ts`), and the registry COUNTS declines, rejecting only once
+  every client has declined — at which point *"nothing out there has this op"* is true rather than
+  merely first.
+  - ⚠️ **The denominator is ANNOUNCED BRIDGE CLIENTS, not `ws.clients.size`.** Counting sockets
+    made an ordinary case hang: `/@vite/client` connects while `index.html` is still parsing, but
+    `initAgentBridge` is reached through a dynamic import several module-graph levels later — and
+    never at all for a tab sitting on the Vite error overlay. Such a tab is counted-but-mute, its
+    decline never arrives, and the request rides the CALLER's full budget instead of settling
+    (1.5s on the move repair, which then warns about a live editor that was never at risk; 60s on
+    `/api/eval`). A client is counted once it has sent a `modoki:schema` or a `modoki:response`;
+    one that has announced nothing has also registered no ops, so excluding it can hide no answer.
+  - ⚠️ **Declines are a SET of clients, not a tally.** `settle`'s contract is that a duplicate or
+    late reply cannot double-settle, and on the decline path keeping that needs identity — Vite
+    supplies it as the second argument to `ws.on`. Without it, two replies carrying one id from
+    the SAME client reach the denominator and reject while the editor is still working, which is
+    #1030 reinstated. `initAgentBridge` has no idempotency flag and `hot.on` appends without
+    dedupe, so that pair is one stray double-registration away.
+  - ⚠️ **`declined` and `error` are separate channels because they mean opposite things.** "I do
+    not have this op" is countable; "this op threw" is a real answer from the one client that OWNS
+    the op and must settle immediately. Collapsing them — which is what letting `runAgentOp` throw
+    did — IS the defect, and collapsing them the other way turns every genuine failure into a
+    stall.
+  - ⚠️ **Membership is asked BEFORE dispatch**, never by catching `/unknown agent op/` out of the
+    dispatch: a string test would miscount an op that legitimately throws those words, and would
+    already have RUN the op before deciding whether it existed.
+  - ⚠️ **The all-declined rejection carries the SAME `unknown agent op '<op>'` string**, and that
+    is load-bearing. Three consumers in `editorBackendRouter` key off it and they disagree about
+    what it MEANS on purpose — a repair's safe answer (`absent`) and a guard's safe answer
+    (`unknown` → refuse) are opposites on that exact string. #1030 removes the race WITHOUT moving
+    the string; a fix that "cleaned it up" would silently re-decide both.
+  - The same string arriving as a plain `error` (a tab loaded before #1030) is counted as a decline
+    too, **at the transport and nowhere else** — that is the only layer that knows the send was a
+    broadcast. ⚠️ That test is **anchored** (`/^unknown agent op\b/i`) and gated on the reply
+    carrying no `result`, unlike the three consumer-side tests. They ask *"is this message about an
+    absent op?"*; this one asks *"is this reply a decline rather than an answer?"* and runs against
+    every reply, so an unanchored version would miscount a real op whose own error contains the
+    words — the precise miscount the client-side membership test exists to avoid.
+  - **Bounds, both accepted:** a client that disconnects mid-flight never declines, so the request
+    rides to its timeout instead of settling absent (honest, and every consumer already treats a
+    timeout as ambiguous); and if a future Vite stops exposing `ws.clients` the intersection
+    falls back to every client still in the announced set — which is bounded only because that set
+    is PRUNED on `vite:client:disconnect`. ⚠️ Without the prune that fallback counts every client
+    ever seen, and after a day of HMR full-reloads every relayed op would ride its full budget.
+  - **Vite only.** Electron sends to its one renderer window and has no broadcast, so its relay
+    reaches `agentBridge`'s dispatcher directly rather than through `relayResponseFor`. ⚠️ **Do not
+    "make the two consistent"** — routing Electron through it would emit `declined` replies, and
+    `main.ts` would resolve them as `undefined`, turning every unregistered op there from a
+    `504 NOT_AVAILABLE_HERE` into a fabricated `200 {}` across ~30 relayed routes. That handler
+    rejects on `declined` now, so the trap is closed from both ends, but the asymmetry is correct.
+
+- **A route never narrows an agent-supplied VOCABULARY — it forwards the raw value, and the op that
+  owns the table refuses it with `options`** (#1072). §1 rules out silently dropping an unknown
+  KEY; this is the same rule for a VALUE, one layer further in. `/api/journal` copied
+  `info|warn|error` and dropped anything else, so `?level=wran` returned the whole ring under a
+  filtered framing and the op's own refusal could never fire; `/api/editor-journal` and
+  `/api/wait-for-edit` did the same to `source`, and the latter then parked for the default
+  `human`. The MCP tools' `z.enum`s hide this from every tool call, which is how it survived —
+  the curl API is still a surface (§9). Guarded by `tests/plugins/routeVocabularyForwarding.test.ts`;
+  the tools' hand-copied enums are pinned to the runtime tables by
+  `tests/tools/vocabularyEnumParity.test.ts`. The same mechanism is not only a ROUTE shape — the
+  close-out sweep found it at an op (`hit-regions` ran an unknown `action` as a read) and in a pure
+  decision (`pickHostSidePlatform` ignored an unknown explicit `platform` and answered about the
+  lease's device); both now refuse. The router guard sees only the one-line `=== … ||` spelling, not
+  a `Set.has`/`switch`/multi-line copy. Three riders:
+  - **Where NO op sits behind the route, the route IS the table's owner, and it refuses** (#1076).
+    The Electron `/api/input/*` routes dispatch trusted input themselves, so an unknown `button` or
+    modifier cannot be "forwarded to the op" — it was coerced instead: `button:'rigth'` pressed left,
+    an unknown modifier fell out of a Cmd+drag's key pair, the device's `press-key` sent Cmd+Z as a
+    plain `z`, all under `ok`. Those vocabularies are declared ONCE in
+    `engine/tools/shared/inputVocabulary.ts`; the tools derive their `z.enum` from it, the routes
+    refuse against it before resolving the aim (a 400 with `REFUSED_BY_OP` + `options`), and
+    `/api/device/request` refuses before choosing a transport — CDP dispatches `press-key` itself and
+    never reaches the bridge handler, which refuses with the same predicate.
+  - **A vocabulary that is not a closed list still gets a table — and the table is the one that gets
+    ADVERTISED** (#1094). `key`/`submitKey` were the last open ones: `z.string()` everywhere, with the
+    legal values named only in prose. The rule is "a single character, or a name from `INPUT_KEYS`",
+    matched case-insensitively, so it cannot be a `z.enum` — enumerating every character is not a
+    list. Two consequences worth copying:
+    - **Refuse AND normalise.** The predicate returns the canonical DOM `key` (`Esc`→`Escape`,
+      `Up`→`ArrowUp`), which is what closed the divergence half of the bug: the editor aliased four
+      arrow names and the device aliased none, so the same request drove one host and did nothing on
+      the other. A vocabulary with aliases must canonicalise at the shared predicate, not per host.
+    - **Parity moves to the DESCRIPTION.** `vocabularyEnumParity.test.ts` pins each `z.enum` to its
+      runtime tuple; here it pins each tool's advertised description to `KEY_ARG_DESCRIPTION`, which
+      is DERIVED from the table. Same anti-drift job, different axis.
+    - ⚠️ **Canonicalising an input breaks whatever was DERIVED from it, one layer down.** Both device
+      transports computed the DOM `code` from `key` with a single-letter rule; normalising `Space` to
+      the canonical key `' '` therefore fixed `e.key` and silently broke `e.code`, and
+      `e.code === 'Space'` is the idiomatic spacebar test precisely because `e.key` is an
+      easily-missed space. The derived value needs its own measured table (`domCodeForKey`), in the
+      SAME shared module — derived per host it re-opens the divergence the canonicalisation just
+      closed. Found by review, not by the tests, which asserted `[key, code]` for one alias and only
+      `key` for the rest.
+    ⚠️ **Pick the table by who CALLS the tool, not by what the host accepts.** Measured on Electron
+    43.2.0 (2026-09-12): `sendInputEvent` takes Electron's Accelerator dialect case-insensitively, so
+    `VolumeUp` and `numadd` work and are now refused. That is deliberate — the caller is an agent,
+    which reaches for DOM names because that is what web code looks like, and a table that IS the
+    accepted set can print `Valid: …` truthfully where a hint cannot. The aliases that survive were
+    MEASURED, not reasoned: `Del` is rejected by Chromium where `Delete` works, so the accepted set
+    is not guessable.
+    ⚠️ **An unrecognised name is not an error anywhere downstream, which is why nothing caught this.**
+    Chromium turns it into a keydown whose `key` is the EMPTY STRING — it matches no handler and
+    inserts nothing — so `type_text {submitKey:'Retrun'}` answered `ok, typed:3` having submitted
+    nothing. On the DEVICE side it is worse: `new KeyboardEvent({key:'Excape'})` is well-formed and
+    carries the typo, so there is no signal at all and only the table can catch it.
+  - **SWEPT AND CLEARED, so the next sweep does not re-derive it: `modoki_handles`' `editor`/`kind`.**
+    They look like the last unrefused vocabulary on this surface — free-form strings that FILTER a
+    read, where an unknown value would yield an empty list and the tool's own description says an
+    empty result should "read as a correct negative answer". **Driven live (2026-09-12), and it does
+    not conflate:** `GET /api/enact-handles?editor=zzzzz` answers `count:0` with
+    `hint: "no handle matches editor=zzzzz. Live now: editor ∈ {chrome}, kind ∈ {button, span} —
+    check the spelling, or drop the filter for counts."` It names the live vocabulary and says to
+    check the spelling, which is the recovery information a refusal would have carried. A closed
+    table would also be WRONG here: the legal set is what is currently mounted, so `editor:'sprite'`
+    is a correct spelling that is legitimately empty whenever the Sprite Editor is shut — refusing it
+    would be the #285 carve-out, a refusal the caller cannot satisfy. Listed the way #731 listed its
+    clean sites: the ambiguity is real and the consumer makes it harmless.
+  - **On a GET, the refusal needs a CODE.** `getJson` does not run `isFailureBody` on a plain read,
+    so an uncoded `{ok:false}` reaches the agent as a SUCCESS; a coded envelope leaves `relayJson`
+    as a 400. (`/api/watch/read` is safe without one only because its route re-codes the op's
+    uncoded refusal as a 404.)
+  - **A runtime vocabulary check RETURNS its refusal as data, and each op adapts it once** —
+    `resolveCreateEntitySpec` for `create-entity` (#1070): the editor op throws `OpRefusal`, the
+    device twin returns `{ok:false, error, options}`. A runtime THROW serves neither transport: the
+    device relay flattens it to a string, and the editor relay can only call it `REFUSED_BY_OP`
+    with the options stranded in the prose. The builders keep a throw as a programming-error
+    backstop, using the SAME membership predicate — one check per table, not a second copy.
+- **A relayed route never HARD-CODES its catch status** (#1013). This is the receive-side half of
+  the rule above, and the two are not the same fix: the emit side stops an op from *losing* its
+  code, this side stops the route from *inventing* one. `ctx.requestBrowser` rejects identically
+  whether the relay died or the op threw, so a literal `504` in the catch reports every refusal the
+  op raised as `NOT_AVAILABLE_HERE` — the editor declared unreachable while it is answering. Twenty-
+  six routes did that; `relayJson` in `editorBackendRouter.ts` now states the recipe once, and a
+  guard (`tests/plugins/relayRefusalStatus.test.ts`) fails on a new literal.
+  - **The classifier is what PRESERVES the 504**, so adopting it costs a genuine transport failure
+    nothing. The argument for leaving a route on a hard-coded 504 — *"a route SHOULD 504 on a real
+    transport failure"* — is true and is an argument FOR `relayFailureStatus`, not against it.
+  - ⚠️ **The accept side is the half to test.** `relayFailureStatus` decides by matching the
+    message, and that list has been found incomplete three times. A change that made every relay
+    error a 400 would pass every refusal test and be worse than the bug it replaced, so a
+    genuinely-dead renderer must be pinned by signature, with the strings the host actually sends.
+  - ⚠️ **`/api/eval` is the one route that must NOT read a returned envelope as a refusal.** The
+    reply is the eval's own return value, so a body ending `return {ok:false, code:'NOT_FOUND'}` is
+    agent DATA; it is wrapped in `{result: …}` so no envelope reaches the top level. Every other
+    relayed route relays one. ⚠️ Three did not until #1012 — `/api/editor-action`, `/api/asset-def`
+    and `/api/asset-meta` sent a bare `json(raw)`, i.e. the envelope as a **200**. `postJson`'s
+    `isFailureBody` rescued the POST, but the two GET tools run no `checkFailure`, so a coded
+    refusal there would have reached the agent as a SUCCESS.
+  - ⚠️ **A route that post-processes its reply must check the envelope before it returns.** Only one
+    of the six spreads unconditionally (`/api/editor-state`, which merges main-process facts into
+    the relayed object) — there an envelope really would come back as a 200 whose body is a refusal
+    wearing `persistenceMode`. `enact-handles` gates its decoration on `Array.isArray(handles)`,
+    which an envelope cannot pass, so its bug was the STATUS alone. Worth separating: the
+    reshaped-into-a-plausible-answer failure (§0's rank 1) and a merely wrong status are different
+    severities, and an earlier draft of this bullet claimed the first for a route that only had the
+    second.
 
 ## 6. Response budget: summary-first
 
@@ -395,6 +621,17 @@ variance is machine-readable while it lasts.
   leaves the renderer's particle cache stale, so a read-back returns the pre-write def as live truth
   and a read→modify→write round-trip silently reverts the file (S1) — the bug already fixed for
   `.anim.json`, unfixed for particles.
+- **Never expose a tool option no HUMAN path in the editor uses** (#288). A parameter on an
+  internal function is a seam for its callers; a parameter on an agent tool is a *published
+  capability*, and an agent has no UI affordance telling it which values are sane. Before exposing
+  one, grep every call site of the underlying function and ask, in order: *does a human path pass
+  this value?* and, if not, *what does it do that the human path deliberately avoids?* If the answer
+  is "the thing the surrounding machinery exists to prevent", leave it out — not behind a flag or a
+  confirm. Scar (2026-08-21): `modoki_exit_pose_envelope` shipped `restore:false`, mirroring
+  `endTimelinePreviewSession`; all eight `AnimationEditor`/`TimelineEditor` call sites pass
+  `restore:true`, and `false` only bakes a preview pose into the authored world — the damage the
+  envelope exists to prevent, which had cost the owner data two days earlier. The option has since
+  been removed. `create_registered_asset {kind:'scene'}` was refused for the same reason.
 
 ## 9. Cross-surface parity
 
@@ -502,6 +739,15 @@ site must apply `ctx.htmlFallthrough`/`ctx.noSuchRoute` itself.
   months with T1 and T2 green. The repo owner does not drive MCP tools — the surface exists for the
   agent — so "someone will notice" is not a safety net. Run it after any change to
   `engine/tools/**`, an `/api/*` route, or an agent op.
+  ⚠️ **A `SMOKE INCOMPLETE` exit 1 can be a precondition, not your change.** The smoke half skips
+  UC3 unless the editor's `surfaces` include `scene-view`, and a default launch comes up with
+  `['game-2d','game-3d']` — relaunching does not change that; T3 passes regardless. Mount the Scene
+  tab with a trusted tap: `POST /api/input/tap {"label":"Scene"}` (`modoki_tap {label:'Scene'}`).
+  The 2026-09-09 note that a tap at a tab's coordinates "reports ok:true and does not switch the
+  tab" did not reproduce on 2026-09-13: a trusted tap on the Console tab switched it, and a tap on
+  Assets switched it back (#1152). The offscreen copy at y≈-9960 it warned about is real — it is
+  FlexLayout's tab *stamps* — but the label aim counts only on-window matches and the handle
+  provider skips stamps, so no `y > 0` filter is needed.
 - **What T3 cannot reach is DECLARED, not implied.** A sweep must not damage the human's open project,
   so ~39 mutating tools (`build`, `press_key`, `menu`, `eval`, …) are listed in
   `src/liveCoverage.ts` with the reason each is un-sweepable, and a CI-safe guard asserts the split
@@ -551,6 +797,117 @@ site must apply `ctx.htmlFallthrough`/`ctx.noSuchRoute` itself.
   compares against the same render function the generator writes with; comparing against a second
   implementation of the table would reintroduce the drift it exists to prevent (§9).
 
+### 10a. The size budget is a gate; the ledger beside it is data (#894)
+
+`DEFINITION_BYTES` in `engine/tests/tools/mcpRegistry.test.ts` pins the total byte size of the whole
+advertised surface — every description plus every schema, property NAMES included — with a
+4,000-byte headroom. **It is a real product cost, not bookkeeping:** `engine/electron/connectClaude.ts`
+writes this server into the user's `.mcp.json`, so everyone who connects Claude Code to a packaged
+editor pays those ~153 KB in their context window every session, before asking for anything. Growth
+should be spent deliberately, and the pin is what forces someone to decide.
+
+**What the pin cannot do is say whose bytes they were.** It is one scalar, and six clones add tool
+prose concurrently: each stays inside the headroom alone, so each is green, and whoever crosses first
+inherits the whole accumulated gap. `61fccae48` is the pure case — a re-pin after a four-branch
+merge in which no tool changed at all.
+
+So attribution lives beside it as **data that never votes**:
+
+| | |
+|---|---|
+| written by | `npm --prefix engine/tools/modoki-mcp run gen:ledger`, **unconditionally** from `/close-out` § 6 |
+| lands in | `engine/tools/modoki-mcp/ledger/<branch>.csv`, committed |
+| grain | one row per tool whose size CHANGED — a quiet run appends nothing |
+| columns | `date, clone, tool, delta_bytes, tool_bytes_after, surface_bytes_after, sha` |
+| query | `sqlite3 :memory: '.import --csv engine/tools/modoki-mcp/ledger/work-ai3.csv l' '…'` |
+
+Three things about it are load-bearing:
+
+- **It changes no verdict.** `verify` and the free 3-OS public CI compute the same red/green from the
+  same committed pin as before. An earlier sketch put the counter in a machine-local file under
+  `~/.modoki/` and was rejected for making the GATE non-reproducible — CI has no such file, a fresh
+  clone has no such file, and the Windows clone cannot share the Mac's.
+- **One CSV per clone, never one shared file.** Six writers appending to one file conflict on every
+  merge; six files never do, and the sum is a glob.
+- ⚠️ **Run it unconditionally, not "when you touched the surface".** Skipping the step does not skip
+  the bytes, it defers them onto whoever runs it next: a clone that merges `origin/main` and skips,
+  then later edits one description, records the whole merged delta against its own sha that day.
+  A quiet run appends nothing.
+- ⚠️ **The writer REFUSES to run against an uncommitted tool surface**, and the reason is a real
+  incident rather than a precaution. `/close-out` § 2 spawns an `opus-reviewer`; reviewers
+  mutation-test by editing the tree; § 6 then runs the writer unconditionally. On 2026-09-11 those
+  overlapped during this ledger's own close-out and it recorded **105 phantom rows** (+1 B on every
+  tool, "surface now 153065") into the committed CSV — silently wrong, and authoritative-looking,
+  which is the one thing the ledger must never be. Reverted by hand; the guard now makes it
+  impossible. A clean tree at that point is what the workflow already guarantees (CLAUDE.md: commit
+  before the gate), so it refuses only where the number would be a lie.
+- ⚠️ **INTEGRATION branches keep no ledger.** `ledgerSkipReason` refuses on `main` **and on
+  `release_*`** — a release branch is the HUB under another name (CLAUDE.md § Dev Workflow: the hub
+  cuts it and merges it back), so its rows would be the same union `main`'s would be, and the
+  never-delete rule would keep the file visible forever. An earlier version of this guard argued
+  `release_*` was a worker concern and left it open; that had the workflow backwards.
+  `MODOKI_LEDGER_CLONE` overrides both, so this is a default rather than a prohibition.
+- ⚠️ **It is keyed by BRANCH, not by clone directory** — the filename comes from
+  `git branch --show-current`, and the two coincide only because each clone stays on its own
+  long-lived branch (CLAUDE.md § Clones).
+- ⚠️ **The decision is a pure function with a test, not an `if` in the script**, and that is not
+  ceremony: the branch is unreachable from any clone that could exercise it (a worker cannot be on
+  `main`; its only lever *disables* the check), so a typo like `'Main'` would be invisible to
+  `verify`, to CI and to every worker, and would first execute on the hub — once — seeding the file
+  it exists to prevent.
+- ⚠️ **A row says what a lane SPENT — since #1103, and not before it.** It reads *this tool
+  measured N bytes on this clone on this date, having moved D since ANYONE last looked at a commit
+  in this clone's history*. The baseline is the whole `ledger/*.csv` corpus, not this clone's own
+  file, so **work that merely arrived via `git merge` books nothing** and a clone's column sums to
+  what that lane actually spent — which is the question #894 created the ledger to answer.
+
+  ⚠️ **This bullet said the OPPOSITE until 2026-09-12** — *"a worker merges `origin/main` before
+  pushing, so an observed delta may be work that arrived from another clone entirely"* — which
+  stated the defect as a guarantee. #1103 fixed it in `surfaceLedger.ts` and rewrote the module's
+  own docblock; the retraction never reached this doc, so for two days § 10a taught the invariant
+  the code had just stopped having. Two limits DO survive: two clones changing the same tool
+  concurrently still book against whoever runs second, and **rows dated on or before 2026-09-12
+  pre-date the fix**, so any sum reaching back past that date still double-counts every merged
+  change. Those were left uncorrected deliberately — the CSV is automated on purpose, and a
+  hand-edited ledger is worse than a wrong one.
+- ⚠️ **"Latest" is ANCESTRY, and it can genuinely have no answer** (#1114). #1103 ordered the corpus
+  by position in `git rev-list HEAD` and called that ancestry; it is not, it is committer DATE —
+  measured at 8,822 commits, monotonic across the whole listing with zero inversions. Rows on
+  divergent branches are **incomparable, permanently**, so the baseline takes the ancestry maxima
+  and breaks a tie on the CURRENT measurement, which is ground truth about the tree you are standing
+  in. An equidistant residual errs toward **under-booking**, and an ambiguity **warns and never
+  gates**. Mechanism, the two fixes that do not work, and why refusing is not an option:
+  `corpusBaseline`'s docblock in `engine/tools/modoki-mcp/surfaceLedger.ts`.
+- `sha` is what turns an interesting row into an answer (`git log`/`git blame` from there); the
+  ledger's job is to make you read four rows instead of an anonymous 4 KB.
+
+⚠️ **The measurement is shared, and must stay shared.**
+`engine/tools/modoki-mcp/surfaceBytes.ts` owns the walk; both the pin test and the ledger script call
+it. **Do not build a second walker on `dump-surface.mjs`** — that one is per-tool too, but its
+`sumDescriptionBytes` deliberately EXCLUDES property names because it prices documentation prose,
+where the budget prices the whole advertised surface. Rows built on it would look authoritative and
+quietly fail to sum to the number they exist to explain. Same reasoning as the catalog generator
+sharing `renderCatalog()` with its guard (§9).
+
+⚠️ **What the guard test can and cannot do — measured, and previously documented wrongly in BOTH
+directions.** `mcpRegistry.test.ts`'s *"the ledger prices the surface identically to the gate, tool
+for tool"* **does** catch a divergent enumeration *and* a divergent pricing function: a ledger priced
+1 B/tool differently, with identical tool names, is red there while `DEFINITION_BYTES` stays green.
+That makes it the only guard against the `dump-surface.mjs` trap above, so its per-tool loop is
+load-bearing and must not be trimmed as redundant. What it **cannot** catch is a walk that is wrong
+the same way on both sides — both call one `toolBytes` in one process — so inflating `toolBytes` by
+100 B/tool reddens the pin and leaves it green. Walk correctness belongs to the `sumSchemaBytes walk`
+block (dropping `key.length` from its `properties` branch reddens 6 of those cases; the
+`patternProperties` branch is a separate occurrence and reddens 1).
+
+There is **no zod v3/v4 skew to worry about**, and an earlier draft of this section wrongly claimed
+there was one held in check by that test. `surfaceBytes.ts` lives **inside**
+`engine/tools/modoki-mcp/`, so a bare `zod` specifier resolves to that package's nested v3 under Vite
+and Node alike — a structural guarantee from `node_modules` nesting, not a tested one. Measured both
+ways at **105 tools / 152,960 B**. (The hoisted-v4 hazard the import comment in `mcpRegistry.test.ts`
+warns about is real for files under `engine/tests/**`, which is why those import zod by explicit
+path — it just does not reach a file inside the package.)
+
 ## 11. Writing a description
 
 The description is the tool's contract with the agent — it is read far more often than this file.
@@ -559,9 +916,17 @@ The description is the tool's contract with the agent — it is read far more of
   undocumented param is one an agent ignores or guesses at. This started as F1 (25 undocumented params
   across 21 tools) and is now a guard in `mcpRegistry.test.ts`, so the count cannot creep back up.
 - **A documented default matches the code.** A wrong default is worse than none.
-- **Say what the tool does NOT do**, when that is the trap: `capture_viewport` FORCES a render and
-  therefore masks render-on-demand and stale-frame bugs — a caller debugging exactly that class
-  needs to know the instrument heals the symptom.
+- **Say what the tool does NOT do**, when that is the trap: `render_scene`/`render_sequence` FORCE a
+  render and therefore mask render-on-demand and stale-frame bugs — a caller debugging exactly that
+  class needs to know the instrument heals the symptom.
+  ⚠️ This bullet named **`capture_viewport`**, which is the tool that does the OPPOSITE: it is
+  `webContents.capturePage()`, a screenshot of whatever each surface last drew, so it is the one
+  capture that CAN hand back a stale frame. Corrected against [rendering.md](rendering.md)
+  § "The measurement protocol" (measured 2026-08-18: three successive captures byte-identical
+  through a real material change until a camera move re-armed the SceneView's dirty gate). Being
+  wrong *here* is the expensive kind — this is the rule's worked example, so it taught the
+  inversion to every reader learning the rule from it, and the same sentence is still copied
+  verbatim across ~10 `qa/cases/**` (filed as a class, not patched here).
 - **Name the verification.** A mutating tool's description names the read that confirms it.
 
 ## Decisions taken (the surface changes these rules implied)

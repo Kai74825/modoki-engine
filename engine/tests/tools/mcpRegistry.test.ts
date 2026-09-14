@@ -17,9 +17,11 @@
  *  See `docs/debug-tools-mcp.md` (`modoki_batch`), which is why the registry exists. */
 
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { found } from '@modoki/engine/testing/inOrder';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { assertExemptionLedger } from '@modoki/engine/testing/exemptionLedger';
 // Deliberately the MCP SERVER'S OWN zod, not a bare `from 'zod'`. The root package.json does
 // not depend on zod at all — a bare specifier resolves to zod v4, hoisted in transitively by
 // eslint-plugin-react-hooks → zod-validation-error, while modoki-mcp pins ^3.23.8 and installs
@@ -40,6 +42,7 @@ import {
   clearRegistry,
 } from '../../tools/modoki-mcp/src/registry';
 import { loadSurface, sumSchemaBytes, type Surface } from './mcpSurface';
+import { perToolBytes, surfaceBytes, toolBytes } from '../../tools/modoki-mcp/surfaceBytes';
 import { CONTRACTS } from '../../tools/modoki-mcp/src/contracts';
 
 const SRC = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../tools/modoki-mcp/src');
@@ -63,10 +66,9 @@ const allSrcFiles = () =>
  * asserting the offsets catches both directions.
  */
 function between(src: string, startAnchor: string, endAnchor: string, label: string): string {
-  const a = src.indexOf(startAnchor);
+  const a = found(src.indexOf(startAnchor), `${label}: start anchor ${JSON.stringify(startAnchor)} (without it the slice `
+    + 'below measures the wrong region)');
   const b = src.indexOf(endAnchor);
-  expect(a, `${label}: start anchor ${JSON.stringify(startAnchor)} no longer appears — the slice `
-    + 'below is measuring the wrong region').toBeGreaterThanOrEqual(0);
   expect(b, `${label}: end anchor ${JSON.stringify(endAnchor)} no longer appears — slice(a, -1) `
     + 'would silently widen to the rest of the file').toBeGreaterThan(a);
   return src.slice(a, b);
@@ -166,6 +168,33 @@ describe('the real registered surface', () => {
   // (`modoki_particle_set`, `modoki_timeline_set`, `modoki_anim_set_clip`) is subject-first by
   // design so siblings sort together, and its names match their ops exactly;
   // `modoki_select_sprite_slice` is a genuine `select-` verb, not a setter.
+  /** #1137 — `modoki_history` told the agent "selection changes are not [undoable]". They are.
+   *
+   *  `pushSelectionChange` puts its own `Select …` entry on the stack for every UI-GESTURE
+   *  selection (a Hierarchy or Assets click, so `modoki_tap` too). Observed live: after undoing a
+   *  create, `undoLabel` read "Select entity". An agent that believed the description, selected,
+   *  edited and then undid ONCE popped the selection and left its edit applied — while `did:true`
+   *  reported success.
+   *
+   *  ⚠️ This guards the RESTATEMENT, not the mechanism. The mechanism is pinned in
+   *  `packages/modoki/tests/editor/undoManager.test.ts` § getEditVersion, which asserts the exact
+   *  divergence: a selection push bumps `getUndoVersion` (the stack moved) and leaves
+   *  `getEditVersion` alone (no world edit). That divergence is also the whole of #1142 — the same
+   *  two counters, read by the dnd commit probe — so if it ever collapses, BOTH those suites go
+   *  red and this one stops being the interesting failure. What this catches is the agent-facing
+   *  COPY of the fact drifting back to the false version, which no behavioural test can see. */
+  it('modoki_history does not tell the agent selection is off the undo stack (#1137)', () => {
+    const desc = s.descriptionOf('modoki_history');
+    expect(desc, 'the false claim is back').not.toMatch(/selection changes are not/i);
+    expect(desc, 'it must still SAY something about selection — silence just moves the trap').toMatch(/selection/i);
+    expect(desc, 'and name the field to steer by, since counting undos is what breaks').toMatch(/undoLabel/);
+    // The sibling that already had it right, and the reason this is one correction rather than
+    // two: `modoki_set_selection` writes selection RAW (`setSelectionRaw`) and genuinely pushes
+    // nothing. The two descriptions must not disagree about the same stack.
+    expect(s.descriptionOf('modoki_set_selection'), 'the accurate sibling drifted instead')
+      .toMatch(/does NOT push an undo entry/i);
+  });
+
   it('a tool whose backend op is `set-*` is NAMED `modoki_set_*`', () => {
     const offenders = Object.entries(CONTRACTS)
       .filter(([name, c]) => typeof c.op === 'string' && c.op.startsWith('set-') && !name.startsWith('modoki_set_'))
@@ -173,12 +202,9 @@ describe('the real registered surface', () => {
     expect(offenders).toEqual([]);
   });
 
-  /** Parameters documented NOWHERE — neither `.describe()` on the zod field nor a mention in the
-   *  tool description. This list was 25 entries across 21 tools when the guard was written on
-   *  2026-07-30; Phase 4 of the MCP audit emptied it the same day, so it now exists to keep a NEW
-   *  tool from quietly starting a new backlog. It may only ever SHRINK — an entry that no longer
-   *  applies must be deleted, which is asserted below. */
-  const UNDOCUMENTED_PARAMS = new Set<string>([]);
+  /* ⚠️ **No `UNDOCUMENTED_PARAMS` backlog (#1140).** It held 25 entries across 21 tools when this guard
+   *  was written (2026-07-30), Phase 4 of the MCP audit emptied it the same day, and the empty list
+   *  is deleted: a new undocumented param is fixed, not ledgered. */
 
   it('every parameter is documented — in its own .describe() or the tool description', () => {
     // The agent sees ONLY the schema and the description. An undocumented param is a param it
@@ -193,12 +219,7 @@ describe('the real registered surface', () => {
         if (!own && !mentioned) missing.push(`${name}.${param}`);
       }
     }
-    // New offenders only — the known backlog is allowed until Phase 4 clears it.
-    expect(missing.filter((m) => !UNDOCUMENTED_PARAMS.has(m))).toEqual([]);
-    // And the backlog must only ever SHRINK: an entry that no longer applies has to be deleted,
-    // so this list cannot rot into a permanent exemption.
-    expect([...UNDOCUMENTED_PARAMS].filter((m) => !missing.includes(m)),
-      'these are documented now — delete them from UNDOCUMENTED_PARAMS').toEqual([]);
+    expect(missing).toEqual([]);
   });
 
   it("an unknown key is refused with a message NAMING the tool's real parameters", () => {
@@ -248,12 +269,21 @@ describe('the real registered surface', () => {
   // was renamed to `discardUnsaved` (2026-08-22, owner), so the word means exactly one thing
   // everywhere it appears and the containment check polices it instead of an exemption. That is the
   // outcome an entry here should always be aiming at: the list is a holding pen, not a home.
-  const PER_TOOL_MEANING = new Set([
-    'path', 'action', 'type', 'name', 'kind', 'id', 'ids', 'key', 'keys', 'limit', 'all',
-    'from', 'to', 'value', 'target', 'mode', 'clear', 'since', 'guid', 'guids',
-    'width', 'height', 'quality', 'selector', 'button', 'steps', 'entity', 'panel',
-    'timeoutMs', 'parentId', 'parentGuid', 'source', 'level', 'platform', 'provider', 'fields',
-  ]);
+  // ⚠️ 36 → 23 in #1140: putting this list on the ledger as `sanctioned` found thirteen names whose
+  // descriptions no longer drift (or that fewer than three tools take) — fields, height, keys, level,
+  // mode, panel, platform, provider, source, target, timeoutMs, value, width. Each was a pardon for a
+  // convention that had already converged, i.e. a blind spot waiting for its next drift. (`action`
+  // and `type` were first counted among them too, but only because an undescribed param's `''` was
+  // taken as the shared base — see the comparison below. Both are per-tool enums, 10 and 8 wordings.)
+  const PER_TOOL_MEANING: readonly string[] = [
+    'path', 'name', 'kind', 'id', 'ids', 'key', 'limit', 'all', 'from', 'to', 'clear', 'since',
+    'guid', 'guids', 'quality', 'selector', 'button', 'steps', 'entity', 'parentId',
+    'parentGuid', 'action', 'type',
+    // #1152/#1153: an AIM on the input tools ("press the element labelled X") and a FILTER on
+    // modoki_handles ("list the handles labelled X"). Two jobs, deliberately one word: both match by
+    // the same `labelMatches` rule, so the filter previews exactly what the aim would hit.
+    'label',
+  ];
 
   it('a param used by 3+ tools means ONE thing, or is declared per-tool', () => {
     // §2 ("a field or parameter name means the same thing in every tool that uses it") had a
@@ -281,24 +311,36 @@ describe('the real registered surface', () => {
     // failing when two tools state the SAME rule two ways, which is the drift §2 is about.
     // Mechanically it also forces the base into `shapes.ts`, since that is the only way to repeat
     // a long string verbatim without copying it.
-    const drifted: string[] = [];
+    const drifted: Array<{ item: string; site: string }> = [];
     for (const [param, byDesc] of byParam) {
-      if (PER_TOOL_MEANING.has(param)) continue;
-      const users = [...byDesc.values()].flat();
-      if (users.length < 3 || byDesc.size === 1) continue;
-      const descs = [...byDesc.keys()];
+      // ⚠️ An EMPTY `.describe()` is not a wording (#1140 close-out): such a param is documented in
+      // its tool's description instead (the check above allows that), and as the shortest string it
+      // became the "shared base" every other wording trivially contains — `action` read as converged
+      // across 11 tools with 11 different wordings. Compare only the wordings that exist.
+      const described = [...byDesc].filter(([d]) => d !== '');
+      const users = described.flatMap(([, tools]) => tools);
+      if (users.length < 3 || described.length === 1) continue;
+      const descs = described.map(([d]) => d);
       const base = descs.reduce((a, b) => (a.length <= b.length ? a : b));
       const strayed = descs.filter((d) => !d.includes(base.replace(/\.$/, '')));
       if (strayed.length) {
-        drifted.push(`${param}: ${strayed.length} of ${descs.length} wordings do not extend the shared base across ${users.length} tools (${users.join(', ')})`);
+        drifted.push({ item: param, site: `${param}: ${strayed.length} of ${descs.length} wordings do not extend the shared base across ${users.length} tools (${users.join(', ')})` });
       }
     }
-    expect(
-      drifted,
-      'these params state the same rule different ways. Put the shared wording in shapes.ts, and '
-      + 'have a tool that needs more CONCATENATE onto it rather than replace it — or, if the '
-      + 'meanings really differ, add the name to PER_TOOL_MEANING with that judgement.',
-    ).toEqual([]);
+    // ⚠️ Spent through the shared ledger since #1140: PER_TOOL_MEANING is `sanctioned` (a per-NAME
+    // judgement that the word means different things per tool), so a name whose descriptions have
+    // since CONVERGED — the `force` outcome above, the one this list should always aim at — reddens
+    // instead of keeping a pardon that would hide its next drift. The old staleness check asked only
+    // that some tool still took the param.
+    assertExemptionLedger({
+      label: 'PER_TOOL_MEANING in mcpRegistry',
+      population: drifted,
+      sanctioned: PER_TOOL_MEANING,
+      floor: 1,
+      fix: 'these params state the same rule different ways. Put the shared wording in shapes.ts, and '
+        + 'have a tool that needs more CONCATENATE onto it rather than replace it — or, if the '
+        + 'meanings really differ, add the name to PER_TOOL_MEANING with that judgement.',
+    });
   });
 
   it('the two halves are now two NAMES, and each still points at the other', () => {
@@ -354,14 +396,6 @@ describe('the real registered surface', () => {
       'modoki_reimport_asset', 'modoki_duplicate_asset']
       .map((n) => (getTool(n)!.shape as Record<string, { description?: string }>).force?.description));
     expect(descs.size, '`force` must read identically wherever it survives').toBe(1);
-  });
-
-  it('PER_TOOL_MEANING names no param that has left the surface', () => {
-    // Same rule as every other ledger here: a stale entry rots into a blanket exemption, and the
-    // next genuine drift on that name lands on it unnoticed.
-    const live = new Set(s.names.flatMap((n) => Object.keys(getTool(n)!.shape)));
-    expect([...PER_TOOL_MEANING].filter((p) => !live.has(p)).sort(),
-      'delete these — no tool takes them any more').toEqual([]);
   });
 
   it("a description never tells the caller to pass a param the tool does not have", () => {
@@ -560,7 +594,14 @@ describe('the real registered surface', () => {
   // panel repairs for a human and nobody repairs for an agent.
   // ⚠️ The union hazard from the 2026-09-07 note below has NOT gone away: this number was measured
   // on one branch, and the hub may still land past it after merging the others.
-  const DEFINITION_BYTES = 152_065;
+  // 2026-09-13 (#1152/#1153, work-qa): RE-PINNED to 157,944 — measured, not estimated. The merge
+  // base already priced 155,174 (3,109 over the old pin, inside the headroom), and this change adds
+  // 2,770: the `label`/`within` aim on six input tools (seven schema sites, drag's from/to included),
+  // `prefix`/`label` on modoki_handles, and one sentence each telling modoki_tap and modoki_handles
+  // readers that chrome is now aimable by label and readable without modoki_eval — the ~1,900 evals
+  // #1152/#1153 measured are the spend this buys back. The param wording was trimmed once before
+  // pinning (158,364 → 157,776); the close-out then named label/entity in the x/y descriptions (+168).
+  const DEFINITION_BYTES = 157_944;
   const DEFINITION_HEADROOM = 4_000;
 
   // `sumSchemaBytes` itself now lives in `mcpSurface.ts` (imported above), not here — this ledger
@@ -570,13 +611,11 @@ describe('the real registered surface', () => {
   // walk itself and the full reasoning behind which containers it descends into.
 
   it(`the tool definitions stay near their recorded size (~${Math.round(DEFINITION_BYTES / 1000)} KB)`, () => {
-    let bytes = 0;
-    for (const name of s.names) {
-      const entry = getTool(name)!;
-      bytes += entry.description.length;
-      const schema = zodToJsonSchema(z.object(entry.shape));
-      bytes += sumSchemaBytes(schema);
-    }
+    // Priced through the SHARED walk (`surfaceBytes.ts`), not an inline loop, so the #894 ledger
+    // and this gate cannot answer differently about the same surface — the sibling test below
+    // pins that they don't.
+    const perTool = new Map(s.names.map((name) => [name, toolBytes(name)] as const));
+    const bytes = surfaceBytes(perTool);
     const ceiling = DEFINITION_BYTES + DEFINITION_HEADROOM;
     expect(
       bytes,
@@ -588,6 +627,37 @@ describe('the real registered surface', () => {
     // A floor too: a refactor that accidentally strips descriptions would otherwise pass silently,
     // and losing them is the more damaging direction.
     expect(bytes, 'the surface SHRANK sharply — descriptions lost?').toBeGreaterThan(DEFINITION_BYTES - 8_000);
+  });
+
+  it('the ledger prices the surface identically to the gate, tool for tool (#894)', () => {
+    // ⚠️ THIS COMMENT HAS BEEN WRONG IN BOTH DIRECTIONS. Read the measured boundary, not a summary.
+    //
+    // It DOES catch (each measured, each reddening this test and only this test, 1 of 41):
+    //   · the ledger enumerating a different set of tools than the gate prices;
+    //   · the ledger pricing through a DIFFERENT function — +1 B/tool with identical key sets is
+    //     red here while `DEFINITION_BYTES` stays green. That is the real guard against the
+    //     `dump-surface.mjs` trap (its `sumDescriptionBytes` omits property names), so **do not
+    //     delete the per-tool loop or the `surfaceBytes` equality below as redundant** — they are
+    //     the only thing standing between this repo and a ledger rebuilt on a second walker.
+    //
+    // It CANNOT catch a walk that is wrong the SAME way on both sides, because both call one
+    // `toolBytes` in one process off one module: inflating `toolBytes` by 100 B/tool reddens the
+    // `DEFINITION_BYTES` pin above and leaves this test GREEN (1 failed / 40 passed). Correctness
+    // of the walk itself is the `sumSchemaBytes walk` block's job — dropping `key.length` from its
+    // `properties` branch reddens 6 of those cases and none of these (the `patternProperties`
+    // branch is a separate occurrence and reddens only 1 — say which branch when quoting this).
+    //
+    // The first version of this comment claimed it policed the arithmetic (false); the second
+    // over-corrected to "enumeration only" (also false, and worse — it invites deleting a live
+    // guard). The line above is where it actually sits.
+    const standalone = perToolBytes();
+    const viaHarness = new Map(s.names.map((name) => [name, toolBytes(name)] as const));
+    expect([...standalone.keys()].sort()).toEqual([...viaHarness.keys()].sort());
+    for (const [name, bytes] of viaHarness) {
+      expect(standalone.get(name), `${name} priced differently by the ledger and the gate`)
+        .toBe(bytes);
+    }
+    expect(surfaceBytes(standalone)).toBe(surfaceBytes(viaHarness));
   });
 
   it('every tool validates its args against its own real schema', () => {
@@ -604,7 +674,7 @@ describe('sumSchemaBytes walk (#456 close-out)', () => {
   // The definitions ledger above drives `sumSchemaBytes` against the REAL 105-tool surface, and a
   // scan of every served schema found `tuples:0, oneOf:0, not:0, patternProperties:0, $defs:0` —
   // none of those branches has ever executed against real traffic. `DEFINITION_BYTES` staying pinned
-  // at 143_859 proves the walk is STABLE on today's surface; it proves nothing about whether the
+  // (143_859 when this was written; 152_065 today) proves the walk is STABLE on today's surface; it proves nothing about whether the
   // array-aware / oneOf / not / patternProperties branches are actually CORRECT, since nothing here
   // has ever forced them to run. These tests drive `zodToJsonSchema` output built to exercise each
   // branch on purpose, and assert the SUMMED byte count — not merely "greater than zero", which

@@ -70,6 +70,20 @@ export const WATCHED = [
   // built to catch the effect — silently, because the assertions stay green (tablets
   // never bind); what rots is the prose. Guarded by courtSweepScope.test.ts.
   'engine/packages/modoki/src/editor/scene/devicePresets.ts',
+  // #813: Court's preserved-bag merge consumes `collectUnknownFields`, and a change to THAT file is
+  // what produced the sync crash `preservedProtoKey.test.ts` exists to catch. Without this entry a
+  // clone editing only the engine helper matches no watched path, so `games/court/tests/**` is
+  // dropped from discovery entirely and the seam guard does not run for its own change class —
+  // which is exactly what happened. Costs a Court-touching change nothing (this is an OR over a
+  // pathspec); it costs only a clone that edits this one file, which is the clone that should pay.
+  'engine/packages/modoki/src/runtime/core/formatVersion.ts',
+  // #1024: Court's tap-target floor guard is DATA over this shared resolver, and the corpus walk,
+  // the axis model and the population predicate all live there. A clone editing it and touching
+  // nothing under games/court would skip `games/court/tests/**` entirely — and Court is the only
+  // project whose prefabs exercise the parent index by `localId`, and the only one with a
+  // `UIToggle` host, so a resolver change can break Court's lists while the other eight suites
+  // stay green. Guarded by courtSweepScope.test.ts.
+  'engine/packages/modoki/tests/helpers/tapTargetFloor.ts',
 ];
 
 /** Runs a git command in the repo, or `null` if it cannot. Injectable so a test can bind it to a
@@ -110,27 +124,43 @@ export function authoredInRange(run, base) {
 }
 
 /**
- * Does this working tree or branch author anything Court's tests depend on? `null` = cannot tell.
+ * Does this working tree or branch author anything Court's tests depend on?
  *
- * ⚠️ **FAILS TOWARD RUNNING.** git unavailable, unparseable, or a degenerate range all return
- * `null`, and every consumer maps `null` to "run". A detector that cannot answer must never be
- * indistinguishable from one answering "nothing changed" — that conflation is how a gate rots.
+ * `true`/`false` are answers. Anything else is "cannot tell", and since #826 it SAYS WHICH:
+ * `'git-failed'` (git unavailable, unparseable, or no `origin/main`) or `'no-own-commits'` (the
+ * degenerate `merge-base === HEAD` range — git answered fine, HEAD just has nothing beyond
+ * `origin/main`).
+ *
+ * ⚠️ **FAILS TOWARD RUNNING, and the split does not change that.** Every consumer must run unless
+ * it sees an explicit `false`. Written as `courtTouched() === false` and never as a truthiness
+ * test: a reason string is TRUTHY, so `!courtTouched()` would silently stop excluding anything,
+ * and `courtTouched() === null` would silently start including everything. A detector that cannot
+ * answer must never be indistinguishable from one answering "nothing changed" — that conflation is
+ * how a gate rots.
+ *
+ * ⚠️ **KEEP IN SYNC with `games/court/tests/sweepGate.ts`** — the two copies must agree on the
+ * degenerate arm, and #826 changed what it returns in both. The parity of `WATCHED` is guarded by
+ * `engine/tests/architecture/courtSweepScope.test.ts`; this arm is guarded by that file too.
  */
 export function courtTouched() {
   // Uncommitted work first — the common case for the session actually editing Court. Deliberately
   // NOT first-parent-aware: a dirty tree is by definition this session's own doing.
   const dirty = git('status', '--porcelain', '--', ...WATCHED);
-  if (dirty === null) return null;
+  if (dirty === null) return 'git-failed';
   if (dirty.trim() !== '') return true;
 
   const base = git('merge-base', 'HEAD', 'origin/main');
-  if (base === null) return null;
+  if (base === null) return 'git-failed';
 
   // ⚠️ A branch with NO commits of its own cannot be asked what it changed, and answering "nothing"
-  // there is this gate's worst failure: `merge-base(HEAD, origin/main) === HEAD` on any checkout of
-  // `main` itself, which is EVERY CI run. That is the degenerate case, not a negative answer, so it
-  // maps to "could not tell" and therefore to RUN.
-  if (base.trim() === git('rev-parse', 'HEAD')?.trim()) return null;
+  // there is this gate's worst failure: `merge-base(HEAD, origin/main) === HEAD` on any checkout
+  // with no commits beyond `origin/main`, at or behind it — a clean `main` with nothing unpushed (NOT the hub between a merge and
+  // its push, which answers `false` here, #1073) — and on EVERY CI run. That is the degenerate case,
+  // not a negative answer, so it maps to "could not tell" and therefore to RUN.
+  // ⚠️ #826: `'no-own-commits'`, not `null`. Same fail-safe direction, honest about the cause —
+  // a caller that reports this as a git FAILURE is making a false statement, which is what the
+  // Court sweep banner did on every hub push and every fast-forward worker merge.
+  if (base.trim() === git('rev-parse', 'HEAD')?.trim()) return 'no-own-commits';
 
-  return authoredInRange(git, base.trim());
+  return authoredInRange(git, base.trim()) ?? 'git-failed';
 }

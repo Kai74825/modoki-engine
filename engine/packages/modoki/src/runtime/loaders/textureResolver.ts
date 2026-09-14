@@ -23,6 +23,7 @@ import {
 } from '../core/activeRenderer';
 import { ktx2LoaderCtor, prewarmGlbLoaders } from './threeLoaderModules';
 import { warnVocabOnce } from '../core/warnVocab';
+import { hasDocKey } from '../core/docKeys';
 import { getActiveTextureSizeCap } from '../core/textureSizeCap';
 import { emitAssetInvalidated } from '../core/assetInvalidation';
 import { createSupersessionToken, createTeardownToken } from '../core/liveness';
@@ -202,8 +203,10 @@ export function resolveTextureVariantUrl(ref: string, usage: '2d' | '3d'): strin
   // rather than fails, per this repo's own history).
   const cap = getActiveTextureSizeCap();
   const sizeCap = cap > 0 && settings.sizes?.includes(cap) ? cap : undefined;
-  // Cache-bust immutable production assets with the content hash (shared helper —
-  // matches modelGlbUrl + the invalidateTexture eviction key below).
+  // Cache-bust with the content hash (shared helper — matches modelGlbUrl + the
+  // invalidateTexture eviction key below). ⚠️ Said "immutable production assets" until
+  // #1022: the bust applies wherever a hash is known, dev included, because the URL is
+  // the identity every downstream cache keys on and not merely a CDN concern.
   return withCacheBust(assetUrl(sourcePath + variantSuffix(variant, sizeCap)), entry?.hash);
 }
 
@@ -386,10 +389,17 @@ export function resolveBrowserImageUrl(ref: string, warnKtx = false): string | u
 function applyTextureSettings(tex: THREE.Texture, s: TextureImportSettings, isKtx: boolean, flipY?: boolean): void {
   // Unrecognised wrapS/wrapT falls through to `undefined` (not three's own ClampToEdgeWrapping
   // default — verified they differ, see #73) — preserved as-is, just warned once.
-  if (!(s.wrapS in WRAP)) warnVocabOnce('texture', 'wrapS', s.wrapS, 'wrapS left unset (undefined)');
-  if (!(s.wrapT in WRAP)) warnVocabOnce('texture', 'wrapT', s.wrapT, 'wrapT left unset (undefined)');
-  tex.wrapS = WRAP[s.wrapS];
-  tex.wrapT = WRAP[s.wrapT];
+  // ⚠️ `hasDocKey`, NOT `s.wrapS in WRAP` (#993). `wrapS`/`wrapT` come from the texture
+  // `.meta.json`; `WRAP` is a code-declared literal, so `'toString' in WRAP` is TRUE — the
+  // warning never fired AND `Object.prototype.toString` was assigned into a three.js wrapping
+  // enum. Both halves have to move together: guarding the warning alone still leaks the value.
+  const wrapS = hasDocKey(WRAP, s.wrapS) ? WRAP[s.wrapS] : undefined;
+  const wrapT = hasDocKey(WRAP, s.wrapT) ? WRAP[s.wrapT] : undefined;
+  if (wrapS === undefined) warnVocabOnce('texture', 'wrapS', s.wrapS, 'wrapS left unset (undefined)');
+  if (wrapT === undefined) warnVocabOnce('texture', 'wrapT', s.wrapT, 'wrapT left unset (undefined)');
+  // The casts are the #73 behaviour above, which `Record<TextureWrap, Wrapping>` cannot express.
+  tex.wrapS = wrapS as THREE.Wrapping;
+  tex.wrapT = wrapT as THREE.Wrapping;
   // Only 'linear' and 'srgb' are valid TextureColorspace values — anything else silently keeps
   // today's fallback (SRGBColorSpace), same as a legitimate 'srgb'.
   if (s.colorspace !== 'linear' && s.colorspace !== 'srgb') {
@@ -439,9 +449,14 @@ const texCache = new Map<string, TexCacheEntry>();
  *  refcount, and the LAST `releaseTexture3D` frees it exactly as the refcount intended.
  *
  *  ⚠️ Keyed by the TEXTURE INSTANCE, never by the cache key. A re-load after invalidation
- *  builds a new entry under the SAME key (the URL is unchanged in dev — the ?v= cache-bust
- *  only moves when the content hash does), so a key-keyed map would let a stale release
- *  decrement the NEW entry and dispose a texture that is very much in use. */
+ *  can build a new entry under the SAME key — the ?v= cache-bust moves only when the content
+ *  hash does, so any invalidation that is not a byte change (a re-slice, a retype) re-resolves
+ *  to the identical URL — and a key-keyed map would then let a stale release decrement the NEW
+ *  entry and dispose a texture that is very much in use.
+ *
+ *  ⚠️ The parenthetical here used to read "the URL is unchanged **in dev**", which was about
+ *  `withCacheBust`'s old PROD gate rather than about the hash. That gate is gone (#1022) and
+ *  this rule is unaffected: it never depended on the environment. */
 const retired = new Map<THREE.Texture, TexCacheEntry>();
 
 /** Teardown liveness, invalidated wholesale by `disposeAllSharedTextures`. Exists because an
@@ -611,7 +626,10 @@ export function invalidateTexture(ref: string): void {
   // resolved source path is what a subscriber can match itself against.
   emitAssetInvalidated('texture', sourcePath);
   // The set of variant URLs this ref could have been loaded under — built with the
-  // SAME key construction loadTexture3D uses, including the ?v=<hash> suffix in prod.
+  // SAME key construction loadTexture3D uses, including the ?v=<hash> suffix. ⚠️ That
+  // suffix used to be prod-only; since #1022 it is present in dev too, so these eviction
+  // keys carry it in every environment — do not read the `withCacheBust` calls below as
+  // dead in dev.
   const hash = getAssetEntry(ref)?.hash;
   const urls = new Set<string>();
   // ⚠️ **EVERY EMITTED SIZE, NOT JUST THE UNCAPPED ONE (#212).** This set is matched against

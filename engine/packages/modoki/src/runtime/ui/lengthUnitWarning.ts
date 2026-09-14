@@ -37,7 +37,10 @@
  *  heuristic to catch the common mistake, not a proof of one; it only ever runs in
  *  DEV. */
 
-export const RELATIVE_LENGTH_UNITS = new Set(['%', 'vw', 'vh', 'vmin', 'vmax']);
+import { readUILength, UI_LENGTH_UNITS } from '../traits/uiLength';
+
+/** Every unit that is not a fixed px — derived from the one list rather than restated (#1064). */
+export const RELATIVE_LENGTH_UNITS: ReadonlySet<string> = new Set(UI_LENGTH_UNITS.filter((u) => u !== 'px'));
 
 /** A min/max px value at or below this is "small enough to plausibly be a stray
  *  percentage/vh/vmin number" rather than an intentional pixel constraint. */
@@ -68,20 +71,17 @@ export interface LengthUnitSuspect {
   constraintUnit: string;
 }
 
-function checkAxis(
-  axis: LengthAxis,
-  sizeValue: number | undefined,
-  sizeUnit: string | undefined,
-  constraints: Array<{ field: ConstraintField; value: number | undefined; unit: string | undefined }>,
-): LengthUnitSuspect[] {
-  const size = sizeValue ?? 0;
-  const unit = sizeUnit ?? '%'; // UIElement.width/height default to '%'
+/** Every length is read with its unit through `readUILength`, so an omitted unit resolves to THAT
+ *  field's own default — `%` for the size, `px` for its min/max. The asymmetry is the whole premise
+ *  of this warning, so it must come from the one table that defines it, not from two literals
+ *  written here beside each other (#840). */
+function checkAxis(axis: LengthAxis, ui: LengthUnitCheckInput, constraintFields: ConstraintField[]): LengthUnitSuspect[] {
+  const { value: size, unit } = readUILength(ui, axis);
   if (size === 0 || !RELATIVE_LENGTH_UNITS.has(unit)) return [];
 
   const out: LengthUnitSuspect[] = [];
-  for (const c of constraints) {
-    const cValue = c.value ?? 0;
-    const cUnit = c.unit ?? 'px'; // UIElement.min*/max* default to 'px'
+  for (const field of constraintFields) {
+    const { value: cValue, unit: cUnit } = readUILength(ui, field);
     if (cValue === 0 || cUnit !== 'px') continue;
     if (cValue > SUSPICIOUS_PX_THRESHOLD) continue;
     out.push({
@@ -89,7 +89,7 @@ function checkAxis(
       sizeField: axis,
       sizeValue: size,
       sizeUnit: unit,
-      constraintField: c.field,
+      constraintField: field,
       constraintValue: cValue,
       constraintUnit: cUnit,
     });
@@ -101,14 +101,8 @@ function checkAxis(
  *  an axis can trip both its min and its max. */
 export function findLengthUnitSuspects(ui: LengthUnitCheckInput): LengthUnitSuspect[] {
   return [
-    ...checkAxis('width', ui.width, ui.widthUnit, [
-      { field: 'minWidth', value: ui.minWidth, unit: ui.minWidthUnit },
-      { field: 'maxWidth', value: ui.maxWidth, unit: ui.maxWidthUnit },
-    ]),
-    ...checkAxis('height', ui.height, ui.heightUnit, [
-      { field: 'minHeight', value: ui.minHeight, unit: ui.minHeightUnit },
-      { field: 'maxHeight', value: ui.maxHeight, unit: ui.maxHeightUnit },
-    ]),
+    ...checkAxis('width', ui, ['minWidth', 'maxWidth']),
+    ...checkAxis('height', ui, ['minHeight', 'maxHeight']),
   ];
 }
 

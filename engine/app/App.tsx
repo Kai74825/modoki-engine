@@ -1,11 +1,10 @@
-import React, { Component, lazy, Suspense, useEffect, useRef, useState } from 'react';
-import type { ErrorInfo, ReactNode } from 'react';
+import React, { lazy, Suspense, useEffect, useRef, useState } from 'react';
 import { Capacitor } from '@capacitor/core';
 import { useWebCanvasSizing } from './useWebCanvasSizing';
 import { useAudioResumeRearm } from './useAudioResumeRearm';
 import { useBackgroundFlush } from './useBackgroundFlush';
 import { useResumeReload } from './useResumeReload';
-import { useGameLoop, setGameConfig, sceneManager, ensureManifestLoaded, resolveSceneByName, assetUrl, appServices, clearAppServices, getCurrentWorld, PlayerPrefs, selectDefaultBackend, waitForScenePaint, SCENE_PAINT_MAX_WAIT_MS, registerRealmShutdownTask, rearmAudioAutoplay } from '@modoki/engine/runtime';
+import { useGameLoop, setGameConfig, sceneManager, ensureManifestLoaded, resolveSceneByName, assetUrl, appServices, clearAppServices, getCurrentWorld, PlayerPrefs, selectDefaultBackend, InMemoryBackend, waitForScenePaint, SCENE_PAINT_MAX_WAIT_MS, registerRealmShutdownTask, rearmAudioAutoplay } from '@modoki/engine/runtime';
 import { DefaultGameUILayer } from './ui/DefaultGameUILayer';
 import ErrorBoundary from './ui/components/ErrorBoundary';
 import { EditorBootBoundary } from './ui/components/EditorBootBoundary';
@@ -69,19 +68,6 @@ const Game = __MODOKI_MODULE_RENDER2D__
   ? lazy(() => import('@modoki/engine/runtime/rendering/Game'))
   : null;
 
-/** Lightweight error boundary around custom game UI — falls back to default UIRenderer
- *  instead of resetting the entire game. The game keeps running underneath. */
-class GameUIErrorBoundary extends Component<{ fallback: ReactNode; children: ReactNode }, { hasError: boolean }> {
-  state = { hasError: false };
-  static getDerivedStateFromError() { return { hasError: true }; }
-  componentDidCatch(error: Error, info: ErrorInfo) {
-    console.error('[GameUIErrorBoundary] Custom game UI crashed, falling back to default:', error, info.componentStack);
-  }
-  render() {
-    return this.state.hasError ? this.props.fallback : this.props.children;
-  }
-}
-
 function useHashRoute() {
   const [hash, setHash] = useState(window.location.hash);
   useEffect(() => {
@@ -130,7 +116,6 @@ export const GameShell = React.memo(function GameShell({ gameId }: { gameId: str
   const [initialized, setInitialized] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [transitioning, setTransitioning] = useState(false);
-  const [GameUI, setGameUI] = useState<React.ComponentType | null>(null);
   const [disable3D, setDisable3D] = useState(false);
   const [otaGate, setOtaGate] = useState<OtaGateState | null>(null);
   /** Copy for the tier-switch overlay, or null when no tier switch is being applied (#227). The
@@ -407,7 +392,19 @@ export const GameShell = React.memo(function GameShell({ gameId }: { gameId: str
         // Scene3D, so this await must stay ahead of it — move it after and a player's chosen tier
         // silently reads as null on every launch, falling back to the project setting with no
         // error anywhere.
-        const prefsInit = await PlayerPrefs.init({ namespace: gameId, backend: selectDefaultBackend() });
+        // ⚠️ **A PLAYABLE AD NEVER PERSISTS** (#934). It has no player identity and no second
+        // session that means anything: the CTA end-card's Replay is a `location.reload()`, and an ad
+        // container can serve a second impression into the same origin. With the default backend the
+        // save survives both, so a game that resumes where the player left off reopens the ad
+        // MID-WAY — wordweave's two-board playable came back on board 2, and the opening board the
+        // whole ad was designed around never showed again. A first impression looked correct, which
+        // is why this survived a passing smoke.
+        //
+        // In-memory rather than "wipe at boot": wiping is a write, and it would clear a REAL save if
+        // this ever ran in a context that shares an origin with the shipped game. This backend
+        // cannot reach storage at all, so there is nothing to get wrong.
+        const backend = __MODOKI_PLAYABLE__ ? new InMemoryBackend() : selectDefaultBackend();
+        const prefsInit = await PlayerPrefs.init({ namespace: gameId, backend });
         if (prefsInit.discardedPending.length > 0) {
           console.error(
             `[App] PlayerPrefs.init() discarded pending write(s) while swapping from ` +
@@ -416,14 +413,6 @@ export const GameShell = React.memo(function GameShell({ gameId }: { gameId: str
         }
         if (cancelled) return;
         if (def.resetPhase) setActiveResetPhase(def.resetPhase);
-
-        // Resolve custom UI component (supports lazy and eager)
-        if (def.UIComponent) {
-          // React.lazy components are functions with $$typeof — just use them directly
-          setGameUI(() => def.UIComponent!);
-        } else {
-          setGameUI(null);
-        }
 
         const config = await def.loadConfig();
         if (cancelled) return;
@@ -725,13 +714,7 @@ export const GameShell = React.memo(function GameShell({ gameId }: { gameId: str
         >
           {Scene3D && !disable3D && <Suspense fallback={null}><Scene3D /></Suspense>}
           {Game && <Suspense fallback={null}><Game /></Suspense>}
-          {GameUI ? (
-            <GameUIErrorBoundary fallback={<DefaultGameUILayer />}>
-              <Suspense fallback={null}><GameUI /></Suspense>
-            </GameUIErrorBoundary>
-          ) : (
-            <DefaultGameUILayer />
-          )}
+          <DefaultGameUILayer />
           {/* Cutscene layer — above the game + UI, below the loading/OTA gates (a
               download prompt must still win over a movie). Renders nothing unless a
               presentation-mode clip is playing. */}
@@ -792,7 +775,7 @@ function App() {
         // `pagehide` backstop below over-triggering on iOS, or `shutdownRealmThenReload()`'s
         // throwing route re-arming the latch while leaving ads dead — a pre-existing gap this
         // also closes, since nothing else ever called `ads.init()` a second time). Gated the same
-        // way as the boot-time init above (`Capacitor.isNativePlatform()`, line ~389) — off-device
+        // way as the boot-time init above (its `Capacitor.isNativePlatform()` gate around `ads?.init()`) — off-device
         // `ads.init()` is already a no-op, but mirroring the gate keeps the two call sites reading
         // the same.
         //

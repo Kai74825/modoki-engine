@@ -38,6 +38,7 @@
  *     that fails is re-parked, so a failed flush is still pending and still reported. */
 
 import { backendFetch } from '../backend/editorBackend';
+import { notifyListeners } from '../../runtime/core/notifyListeners';
 
 /** Set (or clear, with `null`) the `baseScene` ref on a scene FILE.
  *
@@ -90,7 +91,7 @@ const activeFlushMarkers = new Set<Set<string>>();
 
 let _version = 0;
 const listeners = new Set<() => void>();
-function bump(): void { _version += 1; for (const fn of listeners) fn(); }
+function bump(): void { _version += 1; notifyListeners(listeners, 'pendingBaseScene', []); }
 
 /** Subscribe to changes (park / flush / discard). Returns an unsubscribe. */
 export function subscribePendingBaseScenes(fn: () => void): () => void {
@@ -171,10 +172,15 @@ export function clearPendingBaseScenes(): void { pending.clear(); bump(); }
 
 /** Drop pending base-scene edits WITHOUT writing them. `paths` omitted = drop everything.
  *
- *  ⚠️ No agent op reaches this yet. `discard_asset_edits` deliberately does NOT — its contract is
- *  asset DOCUMENTS, and quietly widening it would make a caller asking for one thing get another.
- *  So today the only way to back one of these out is to set the field again in the panel. Worth an
- *  op if a second caller ever needs it; not worth inventing one for a hypothetical.
+ *  ⚠️ `discard_asset_edits` deliberately does NOT reach this — its contract is asset DOCUMENTS, and
+ *  quietly widening it would make a caller asking for one thing get another.
+ *
+ *  ⚠️ **`resolve-unsaved` DOES, since #889** (`DISCARDERS.pendingBaseScene`), so the "no agent op
+ *  reaches this yet" that stood here is no longer true. It is reachable only by naming
+ *  `discard: ['pendingBaseScene']` explicitly — no Node route passes that today (`/api/write-meta`
+ *  passes `['pendingMeta']` and nothing else), so in practice it is `modoki_eval`-only. That is a
+ *  deliberately narrow surface, not an oversight: the discard is registry-SCOPED precisely so a
+ *  route cannot drop state it never asked about.
  *  Mirrors `discardDirtyAssets`, including telling a caller apart from a typo: "I dropped your
  *  edit" and "there was nothing to drop" are different answers. */
 export function discardPendingBaseScenes(paths?: readonly string[]): { discarded: string[]; notPending: string[] } {

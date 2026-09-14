@@ -20,14 +20,13 @@
 
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import net from 'net';
-import os from 'os';
 import fs from 'fs';
-import path from 'path';
 import { DeviceConnectionManager, adbRunner, DEVICE_PORT } from '../../plugins/backend/deviceConnection';
 import { androidDevicesExec, _clearFriendlyNameCache } from '../../plugins/backend/androidDevices';
 import { DeviceLeaseAuthority, DeviceLeaseClient } from '../../plugins/backend/deviceLease';
 import { listClaims, adbDeviceId } from '../../plugins/backend/deviceClaims';
 import { bridgePortExec } from '../../plugins/backend/androidBridgePort';
+import { makeScratchDir } from '@modoki/engine/testing/scratchDir';
 
 const realForward = adbRunner.forward;
 const realRemove = adbRunner.removeForward;
@@ -59,7 +58,7 @@ let prevHome: string | undefined;
 let prevBackendPort: string | undefined;
 
 beforeEach(() => {
-  home = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-home-'));
+  home = makeScratchDir('modoki-home-');
   prevHome = process.env.MODOKI_HOME;
   process.env.MODOKI_HOME = home;
   adbRunner.forward = vi.fn();
@@ -73,7 +72,7 @@ beforeEach(() => {
   bridgePortExec.packageUid = () => FAKE_PACKAGE_UID;
   prevBackendPort = process.env.MODOKI_BACKEND_PORT;
   delete process.env.MODOKI_BACKEND_PORT;
-  stateDir = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-reentrancy-'));
+  stateDir = makeScratchDir('modoki-reentrancy-');
 });
 
 afterEach(() => {
@@ -267,9 +266,9 @@ describe('DeviceConnectionManager — a disconnect() landing inside the #283 red
 
   it('a superseded PRIMARY onState callback cannot write connected status onto a disconnected manager', async () => {
     const authority = new DeviceLeaseAuthority();
-    // Gate connection #1 (the PRIMARY `client.connect()` at `:716`, before rediscovery even runs)
+    // Gate connection #1 (the PRIMARY `client.connect()` in `connectInner`, before rediscovery even runs)
     // instead of #2 (the rediscovery retry the other three tests exercise). Removing the
-    // `generation !== this.sessionGeneration` guard from the PRIMARY `onState` callback (`:713`)
+    // `generation !== this.sessionGeneration` guard from the PRIMARY `onState` callback in `connectInner`
     // leaves the other tests in this file green — they all suspend later, inside the rediscovery
     // block's own retry client, which has its own separately-guarded `onState`. This is the common
     // path: no adb rediscovery even needs to fire for a `disconnect()` to land while the primary
@@ -298,7 +297,7 @@ describe('DeviceConnectionManager — a disconnect() landing inside the #283 red
   it('does not write a stale detail after a superseded connect fails to land (#506 finding 4)', async () => {
     const authority = new DeviceLeaseAuthority();
     // Gate the PRIMARY connection and REFUSE it once released, so it lands as something other than
-    // 'connected' — the finding-4 write path (`:854`) is only reached on a non-connected landing,
+    // 'connected' — the finding-4 write path (`connectInner`'s failed-adb logcat sniff) is only reached on a non-connected landing,
     // which none of the tests above exercise (their primary attempt always succeeds outright).
     const device = await startGatedMockDevice(authority, 1, { refuseGated: true });
     process.env.MODOKI_DEVICE_HOST_PORT = String(device.port);

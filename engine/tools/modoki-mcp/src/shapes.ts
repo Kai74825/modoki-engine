@@ -8,6 +8,7 @@
  */
 
 import { z } from 'zod';
+import { EDITOR_INPUT_MODIFIERS } from '../../shared/inputVocabulary.js';
 
 /* `SAVE_PARAM` was here. REMOVED 2026-08-22 (owner decision).
  *
@@ -22,8 +23,9 @@ import { z } from 'zod';
  *  tool's real parameters (§1/§5) instead of being silently accepted and ignored. Persistence is
  *  manual-only: `modoki_save_all` is the one route to disk. */
 
-// Chromium input modifiers, shared by the trusted-input tools below.
-export const modifierEnum = z.enum(['shift', 'control', 'alt', 'meta', 'cmd', 'command']);
+// Chromium input modifiers, shared by the trusted-input tools below. Derived from the table the
+// `/api/input/*` routes refuse against (#1076), so the advertised enum and the enforced one are one list.
+export const modifierEnum = z.enum(EDITOR_INPUT_MODIFIERS);
 
 /** A point to aim trusted input at: page CSS coordinates, or a CSS selector resolved to
  *  the element's center inside the same call (no read-then-tap race).
@@ -73,6 +75,10 @@ export const ALLOW_OCCLUDED_BASE =
   + 'worst outcome on this surface. Applies to `entity` and `selector` aims; raw {x,y} is never '
   + 'refused, because a coordinate is exactly what you asked for';
 export const allowOccludedParam = z.boolean().optional().describe(`${ALLOW_OCCLUDED_BASE}.`);
+
+/** The shared half of every `timeoutMs` description (#1154 made it three tools). Each tool
+ *  CONCATENATES its own default and ceiling, which really do differ. */
+export const TIMEOUT_MS_BASE = 'How long to wait before giving up, in ms';
 
 /** The shared half of every `modifiers` description. A tool that needs to say more CONCATENATES —
  *  `${MODIFIERS_BASE}, e.g. …` — rather than replacing, so the rule reads identically everywhere
@@ -225,6 +231,16 @@ export const DISCARD_UNSAVED_BASE =
   + 'modoki_ota_publish destroys NOTHING, and one word cannot mean both';
 export const discardUnsavedParam = z.boolean().optional().describe(`${DISCARD_UNSAVED_BASE}.`);
 
+/** The `label` aim (#1153): editor chrome by its visible label. Factories, not shared consts, for
+ *  the `$ref`-dedup reason `makePointSpec` documents below — drag's `from`/`to` both carry them. */
+export const makeLabelAimParam = () => z.string().optional().describe(
+  'Editor chrome (data-ui-id control or dock tab) by its WHOLE label, e.g. "Console"; case-insensitive. '
+  + 'Refused unless exactly one on-screen match. Not with selector/entity.',
+);
+export const makeWithinParam = () => z.string().optional().describe(
+  'CSS selector scoping `label`, e.g. \'[data-panel-scope="assets"]\'.',
+);
+
 /** A factory for the same `$ref`-dedup reason as `makeEntitySpec` above — `modoki_drag` uses this
  *  twice (`from`/`to`) in one shape, so a shared instance would dedupe the same way.
  *
@@ -240,6 +256,8 @@ export const makePointSpec = () => z.object({
   x: z.number().optional(),
   y: z.number().optional(),
   selector: z.string().optional(),
+  label: makeLabelAimParam(),
+  within: makeWithinParam(),
   entity: makeEntitySpec().optional(),
   allowOccluded: z.boolean().optional().describe(`${ALLOW_OCCLUDED_BASE}.`),
 });

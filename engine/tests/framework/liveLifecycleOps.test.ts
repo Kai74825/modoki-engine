@@ -6,13 +6,17 @@
  *  a false success: a copy that silently drops its children, two entities sharing one guid, and a
  *  partial delete reported alongside a miss. */
 
+import path from 'node:path';
+import { readScannedSource } from '@modoki/engine/testing';
 import { describe, it, expect, afterEach, vi } from 'vitest';
+import { found } from '@modoki/engine/testing/inOrder';
 import { createTestWorld, type TestWorld, Transform, EntityAttributes,
   getCurrentWorld, setCurrentWorld, setTimeScale, getTimeScale, sceneManager, reparentRefusal,
   stepOneFrame } from '@modoki/engine/runtime';
+import { updateContactIndex } from '../../packages/modoki/src/runtime/physics/physicsContactIndex';
 import { createWorld } from 'koota';
 import { registerAllTraits } from '../../app/ecs/registerTraits';
-import { runAgentOp, simStepDefaultTimeout, SIM_STEP_MAX_TIMEOUT_MS, inferAssetDefType } from '../../app/debug/agentBridge';
+import { runAgentOp, hasAgentOp, listAgentOps, relayResponseFor, registerRelayResponder, simStepDefaultTimeout, SIM_STEP_MAX_TIMEOUT_MS, inferAssetDefType } from '../../app/debug/agentBridge';
 import { ASSET_SCHEMA_TYPES } from '../../packages/modoki/src/runtime/assets/assetSchemas';
 import { DEVICE_READ_ASSET_DEF_TYPES } from '../../tools/game-debug-mcp/src/mcp-tools';
 import { classifyReadAssetDef, probePathFor, probeServedTypes, type ReadAssetDefProbe }
@@ -24,8 +28,8 @@ let game: TestWorld | undefined;
 afterEach(() => { game?.dispose(); game = undefined; });
 
 type CreateReply = { ok?: boolean; error?: string; options?: string[]; id?: number; guid?: string; name?: string; saved?: boolean };
-type DupReply = { ok?: boolean; error?: string; created?: number; entitiesPerCopy?: number; roots?: Array<{ id: number; guid: string }> };
-type DelReply = { ok?: boolean; error?: string; deleted?: number; guids?: string[] };
+type DupReply = { ok?: boolean; error?: string; created?: number; entitiesPerCopy?: number; roots?: Array<{ id: number; guid: string | null }> };
+type DelReply = { ok?: boolean; error?: string; deleted?: number; guids?: Array<string | null> };
 
 async function sceneGuids(): Promise<string[]> {
   const s = await runAgentOp('scene-state', { trait: 'Transform', full: true }) as
@@ -52,6 +56,30 @@ describe('create-entity (runtime twin)', () => {
     expect(r.ok).toBe(false);
     expect(r.options).toContain('sphere');
     expect((await sceneGuids()).length).toBe(before);
+  });
+
+  // #1070: the light/preset checks used to THROW out of the spec builders, escaping this op's own
+  // `{ok:false, options}` convention — the device relay flattened the throw into a bare error string.
+  // An unknown kind was worse: the builder returned undefined and the destructuring threw a TypeError.
+  // A throw here would REJECT `runAgentOp`, so awaiting a plain reply is itself the assertion.
+  it.each([
+    { spec: { kind: 'light', light: 'pont' }, option: 'point' },
+    { spec: { kind: 'ui', preset: 'toString' }, option: 'view' },
+    { spec: { kind: 'pyramid' }, option: 'camera' },
+  ])('refuses $spec in its own {ok:false, options} shape, creating nothing (#1070)', async ({ spec, option }) => {
+    game = createTestWorld({});
+    const before = (await sceneGuids()).length;
+    const r = await runAgentOp('create-entity', { spec }) as CreateReply;
+    expect(r.ok).toBe(false);
+    expect(r.options).toContain(option);
+    expect((await sceneGuids()).length).toBe(before);
+  });
+
+  it('a light with no `light` field gets the default rather than a refusal', async () => {
+    game = createTestWorld({});
+    const r = await runAgentOp('create-entity', { spec: { kind: 'light' } }) as CreateReply;
+    expect(r.ok).not.toBe(false);
+    expect(r.name).toBe('Point Light');
   });
 
   it('refuses a stale parentGuid rather than silently creating an orphan', async () => {
@@ -211,7 +239,7 @@ describe('sim-step (runtime twin)', () => {
     const callsAtSwap = queryFirstSpy.mock.calls.length + querySpy.mock.calls.length;
 
     // Simulate a scene load swapping in a NEW world mid-step, destroying the one sim-step
-    // captured — the two-world atomic swap (SceneManager.ts:880-885).
+    // captured — the two-world atomic swap (`SceneManager.loadScene`'s `setCurrentWorld(promotedWorld)` + `destroyWorldWhenSafe`).
     const otherWorld = createWorld();
     setCurrentWorld(otherWorld);
 
@@ -410,13 +438,69 @@ describe('lifecycle: findings from the close-out review', () => {
     const p = game.spawn(Transform({ x: 0 }), EntityAttributes({ guid: 'p', name: 'P' }));
     game.spawn(Transform({ x: 0 }), EntityAttributes({ guid: 'c', name: 'C', parentId: p.id() }));
 
-    // Deleting P cascades to C, so reading C's guid AFTERWARDS fell through to String(id) — a live
+    // Deleting P cascades to C, so reading C's guid AFTERWARDS found no entity — once a live
     // entity id disguised as a guid, which a caller would then use for a nonsensical lookup.
     const r = await runAgentOp('delete-entities', { guids: ['p', 'c'] }) as DelReply;
 
     expect(r.ok).not.toBe(false);
     expect(r.guids?.sort()).toEqual(['c', 'p']);
     expect(await sceneGuids()).toEqual([]);
+  });
+});
+
+/** #1199 — an entity with no minted guid used to report `String(id)` as its guid. That value looks
+ *  addressable and every guid-addressed op refuses it (a guid-less entity is not in the guid index),
+ *  so each producer must say `null` instead. One case per producer: they were four copies once. */
+describe('a guid-less entity reports guid:null, never its id disguised as a guid (#1199)', () => {
+  type Row = { id: number; guid: string | null; name: string };
+  type StateReply = { entities: Row[] };
+
+  it('scene-state INDEX and FULL rows carry null, and the id-shaped value resolves nothing', async () => {
+    game = createTestWorld({});
+    const bare = game.spawn(Transform({ x: 0 }), EntityAttributes({ name: 'Bare' }));
+    game.spawn(Transform({ x: 0 }), EntityAttributes({ guid: 'real', name: 'Real' }));
+
+    for (const params of [{}, { full: true }]) {
+      const s = await runAgentOp('scene-state', params) as StateReply;
+      const row = s.entities.find((e) => e.name === 'Bare')!;
+      expect(row.id).toBe(bare.id());
+      expect(row.guid).toBeNull();
+      expect(s.entities.find((e) => e.name === 'Real')!.guid).toBe('real');
+    }
+    // The premise of the bug, pinned: the old reported value is not an address.
+    const byOldValue = await runAgentOp('scene-state', { guid: String(bare.id()) }) as StateReply;
+    expect(byOldValue.entities).toEqual([]);
+  });
+
+  it('contacts list a guid-less partner as `id:<n>` — a bare null would lose WHICH body it is', async () => {
+    game = createTestWorld({});
+    const ball = game.spawn(Transform({ x: 0 }), EntityAttributes({ guid: 'ball', name: 'Ball' }));
+    const floor = game.spawn(Transform({ x: 0 }), EntityAttributes({ guid: 'floor', name: 'Floor' }));
+    const debris = game.spawn(Transform({ x: 0 }), EntityAttributes({ name: 'Debris' }));
+    // The index takes PACKED entities (`valueOf()`, #868) and reports partner ids.
+    updateContactIndex(getCurrentWorld(), ball.valueOf(), floor.valueOf(), false, 'enter');
+    updateContactIndex(getCurrentWorld(), ball.valueOf(), debris.valueOf(), false, 'enter');
+
+    const s = await runAgentOp('scene-state', { guid: 'ball', contacts: true }) as
+      { entities: Array<{ contacts?: string[] }> };
+    expect(s.entities[0].contacts?.sort()).toEqual(['floor', `id:${debris.id()}`]);
+  });
+
+  it('set-traits readback rows carry null for a guid-less target', async () => {
+    game = createTestWorld({});
+    const bare = game.spawn(Transform({ x: 0 }), EntityAttributes({ name: 'Bare' }));
+    const r = await runAgentOp('set-traits', { id: bare.id(), set: { 'Transform.x': 3 } }) as
+      { ok?: boolean; entities?: Row[] };
+    expect(r.ok).not.toBe(false);
+    expect(r.entities?.[0].guid).toBeNull();
+  });
+
+  it('delete-entities by id reports null for a guid-less entity', async () => {
+    game = createTestWorld({});
+    const bare = game.spawn(Transform({ x: 0 }), EntityAttributes({ name: 'Bare' }));
+    const r = await runAgentOp('delete-entities', { id: bare.id() }) as { ok?: boolean; guids?: Array<string | null> };
+    expect(r.ok).not.toBe(false);
+    expect(r.guids).toEqual([null]);
   });
 });
 
@@ -592,5 +676,186 @@ describe('device_read_asset_def\'s enum lists exactly what THIS op dispatches (#
     // What this adds is that the two ops have not diverged from each other.
     const { READ_ASSET_DEF_TYPES_FOR_TESTS } = await import('../../tools/modoki-mcp/src/tools/assets');
     expect([...DEVICE_READ_ASSET_DEF_TYPES].sort()).toEqual([...READ_ASSET_DEF_TYPES_FOR_TESTS].sort());
+  });
+});
+
+/** #1030 — the membership test behind the relay's DECLINE. The dev server broadcasts
+ *  `modoki:request` to every HMR client, so this handler runs in every open tab; a tab without a
+ *  given op must say "I do not have this" rather than reject, or it settles the request on the
+ *  editor's behalf and a live editor's state repair is skipped silently.
+ *
+ *  ⚠️ Tested as MEMBERSHIP rather than through `runAgentOp`'s throw, because that is the whole
+ *  point: catching `/unknown agent op/` from the dispatch would miscount an op that legitimately
+ *  throws those words, and would have RUN the op before deciding whether it existed. */
+describe('hasAgentOp — the relay decline test (#1030)', () => {
+  it('is true for a registered op and false for an unregistered one', () => {
+    const registered = listAgentOps();
+    expect(registered.length).toBeGreaterThan(0);
+    for (const name of registered) expect(hasAgentOp(name)).toBe(true);
+    expect(hasAgentOp('definitely-not-an-op')).toBe(false);
+    expect(hasAgentOp('')).toBe(false);
+  });
+
+  it('is false for an EDITOR op in a runtime build — the exact tab that used to win the race', () => {
+    // `apply-asset-path-moves` is registered inside registerEditorAgentOps(), which a runtime page
+    // never calls. This suite is that build: the op is absent, so the client declines, and #1030's
+    // counting is what stops that decline standing in for the editor's answer.
+    expect(listAgentOps()).not.toContain('apply-asset-path-moves');
+    expect(hasAgentOp('apply-asset-path-moves')).toBe(false);
+  });
+
+  it('does not RUN the op it is asked about', async () => {
+    const { registerAgentOp } = await import('../../app/debug/agentBridge');
+    let ran = 0;
+    registerAgentOp('probe-1030', () => { ran += 1; return null; });
+    expect(hasAgentOp('probe-1030')).toBe(true);
+    expect(ran).toBe(0);
+  });
+});
+
+/** ⚠️ A SOURCE guard, and the only kind available here (#1030 close-out F1).
+ *
+ *  `relayResponseFor`'s DEFAULTS are `hasAgentOp` and `runAgentOp`, so the handler calls it with
+ *  the message alone — nothing to pass is nothing to mis-wire. But an argument can still be ADDED,
+ *  and `relayResponseFor(msg, () => true)` makes every client claim every op, restoring #1030's
+ *  race with the whole suite green. The handler lives inside `initAgentBridge` behind a live Vite
+ *  `hot`, so no behavioural test can reach it; the decision it makes is tested below, and this
+ *  pins that the decision is reached with its real collaborators.
+ *
+ *  If this ever needs to take an override for a genuine reason, delete this guard deliberately and
+ *  say why — do not widen the pattern until it passes. */
+describe('the modoki:request handler is wired to the REAL membership test (#1030)', () => {
+  it('calls relayResponseFor with the message alone — no overridden collaborators', () => {
+    // ⚠️ Through `readScannedSource`, not `fs.readFileSync` — `commentStripperIsShared.test.ts`
+    // (#812) fails any guard that matches a pattern against RAW repo source, because a comment can
+    // then satisfy the assertion on its own. It caught this guard's first draft doing exactly that.
+    const { code: src } = readScannedSource(
+      path.resolve(__dirname, '../../app/debug/agentBridge.ts'));
+    const calls = [...src.matchAll(/relayResponseFor\(([^)]*)\)/g)].map((m) => m[1].trim());
+    // ⚠️ The DECLARATION matches this pattern too (`relayResponseFor(\n  msg: {…`), so a naive
+    // `startsWith('msg')` finds two and the guard fails on a clean tree — which it did. A call
+    // site's argument list is one line and carries no type annotation.
+    const wired = calls.filter((a) => a.startsWith('msg') && !a.includes(':') && !a.includes('\n'));
+    expect(wired, 'no relayResponseFor(msg…) call site found — fix the parser, not the test')
+      .toHaveLength(1);
+    expect(wired[0], 'the relay handler must not override `has` or `run`').toBe('msg');
+  });
+});
+
+/** #1030 — the CLIENT half of the fix, which the server's decline counting is inert without.
+ *  `relayResponseFor` is the decision the `modoki:request` handler makes; the handler itself lives
+ *  behind a live Vite `hot`, so the decision was extracted to be testable at all. */
+describe('relayResponseFor — what a client answers to a relayed request (#1030)', () => {
+  const msg = { id: 7, op: 'apply-asset-path-moves', params: { moves: [] } };
+
+  it('DECLINES an op it does not have — no error, and the op is never run', async () => {
+    let ran = 0;
+    const r = await relayResponseFor(msg, () => false, async () => { ran += 1; return 'nope'; });
+    expect(r).toEqual({ id: 7, declined: true });
+    expect(r.error).toBeUndefined();     // ⚠️ a rejection here is what let a runtime tab win
+    expect(ran).toBe(0);                 // ⚠️ membership is asked BEFORE dispatch
+  });
+
+  it('answers with the RESULT when it owns the op', async () => {
+    const r = await relayResponseFor(msg, () => true, async () => ({ notes: ['ok'] }));
+    expect(r).toEqual({ id: 7, result: { notes: ['ok'] } });
+    expect(r.declined).toBeUndefined();
+  });
+
+  it('reports a THROW as an error, never as a decline — it is an answer', async () => {
+    // ⚠️ The distinction the whole fix rests on. Only the client that owns an op can throw from
+    // it, so that failure is authoritative and must settle the request immediately; marking it
+    // `declined` would make a real failure wait for other clients and then be reported as
+    // "nothing has this op".
+    const r = await relayResponseFor(msg, () => true, async () => { throw new Error('boom'); });
+    expect(r).toEqual({ id: 7, error: 'boom' });
+    expect(r.declined).toBeUndefined();
+  });
+
+  it('does not special-case an op that THROWS the words "unknown agent op"', async () => {
+    // The reason membership is a registry lookup rather than a string test on the throw: an op
+    // that mentions those words in its own error would otherwise be miscounted as a decline.
+    const r = await relayResponseFor(msg, () => true,
+      async () => { throw new Error("cannot proxy: unknown agent op 'inner' on the device"); });
+    expect(r.declined).toBeUndefined();
+    expect(r.error).toMatch(/unknown agent op 'inner'/);
+  });
+});
+
+/** #1030 close-out round 4 — the PRODUCER of the announce.
+ *
+ *  ⚠️ Round 3 gave the server side a seam test and left this side covered by nothing: deleting
+ *  `announce(); hot.on('vite:ws:connect', announce);` from `initAgentBridge` left 3,621 tests
+ *  green. `modoki:bridge-hello` existed in three places — the producer, the consumer, and a test
+ *  that FIRED the event itself, so it exercised only the consumer. That is the same
+ *  producer-nobody-wired shape as the bug being fixed, two layers down. */
+describe('registerRelayResponder — announce, THEN take the ops (#1030)', () => {
+  function fakeHot() {
+    const sent: { event: string; data: unknown }[] = [];
+    const handlers = new Map<string, (d: never) => void>();
+    // ⚠️ ONE ordered log across BOTH calls. Separate `sent`/`on` arrays cannot express "the
+    // announce came first" — the previous version compared indices within each list and passed
+    // happily with the announce moved to the very end, which is the mutation that matters.
+    const log: string[] = [];
+    return {
+      sent, handlers, log,
+      hot: {
+        send: (event: string, data: unknown) => { log.push(`send:${event}`); sent.push({ event, data }); },
+        on: (event: string, cb: (d: never) => void) => {
+          log.push(`on:${event}`);
+          // ⚠️ Loud rather than last-wins. A bare `handlers.set` keeps only the LAST listener:
+          // measured, a duplicate `hot.on('modoki:request', …)` in `registerRelayResponder` left
+          // all 50 tests in this file green. Real Vite ACCUMULATES listeners, so that duplicate
+          // means every relayed op runs twice and TWO `modoki:response` frames go back for one
+          // request. It is a live merge hazard, not a hypothetical: a conflict resolution that
+          // keeps the old inline `hot.on(…)` block AND the new `registerRelayResponder(hot)` call
+          // reinstates exactly that, and the gate stays green.
+          // (The source guard at `the modoki:request handler is wired to the REAL membership test`
+          // only catches the variant that adds a second `relayResponseFor(msg)` call site.)
+          if (handlers.has(event)) throw new Error(`a SECOND '${event}' listener was registered — real Vite calls BOTH`);
+          handlers.set(event, cb);
+        },
+      },
+    };
+  }
+
+  it('ANNOUNCES, and does so BEFORE it can answer anything', () => {
+    const f = fakeHot();
+    registerRelayResponder(f.hot);
+
+    const announcedAt = found(f.log.indexOf('send:modoki:bridge-hello'), 'a SENT modoki:bridge-hello');
+    const tookOpsAt = found(f.log.indexOf('on:modoki:request'), 'a registered modoki:request handler');
+    // ⚠️ THE assertion. "Nothing may answer `modoki:request` before it has announced" — a client
+    // that can decline while uncounted completes a denominator that was one short, which is
+    // #1030. Both-happened is not enough: with the announce moved to the end of the function the
+    // weaker version of this test passed.
+    expect(announcedAt, 'the op handler was taken BEFORE announcing — a decline could arrive uncounted')
+      .toBeLessThan(tookOpsAt);
+    // The announce is the first thing SENT, and its body is empty on purpose — the server keys
+    // the client off the socket identity, never off the payload.
+    expect(f.sent[0]).toEqual({ event: 'modoki:bridge-hello', data: {} });
+  });
+
+  it('answers a relayed request through relayResponseFor — declining an op it does not have', async () => {
+    const f = fakeHot();
+    registerRelayResponder(f.hot);
+    const handler = f.handlers.get('modoki:request')!;
+    expect(handler).toBeTruthy();
+    f.sent.length = 0;
+    await handler({ id: 9, op: 'definitely-not-an-op' } as never);
+    expect(f.sent).toEqual([{ event: 'modoki:response', data: { id: 9, declined: true } }]);
+  });
+
+  it('re-announces when the connect listener fires — cheap, and correct if Vite ever reconnects', () => {
+    // ⚠️ This listener CANNOT fire in Vite 8 today (it emits vite:ws:connect once per page, from
+    // inside /@vite/client, long before this module is dynamically imported — and it reloads the
+    // page rather than reconnecting in place). Kept because it costs nothing and is right if that
+    // changes; pinned so it stays correct rather than rotting into a listener that sends the
+    // wrong thing. Do NOT cite it as the reconnect mechanism — the fresh page's own announce is.
+    const f = fakeHot();
+    registerRelayResponder(f.hot);
+    f.sent.length = 0;
+    f.handlers.get('vite:ws:connect')!(undefined as never);
+    expect(f.sent).toEqual([{ event: 'modoki:bridge-hello', data: {} }]);
   });
 });

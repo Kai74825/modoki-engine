@@ -136,15 +136,41 @@ const rows: Row[] = [];
  *  plausible path, not a guaranteed one. */
 const ENV_CODES = new Set(['NOT_FOUND', 'NO_RENDERER', 'REQUIRES_SAVE', 'AMBIGUOUS_SURFACE']);
 
+/** ⚠️ `REQUIRES_SAVE` cannot fire in THIS sweep, and is kept anyway (#994 widen, 2026-09-09).
+ *
+ *  Its only producers are `modoki_build`, `modoki_add_native_target`, `modoki_ota_publish`
+ *  (`src/tools/project.ts`) and the four `unsavedRefusal()` callers in `editorBackendRouter.ts`
+ *  (`/api/write-meta`, `/api/reimport`, `/api/asset-write`, `/api/duplicate-asset`). All seven
+ *  MUTATE, so none is among the non-mutating tools swept below. Same "declared ≠ reachable" shape
+ *  as the defect #994 fixed — but this one produces no wrong verdict, and deleting it would be a
+ *  claim that no future read-only tool can refuse that way, which is not ours to make.
+ *
+ *  ⚠️ `engine/tests/tools/mcpErrorCodes.test.ts` does NOT cover this. It asserts every code in
+ *  `ERROR_CODES` has A PRODUCER SOMEWHERE in the repo — strictly weaker than "reachable by a tool
+ *  in this sweep", which is the property this set actually needs. Do not read its green as cover. */
+
 // `modoki_render_sequence`'s REFUSED_BY_OP only fires when the editor is STOPPED (`runMode`, not the
 // 3-value `playState` — see editorBackendRouter.ts's own comment on why). While Playing the ergonomic
 // call succeeds normally, which is correct behaviour, not a defect — so fetch `runMode` up front to
+/** Flatten an MCP tool result's content blocks to text.
+ *
+ *  The SDK types `content` as `unknown`, so every call site used to re-cast it inline — and this
+ *  file was typechecked by NOTHING until #894's close-out widened the package tsconfig, so those
+ *  casts had never been compiled. One helper, so the next call site cannot invent a sixth spelling. */
+const textOf = (r: unknown): string => {
+  // ⚠️ `unknown`, not `{ content?: unknown }`: `callTool` returns a UNION, and its
+  // `CompatibilityCallToolResult` branch carries `toolResult` with no `content` at all — a param
+  // typed with an optional `content` has "no properties in common" with that branch and is rejected.
+  const content = (r as { content?: unknown })?.content;
+  return (Array.isArray(content) ? content : [])
+    .map((c) => (c as { text?: string }).text ?? '').join('');
+};
+
 // gate that one expectation on the state actually observed THIS run, rather than assuming stopped.
 let observedRunMode: string | undefined;
 let editorStateBody = '';
 try {
-  editorStateBody = (await client.callTool({ name: 'modoki_get_editor_state', arguments: {} })).content
-    .map((c) => (c as { text?: string }).text ?? '').join('');
+  editorStateBody = textOf(await client.callTool({ name: 'modoki_get_editor_state', arguments: {} }));
   const editorStateForGate = JSON.parse(editorStateBody) as { runMode?: string; playState?: string };
   observedRunMode = editorStateForGate.runMode ?? editorStateForGate.playState;
 } catch (e) {
@@ -196,7 +222,7 @@ for (const name of [...sweep, ...gameSweep]) {
   let expectationFired = false;
   try {
     const r = await client.callTool({ name, arguments: args as Record<string, unknown> });
-    const body = r.content.map((c) => (c as { text?: string }).text ?? '').join('');
+    const body = textOf(r);
     if (r.isError) {
       let code = '';
       try { code = (JSON.parse(body) as { error?: { code?: string } }).error?.code ?? ''; } catch { /* not an envelope */ }

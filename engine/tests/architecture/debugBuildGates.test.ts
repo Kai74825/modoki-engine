@@ -2,7 +2,7 @@
  *
  *  Why this guard exists — and why it is not optional. `build.debugBuild` is the single source of
  *  truth for "does this build carry the debug bridge", and **this exact invariant has already
- *  drifted once**: `engine/app/main.tsx:42` records it — *"Previously this was ungated on native,
+ *  drifted once**: `engine/app/main.tsx`'s debug-bridge gate comment records it — *"Previously this was ungated on native,
  *  so a RELEASE build shipped the eval-capable server."* A single source of truth that nothing
  *  verifies will drift again, and the next drift is a store submission carrying a TCP server with
  *  `handleEval` (arbitrary JS) on it.
@@ -30,11 +30,12 @@
 
 import { describe, it, expect, afterEach } from 'vitest';
 import fs from 'node:fs';
-import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { healNativeConfig } from '../../plugins/healNativeConfig';
 import { PROJECT_ROOT_DIRS } from '../../scripts/projectRoots.mjs';
+import { hasNativeProjects } from '../helpers/repoLayout';
+import { makeScratchDir } from '@modoki/engine/testing/scratchDir';
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../..');
 
@@ -100,11 +101,16 @@ describe('build.debugBuild is the single gate — committed native projects (#11
 
   // The OSS snapshot ships no projects with native folders, so there is nothing to check there.
   // Skipping is correct; passing vacuously without saying so is how a guard rots unnoticed.
-  it.skipIf(projects.length === 0)('finds native game-debug projects to check', () => {
+  //
+  // ⚠️ Gated on the PREDICATE, not on `projects.length === 0` (#1071). An emptiness gate cannot
+  // tell "this checkout has no native projects" from "the finder above broke" — a renamed
+  // dependency key or a moved root reads as the first and skips all three tests, including the
+  // one whose whole job is to catch it.
+  it.skipIf(!hasNativeProjects())('finds native game-debug projects to check', () => {
     expect(projects.length).toBeGreaterThan(0);
   });
 
-  it.skipIf(projects.length === 0)('every native debug surface matches the project\'s own flag', () => {
+  it.skipIf(!hasNativeProjects())('every native debug surface matches the project\'s own flag', () => {
     const wrong: string[] = [];
     for (const p of projects) {
       for (const m of NATIVE_MARKERS) {
@@ -126,7 +132,7 @@ describe('build.debugBuild is the single gate — committed native projects (#11
     ).toEqual([]);
   });
 
-  it.skipIf(projects.length === 0)('no project has resurrected a build-configuration gate', () => {
+  it.skipIf(!hasNativeProjects())('no project has resurrected a build-configuration gate', () => {
     const found: string[] = [];
     for (const p of projects) {
       for (const g of RETIRED_GATES) {
@@ -149,7 +155,7 @@ describe('build.debugBuild OFF strips every native debug surface (#112)', () => 
 
   /** A minimal but structurally faithful native project the heals can act on. */
   function scaffold(debugBuild: boolean): string {
-    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-debugflag-'));
+    const dir = makeScratchDir('modoki-debugflag-');
     fs.writeFileSync(path.join(dir, 'project.config.json'), JSON.stringify({ build: { debugBuild } }));
     fs.writeFileSync(path.join(dir, 'package.json'),
       JSON.stringify({ dependencies: { 'capacitor-game-debug': 'file:plugins/x.tgz' } }));

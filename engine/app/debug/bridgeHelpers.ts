@@ -3,6 +3,9 @@
  *  re-implementing them (which let copies silently drift from the shipping code — code-review T7). */
 
 import { withTimeout } from '@modoki/engine/runtime/core/abandonment';
+import {
+  PENDING_PROMISE_MARKER, isThenable, jsonSafeReplacer, renderError,
+} from '@modoki/engine/runtime/core/jsonSafe';
 
 /** Native (iOS drawHierarchy) capture dims, kept by the bridge after a native screenshot. */
 export interface LastScreenInfo { imageWidth: number; imageHeight: number; screenWidth: number; screenHeight: number }
@@ -23,23 +26,18 @@ export interface ConsoleLine {
   timestamp: number;
 }
 
-/** What an un-awaited Promise serializes to. A pending thenable has no own enumerable properties,
- *  so `JSON.stringify` renders it `{}` — an empty-looking RESULT rather than a mistake, which is
- *  how it silently cost real debugging calls (#145). Naming it makes the omission self-diagnosing. */
-export const PENDING_PROMISE_MARKER = '[unresolved Promise — did you forget `await`?]';
-
-function isThenable(v: unknown): boolean {
-  return !!v && (typeof v === 'object' || typeof v === 'function')
-    && typeof (v as { then?: unknown }).then === 'function';
-}
+/** What an un-awaited Promise serializes to (#145). Re-exported: the one definition is in
+ *  `runtime/core/jsonSafe.ts` (#1068), shared with the console ring and the editor transports. */
+export { PENDING_PROMISE_MARKER };
 
 /** A short, content-free description of a value's shape — for a refusal that must never echo what
  *  the value actually held (a log line can carry secrets).
  *
  *  ⚠️ Deliberately a COPY of `describeShape` in `engine/tools/shared/mcpResult.ts` rather than an
  *  import of it (#648). Every OTHER `engine/app` → `tools/shared` reference is `import type`, which
- *  costs the bundle nothing — `agentBridge.ts`'s `simStepTiming.ts` import is the one deliberate
- *  VALUE-import exception (#822), and its own docblock explains why THAT one is worth the cost. A
+ *  costs the bundle nothing — `agentBridge.ts`'s `simStepTiming.ts` (#822) and `bridge.ts`'s
+ *  `inputVocabulary.ts` (#1076) are the deliberate VALUE-import exceptions, each a few dependency-free
+ *  constants where a hand-kept copy is the very defect being fixed, and each module's docblock says so. A
  *  value import here would pull MCP result-formatting code into the bundle that ships to devices for
  *  no comparable reason. Eight lines on this side of that boundary is the cheaper trade. If this
  *  ever needs to change, change both — they are the same refusal vocabulary. */
@@ -63,21 +61,23 @@ export function safeStringify(value: unknown): string {
   // it through here and did not, which is exactly the kind of divergence one shared helper exists
   // to prevent.
   //
-  // Handled at BOTH depths, like the thenable case beside it: the top-level branch returns the raw
-  // stack (so a captured console arg reads as text, matching `agentBridge`'s capture), and the
+  // Handled at BOTH depths, like the thenable case beside it: the top-level branch returns the
+  // stack as text (so a captured console arg reads as text, matching `agentBridge`'s capture), and the
   // replacer below catches Errors NESTED in an object or array. The first cut of this fix did only
   // the top level — `{cause: err}` and `[err]` still serialized to `{"cause":{}}` / `[{}]`, which is
   // the same defect one level down, and a rejection value is exactly the kind of thing that arrives
   // wrapped. Caught in close-out review by asking why the thenable directly above was nested-aware
   // and this was not.
-  if (value instanceof Error) return value.stack || value.message;
+  //
+  // Both depths render through `runtime/core/jsonSafe.ts` (#1068): `errorText`, never
+  // `stack || message` (on iOS the stack has no message line, so the device bridge showed frames
+  // with no message, #1055), plus the `cause` chain. The two EDITOR transports render through the
+  // same module (`opReplyFor`), so all three agree on what an Error in a reply reads as.
+  if (value instanceof Error) return renderError(value);
   try {
     return typeof value === 'string'
       ? value
-      : JSON.stringify(value, (_k, v) => (
-        isThenable(v) ? PENDING_PROMISE_MARKER
-          : v instanceof Error ? (v.stack || v.message)
-            : v));
+      : JSON.stringify(value, jsonSafeReplacer);
   } catch {
     return String(value);
   }

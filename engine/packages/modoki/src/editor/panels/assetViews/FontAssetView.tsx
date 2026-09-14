@@ -12,7 +12,7 @@ import {
   DEFAULT_FONT_SETTINGS, resolveFontSettings, FONT_ATLAS_SUFFIX,
   type FontImportSettings, type FontFieldType, type FontCharsetPreset, type FontMode, type FontCacheInfo,
 } from '../../../runtime/core/fontSettings';
-import { assetUrl } from '../../../runtime/loaders/assetUrl';
+import { assetUrl, withCacheBust } from '../../../runtime/loaders/assetUrl';
 import { inputStyle } from '../fields';
 import { DropdownField, formatBytes, reimportBtnStyle } from './widgets';
 import { withCurrentValue } from './importSettingOptions';
@@ -265,6 +265,7 @@ export function FontAssetView({ path, name }: { path: string; name: string }) {
       <div style={sectionStyle}>Charset</div>
       <DropdownField
         label="Preset"
+        dataUiId="assetView.font.charset"
         value={settings.charset}
         options={CHARSET_OPTIONS.map((o) => o.value)}
         onChange={(v) => update({ charset: v as FontCharsetPreset })}
@@ -303,6 +304,7 @@ export function FontAssetView({ path, name }: { path: string; name: string }) {
       <div style={sectionStyle}>Mode</div>
       <DropdownField
         label="Glyph source"
+        dataUiId="assetView.font.mode"
         value={settings.mode}
         options={MODE_OPTIONS.map((o) => o.value)}
         onChange={(v) => update({ mode: v as FontMode })}
@@ -471,7 +473,12 @@ function AxisRow({ axis, value, onChange }: {
  *  bug. Cache-busted by the content hash so a re-bake refreshes the preview. */
 function FontAtlasPreview({ path, cache }: { path: string; cache: FontCacheInfo | undefined }) {
   const sectionStyle: React.CSSProperties = { color: '#f1c40f', fontSize: '10px', textTransform: 'uppercase', margin: '10px 0 3px' };
-  const url = assetUrl(path + FONT_ATLAS_SUFFIX) + (cache?.hash ? `?v=${cache.hash}` : '');
+  // ⚠️ Through `withCacheBust`, not a hand-rolled `?v=` (#1022 review). This line spelled the
+  // scheme itself, which made it the ONE emitter invisible to a `grep withCacheBust` — and it had
+  // already drifted: before #1022 removed that helper's PROD gate, this busted in dev while
+  // `fontAtlasLoader`'s `fontUrls()` did not, for the same atlas. The helper's docblock claims to
+  // be the single source of truth for the scheme; this is what makes that true.
+  const url = withCacheBust(assetUrl(path + FONT_ATLAS_SUFFIX), cache?.hash);
   return (
     <>
       <div style={sectionStyle}>Atlas preview</div>

@@ -510,7 +510,21 @@ would ship the whole Three node pipeline into a `render3d:false` build (#214). I
 still dies with its source; a 2D-only build never imports the module and the registry stays empty.
 It is reclassified L3 in place for that edge — see [architecture-layers.md](./architecture-layers.md) D4.
 
-### The r185 bump — measured, and what it did NOT fix
+### The r185 bump — measured, REVERTED, and now capped
+
+⚠️ **WE ARE NOT ON r185 AND MUST NOT GO THERE. `three` is pinned to `0.184.0`** (#956): r185
+**black-screens EVERY iOS device on first launch after a clean install**. Everything below is a
+record of what the bump *would* buy, kept because the measurement is real and #957 will want it —
+**it is not a recommendation, and it was read as one.** This section previously ended on "a 67% cut
+in texture-memory growth for a dependency bump" with no mention of the regression, which made the
+doc a developer reads before touching three's version argue for crossing the ceiling (#966).
+
+⚠️ **No gate can catch the regression.** The repro is first-launch-on-a-cold-install only; a warm
+pipeline cache hides it, and `npm run verify`, `verify:all`, both CI legs and both signed release
+builds were all green on the affected tree. The ceiling is therefore asserted as a DECLARATION:
+`engine/tests/architecture/threeVersionCeiling.test.ts` (the installed version, plus both manifests
+that declare `three`) and a `three` ignore entry in `.github/dependabot.yml`. Raising it needs an
+on-device clean-install check — that is #957, and it is the only thing that can observe the defect.
 
 three `0.184.0 → 0.185.1` closed the expensive half of the env leak with **no engine code**. Same
 fixture, same probe, same island↔empty cycle:
@@ -525,9 +539,10 @@ fixture, same probe, same island↔empty cycle:
 A **67% cut in texture-memory growth for a dependency bump.** The geometry half is untouched exactly
 as predicted — it was the `modelOwners` ownership gap, not a three defect.
 
-⚠️ `"three": "^0.184.0"` is a 0.x caret (`>=0.184.0 <0.185.0`), so a plain `npm install` will NOT pick
-0.185.1 up; the range must be bumped explicitly. **0.185.0 and 0.185.1 are the only releases after
-0.184.0** — there is nothing further to bump to.
+⚠️ `"three"` is now an **exact pin** (`0.184.0`, no caret) and the engine package's peer range carries
+the matching ceiling (`>=0.183.0 <0.185.0`), so neither a plain `npm install` nor a lockfile
+regeneration can pick 0.185.x up. **0.185.0 and 0.185.1 are the only releases after 0.184.0** — so
+the cap costs nothing today beyond the env-leak win recorded above.
 
 **What r185 fixed:** `PMREMNode` now registers a dispose listener and caches the RENDER TARGET, so
 `pmrem.dispose()` disposes the target. **What it did NOT fix:** `CubeMapNode` is byte-identical to
@@ -956,6 +971,16 @@ The one number here with neither a measurement nor a carry-forward is the **1024
 ceiling**: 512 is measured unusable and 2048 is what projects author, so it is the step between.
 Worst case it renders coarser shadows than intended, which costs quality and not the frame.
 
+⚠️ **On any device measurement, read the RESOLVED tier before believing a null result.** Tiers
+resolve per DEVICE, so a low-end device (exactly where you go to reproduce a low-end bug) can
+switch off the very feature under test. Reproducing #956 (the r185 iOS black screen) on the iPhone
+8 with `demos/postfx-demo`, the app "rendered fine" on the suspect version — but `qualityTier` was
+unset → `auto` → resolved `mid` (`[qualityTier] mid via model — iPhone10,1` in the device console),
+and that project's authored `mid` sets `npr:false, ao:false, dof:false`. GTAO, NPR and DOF, the
+pipelines whose compile failures were captured on the failing device, never compiled. Check what
+the resolved tier disables, and pin `qualityTier` in the project config so the feature actually
+runs.
+
 #### A frame time measured on a big.LITTLE phone is a LITTLE-core number — and that is the shipping budget
 
 Every CPU figure above from the Galaxy A23 was produced with the **big cores idle**. Sampling the
@@ -1251,7 +1276,7 @@ of #202 named only `disable3D` and was wrong about the blast radius:
 
 | route | mechanism | projects |
 |---|---|---|
-| `disable3D: true` in the game config | `App.tsx` renders `Scene3D && !disable3D` | `games/chess`, `games/audio-demo` |
+| `disable3D: true` in the game config | `App.tsx` renders `Scene3D && !disable3D` | `games/audio-demo` |
 | `build.modules.render3d: false` | `Scene3D` is `null` at module scope (`__MODOKI_MODULE_RENDER3D__`) | `games/space-invader` |
 
 A 2D project that does neither (`games/court`, `games/text_demo`, `demos/2d-physics-demo`) mounts
@@ -2753,7 +2778,8 @@ everything else — and both were overtaken:
   ⚠️ **STILL true, and still the rule: not verifiable in the editor.** The seam is in `App.tsx`'s
   `GameShell`, which the editor does not mount. An attempt to read the live tier through CDP
   returned `null`, and that reading is UNTRUSTWORTHY — the `/@fs/` import produced a second module
-  instance (its `tiers` came back `[]`), so it reported a fresh module's state, not the app's.
+  instance (its `tiers` came back `[]`), so it reported a fresh module's state, not the app's
+  (mechanism, and `modoki.import`: [debug-tools-mcp.md](debug-tools-mcp.md) § "Second module instance").
   **Verify on a device build, or via the web build served at `/`.**
 
   ⚠️ **iOS console logs do NOT reach `idevicesyslog` or `log stream`** — a WKWebView's
@@ -2875,6 +2901,28 @@ Each cost a session or more.
   Game panel only) or move the camera; for the true framebuffer use CDP `Page.captureScreenshot`.
   The corollary: if a device surface ever goes on-demand, the same trap arrives with it.
 - **Tooling**: Android over `adb`; iOS 15/16 via `libimobiledevice`, iOS 17+ via `xcrun devicectl`.
+- **Measuring a 1–2 frame flash in a WEB build** (the browser twin of the `adb screenrecord` +
+  `ffmpeg signalstats` method in [particles.md](./particles.md)):
+  1. Launch a Chrome with its OWN `--user-data-dir` and a `--remote-debugging-port`. The fresh
+     profile is what makes "first load" reproducible — the GPU shader cache and HTTP cache both
+     live in the profile — and it leaves the owner's normal Chrome untouched.
+  2. Drive it with a plain Node CDP client (`WebSocket` is global in Node 22+):
+     `Target.createTarget` → `Target.attachToTarget {flatten:true}` →
+     `Page.addScriptToEvaluateOnNewDocument` (in-page probe) → `Page.startScreencast
+     {format:'jpeg'}`, saving and acking each `Page.screencastFrame`. Then
+     `ffmpeg -f image2 -i f%05d.jpg -vf signalstats,metadata=print:file=- -f null -` gives per-frame
+     `YAVG`.
+  3. **Amplify the race instead of chasing it.** A localhost fetch always wins, so serve through a
+     tiny handler that sleeps on `*.ktx2|png|webp` (800 ms made it present on every run, and absent
+     on every run after the fix). That before/after pair is the evidence, not a lucky capture.
+
+  ⚠️ **In-page readback of a three WebGPU canvas returns transparent black.** `drawImage`,
+  `createImageBitmap` and `getImageData` all see `a=0, rgb>0` (the renderer clears with alpha 0 and
+  additive blending never raises it), so every 2D-canvas path unpremultiplies by zero, while the
+  compositor shows the RGB. `toDataURL()` returns a large PNG, which looks like proof of content and
+  is not. Use the compositor's frames (screencast or `Page.captureScreenshot`). And put every
+  timestamp on ONE clock (`Date.now()` in the probe; CDP frame `metadata.timestamp` is epoch
+  seconds) — mixing in `performance.now()` cost an hour of "was this before or after the fetch".
 
 #### More reference measurements
 
@@ -2986,7 +3034,9 @@ breaks. Three consequences that are easy to get wrong:
   tear down a healthy renderer in sympathy.
 - **A render-on-demand viewport must be re-marked dirty after a rebuild**, or it completes
   recovery and stays black until the user nudges the camera — indistinguishable from failure.
-  `SceneView`'s dirty gate is created at mount, so a rebuild inherits it already spent.
+  `SceneView`'s dirty gate is created at mount, so a rebuild inherits it already spent. The re-arm
+  lives at the END of SceneView's `install`, not after the rebuild's await: since #1052 a renderer
+  can be adopted LATE, after the bring-up bound, with no caller left to run a line after any await.
 
 **It is a re-UPLOAD, not a re-download.** Bring-up never calls `loadScene`; it rebuilds the three
 objects from the ECS world through the scene-scoped caches (the same path a world swap uses), so
@@ -3003,7 +3053,21 @@ geometries + 39 textures resident on it.
 one — the only way to kill the device is `device.destroy()`, and that reports
 `reason: 'destroyed'`, which the detection layer deliberately filters as orderly teardown. So a
 WebGPU device is best exercised by dispatching a synthetic `webglcontextlost` on the canvas, which
-drives the same rebuild path but is not a real loss.
+drives the same rebuild path but is not a real loss (the canvas listener is attached whatever the
+backend — `SceneView.tsx` and `Scene3D.tsx` pass `renderer.domElement` alongside the device).
+
+⚠️ **Do not try `device.destroy()` from `modoki_eval` as a "real" WebGPU loss** (#1052,
+2026-09-11). Destroying SceneView's device (reached via `GPUCanvasContext.getConfiguration()`)
+with `navigator.gpu.requestAdapter` patched to hang produced total silence and zero adapter calls:
+`makeViewportLossPolicy` filters `'destroyed'` in both `describe` and `onLost`, by design. Two
+remount levers tried in the same session also failed, each observed:
+`modoki_set_scene_view_mode` 3d↔ui does **not** remount SceneView's 3D viewport (the same canvas
+survived), but it **does** remount the Scene panel's `Canvas2DMount`s — which then failed Pixi init
+against the patched adapter, i.e. patching a global broke unrelated surfaces. Relaunch the editor
+after patching globals like `navigator.gpu`. When a few levers fail, stop escalating side effects
+in the live editor, report "attempted, could not trigger", and verify through the extracted
+module's fake-timer tests plus a wiring guard. (Why maximizing another tabset does not unmount a
+panel either: [editor.md](./editor.md), the tab-mounting section under #1015.)
 
 ⚠️ **Do not "simplify" the two detection paths into three's single `renderer.onDeviceLost(info)`
 hook without preserving the false-positive filters.** Unifying them is a real and worthwhile
@@ -3166,7 +3230,7 @@ caller's own `onLost`, exactly as before.
 | Surface | On loss | Why |
 |---|---|---|
 | `canvas2DPool` slots | rebuild in place | mid-scene 2D content must not go permanently blank |
-| `Scene3D` / `SceneView` (via `activeRenderer.ts`) | rebuild in place, bounded recovery budget | the GameView/SceneView must not stay blank mid-play |
+| `Scene3D` / `SceneView` (via `activeRenderer.ts`) | rebuild in place, bounded recovery budget; each rebuild's bring-up is bounded by `REBUILD_BRINGUP_TIMEOUT_MS` through `viewportBringUp.ts` (#820, #1052) | the GameView/SceneView must not stay blank mid-play |
 | `ShaderPreview`, `previewScene` (Mesh/Material previews), `ModelPreview`, `ParticleEditor` | log loudly, then run the panel's OWN existing teardown | these panels are cheap to reopen, and rebuild-in-place would land this decision inside `canvas2DPool.ts`, where #801 is a pending, separate design change to that machinery |
 
 The four previews share ONE policy, `editor/panels/previewLossPolicy.ts`'s
@@ -4053,6 +4117,46 @@ three's incrementing material id, which differs between two runs of the same bui
   presence rather than `enabled`. What remains is the F4 build itself, which is not waste: it is
   what keeps a normal material the renderer's first compile, and what absorbs the first-lit-build
   premium below.
+- ⭐ **…and its LIGHT/shadow mirrors were the other half of that waste — FIXED 2026-09-10 (#324a).**
+  #324b skipped the per-object walk because nothing downstream can cache-hit it; the light and
+  shadow-caster mirrors were left in, and they are wasted for exactly the same reason. Under a stack
+  F4's only remaining jobs are being a normal material compiled first (the TSL race) and absorbing
+  the one-time premium, and **neither needs the lights**. Measured on `demos/postfx-demo`, three
+  paired local runs: F4 build **19.5 ms → 8.8 ms** while the live compile held at **138.3 ms →
+  137.9 ms over an identical 106 builds**, same 36 draw calls, no `LightsNode` warning and no
+  `OutputType` error. Device A/B on the **A23**, both arms built from the same tree as debug APKs
+  and installed back-to-back, three cold boots each — the prewarm longtask:
+
+  | arm | runs | mean |
+  |---|---|---|
+  | lights mirrored | 310 / 283 / 273 ms | **288.7 ms** |
+  | mirror skipped | 208 / 185 / 186 ms | **193.0 ms** |
+
+  ⚠️ **A fourth idea was BUILT, measured and deliberately reverted — read this before rebuilding it.**
+  Paying the premium when the scene's ENVIRONMENT resource lands (~1.0-1.1 s) rather than at the
+  swap (~2.1 s), via a `SceneManager` hook fired per acquired resource. It **works**: on the A23 the
+  pre-swap stall left the top-6 longtasks entirely and a ~270 ms task appeared at ~1000-1120 ms
+  instead, during model streaming, and the ctx-0 build count proves the transfer (1 standard build
+  before — F4 paying ~8 ms; 2 after — prime 5.3 ms, then F4 **0.0 ms**). It was reverted anyway
+  (owner, 2026-09-10) because **relocation is not a saving**:
+  - `#334`'s `waitForScenePaint` holds the loading overlay up until the swapped scene's first
+    painted frame, so work moved from one side of that window to the other is invisible to the
+    player unless the window itself shrinks.
+  - Total longtask across the three arms went 1544 -> 1574 -> 1488 ms, and the MIDDLE arm is higher
+    than the control despite the light-mirror fix definitively removing ~96 ms. The metric is
+    noisier than the effect.
+
+  **What it would need to be worth landing is an end-to-end time-to-first-paint metric, not a better
+  implementation** — the mechanism is sound. Three traps it hit, all worth knowing: firing after the
+  whole acquire loop is NOT early (2156 ms on the A23, ~100 ms before the stall it targets); firing
+  per-resource puts it in front of its own registrar, because the renderer does not exist until
+  `Scene3D` mounts, and the hook then silently does nothing; and a new callback fan-out trips #888's
+  `notifyIsShared` ledger.
+
+  **−95.7 ms (−33%), with no overlap between the arms.** ⚠️ The mirror stays ON for the no-stack
+  path, where the placeholders ARE compiled in the render's own context and ARE cache-hit by the
+  first frame — an unconditional skip re-buys #238's first-frame stall on most projects, and the
+  control test in `prewarmShaders.test.ts` exists to catch exactly that.
 - ⚠️ **The FIRST lit node-graph build a renderer performs costs several times an identical later
   one, and nothing can move it off the boot.** Measured on `games/3d-test` with `nodeprobe.mjs`
   (2026-08-26): of the prewarm's 26 builds the first costs **24.4 ms** and the other 25 cost
@@ -4073,6 +4177,89 @@ three's incrementing material id, which differs between two runs of the same bui
     node builder reported `env none` for the stand-in). The premium belongs to the first material
     carrying the scene's REAL environment and shadow subgraphs, which do not exist before the
     assets load. It can be moved a few hundred ms earlier within the same boot, not off it.
+  - **A cheap SYNTHETIC environment primes — and costs ~9x what it saves (2026-09-10, #324a).**
+    The rejection above was cited for more than it proved: its own parenthesis says the node builder
+    reported `env none` for the stand-in, so it measured *"a build with no environment does not
+    prime"* — already known, and the whole reason F4 mirrors the real env. **Whether an early build
+    carrying a WORKING environment primes had never been tested.** It has now.
+
+    A 4×2 `DataTexture` → `getEnvPMREMTexture` → one lit `MeshStandardMaterial` compiled at
+    `createRenderer` time, `demos/postfx-demo`, URL-gated so both arms run from ONE dev server
+    (three paired runs, first run discarded as vite warm-up):
+
+    | | control | synthetic prime |
+    |---|---|---|
+    | F4 build (pre-swap, ctx 0) | 8.5 / 8.2 / 7.9 → **8.20 ms** | 5.5 / 5.4 / 5.6 → **5.50 ms** |
+    | all probe-visible builds | 172.1 ms | 163.3 ms |
+    | **the prime's own cost** | — | **51.8 ms + 27.7 ms = 79.5 ms** |
+
+    **It DOES prime** — F4 −33% with no overlap between arms, and the live compile's first build
+    drops too (10.8 → 8.9 ms). That is genuinely new: the premium is partly per-node-TYPE, not
+    purely per-texture. **And it is still dead**, for a reason nobody had written down: **making a
+    working environment is itself GPU work with its own shader compiles.** PMREM generation costs
+    ~52 ms on the first renderer to save ~9 ms of node-building — a **net ~70 ms LOSS**, before
+    considering that it runs on every renderer (two here, so 79.5 ms total).
+
+    ⚠️ **Do not re-propose "prime it earlier / cheaper" in any form.** The line is now closed from
+    both ends: a stand-in with no working environment primes NOTHING, and one with a working
+    environment costs more than the premium it absorbs. What remains is inside three.js, and it is
+    accepted rather than chased (the ⛔ CLOSED entry at the end of this bullet).
+
+    ⚠️ **Instrument note for whoever measures this next:** `nodeprobe.mjs` **cannot see a build that
+    happens inside `createRenderer`** — its `getForRender` hook is installed after that, and the
+    prime's own compile appears nowhere in the log. The intended falsifier ("does the probe report a
+    real `env` on the prime build, or `env none`?") is therefore NOT directly observable, and the
+    reading above rests on the indirect evidence: an `env none` build is recorded as priming nothing,
+    and this one measurably primes.
+  - **Skipping the F4 build's env/light mirrors under a post-FX stack does not help — the premium
+    transfers across render contexts.** The idea, and it is a tempting one: #324b measured the
+    pre-swap and post-swap compiles as sharing **zero** node-builder cache entries (different
+    `context.id`, sharp edge 3), so the expensive lit+env F4 build in `ctx 0` looks like something
+    `compileLiveScene` throws away and rebuilds in the stack's context — which would make its cost
+    buy only TSL-race protection, and a mirror-free placeholder would buy that for ~1 ms.
+    **Measured 2026-09-10 on `demos/postfx-demo` with `nodeprobe.mjs`, and it is wrong:**
+
+    ```
+    17.6ms compile obj#13  env=7052…  ctx=0@d-1(1000x700 s4 t1 mrtnone)   MeshStandardMaterial  ← F4, pre-swap
+     7.9ms compile obj#14  env=7052…  ctx=4@d-1(0x0 s4 t3 mrt7737)        MeshStandardMaterial  ← compileLiveScene, first
+     7.8ms compile obj#17  …ctx=4…      (and 20 more, all 4.5-7.9 ms)
+    ```
+
+    The FIRST build in the stack's `ctx 4` costs **7.9 ms, not 17.6 ms** — it does not re-pay the
+    premium. So zero cache overlap does **not** imply zero benefit: the premium is a
+    renderer-lifetime warm-up inside three's `NodeBuilder`, not a per-context cache effect, and the
+    F4 build absorbs it for the whole renderer. ⚠️ **Do not "optimise" the F4 placeholder by dropping
+    its scene-global mirrors** — that is the same experiment as the rejected hoist above (a
+    mirror-free build reports `env none` and primes nothing), and it would move the full premium
+    onto the first post-swap build instead of removing it.
+  - ⚠️ **And there is no hotspot inside the build to attack.** Re-measured 2026-09-10 on the A23
+    (`demos/postfx-demo`, cold boot, 500 µs sampling — 4x finer than the 2 ms default, which is as
+    fine as the CDP link survives; 200 µs and below closes the socket with `code=1006`): the
+    prewarm's longtask is **336 ms**, of which the top-20 self rows account for **54.2 ms (16.1%),
+    spread across 180 distinct functions**, the largest single entry being the garbage collector at
+    11 ms. For contrast, the HDR-decode longtask in the same boot is **100% of its self time in 9
+    functions**. That is the profile of graph traversal, not of a hot loop — so a fix has to remove
+    or move the build, because there is nothing inside it to make faster.
+  - ⛔ **CLOSED 2026-09-11 (#324), on the owner's call: the remaining ~193 ms (A23) is accepted, not
+    fixed.** Five sessions reopened this and each left it open, so the reason to stop is recorded here:
+    - **It already runs behind the loading screen.** `App.tsx` awaits `sceneManager.loadScene`
+      (which fires the before-swap hooks, and so the prewarm) *before* `waitForScenePaint`, and the
+      loading overlay is dismissed only after both. The player's cost is that much longer on the
+      loading screen of a low-end phone, not a frozen game. `LoadingOverlay`'s spinner is a CSS
+      `transform` keyframe animation, which normally runs on the compositor through a main-thread
+      block (not verified on the A23). Moving the build EARLIER inside that window was tried and
+      reverted (the early-environment prime above): same total, nothing the player can see.
+    - **A worker renderer (OffscreenCanvas) was considered and not pursued.** It does not shrink the
+      build — the same CPU work runs on another core, so at most part of ~193 ms comes back, and only
+      if other boot work runs alongside it. The build cannot be split out on its own: it reads the
+      live scene, lights and environment, so the whole Three.js layer would have to move into the
+      worker (`Scene3D`, the per-frame ECS→three sync, picking, video textures, the editor
+      viewports). A rewrite of that size for at most ~0.2 s on the lowest-end target is the wrong
+      trade. Mobile WebView support for a worker-hosted WebGPU/WebGL2 context was not checked.
+    - **Not reported upstream.** No three.js issue covers the premium (searched 2026-09-11).
+    - **Reopen only with a changed premise**: a player-visible symptom (the spinner freezing, or a
+      stall OUTSIDE the loading screen), a three.js change to `NodeBuilder`, or a worker-hosted
+      renderer wanted for its own reasons.
 - ⭐ **The post-FX STAGE quads now have a precompile — PARTIALLY (#323, 2026-08-26).**
   `PostFXStack.compileStagesAsync()` warms them; see § "Precompiling the stack's own stage quads"
   above for the mechanism, the two new three.js sharp edges it exists for, and what it still
@@ -4089,6 +4276,106 @@ TSL node builders have a racy lazy initialization on the **first** compile a ren
 **Related HMR caveat — editing a shader module forces a RELOAD, automatically.** TSL node (and `wgslFn`) instances get baked into compiled WGSL pipelines; hot-reloading a module creates new node identities that the old cached pipeline still references, raising the same `unresolved type 'OutputType'` error — or, worse, silently keeps rendering the PREVIOUSLY compiled graph so a correct fix looks like it did nothing. A full page reload is the correct (and cheap) price for a stable cache.
 
 The reload is now decided **by path on the dev server**: `isShaderGraphFile` (`engine/plugins/vite-asset-scanner.ts`) matches anything under `runtime/rendering/postfx/` or `runtime/rendering/npr/`, and `handleHotUpdate` sends `modoki:shader-code-changed` instead of letting Vite propagate an update. The renderer (`engine/app/debug/hmrStaleness.ts`) then reloads — via the same unsaved-scene countdown banner the game-code reload uses, so a shader edit can never silently discard scene work. ⚠️ **Do NOT re-add `import.meta.hot.invalidate()` to these modules** (they all used to carry it): `invalidate()` does not force a reload, it propagates to importers and stops at the first one that ACCEPTS — and the only importer is `Scene3D.tsx`, a React Fast Refresh boundary that self-accepts, so it was silently swallowed. Fast Refresh then re-ran the component but not its `[]`-deps effect, leaving the already-built `PostFXStack` (and its stale compiled graph) alive. That is exactly how one DOF `viewZ` fix was concluded "didn't work" three separate times. Since `engine/plugins/**` is not hot-reloadable, restart the editor once after changing the rule itself.
+
+## Gotcha: on three r185 an MRT pass is set up against the BLOOM pass's render target (why three is pinned)
+
+⚠️ **`MRTNode.setup()` (three) resolves its declared output names against
+`builder.renderer.getRenderTarget()` — whatever target is bound at BUILD time.** A name that does not
+match a texture on that target resolves to index `-1`.
+
+**On r185 that setup also runs while `UnrealBloomPass`'s internal blur targets are bound** — observed
+four times in one run, against `h0`, `h1`, `h3`, `h4` (⚠️ **`h2` did not appear**, and that is
+unexplained: either a build did not happen for that mip or the log was short). Each carries one
+texture named `UnrealBloomPass.hN`, so **every** declared output misses, `members` is empty, and
+`OutputStructNode` emits `struct OutputType {}` — *"structures must have at least one member"* →
+`Fragment module is invalid` → pipeline creation fails → **black screen**, plus `writeMask is invalid`.
+
+**r184 never runs the setup against those targets**, and that is the whole behavioural difference —
+the new `-1` guard alone does not explain it, because r184's `members[-1] = …` also leaves `length` at
+0 and would fail identically *if it ever ran there*. Tracked as #956; three is pinned at 0.184.0.
+
+⚠️ **The r185 hunk changes THREE things, not one** — quoting only the guard misleads:
+
+```diff
+-			members[ index ] = vec4( outputNodes[ name ] );
++			// Ignore if the output exists in the MRT but has never been used.
++			if ( index === - 1 ) continue;
++			const type = builder.getOutputType( index );
++			members[ index ] = outputNodes[ name ].convert( type );
+```
+
+The guard is **not gratuitous** — `getOutputType( index )` does `renderTarget.textures[ index ].type`
+and would throw on `-1`, so the guard is required by the line under it. And the member **type**
+changed from always-`vec4` to one derived from the target's format. Do not read "the guard is the
+difference" as "the guard is the bug".
+
+### ⚠️ When this can fire at all — NOT unconditionally
+
+`requiredMrtTargets` (`postfx/stackPlan.ts`) adds `normal` only for `npr || ao`, and `lineColor` only
+for `npr`; `PostFXStack.ts` calls `setMRT` **only when `targets.length > 1`**. So a project with
+neither NPR nor AO has a single `output` target, **no `MRTNode` is ever built, and this bug cannot
+fire**. AO-only gives two outputs and the same shape with two misses. A future session asking "can we
+lift the r185 ceiling for this project?" must check that gate first — the pin is not unconditional.
+
+### ⚠️ An unresolved question — do not treat the `[output]` row as settled
+
+The device log also carries one `rtTextures=[output] outputs=[output|normal|lineColor] membersLen=1`
+row, on **both** versions, which was written up as the benign "declared but unread" case (below).
+**That explanation may not hold.** `PostFXStack.ts` consumes `normal`/`lineColor` **eagerly in the
+constructor**, gated on the same condition that declares them — so for any pass whose MRT declares
+three, its own target should already hold three textures by build time and `membersLen` should be 3.
+A row showing one texture named `output` may therefore be a **fifth foreign-target build**, i.e. part
+of the bug rather than benign.
+
+**This is unresolved.** The log prints texture *names*, and two different targets whose single texture
+is named `output` are indistinguishable in it. **Next measurement: add `renderTarget.uuid` to the log
+line** (`tools-scratch/three-r185-mrt/instrumentation/`) — one field, one run, and it separates the
+two hypotheses. #1007 was closed as not-a-defect on the benign reading; if this resolves the other
+way, that closure needs revisiting.
+
+⚠️ **Also undisclosed so far, and material:** this engine runs its own precompile session that
+**stubs `renderer.render` and saves/restores `setMRT`/`setRenderTarget`**
+(`postfx/precompileSession.ts`). Any claim that the foreign-target binding is purely three's must
+account for that first — it is also a cheaper repro axis than the ones tried below.
+
+### The benign case — a `-1` on its own is NOT a bug
+
+The pass allocates exactly the outputs the graph **consumes**, so an unread `normal`/`lineColor`
+legitimately has no texture and skipping it is the documented intent. Measured on both versions,
+one variable at a time (`tools-scratch/three-r185-mrt/minimal-repro.html`, which prints
+`renderTarget.textures` directly):
+
+| consumed | `renderTarget.textures` |
+|---|---|
+| `output` | `[output]` |
+| `output` + `normal` | `[output\|normal]` |
+| `output` + `normal` + `lineColor` | `[output\|normal\|lineColor]` |
+
+What makes a `-1` real is a miss for a name a LIVE stage is reading — the bloom-target case above,
+and possibly the `[output]` row per the open question.
+
+**Two things a future session should not re-derive** (both tested and disproved during #956):
+- It is **not** r185's reuse of a module-level `_renderPipelineDescriptor` with a `reset()` after
+  `createRenderPipelineAsync()`. WebKit snapshots the descriptor synchronously; verified with a
+  standalone WebGPU page, no three.js involved.
+- It is **not** the F4 prewarm ordering. Building r185 with the F4 placeholder disabled changes
+  nothing.
+
+**Measuring it is cheap — do not reach for a device build.** It reproduces from a plain
+`--target web` build served over LAN and opened in **iPad Safari**, and intermittently (~1 in 20
+loads) in **macOS Safari**. ⚠️ Three traps: Safari caches `index.html` across builds, so serve with
+`Cache-Control: no-store` or you will silently compare the wrong bundle; the failure is
+**self-healing** in Safari — `frameDriver`'s watchdog re-arms the rAF chain and the app paints a few
+seconds later, so a screenshot taken late reads as a pass (the packaged app does not recover, because
+the readiness ceiling reveals the game first); and a `fetch`-based console collector **drops lines**
+under rapid logging, so read the page's own log for anything high-volume.
+
+⚠️ **Reproducing the bloom-target case MINIMALLY is unsolved.** A standalone page with the same MRT
+shape plus `bloom()` does not produce it, with or without effect-graph churn, mid-sequence material
+creation, `BloomNode.setResolutionScale(2)` (note: that is bloom's own internal scale, **new in
+r185** — not the engine's NPR `superSampleScale`, which scales the scene pass), a `setLayers` split,
+or a GTAO stage. So far it needs the full app. That gap, and the un-identified r185 change behind it,
+are what stand between us and an upstream report — `tools-scratch/three-r185-mrt/`.
 
 ## Bloom Post-Process
 
@@ -4147,11 +4434,38 @@ stage bar FXAA, working on the WebGL2 backend too (see the stack's gate above).
 
 ## Ambient Occlusion (GTAO)
 
-`AmbientOcclusionPostFX` `{enabled, radius, intensity}`, off by default, WebGL2 backend included
-(see the stack's gate above). Uses
+`AmbientOcclusionPostFX` `{enabled, radius, intensity, resolutionScale, samples}`, off by default,
+WebGL2 backend included (see the stack's gate above). Uses
 `ao(depthNode, normalNode, camera)` from `three/examples/jsm/tsl/display/GTAONode.js`, which
 returns a `GTAONode`; its output texture's `.r` (raw 0..1 occlusion) is lerped toward `1` by
 `intensity` (GTAO has no strength knob of its own) and multiplied into the incoming color.
+
+⚠️ **Cost is AUTHORED, not tiered — `resolutionScale` and `samples` are the knobs (#962).** GTAO at
+three's defaults renders at **full drawing-buffer resolution with 16 samples and no denoise**, and
+that made `demos/postfx-demo` slow on a Galaxy S22 (Adreno 730) on both three 0.184 and 0.185 — a
+cost, not a leak. A quality tier cannot help there: tiers can only switch AO on or off, a project
+cannot author a `high` tier, and the S22 resolves to `high`; calibration demotes on main-thread CPU
+only, so GPU-side AO cost never demotes it either. So the cost lives on the trait, where the owner
+tunes it in the Inspector: `resolutionScale` (1 = full res; three documents 0.5 as enough for most
+scenes, a quarter of the pixels) and `samples` (below 30 three searches 3 directions, from 30 it
+searches 5). Both apply live — `samples` is a uniform and GTAONode re-reads `resolutionScale` in
+its per-frame `setSize` — and both are clamped by `stackPlan.ts`'s `aoPassSettings`, because a scene
+file can hold what the Inspector would refuse. Defaults equal three's, so a project that never sets
+them renders exactly as before.
+
+**Measured 2026-09-11, Galaxy S22 (Adreno 730, WebGPU, 720×1410 buffer), `demos/postfx-demo` with AO
+the ONLY effect, tour frozen at timeScale 0, input driven, GPU timestamps on — A/B/A in one run:**
+
+| `resolutionScale` | fps | GPU frame median | GTAO pass median |
+|---|---|---|---|
+| 1 (three's default) | 28.2 | 35.9 ms | 31.1 ms |
+| 0.5 | 59.9 (vsync-bound) | 14.5 ms | 9.6 ms |
+| 1 again (control) | 28.2 | 35.8 ms | 31.0 ms |
+
+The pass is ~85% of the GPU frame at full resolution; halving the resolution takes the S22 from 28 fps
+to its 60 fps cap. The same perturbation in the desktop editor (1600×909) moved the GPU frame 8.2 →
+3.9 ms, and `samples` 16 → 4 at full resolution moved it 8.2 → ~4.0 ms — so both knobs reach
+GTAONode live. Not measured: the look at 0.5 on a phone, which is the owner's call.
 
 ⚠️ **Always passes a REAL normal buffer — the "nullable normalNode" cheap path is broken here.**
 `ao()`'s `normalNode` argument is documented as nullable (GTAO reconstructs normals from depth
@@ -4215,9 +4529,12 @@ effectiveRefW = clamp(referenceHeight x hostAspect, referenceWidth, maxReference
   nothing moves.
 - Past the cap the content letterboxes exactly as before. **That ceiling is load-bearing, not
   cosmetic**: an iPad in LANDSCAPE would otherwise follow the aspect to ~2746 design px. Apple
-  requires an iPad-capable bundle to declare all four orientations (`healNativeConfig.ts`), and
-  Android 16 ignores `android:screenOrientation` on displays >= 600dp, so a wide host is reachable on
-  both platforms in a shipping build.
+  requires an iPad-capable bundle to declare all four orientations (`healNativeConfig.ts`), so a wide
+  host is reachable on iPad in a shipping build. ⚠️ **Not on an Android tablet — this line said so
+  until #782, and it was wrong.** Android 16+ ignores `android:screenOrientation` on displays >= 600dp
+  for apps targeting API 36, but EXEMPTS games (`android:appCategory`), at API 37 as well, and
+  `healAndroidGameMode` declares every Modoki project a game. Read from Google's behavior-change pages
+  and the manifests, not observed on an Android 16 tablet.
 
 ⚠️ **The mode is NOT the lever — do not reach for `fitH` instead.** Every mode in
 `computeCanvasScale` centres on both axes, so with `referenceWidth` pinned, `fitH` pillarboxes
@@ -4226,6 +4543,68 @@ exactly as `contain` does. Only the reference WIDTH changes the answer.
 ⚠️ **`CanvasScale` carries the EFFECTIVE box back as `refW`/`refH`.** A consumer that needs the box's
 own size — `contentRect = refW * scaleX`, a design-space centre at `refW / 2` — must read those,
 not its own input, or it describes a box that is not the one on screen.
+
+### `maxReferenceHeight` — the vertical twin (#1087)
+
+The same feature on the other axis: a host TALLER than the design aspect letterboxes, and on a
+1080x1920 box that is every recent phone — about 32pt a side on an iPhone 16 Pro. Set
+`maxReferenceHeight` and the box grows toward the host aspect instead, turning the strip into
+addressable design space.
+
+```
+effectiveRefH = clamp(referenceWidth / hostAspect, referenceHeight, maxReferenceHeight)
+```
+
+⚠️ **At most ONE axis ever adapts, and it falls out of the clamps — there is no tie-break to get
+wrong.** A host is either wider than the design aspect or taller than it, never both. On a wide host
+`referenceWidth / hostAspect <= referenceHeight`, so the height clamps back to its authored value;
+on a tall host `referenceHeight x hostAspect <= referenceWidth`, so the width clamps back. That is
+why `effectiveRefW` is derived from the RAW `referenceHeight` and `effectiveRefH` from the RAW
+`referenceWidth`: deriving either from the other's effective value would be mutually recursive, and
+whichever axis did not grow still equals its raw value, so each formula's raw input already IS the
+effective one.
+
+⚠️ **Under `contain` this does not change `scale` at all — and that is what makes this axis safe
+where the width half was not.** Widening the box LOWERS `scale`, which is how #774 produced #806: a
+`vmin`-anchored control does not move with `scale`, so host-space chrome drifted against design-space
+content until an owner bug report caught it, and #815 closed it with `ratio = vmin / (1080 x scale)`.
+Growing the HEIGHT to `referenceWidth / hostAspect` makes `actualH / effectiveRefH` equal
+`actualW / referenceWidth`, so the `contain` min is taken between two equal terms and lands exactly
+where it does today; past the cap the width term wins and it is unchanged again. So that ratio stays
+exactly 1.000 on every 9:16-or-taller phone and chrome cannot drift.
+`engine/packages/modoki/tests/runtime/canvas2DAdaptiveHeight.test.ts` asserts this directly on four
+phone shapes, paired with an assertion that the box really grew so the claim cannot pass vacuously.
+
+⚠️ **`fitH` is the exception**: it matches the host height by definition, so there the scale DOES
+move with the effective height. The "scale is unchanged" property is about `contain`/`cover`, not
+about every mode.
+
+⚠️ **The cap is load-bearing here too.** Uncapped, a very tall window — a narrow desktop browser, a
+split-screen tablet, the editor's free-size Game panel — would stretch the box without bound.
+`games/wordweave` authors `2560`, which covers every shipping phone with headroom (the tallest,
+a Galaxy A23 at 412x915, needs 2399; a 21:9 handset needs 2520) and letterboxes beyond.
+
+⚠️ **Every design<->host mapping site must take the new argument.** #806 exists because one such site
+was left behind when the width adapted. In `games/wordweave/runtime/systems.ts` that is eight call
+sites plus `geometrySignature` — a value measured against the live host, so it changes on a rotation
+or a device-preset switch with nothing in the config moving, and omitting it from the signature would
+compute the right height every frame and apply it never.
+
+⚠️ **`games/court` passes NEITHER cap to the scaler, and that is a trap waiting on one edit.**
+Court's three `computeCanvasScale` calls (`games/court/runtime/systems.ts`, in `layoutBoard` and
+the two chrome syncs) omit the `maxRefW`/`maxRefH` arguments entirely, so they always compute the
+UNADAPTED box. That is harmless only because Court's scene authors neither cap —
+`games/wordweave/.../main.scene.json` is the only author of either in the repo. The day Court
+authors one, its own layout math silently disagrees with what `Scene2D` renders, and the symptom is
+a board offset against its own chrome with nothing erroring. Fix the three call sites in the same
+change that authors the cap, not afterwards.
+
+⚠️ **And the design box's EXTENT is not `referenceHeight` any more.** Anything that measures a
+distance to the box's bottom edge must read `CanvasScale.refH`. wordweave's ad-banner reserve did
+not, and the letter board rendered under an opaque banner on every tall phone — the reserve came out
+short by exactly half the reclaim. Related: because `contain` CENTRES the box, growing it by `extra`
+adds `extra/2` above the old top edge and `extra/2` below, so a game with bottom-anchored host chrome
+can only address the top half.
 
 ⚠️ **Adaptation is opt-in because a game may DEPEND on the pillarbox.** `games/court` authors
 `contain` and clamps `ChromeRoot`, `NarrationBand` and `BoardPage` to `maxWidth: 56.25vh`
@@ -4246,6 +4625,19 @@ Why it is a rule and not a preference: a divergent re-derivation WAS the coordin
 - **Primitive keyword** — `square` / `triangle` / `circle` (empty ⇒ circle) → a PixiJS `Graphics` tinted by `Renderable2D.color`, vertices from `computeShapeGeometry` (`render2DUtils.ts`).
 - **Image ref** (GUID / path / URL) → a PixiJS `Sprite`; textures load async through the GLOBAL `Assets` cache (KTX2 decoded for the 2D path — see [Materials & Textures](./textures.md)) and are preloaded before a scene swap so there's no pop-in. A sliced sprite / atlas frame gets a per-slot framed Texture WRAPPER (sub-rect of the shared source); a sprite-sheet frame swap that keeps the same base texture swaps the sub-rect IN PLACE (no texture-unload churn).
 - **`collider`** sentinel → draws the entity's OWN `Collider2D` shape as a filled (open polyline: stroked) body — for polygon/polyline/concave colliders that have no primitive form.
+
+⚠️ **An image sprite on an entity that is despawned and respawned every frame never renders.** Each
+respawn builds a new Pixi sprite, and an uncached texture's async load is always beaten by the next
+despawn — permanently blank, while the entity reads back with correct sprite/position/visibility.
+**The tell:** swap the sprite for `'square'`; primitives draw synchronously, so if the square
+appears it is this bug, not position/Z/parent/opacity. **The fix is a persistent entity that is
+MOVED each frame.** Adding the texture to the scene `resources` manifest is the tempting wrong fix:
+it starts the load earlier without making it win, so the art renders only when the HTTP cache is
+warm and reads as fixed once, then regresses (Court's tutorial hand, 2026-08-04, took two owner
+reports because the first fix was that one). Two traps from the same hunt: entity ids are
+**recycled**, so a stale root id can despawn an innocent bystander (passes alone, fails in suite);
+and `Time.delta` keeps the last step's value, so ticking a system in a test to "force a sync" also
+ages its animation by a frame.
 
 Shared placement knobs: `width`/`height` (half-extents), `pivotX`/`pivotY` (0 = edge, 0.5 = center), `keepAspect` (uniform sprite scale = `min(scaleX, scaleY)`), `flipX`/`flipY` (render-only mirror about the pivot — a sign flip on scale that never touches the transform, mirrors no children, and is invisible to the physics collider), `opacity` (alpha), and `isVisible` (per-renderer hide, ANDed with the entity's `isActive`).
 
@@ -4303,7 +4695,7 @@ The pass is a `Scene2DRenderer` CLASS (not a singleton): a Pixi display object a
 
 #### Sprite textures: why the unload is DEFERRED, and the sourceless-entry trap
 
-⚠️ **A refcount reaching 0 does NOT mean a texture is finished with — it means nothing holds it AT THIS INSTANT.** A renderer that rebuilds a subtree by despawning and respawning it (Court's board overlay does this on every interaction) legitimately drops a url to 0 and back to 1 inside ONE synchronous frame. `releaseSpriteTexture` therefore defers its `Assets.unload` by a macrotask and `retainSpriteTexture` CANCELS a pending one; `unloadAllSpriteTextures` flushes any still armed, so none can fire against the next scene (the F3 "no texture accounting survives a scene" invariant stays exact).
+⚠️ **A refcount reaching 0 does NOT mean a texture is finished with — it means nothing holds it AT THIS INSTANT.** A renderer that rebuilds a subtree by despawning and respawning it (Court's board overlay does this on every interaction) legitimately drops a url to 0 and back to 1 inside ONE synchronous frame. `releaseSpriteTexture` therefore defers its `Assets.unload` by a macrotask and `retainSpriteTexture` CANCELS a pending one; `unloadAllSpriteTextures` flushes any still armed, so none can fire against the next scene (the F3 "no texture accounting survives a scene" invariant stays exact). ⚠️ **The deferral covers a rebuild inside ONE task only.** A rebuild that awaits in between — Court's level load despawns the board, awaits the next level's fetch, then respawns the same art — outlives it, which is why a release made during Play parks instead (#1053, § "Sprite textures are SCENE-scoped" below).
 
 **The trap this closes**: `Assets.unload` destroys the texture's `source` EAGERLY but removes the cache entry ASYNCHRONOUSLY, so there is a window where the entry is **present and unusable**. `Assets.cache.has(url)` says yes, `Assets.get(url)` hands back a corpse, and every consumer reads it as live — a Sprite binds it and draws **nothing, forever** (no load is ever kicked, because `has()` stays true), a Mesh binds it, and the font atlas path does `tex.source.scaleMode = 'linear'` and throws. Measured on a live renderer 2026-08-10: `{inCache: true, hasSource: false}` while a healthy sibling texture in the same overlay rendered fine.
 
@@ -4321,7 +4713,11 @@ Found via Court's memo pen marks, which rendered nothing while being perfectly c
 ### Dirty gating
 
 `renderFrame` used to re-tessellate + GPU-render every Canvas2D every frame; a two-tier gate fixes that:
-1. **Idle whole-frame skip** — while the sim is stopped / paused, 2D only changes via paths that set `_externalDirty` (editor edits, async texture loads, canvas resizes, world swaps, play-state changes), so idle + clean ⇒ no ECS scan, no render.
+1. **Idle whole-frame skip** — while the sim is stopped / paused, 2D only changes via paths that set `_externalDirty` (editor edits, async texture loads, canvas resizes, world swaps, play-state changes), so idle + clean ⇒ no ECS scan, no render. One more signal is read BEFORE the skip rather than setting the flag: `hasAny2DMaterialDirty()`, the material driver's "a uniform changed this frame" mark, whose per-entity read otherwise sits inside the scan the skip returns before.
+
+   ⚠️ **Anything a stopped 2D renderer reads that is NOT an ECS trait write must wake it itself — and the wake belongs in the WRITER, not the call site** (#1141). Found live, five times in one pass, each looking like "the edit did nothing" until an unrelated trait write redrew it: a Skin-editor weight paint (the rig cache), a particle def edit (the particle cache), a SceneView 2D gizmo / group / collider-point drag and its undo (direct `entity.set`, which bypasses `writeTraitField`'s broadcast), and a material uniform the driver re-wrote after a Shader rebuild. The rule the fixes follow: a cache's ONE store function calls `fireDirtyListeners()` (`rig2dCache`'s `storeRig`, `particleCache`'s `storeEffect`, as `registerAsset` already did), so every writer — editor panel, undo closure, agent op, a load that resolves while stopped — is covered at once; a direct `entity.set` fires it after the write, as the 3D gizmo drag always did. `mark2DDirty` is NOT a substitute: it reaches only the SceneView's chrome overlay. Not every cache needs it — `spriteAnimCache`, `animationClipCache` and `timelineCache` feed systems that do not run while stopped, and the editor's previews wake the loop on their own.
+
+   ⚠️ **A wake that is now honoured turns a harmless per-frame "change" into a per-frame render.** Two surfaced in the same review: a `time` source with `wrap: 0` yields NaN, and `NaN !== NaN` marked its entity dirty every frame (the driver now never writes a non-finite value); and a rig whose sprite never resolves rebuilt its skin buffer every frame (the retry now waits for the unresolved count to drop). Before adding a wake, ask what else already writes that signal every frame.
 2. **Per-entity change detection** — a `RenderSnap` / `MeshSnap` / `TextSnap` per entity captures the exact inputs that determine its output; only Canvas2D hosts with a CHANGED entity are GPU-rendered (`dirtyCanvases` → `pool.renderAll(dirtyIds)`). `preserveDrawingBuffer: true` keeps a skipped canvas's last frame on screen across a browser recomposite (scroll, ancestor transform, tab refocus) — but that is belt-and-braces, NOT the property the skip rests on: retention was measured to hold on WebGPU too, which has no such flag. Reading this line as a WebGL-only guarantee is exactly what produced #455's falsified first diagnosis.
 
 ⚠️ **A snapshot that trips is NOT the same as work that must be redone, and conflating the two is its
@@ -4369,7 +4765,205 @@ A slot has TWO independent claims and is reclaimable only when BOTH drop:
 
 ⚠️ **`mounted` does NOT mean "the canvas is in the DOM", and conflating the two cost #213 five fixes.** `Canvas2DMount` takes the claim synchronously in its effect but appends the canvas only once `slot.ready` resolves — i.e. after an async `Application.init()`. Inside that gap the slot is fully claimed and `canvas.parentElement` is `null`. **Any teardown that asks the DOM "is anyone using this slot?" gets the wrong answer there.** Ask the CLAIM. See the incident below.
 
-Reclaiming only when both clear stops mount/unmount churn from leaking slots AND stops slot reuse from destroying the WebGL context behind a still-visible canvas; `entityId === null` is the canonical "unclaimed" marker. The pool DETACHES children on reclaim but never destroys them — Scene2D owns display-object destruction + texture-refcount release (destroying in both places would double-free). `renderAll` swallows a transient teardown-race throw (a canvas losing its context mid-swap) silently and only warns after 30 consecutive stuck frames.
+Reclaiming only when both clear stops mount/unmount churn from leaking slots AND stops slot reuse from destroying the WebGL context behind a still-visible canvas; `entityId === null` is the canonical "unclaimed" marker. The pool DETACHES children on reclaim but never destroys them — Scene2D owns display-object destruction + texture-refcount release (destroying in both places would double-free). `renderAll` swallows a transient teardown-race throw (a canvas losing its context mid-swap) silently, warns after 30 consecutive stuck frames, and — since #1000 — asks `slot.recovery` for a rebuild at that point.
+
+#### ⚠️ `app.destroy(true)` sweeps pools that belong to the whole PROCESS (#1000)
+
+**The rule: never call `app.destroy(true)`. Tear a Pixi `Application` down through
+`destroyPixiApplication` (`runtime/rendering/pixiGlobalResources.ts`).** Guarded by
+`engine/tests/architecture/pixiApplicationTeardown.test.ts` — the third property over the same
+construction census as `glContextRelease.test.ts` and `rendererLossHandling.test.ts`.
+
+⚠️ Cited by SYMBOL, not by line (#966): a dependency's line numbers move on every bump and nothing
+watches them.
+
+`AbstractRenderer.destroy` tests `options === true || (typeof options === 'object' &&
+options.releaseGlobalResources)`, so the **boolean form always** trips
+`GlobalResourceRegistry.release()`, which calls `clear()` on five registered pools —
+`TexturePool`, `CanvasPool`, `BigPool`, the `canvasCache` map, and an anonymous pooled-`Batch`
+registrant in `rendering/batcher/shared/Batcher`. `TexturePool` is a module-level singleton keyed by
+packed dimensions alone, **with no renderer identity in it at all**. So one surface's slot teardown
+reaches into a pool every other live surface draws from, and the surface that WARNS
+(`BindGroup.onResourceChange` — "a 'textureSource' was destroyed while still bound to a shader") is
+not the one that did it. That is why every report of this pointed at the wrong viewport.
+
+Three live Applications make it reachable: GameView's pool, SceneView's own `Canvas2DPool`, and the
+ShaderPreview panel. `GlobalResourceRegistry.release()` has exactly ONE caller in the installed lib
+(`AbstractRenderer.destroy`), so this sweep is never Pixi's own housekeeping — only ever a renderer
+we destroyed with `true`.
+
+⚠️ **The BindGroup warning has (at least) TWO producers, and this fix addresses only one of them.**
+Measured 2026-09-09 on `games/3d-test`, scene `2D Animation` → `empty`, dev editor, WebGPU: the swap
+emits `[BindGroup] a 'textureSource' … destroyed while still bound` + the matching `'textureSampler'`
+— **identically with and without this fix** (a control run with the boolean form restored produced
+the same two lines). Attribution is clean rather than inferred: with the fix, `livePixiApplications`
+goes 4 → 2 and never reaches 0, so **no global sweep ran at all**, and the warnings appeared anyway.
+On that path they come from the *other* producer — `Scene2D`'s `deferUnload` → `Assets.unload(url)`
+destroying a sprite `TextureSource` whose refcount hit zero, while the renderer's cached `BindGroup`
+still references it. Nothing invalidates that bind group first. `Assets` is not a registry
+registrant, so this fix cannot touch it, and it remains **open on #1000**.
+
+So: the pool sweep is real (the owner's own stack names `TexturePoolClass.clear` explicitly) and is
+fixed here, but it is **not** what a routine scene swap trips, and anyone verifying this fix by
+counting console warnings will measure the wrong thing.
+
+**Scoped honestly:** `clear()` destroys the pool's FREE LIST, not every render texture in the
+process — a checked-out texture has been popped off it. The crash is still explained (a *returned*
+texture can sit in a cached `BindGroup` while another surface's teardown destroys it), but the sweep
+is narrower than "everything". `Assets` is **not** a registrant, so decoded sprite textures survive
+it — which is why `Scene2D`'s `spriteTextureRefs` never protected against this and a session looking
+there finds a correctly-guarded cache and no defect.
+
+**Releasing the pools is still correct, exactly once — when the LAST live Pixi `Application` goes
+away.** That is the same rule `Scene2D.tsx` already applies to the shared `Assets` cache via
+`liveRenderers`, applied to the pools Scene2D does not own. Two things the implementation gets wrong
+if copied naively, both caught in review rather than by a test:
+- **The count must be Pixi-Application-specific.** `liveGpuContextCount()` includes the Three.js
+  renderer and the boot GL probes, so it never reaches zero in a real editor session and the release
+  would be disarmed entirely. `livePixiApplications` is reported beside it in the GPU memory report,
+  because the failure mode of this fix is a count that DRIFTS.
+- **A REBUILD is not a terminal teardown** — pass `mayReleaseGlobals: false`. `rebuildSlotApp`
+  replaces the Application immediately and keeps the whole `slot.container` subtree alive across the
+  swap, so "nothing else is bound" is false however the count reads — and on the shipped-game shape
+  (one Canvas2D surface, one Application) the count *does* read zero there, which is exactly when a
+  context-loss rebuild happens on device.
+
+⚠️ **The dangerous direction is the count reading LOW, and it has one door:** an Application
+destroyed before it was ever registered must pass `null` for its deregister, or it spends a *live*
+surface's registration. That is `initSlotApp`'s orphan bail-out, where a rebuild superseded an
+in-flight init. The `null` there looks like an oversight and is not; it survived every test until a
+review found it, and is now pinned by `canvas2DContextLoss.test.ts`.
+
+#### Detection without recovery — the stuck-canvas half of #1000
+
+`slot.recovery` (`rendererRecovery.ts`) is a complete single-flight, bounded-backoff rebuild
+scheduler, and until #1000 the only things that could reach it were the three context-loss
+**listeners** (`webglcontextlost`, `webglcontextrestored`, WebGPU `device.lost`). `renderAll`
+DETECTED a wedged renderer — 30 consecutive throwing frames — and only `console.warn`ed, DEV-gated
+and once per POOL (`_stuckRenderWarned` is an instance field, and two pools are live in the editor —
+an earlier revision of this line said "per process"). So a canvas wedged by anything that is not a loss EVENT retried the same dead
+renderer forever, and in a production build produced no signal at all.
+
+The request is **not** DEV-gated, and it fires behind a per-slot **latch**, cleared by a successful
+render. The latch is load-bearing: `RendererRecovery.request()` sets `failures = 0` on every call, so
+asking once per stuck frame would reset the bounded-attempt budget forever and chain rebuilds end to
+end. ⚠️ **Residual:** one request per episode means a rebuild that *completes but does not cure* the
+wedge is the end of the road — nothing tries again and nothing reports. A rebuild that FAILS still
+reports through `onError`.
+
+#### Sprite textures are SCENE-scoped, so a play/stop swap must not free them (#1000)
+
+**The rule: a sprite texture whose refcount reaches 0 *during a world-swap teardown*, or *from a scene
+slot while the run mode is `playing`* (paused included — #1053), is PARKED, not destroyed. It is freed
+when the SCENE changes, on a texture invalidation, or when the last 2D renderer stops.** A release made
+with Play STOPPED — authoring: an entity deleted, a `Renderable2D.sprite` repointed — and an editor
+panel dropping its hold still free immediately; retaining those would pin every sprite an editing
+session ever touched. The run-mode check lives in `releaseSpriteTexture`, not `deferUnload`, for
+exactly that panel reason.
+
+This brings sprite textures in line with the rule
+[docs/scene-loading.md](scene-loading.md) already states for every other GPU resource — *the scene is
+the unit of memory management*. They were the one exception, which is why they alone churned.
+
+⚠️ **The editor bound is ≤2 scenes' sprite working set, not 1.** The textures released BY a scene
+change are parked under the INCOMING scene's label, so they live until the next change. That overshoot
+exists only where 2+ renderers are live (i.e. the editor, where retention is wanted); a shipped game
+has one renderer, so `unloadAllSpriteTextures` runs on its every scene swap and the bound is exact.
+
+⚠️ **A texture invalidation purges the parked set**, or a re-imported sprite would keep being served
+from it. That listener is **parked-set-only** — a texture a LIVE sprite still holds has a non-zero
+`spriteTextureRefs`, so the `deferUnload` guard keeps it out of the parked set by construction.
+
+⚠️ **The live-sprite half is closed by the URL, not by that listener** (#1022). This passage used to
+say `withCacheBust` was "a no-op in dev, so the cache key does not change on re-import", and that
+nothing Pixi-side listened at all. Both were wrong by the time they were read: the listener above
+already existed, and the dev gate has since been removed — the bust now applies whenever a hash is
+known, so a re-import moves the resolved url and a live sprite's slot rebuilds against a key the Pixi
+`Assets` cache has never seen. See [docs/textures.md](textures.md) § "The dev URL carries the content
+hash".
+
+**What it fixes, measured** (dev editor, WebGPU, pixi 8.20.1, 2026-09-10). Every play/stop cycle
+destroyed each runtime-spawned sprite's `TextureSource` and re-created it on the next play:
+
+| project | before | after |
+|---|---|---|
+| `games/court` | 3 destroys, 12 `[BindGroup]` warnings | **0, 0** |
+| `games/wordweave` | 2 destroys, 4 warnings (`cell-washi.ktx2` — a UASTC **transcode**) | **0, 0** |
+
+Proof it was a re-create and not a one-way free: Pixi `uid`s across two cycles — `king.png` 5 → 11,
+`count-banner.png` 7 → 12, `cell-washi.ktx2` 13 → 16. A new uid is a new `TextureSource`.
+
+**A rebuild DURING Play churned the same way, with no world swap anywhere (#1053).** `court_load_level`
+despawns the board, AWAITS the next level's fetch, then respawns the same art. The one-macrotask
+deferral only protects a rebuild inside ONE task, so it expired inside the fetch, and the swap-only
+park never saw a release that happened outside a swap. Measured in the dev editor on `games/court`
+(WebGPU, ONE 2D renderer — the Scene panel was not mounted — with a counter on
+`_TextureSource.prototype.destroy` installed the way § "The technique that actually settled it"
+describes, over three settled loads Hard 4 → Easy 6 → Hard 4):
+
+| same editor, same probe | `TextureSource` destroys | `[BindGroup]` warn lines |
+|---|---|---|
+| the retention line disabled (a revert run) | 20 — all ten board/tray textures (`king.png` … `count-banner.png`, `tray-badge-frame.png`) | 46 (12 / 20 / 14 per load) |
+| with #1053 | **0** | **0** |
+
+The owner chose engine-wide retention during Play over reordering Court's load, so any game that
+despawns, awaits and respawns is covered, not just Court. The check is `getRunMode() === 'playing'`,
+not `isSimRunning()`, because a PAUSED Play is still a play session.
+
+⚠️ **The bound is WIDER than #1000's, and that is the accepted cost.** #1000 parks one swap's
+working set. #1053 parks EVERY url a scene slot releases during Play, for as long as that scene stays
+current. So a single-scene game that cycles through distinct textures (per-level art, unique `blob:`
+or `data:` urls) keeps all of them loaded until the scene changes, an invalidation purges the set, or
+the last renderer stops. A re-import during Play can park the OLD `?v=<hash>` url, which will never be
+requested again. Whether it lingers depends on which of two independent events lands first. If the
+texture invalidation (which purges the parked set) comes before the manifest update that moves the
+renderer to the new url, the old url is released after the purge, parked, and stays until the next
+such event. In the reverse order the purge frees it. This session did not establish which order a
+real re-import takes.
+
+⚠️ **The `[BindGroup] … destroyed while still bound` warning is the SYMPTOM, not the defect.** It is
+emitted by Pixi's process-global batch bind-group cache (`getTextureBatchBindGroup`'s `cachedGroups`),
+which is never evicted and exposes **no public API to evict** — so it cannot be silenced directly, and
+an attempt to do so is wasted effort. ⚠️ **It fires for a CORRECT destroy too** (#1053):
+`BindGroup.onResourceChange` warns for any destroyed resource a cached group still references, and
+that cache holds every source that was ever in a drawn batch — so on WebGPU even a genuine free of a
+long-off-screen texture warns. (The WebGL batch adaptor binds textures directly, so plain sprite
+batches cannot warn there.) This line used to say the warning "goes quiet only when nothing is wrongly
+destroyed"; it goes quiet only when nothing is destroyed. Warning
+count scales with LIVE RENDERERS, not textures (~2 per renderer per destroyed source), which is why
+Court showed 12 for 3 textures and wordweave 4 for 2.
+
+##### Four things that cost three failed fixes here — do not re-derive them
+
+1. **A longer deferral cannot work.** `deferUnload` already defers a macrotask and cancels on
+   re-retain, but after `stop` the reverted world genuinely does not hold a runtime-spawned board's
+   textures, so nothing re-retains and any timeout expires. The gap is *"a human decides to press
+   Play"* — unbounded. Only retention closes it. A fix judged by "the warnings dropped on a fast
+   double-click" is measuring the timer, not the mechanism.
+2. **`liveRenderers` is a property of the SESSION, not the game.** It counts `Scene2DRenderer`
+   instances, so it is 1 when the **SceneView panel is closed** and 2 when it is open. Court
+   reproduced and wordweave did not *on the same build* purely because of that, and a plausible
+   "runtime-spawned vs authored board" story was invented to explain the difference. Check
+   `get_editor_state.surfaces` for `scene-view` before attributing a 2D difference to a project.
+3. **`sceneManager.getCurrentBaseScene()` is `undefined` in an ordinary project** — it names a scene
+   CHAIN's base. A guard written as `base === undefined || base !== last` is therefore **always
+   true**, which is how a guard added to fix this bug silently gated nothing through three
+   iterations. Use `getCurrent()?.path`. Absent is not "different".
+4. **`play` does not fire a world swap — only `stop` does.** One swap per play+stop pair, which is
+   why every destroy lands on the stop side. Measured with an app-side `onWorldSwap` listener.
+
+##### The technique that actually settled it
+
+Source reading produced three wrong diagnoses in a row. What worked was patching
+`_TextureSource.prototype.destroy` and `console.warn` **through the app's own module instance** —
+reached by walking the prototype chain from a live sprite off `window.__2d.getApp(i).stage` — and
+registering an `onWorldSwap` listener from
+`window.__MODOKI_SHARED__.modules['@modoki/engine/runtime']`, giving an ordered timeline of swap
+vs destroy. ⚠️ **Do not reach for a `/@fs` import here**: it yields a SECOND copy of the module, whose
+prototypes the app never touches, and the probe then measures nothing while looking healthy
+([debug-tools-mcp.md](debug-tools-mcp.md) § "Second module instance"; `modoki.import` reaches the
+app's copy). Note the
+bundled class is `_TextureSource`, not `TextureSource`.
 
 #### Incident: the engine destroying its own GPU context (#213, closed 2026-08-13)
 
@@ -4392,9 +4986,11 @@ Inside `Canvas2DMount`'s async gap (above) that reads `null` on a fully-claimed 
 Step 5 is why "0 of 25,680 sampled pixels ever drawn" was literal rather than "draws into a dead
 context" — nothing ever tried to draw.
 
-**How it was finally pinned, and the transferable technique.** Every destroy path uses
+**How it was finally pinned, and the transferable technique.** Every destroy path then used
 `app.destroy(true)`, which Pixi's `ViewSystem` treats as `removeView` — it removes the canvas from
-its parent. The canvas was measured IN the DOM with a dead context, so it had **no parent when the
+its parent. (Past tense since #1000: the boolean form is gone, replaced by
+`destroyPixiApplication(...)` with an explicit `removeView`. The observation below is unaffected —
+the canvas is still removed — but do not read this paragraph as describing today's call.) The canvas was measured IN the DOM with a dead context, so it had **no parent when the
 context died** and was appended afterwards. That one observation discriminated this from the
 already-fixed "destroyed a mounted slot" case; no amount of source reading could.
 
@@ -4441,6 +5037,9 @@ consequences the pool now handles explicitly, each with a mutation-verified test
 - **Shader** — `text/mtsdfPixiShader.ts` (`makeMtsdfPixiShader`) composes Pixi's own high-shader BITS (`localUniformBit` transform, `textureBit` atlas sampler, `roundPixelsBit`) with ONE custom `mtsdfBit` that overrides the fragment colour — reusing Pixi's per-backend transform boilerplate and shipping BOTH WGSL and GLSL programs (Pixi v8 is WebGPU-preferred). The fragment maths mirrors the 3D TSL graph 1:1: median (sharp) fill, outline via the median, alpha-SDF glow, offset-sample shadow, `screenPxRange` AA via `fwidth`, composited straight-alpha. Style uniforms (`weight` / outline / glow / shadow) update in place (`updateMtsdfPixiStyle`); a per-glyph `aTextColor` vertex attribute (for rainbow/fade colour animation) premultiplies onto Pixi's built-in `vColor`.
 - **The default font is ENGINE-provided** — `DEFAULT_FONT_GUID` (`runtime/assets/builtinAssets.ts`, exported from `@modoki/engine/runtime`) is the engine's Arimo, baked mtsdf/ascii. A game does NOT need a font in its own assets to render `Text2D`; point `Text2D.font` at that GUID. It exists because fonts are otherwise referenced by CSS **family name** and stay guid-less — the asset scanner deliberately skips GUID healing for them — while a `Text2D` ref must be a GUID, so before it, getting MSDF text meant copying a font into the project (Court shipped a byte-identical 500 KB duplicate for exactly this reason, #52). It is the one engine font with a committed `.meta.json`; the other bundled families stay family-name-only, and the tree-shaker keeps a font only if something names it (measured: Court's build keeps **1 of 9** engine font files). A code-only reference still needs an `asset-keep.json` entry — the path is under `/modoki/assets/`, which is keep-listable like any project path.
 - **⚠️ The GLSL program declares `OES_standard_derivatives`, and WHERE it declares it is load-bearing.** Pixi's high-shader assembly emits **version-less (GLSL ES 1.00)** source — it only takes the ES 3.00 path when the source literally contains `#version 300 es` (`GlProgram`: `indexOf('#version 300 es')`). In ES 1.00 the `screenPxRange` line's `fwidth` is illegal without the extension declared, so every MTSDF program failed to compile on iOS 15 (`ERROR: 'GL_OES_standard_derivatives' : extension is disabled`) and **every glyph silently vanished**. Not a capability gap — WebGL2 and the extension are both present; desktop and Android drivers simply accept `fwidth` in ES 1.00 source anyway, so only Apple's stricter compiler rejects it, which is why it hid on every machine we test on. The directive **must precede `precision`**: measured on-device, a pragma placed in this file's `fragment.header` bit (where Pixi injects it, i.e. *after* the precision line) fails just as loudly with `extension directive must occur before any non-preprocessor tokens`. Hence `withDerivativesExtension` rewrites the ASSEMBLED source instead. `enable`, not `require`, so a device lacking it degrades to a warning; not switched to `#version 300 es`, which would hard-fail a genuinely WebGL1-only device.
+- **⚠️ The atlas must be decoded UNPREMULTIPLIED, and `alphaMode` CANNOT enforce that (#1045).** An MTSDF atlas carries the 3-channel distance field in **RGB** and the true SDF in **alpha**, so premultiplying scales the field by alpha and drags `median(rgb)` below the shader's 0.5 edge threshold — `fill = clamp((sd - 0.5) * spr + 0.5, 0, 1)` is then 0 for every pixel and **every 2D glyph in the game renders fully transparent**. `fontTexturePixi` sets `source.alphaMode = 'no-premultiply-alpha'` and that is not enough: per the WebGL spec `UNPACK_PREMULTIPLY_ALPHA_WEBGL` is **ignored for `ImageBitmap` uploads**, so the only lever is the `createImageBitmap` option — and `Assets.load` does not expose it (`loadTextures.mjs` passes `{premultiplyAlpha:'none'}` ONLY when `data.alphaMode === 'premultiplied-alpha'`, and otherwise calls `createImageBitmap(blob)` bare, leaving it to the UA). Hence `loadMtsdfAtlasTexture` (`pixiTextureLoad.ts`) fetches and decodes the atlas itself. ⚠️ **Do not "simplify" it back to `Assets.load({data:{alphaMode:'premultiplied-alpha'}})`** — that yields the right bitmap only by exploiting an inverted condition inside Pixi's loader while mislabelling the source, and would break silently on a Pixi bump. Since Pixi's `Assets` no longer owns the texture, its disposer **destroys** it; `Assets.unload` there would be a silent no-op leaking the whole 8 MB page.
+  - **Why it hid:** the UA default differs by WebKit version. Measured on an iPhone 8 / iOS 16.7.16, `createImageBitmap(blob)` is byte-identical to `{premultiplyAlpha:'premultiply'}`; iOS 26, Android and desktop do not premultiply, so the identical bundle is correct there. Like the `OES_standard_derivatives` trap above, this is **not a capability gap** — and the repro needs a real iOS 16 device, so `verify` and both CI legs are green on the affected tree (the same blind-spot class as the r185 ceiling, § "The r185 bump").
+  - **The measurement that identified it, and the one worth repeating.** Data-correct is not pixels-correct: the glyph entities, geometry, UVs, uniforms, VAO bindings, texture binding, texture completeness, scissor/stencil/blend and viewport ALL checked out on the device. What isolated it was reading the same texel two ways — `ctx.drawImage(bitmap)` on a 2D canvas (the file: `125,194,125 a=126`) versus `gl.readPixels` through an FBO attached to the live GL texture (as uploaded: `62,96,62 a=126`, i.e. `125 x 126/255`). Over one glyph cell, texels with `median(rgb) > 0.5` were **1775 in the file and 0 on the GPU**. ⚠️ **A shader-level bisect nearly sent this the wrong way:** patching the fragment shader to a solid opaque red and relinking showed *nothing*, which reads as "the draw never lands" — but `gl.linkProgram` **resets every uniform to zero**, so the vertex stage was writing a degenerate `gl_Position` and no variant could have drawn. Patch Pixi's shader SOURCE and drop its cached program instead, so Pixi recompiles and re-syncs uniforms.
 - **A baked font's SOURCE file is not always shipped.** `Text2D` needs only `~atlas.png` + `~metrics.json`; the `.ttf` ships only when a DOM consumer names the family. See [build.md](./build.md) § "Converted assets" — including the blind spot where a CSS-named family needs `shipSource: 'always'`.
 - **Per-page meshes + dynamic packing** — one Pixi `Mesh` per atlas PAGE the text touches (a dynamic CJK provider spills glyphs across pages; a baked / single-page font is one mesh), all children of the slot `Container` so the anchor pivot + transform apply to the whole block. Geometry rebuilds only when the layout hash changes (text/font/size/wrap/spacing/`atlasVersion`); the shader updates only on a style-hash change; placement writes only when the transform moves. Atlas textures are FONT-owned (freed on scene teardown), never disposed by the slot. Per-glyph animation recomputes page positions from the base quads each frame while the sim runs (frozen when stopped, like skeletal animation).
 
@@ -4787,6 +5386,56 @@ not. **#828 tracks the six sites where this cover is still missing**, including
 `pixiShaderBuilder.ts`, which shares compiled GPU programs across both live `Scene2DRenderer`s with
 no renderer in the key and may be a live defect rather than a cover gap.
 
+#### `pixiShaderBuilder`'s shared `GlProgram` — MEASURED on desktop AND on an iOS 16 device, invisible on all of them (#846)
+
+`programCache` (`runtime/rendering/pixiShaderBuilder.ts`) keys on backend + manifest path + name +
+params + body, with **no renderer identity**, so one `GlProgram` object is handed to every live Pixi
+`Application` — one per `canvas2DPool` slot, so a shipped scene with two `Canvas2D` entities already
+has two, before the editor adds its own. Pixi's `generateProgram` then mutates that SHARED object in place —
+`program._attributeData = extractAttributesFromGlProgram(...)`, whose `location` values come from
+`gl.getAttribLocation` and are valid only for the `WebGLProgram` just compiled in **that** context.
+`GlGeometrySystem.activateVao` later reads those locations off the shared object when it lazily
+builds a VAO for a NEW geometry against an ALREADY-CACHED program. So renderer A can, in principle,
+build a VAO from renderer B's attribute locations.
+
+**Whether that is a real defect turns on one physical question, and the answer is measured, not
+reasoned:** do two independent WebGL contexts assign the same attribute locations to byte-identical
+GLSL? **Yes, everywhere it has been measured**:
+
+| where (date) | context | renderer | ctx A | ctx B |
+|---|---|---|---|---|
+| macOS, Apple M4 Max (2026-09-09) | Chromium, WebGL2 | `ANGLE (Apple, ANGLE Metal Renderer: Apple M4 Max)` | `aPosition 0, aUV 1, aColor 2` | identical |
+| macOS, Apple M4 Max (2026-09-09) | WebKit, WebGL2 | `Apple GPU` | `aPosition 0, aUV 1, aColor 2` | identical |
+| **iPhone 8 / A11, iOS 16.7.16 (2026-09-11)** | Court's WKWebView, WebGL2 | `Apple GPU` | `aPosition 0, aUV 1, aColor 2` | identical |
+| **iPhone 8 / A11, iOS 16.7.16 (2026-09-11)** | Court's WKWebView, WebGL1 | `Apple GPU` | `aPosition 0, aUV 1, aColor 2` | identical |
+
+A second shader with the declarations deliberately SHUFFLED came back `aColor 0, aUV 1, aPosition 2`
+on both contexts of every row — i.e. assignment follows **declaration order**, deterministically,
+and Pixi generates identical source for both contexts. The GLSL spec does not guarantee this; these
+implementations all do it. The device run went further than the desktop one, on purpose: its two
+contexts compiled the programs in **reverse order** of each other (so any allocation state an
+earlier program left behind would have shown up), and it added a four-attribute batcher-shaped set
+(`aPosition 0, aUV 1, aColor 2, aTextureIdAndRound 3` — identical on both contexts). It ran through
+`device_eval` inside the installed Court app, which reported `navigator.gpu` absent, so this is the
+GL path Pixi actually takes there.
+
+⚠️ **The two-surface condition is NOT editor-only — this paragraph said it was, until the device run
+measured otherwise.** Court on the iPhone 8 had **two** live `data-canvas2d-mount` canvases, each
+under its own `Canvas2D` entity and each holding its own WebGL2 context (neither lost). iOS 16 has no
+WebGPU, so on that class of device GL **and** several live `Application`s is the ordinary shipped
+state, not an exotic pinned-backend one. That is what made the device measurement the deciding one,
+and it is why the verdict below rests on the table rather than on the condition being rare.
+
+⚠️ **Bounds that remain.** Not measured on any Android GPU (Adreno, Mali) — and whether a supported
+Android device takes the GL path at all is itself unmeasured, since `pixi.backend: 'auto'` resolves to
+WebGPU wherever the browser offers it. Every row above is an Apple GPU stack.
+
+**Verdict: a documented caveat, not a fix.** Adding a renderer to our key would diverge from Pixi's
+own design (`GlProgram.from()` is itself a module-level content-addressed cache, so Pixi shares its
+built-in shaders across every `Application` by design) and would cost a duplicate compile per
+surface for a collision no measured driver produces. #846 was closed on the device measurement; do
+not re-run either probe unless an Android GL device turns up a wrong frame.
+
 ### Retractions worth keeping — each was a confident claim that measurement killed
 
 - **`registerRuntimeMeshTemplate` is fragile by design but is NOT a live leak.** It writes into
@@ -4821,8 +5470,9 @@ no renderer in the key and may be a live defect rather than a cover gap.
   shape at install time and degrading to a loud no-op if it moves. **UBOs never leaked** (24/24
   `destroyUniformBuffer` calls issue a `gl.deleteBuffer`; a `deleteBindGroupData` override would
   DOUBLE-FREE). **VAOs do leak and cannot be fixed from here** — `three/build/three.webgpu.js`
-  contains `deleteVertexArray` zero times, so three never signals a VAO is dead. #715 is iceboxed;
-  what remains is three upstream changes, not one: wire `_releaseProgram` to
+  contains `deleteVertexArray` zero times, so three never signals a VAO is dead. #715 is closed
+  (owner, 2026-09-14) with nothing left to do in this repo, and the upstream reports are tracked in
+  #694. What remains is three upstream changes, not one: wire `_releaseProgram` to
   `backend.destroyProgram`; make `WebGLBackend.destroyProgram` actually issue the GL deletes rather
   than only dropping its DataMap entry; and invent a backend hook for the pipeline half, which has
   no `backend.*` call on either backend.

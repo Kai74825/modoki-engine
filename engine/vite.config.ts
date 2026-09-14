@@ -241,7 +241,7 @@ if (courtQuick) {
 // intercepts those bare imports *from external-project files* and re-resolves
 // them against the editor's tree (respecting @modoki/engine's exports map);
 // resolve.dedupe then guarantees one instance. The project's own unique deps
-// (chess.js, …) fall through to normal resolution from its node_modules.
+// (a game's own npm packages) fall through to normal resolution from its node_modules.
 function hostSharedDeps(): Plugin {
   const SHARED = new Set(['@modoki/engine', 'three', 'react', 'react-dom', '@pixi/react', 'koota', 'zustand', 'pixi.js', '@capacitor/core'])
   const anchor = path.join(engineDir, 'app', 'main.tsx') // a real file inside the editor tree
@@ -511,6 +511,19 @@ export default defineConfig(({ command }) => {
       include: [
         '@modoki/engine/runtime',
         '@modoki/engine/runtime/rendering',
+        '@modoki/engine/runtime/core/formatVersion',
+        // #813 — wordweave's save/store modules import this NARROW subpath (deliberately, to keep
+        // two pure format modules off the barrel's graph). It is the first such import from a GAME
+        // rather than from `engine/app/**`, which is exactly the case this list exists for.
+        // #888 — same shape: games/sling's editor stores import the shared listener-isolation
+        // helper by its narrow subpath rather than through the barrel.
+        '@modoki/engine/runtime/core/liveness',
+        '@modoki/engine/runtime/core/notifyListeners',
+        // #928 — Court's (and wordweave's) daily modules import the pure calendar model by its narrow
+        // subpath, so they stay off the barrel's graph like the formatVersion/liveness imports above.
+        '@modoki/engine/runtime/core/dailyCalendar',
+        // #926 — Court's and wordweave's login bonus wheels import its pure decisions the same way.
+        '@modoki/engine/runtime/core/loginBonus',
         '@modoki/engine/runtime/debug',
         '@modoki/engine/editor',
         '@modoki/engine/editor/rendering',
@@ -636,6 +649,8 @@ export default defineConfig(({ command }) => {
     },
     environment: 'jsdom',
     setupFiles: './tests/setup.ts',
+    // Reaps the claims-store fallback dirs the main process and spawned children leave (#1117).
+    globalSetup: './tests/globalSetup.ts',
     // The default 5s per-test timeout is too tight for the FIRST test in a file that cold-imports a
     // heavy dependency graph (three.js + the engine) — esbuild's first transform of that graph can
     // take several seconds on Windows, so tests intermittently timed out under full-suite load.
@@ -669,6 +684,11 @@ export default defineConfig(({ command }) => {
       // MCP server units (result formatting, identity) — `tools/` ships to the agent,
       // not to a game, but it is still CI-gated code.
       'tests/tools/**/*.test.ts',
+      // The STARTER TEMPLATE's own tests (#1024). The template ships a tap-target floor guard so a
+      // scaffolded project is born covered, and a template test that never runs is exactly the
+      // "guard that cannot fail" shape it exists to prevent — so it runs here, against the
+      // template's own scene, before it is ever copied.
+      'templates/starter/tests/**/*.test.ts',
       // Project-owned tests (game/demo logic + @3d-test/app-services packages). Co-located
       // with the project's code so their deps resolve from its own node_modules; each glob
       // matches nothing when that root is absent (the public repo has neither).
@@ -722,9 +742,13 @@ export default defineConfig(({ command }) => {
       // re-measured since, so treat 43s as un-refreshed rather than current.
       //
       // Same predicate as those gates (`courtAuthored.mjs`, one implementation, two consumers) and
-      // the same fail-safe direction: `courtTouched()` returns `null` when git cannot answer, and
-      // only an explicit `false` excludes. So a broken detector runs the tests rather than silently
+      // the same fail-safe direction: `courtTouched()` returns a REASON STRING when git cannot
+      // answer (`'git-failed'` or `'no-own-commits'` since #826, `null` before it), and only an
+      // explicit `false` excludes. So a broken detector runs the tests rather than silently
       // dropping them — the failure mode that makes a gate worse than no gate.
+      // ⚠️ **`=== false`, never `!courtTouched()`** — a reason string is TRUTHY, so a truthiness
+      // test would silently stop excluding anything, and `=== null` would silently start including
+      // everything. The comparison below is load-bearing, not a style choice.
       //
       // `MODOKI_COURT_TESTS=1` forces them back in (and any Court env override implies it, so
       // `MODOKI_COURT_SWEEPS=1` on a non-Court clone still works rather than mysteriously running

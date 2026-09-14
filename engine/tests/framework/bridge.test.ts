@@ -21,9 +21,23 @@ describe('safeStringify', () => {
     expect(out).not.toBe('{}');
     expect(out).toContain('boom');
   });
-  it('falls back to the message when an Error carries no stack', () => {
+  it('falls back to Name: message when an Error carries no stack', () => {
     const e = new Error('no-stack'); e.stack = '';
-    expect(safeStringify(e)).toBe('no-stack');
+    expect(safeStringify(e)).toBe('Error: no-stack');
+  });
+  // #1055. A JavaScriptCore stack (iOS) is frames only, so `stack || message` showed the device bridge
+  // a frame with no message. Fabricated in the shape an iPad produced, since these run on V8.
+  const JSC_STACK = 'anonymous@capacitor://localhost/assets/bridge-6HfFgXzW.js:2:1673';
+  const jscError = (message: string): Error => {
+    const err = new Error(message);
+    Object.defineProperty(err, 'stack', { value: JSC_STACK, configurable: true });
+    return err;
+  };
+  it('keeps the MESSAGE of an Error whose stack is frames only (JavaScriptCore)', () => {
+    expect(safeStringify(jscError('boom'))).toBe(`Error: boom\n${JSC_STACK}`);
+  });
+  it('keeps the MESSAGE of a frames-only Error nested in an object', () => {
+    expect(safeStringify({ cause: jscError('boom') })).toContain('Error: boom');
   });
   // NESTED too — the thenable case beside it is nested-aware, and a rejection value or a `cause`
   // arrives wrapped. The first cut fixed only the top level, leaving `{"cause":{}}`.
@@ -86,7 +100,7 @@ describe('screenshotToCSS', () => {
 // directly: same public shape (`push`/`entries`/`query`), but backed by the ONE shared ring
 // (`runtime/core/consoleRing.ts`) rather than a disconnected duplicate. Concretely, that means these
 // tests now run through `recordConsoleRingEntry` → `record` → `stringifyArg` — the actual shared
-// serializer `bridge.ts:546-547` depends on — so a regression there (the Error-stack one this same
+// serializer `bridge.ts`'s `handleConsoleLogs` depends on — so a regression there (the Error-stack one this same
 // review found and fixed) would fail HERE too, which the dead copy structurally could not do.
 describe('console ring (the live shared-ring projection, deviceConsoleCapture.ts)', () => {
   afterEach(() => {

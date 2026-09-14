@@ -93,6 +93,7 @@ function makeNode(over: Partial<UINodeData> = {}): UINodeData {
     minHeight: 0, minHeightUnit: 'px', maxHeight: 0, maxHeightUnit: 'px',
     alignSelf: 'auto', zIndex: 0, rotation: 0, scale: 1, overflow: 'visible', isVisible: true, pointerThrough: false,
     swallowClicks: false,
+    minTapSize: 0, minTapSizeUnit: 'px',
     scrollbarStyle: 'auto', scrollbarThumbColor: 0x888888, scrollbarTrackColor: 0xdddddd,
     backgroundColor: 0, backgroundOpacity: 0, borderRadius: 0, borderWidth: 0, borderColor: 0x333333, borderOpacity: 1, opacity: 1,
     text: '', fontFamily: '', fontSize: 16, fontSizeUnit: 'px', fontWeight: 'normal', fontStyle: 'normal',
@@ -201,9 +202,9 @@ describe('UINode inheritedFontFamily — the inherited font reaches form control
     expect(container.querySelector('input')!.style.fontFamily).toContain('Varela Round');
   });
 
-  /** The chess/llm-test case: neither game authors a scene font, so `inheritedFontFamily` is `''`
+  /** The no-scene-font case (chess and llm-test were it, before #1191): `inheritedFontFamily` is `''`
    *  and this MUST leave `fontFamily` absent, not fall back to `inherit` — an unconditional
-   *  `inherit` was rejected specifically because it would visibly change these two games'
+   *  `inherit` was rejected specifically because it would visibly change such a game's
    *  inputs from the platform's form font to `body`'s `system-ui` for no reason either asked
    *  for. Asserted as ABSENT (empty string on a CSSStyleDeclaration), not merely falsy. */
   it('an empty inheritedFontFamily leaves fontFamily unset on an <input> — no accidental "inherit"', () => {
@@ -1416,7 +1417,7 @@ describe('UINode toggle branch', () => {
     const node = makeNode({
       guid: 'tg-drop', toggle: toggle({ value: false }),
       action: { bindings: [{ event: 'change', kind: 'set' } as never] },
-      canvas2D: { referenceWidth: 100, referenceHeight: 100, scaleMode: 'contain', maxReferenceWidth: 0 },
+      canvas2D: { referenceWidth: 100, referenceHeight: 100, scaleMode: 'contain', maxReferenceWidth: 0, maxReferenceHeight: 0 },
       children: [makeNode({ guid: 'tg-drop-kid' })],
     });
     try {
@@ -1497,7 +1498,7 @@ describe('UINode toggle branch', () => {
 // ── canvas2D branch ──
 describe('UINode canvas2D branch', () => {
   it('runtime mounts the pooled Canvas2DMount with the entityId', async () => {
-    const node = makeNode({ entityId: 5, canvas2D: { referenceWidth: 1080, referenceHeight: 1920, scaleMode: 'fitH', maxReferenceWidth: 0 } });
+    const node = makeNode({ entityId: 5, canvas2D: { referenceWidth: 1080, referenceHeight: 1920, scaleMode: 'fitH', maxReferenceWidth: 0, maxReferenceHeight: 0 } });
     // Canvas2DMount is a flag-gated lazy import (so a 3D-only build DCEs PixiJS), so it
     // mounts asynchronously via Suspense — await it rather than expecting it synchronously.
     const { findByTestId } = render(<UINode node={node} storeState={{}} />);
@@ -1511,7 +1512,7 @@ describe('UINode canvas2D branch', () => {
     // the editor SceneView viewport, which sizes itself / uses device presets. The prop
     // defaults to false, so this is the call site that has to opt in — if it stops passing
     // applyWebSizeMode, `max` silently goes back to doing nothing on the 2D layer.
-    const node = makeNode({ entityId: 7, canvas2D: { referenceWidth: 1080, referenceHeight: 1920, scaleMode: 'fitH', maxReferenceWidth: 0 } });
+    const node = makeNode({ entityId: 7, canvas2D: { referenceWidth: 1080, referenceHeight: 1920, scaleMode: 'fitH', maxReferenceWidth: 0, maxReferenceHeight: 0 } });
     const { findByTestId } = render(<UINode node={node} storeState={{}} />);
     expect((await findByTestId('canvas2dmount')).getAttribute('data-web-size-mode')).toBe('true');
   });
@@ -1520,7 +1521,7 @@ describe('UINode canvas2D branch', () => {
     const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
     const node = makeNode({
       entityId: 12, elementType: 'input',
-      canvas2D: { referenceWidth: 1, referenceHeight: 1, scaleMode: 'fitH', maxReferenceWidth: 0 },
+      canvas2D: { referenceWidth: 1, referenceHeight: 1, scaleMode: 'fitH', maxReferenceWidth: 0, maxReferenceHeight: 0 },
     });
     render(<UINode node={node} storeState={{}} />);
     expect(warn).toHaveBeenCalledWith(expect.stringContaining('entity 12'));
@@ -1544,7 +1545,7 @@ describe('UINode canvas2D branch', () => {
     // exactly Court's shape.
     const node = makeNode({
       entityId: 25, hasVideo: true,
-      canvas2D: { referenceWidth: 1080, referenceHeight: 1920, scaleMode: 'fitH', maxReferenceWidth: 0 },
+      canvas2D: { referenceWidth: 1080, referenceHeight: 1920, scaleMode: 'fitH', maxReferenceWidth: 0, maxReferenceHeight: 0 },
     });
     const { findByTestId } = render(<UINode node={node} storeState={{}} />);
     expect((await findByTestId('uivideomount')).getAttribute('data-entity-id')).toBe('25');
@@ -1594,14 +1595,14 @@ describe('UINode canvas2D branch', () => {
 
   it('does NOT warn for a plain Canvas2D (elementType div)', () => {
     const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
-    const node = makeNode({ entityId: 13, canvas2D: { referenceWidth: 1, referenceHeight: 1, scaleMode: 'fitH', maxReferenceWidth: 0 } });
+    const node = makeNode({ entityId: 13, canvas2D: { referenceWidth: 1, referenceHeight: 1, scaleMode: 'fitH', maxReferenceWidth: 0, maxReferenceHeight: 0 } });
     render(<UINode node={node} storeState={{}} />);
     expect(warn).not.toHaveBeenCalled();
     warn.mockRestore();
   });
 
   it('editor uses the injected renderCanvas2D instead of Canvas2DMount', () => {
-    const node = makeNode({ entityId: 9, canvas2D: { referenceWidth: 1, referenceHeight: 1, scaleMode: 'fitH', maxReferenceWidth: 0 } });
+    const node = makeNode({ entityId: 9, canvas2D: { referenceWidth: 1, referenceHeight: 1, scaleMode: 'fitH', maxReferenceWidth: 0, maxReferenceHeight: 0 } });
     const renderCanvas2D = vi.fn((id: number) => <div data-testid="injected" data-id={id} />);
     const { getByTestId, queryByTestId } = render(
       <UINode node={node} storeState={{}} onSelectEntity={vi.fn()} renderCanvas2D={renderCanvas2D} />,
@@ -1948,9 +1949,17 @@ describe('UIScrollView inert-trait DEV warning (#743)', () => {
   it('a hidden box still gets the motion fields it can actually honour', () => {
     // The corollary of the test above: these are emitted above `scrollViewStyle`'s early return
     // and genuinely apply to a scroll container, which is why calling them inert was wrong.
+    //
+    // ⚠️ **`overscroll-behavior-X`, not the shorthand, since #964.** The old expectation here was
+    // not merely renamed — it was asserting the DEFECT. The shorthand binds BOTH axes, so an
+    // `axis: 'x'` view also contained its y axis, which it cannot scroll, stranding every vertical
+    // gesture that landed on it instead of chaining to an ancestor. Confirmed on a Galaxy S22.
+    // What this case is actually about — a hidden box still gets the axis-independent motion
+    // fields — is unchanged; only the property that carries it is now correct.
     const el = renderNode(makeNode({ guid: 'sv-hidden-2', overflow: 'hidden', scroll: scrollTrait({ axis: 'x', snap: 'start', overscroll: 'contain' }) }));
     expect(styleAttr(el)).toMatch(/scroll-snap-type:\s*x mandatory/);
-    expect(styleAttr(el)).toMatch(/overscroll-behavior:\s*contain/);
+    expect(styleAttr(el)).toMatch(/overscroll-behavior-x:\s*contain/);
+    expect(styleAttr(el), 'the cross axis must stay free to chain').not.toMatch(/overscroll-behavior-y/);
   });
 
   it('the cross-axis pin still fires on a box that actually scrolls', () => {
@@ -2100,7 +2109,7 @@ describe('dropped-text DEV warnings (#745)', () => {
     try {
       renderNode(makeNode({
         guid: 'dt-3', text: 'hi',
-        canvas2D: { referenceWidth: 100, referenceHeight: 100, scaleMode: 'contain', maxReferenceWidth: 0 },
+        canvas2D: { referenceWidth: 100, referenceHeight: 100, scaleMode: 'contain', maxReferenceWidth: 0, maxReferenceHeight: 0 },
       }));
       const msgs = warn.mock.calls.map((c) => String(c[0])).join('\n');
       expect(msgs).toContain('canvas');
@@ -2314,6 +2323,223 @@ describe('the PRODUCTION world-swap wiring (#838) — not the test-only reset ho
         .toHaveBeenCalledTimes(8);
     } finally {
       warn.mockRestore();
+    }
+  });
+});
+
+// ── minTapSize (#948) ──
+// Raise the area that RECEIVES a tap without moving the area that DRAWS. Court authors 16 icon
+// controls whose glyph is ~22.7pt against a 44pt finger, and the owner's constraint is that the
+// visual must not change — so the two boxes, which every other field on the trait moves together,
+// have to come apart. The expander is a transparent child; these tests pin that it appears only
+// when it can actually do something, and that it never disturbs the element's own box.
+describe('UINode minTapSize (#948)', () => {
+  /** The expander is the one child carrying an absolute `max(100%, …)` box. */
+  const tapZoneOf = (el: HTMLElement): HTMLElement | undefined =>
+    Array.from(el.children).find(
+      c => (c as HTMLElement).style.position === 'absolute'
+        && (c as HTMLElement).style.width.startsWith('max('),
+    ) as HTMLElement | undefined;
+
+  const clickable = { action: { bindings: [{ event: 'click', kind: 'call', action: 'x' }] } } as Partial<UINodeData>;
+
+  it('emits an expander sized max(100%, value) in BOTH axes', () => {
+    const el = renderNode(makeNode({ ...clickable, minTapSize: 48, minTapSizeUnit: 'px' }));
+    const zone = tapZoneOf(el);
+    expect(zone).toBeDefined();
+    expect(zone!.style.width).toBe('max(100%, 48px)');
+    expect(zone!.style.height).toBe('max(100%, 48px)');
+  });
+
+  // The whole constraint, in one assertion. If this ever fails the field has become a layout
+  // field, which is the thing padding/minWidth already do and the reason neither could be used.
+  it('does NOT touch the element\'s own box — no width, height, padding or margin moves', () => {
+    const base = renderNode(makeNode({ ...clickable, width: 34, height: 34, widthUnit: 'px', heightUnit: 'px' }));
+    const grown = renderNode(makeNode({ ...clickable, width: 34, height: 34, widthUnit: 'px', heightUnit: 'px', minTapSize: 48, minTapSizeUnit: 'px' }));
+    for (const prop of ['width', 'height', 'paddingTop', 'paddingLeft', 'paddingRight', 'paddingBottom', 'marginTop', 'marginLeft', 'marginRight', 'marginBottom', 'minWidth', 'minHeight'] as const) {
+      expect(grown.style[prop]).toBe(base.style[prop]);
+    }
+  });
+
+  // zIndex:-1 + isolation is what stops the expander eating clicks meant for this element's own
+  // text and children — inside the box the real content wins the hit test, and only outside it,
+  // where nothing else is, does the expander take the press.
+  it('sits at zIndex -1 inside an isolated stacking context', () => {
+    const el = renderNode(makeNode({ ...clickable, minTapSize: 48, minTapSizeUnit: 'px' }));
+    expect(tapZoneOf(el)!.style.zIndex).toBe('-1');
+    expect(el.style.isolation).toBe('isolate');
+  });
+
+  // #977 — the marker `pressOrigin.ts` reads to know this element is a courtesy area and not
+  // content. Without it the expander is indistinguishable from ordinary content and the veto rule
+  // cannot exist at all, so this is the structural half of that fix.
+  it('stamps the expander so the press router can tell a courtesy area from content (#977)', () => {
+    const el = renderNode(makeNode({ ...clickable, minTapSize: 48, minTapSizeUnit: 'px' }));
+    expect(tapZoneOf(el)!.hasAttribute('data-tap-zone')).toBe(true);
+  });
+
+  // ⚠️ RUNTIME ONLY. `UIRenderer` skips installing the press tracker for the editor's authoring
+  // preview, but the tracker GameView installs is registered on the DOCUMENT the two renderers
+  // share — so the marker alone is enough for a preview click to be redirected, stopping the
+  // original before SceneView's own capture listener and selecting the neighbouring entity instead.
+  // The editor surface manipulates selection, not bindings, and wants the pre-#977 behaviour.
+  it('does NOT stamp the marker in the editor authoring preview (#977)', () => {
+    const el = renderNode(
+      makeNode({ ...clickable, minTapSize: 48, minTapSizeUnit: 'px' }),
+      { onSelectEntity: () => {} },
+    );
+    const zone = tapZoneOf(el);
+    expect(zone, 'the expander itself still exists — only the marker is withheld').toBeDefined();
+    expect(zone!.hasAttribute('data-tap-zone')).toBe(false);
+  });
+
+  it('resolves a viewport unit through the same --ui-* custom property as every other length', () => {
+    const el = renderNode(makeNode({ ...clickable, minTapSize: 6, minTapSizeUnit: 'vmin' }));
+    expect(tapZoneOf(el)!.style.width).toBe('max(100%, calc(6 * var(--ui-vmin, 1vmin)))');
+  });
+
+  it('emits nothing at 0 — the default is the pre-existing behaviour', () => {
+    expect(tapZoneOf(renderNode(makeNode({ ...clickable, minTapSize: 0 })))).toBeUndefined();
+    expect(renderNode(makeNode({ ...clickable, minTapSize: 0 })).style.isolation).toBe('');
+  });
+
+  // An enlarged zone on a node that handles no click would start swallowing taps meant for
+  // whatever is behind it — so the field is deliberately inert there, not merely useless.
+  it('emits nothing on a node that takes no click, however large the value', () => {
+    expect(tapZoneOf(renderNode(makeNode({ minTapSize: 48, minTapSizeUnit: 'px' })))).toBeUndefined();
+  });
+
+  it('DOES emit on a swallowClicks node — it takes the press, so it owns a tap zone', () => {
+    expect(tapZoneOf(renderNode(makeNode({ swallowClicks: true, minTapSize: 48, minTapSizeUnit: 'px' })))).toBeDefined();
+  });
+
+  // The expander is a CHILD, so an element that clips its own overflow cuts the zone back to the
+  // box and the field silently does nothing. Warn rather than leave it inert-and-invisible.
+  // ⚠️ A DISTINCT guid per case, and it is load-bearing: the warning is once-per-entity, so
+  // reusing one guid makes the second case pass on the FIRST case's suppression and assert
+  // nothing. That is exactly how this test failed when it was first written.
+  it.each(['hidden', 'scroll'] as const)('warns and emits nothing under overflow: %s', overflow => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const el = renderNode(makeNode({ ...clickable, guid: `clip-${overflow}`, overflow, minTapSize: 48, minTapSizeUnit: 'px' }));
+    expect(tapZoneOf(el)).toBeUndefined();
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining('minTapSize'));
+    warn.mockRestore();
+  });
+
+  it('warns ONCE per entity, not once per render', () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const node = makeNode({ ...clickable, guid: 'clip-repeat', overflow: 'hidden', minTapSize: 48, minTapSizeUnit: 'px' });
+    renderNode(node);
+    renderNode(node);
+    renderNode(node);
+    expect(warn.mock.calls.filter(c => String(c[0]).includes('minTapSize'))).toHaveLength(1);
+    warn.mockRestore();
+  });
+
+  // ── close-out review finding 3 ──
+  // The expander is a CHILD, and three element types return before the container branches: an
+  // <input>/<input type=range> is a void element, and a UIToggle owns its inner layout. Court has
+  // three such controls under the 44pt floor already, so this is the inert case an author hits
+  // next — it must warn, and it must NOT leave a stacking context behind for nothing.
+  it.each(['input', 'range'] as const)('warns and emits nothing on elementType: %s', kind => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const el = renderNode(makeNode({ ...clickable, guid: `host-${kind}`, elementType: kind, minTapSize: 48, minTapSizeUnit: 'px' } as Partial<UINodeData>));
+    expect(tapZoneOf(el)).toBeUndefined();
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining('minTapSize'));
+    warn.mockRestore();
+  });
+
+  // ⚠️ The half that is easy to get wrong: an inert field that still creates a stacking context
+  // traps its descendants' zIndex for nothing. The guard has to run BEFORE isolation is set.
+  it.each(['input', 'range'] as const)('leaves NO stacking context behind on elementType: %s', kind => {
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const el = renderNode(makeNode({ ...clickable, guid: `iso-${kind}`, elementType: kind, minTapSize: 48, minTapSizeUnit: 'px' } as Partial<UINodeData>));
+    expect(el.style.isolation).toBe('');
+    vi.restoreAllMocks();
+  });
+
+  it('does not warn under overflow: visible — the supported case must stay quiet', () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    renderNode(makeNode({ ...clickable, overflow: 'visible', minTapSize: 48, minTapSizeUnit: 'px' }));
+    expect(warn).not.toHaveBeenCalledWith(expect.stringContaining('minTapSize'));
+    warn.mockRestore();
+  });
+
+  // ── #1025: the REMEDY the warning prints ──
+  //
+  // ⚠️ The assertions above all match `stringContaining('minTapSize')`, which is loose enough to
+  // pass whatever the message advises — so the advice itself was never covered, and it was WRONG
+  // for years: "wrap it in a div that carries the click binding", printed at controls that bind
+  // `change` and therefore have no click binding to carry. A wrapper built to that instruction
+  // fails `takesClick` and gets no expander either.
+  //
+  // These pin the remedy per kind, because the right answer genuinely differs — and a warning that
+  // names the wrong fix is worse than one that names none.
+  it.each(['input', 'range'] as const)('tells a %s author to grow the control itself, NOT to wrap it', kind => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    renderNode(makeNode({ ...clickable, guid: `remedy-${kind}`, elementType: kind, minTapSize: 48, minTapSizeUnit: 'px' } as Partial<UINodeData>));
+    const msg = String(warn.mock.calls.map(c => String(c[0])).filter(m => m.includes('minTapSize')).at(-1));
+    expect(msg).toContain('hit-tests its WHOLE authored box');
+    expect(msg).not.toContain('wrap it in a div');   // the retracted advice
+    warn.mockRestore();
+  });
+
+  it('tells a UIToggle author to wrap it — and that moving the change binding will NOT do', () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    // ⚠️ A real `toggle` BLOCK, not `toggle: true`. `UINode` only tests it for truthiness, so the
+    // boolean rendered identically and the test passed — while `npm run verify`'s typecheck leg
+    // rejected it, because `UINodeData.toggle` is a nested object. A node that cannot exist is not
+    // the node this warning fires on.
+    const toggle = {
+      value: false, trackOnColor: 0x4caf50, trackOffColor: 0x888888, trackOpacity: 1,
+      knobColor: 0xffffff, knobOpacity: 1, knobInset: 2, trackRadius: 16, knobRadius: 14,
+      disabled: false,
+    };
+    renderNode(makeNode({ ...clickable, guid: 'remedy-toggle', toggle, minTapSize: 48, minTapSizeUnit: 'px' } as Partial<UINodeData>));
+    const msg = String(warn.mock.calls.map(c => String(c[0])).filter(m => m.includes('minTapSize')).at(-1));
+    expect(msg).toContain('wrap it in a div that carries its OWN click binding');
+    expect(msg).toContain('does NOT work');          // the trap an author falls into next
+    warn.mockRestore();
+  });
+});
+
+// #868: children were keyed by `entityId` alone — koota's recycled index — so a UI entity destroyed
+// and replaced on the same index between two tree rebuilds kept the dead entity's React fiber and
+// DOM: its scroll position, focus, an input's typed value, AutoFitText's measured refs. The key
+// carries the generation now, so the newcomer mounts fresh.
+describe('a child replaced on a recycled index remounts (#868)', () => {
+  const CANVAS2D = { referenceWidth: 1, referenceHeight: 1, scaleMode: 'fitH', maxReferenceWidth: 0, maxReferenceHeight: 0 };
+  // Both parent shapes map children with their own key: a plain element, and a Canvas2D host.
+  it.each([
+    ['a plain parent', {}],
+    ['a Canvas2D parent', { canvas2D: CANVAS2D }],
+  ] as const)('under %s: gives the newcomer a new DOM element, and keeps a live child\'s element', (_label, parentShape) => {
+    const world = createWorld();
+    try {
+      const a = world.spawn();
+      const childFor = (e: { id(): number; generation(): number }, guid: string) =>
+        makeNode({ entityId: e.id(), generation: e.generation(), guid, width: 10, height: 10 });
+      const parentOf = (child: UINodeData) => makeNode({ entityId: 999, guid: 'parent', ...parentShape, children: [child] } as Partial<UINodeData>);
+      const renderCanvas2D = () => null;
+
+      const { container, rerender } = render(<UINode node={parentOf(childFor(a, 'a'))} storeState={{}} renderCanvas2D={renderCanvas2D} />);
+      const before = container.querySelector(`[data-entity-id="${a.id()}"]`);
+      expect(before).not.toBeNull();
+
+      rerender(<UINode node={parentOf(childFor(a, 'a2'))} storeState={{}} renderCanvas2D={renderCanvas2D} />); // same entity, edited
+      expect(container.querySelector(`[data-entity-id="${a.id()}"]`)).toBe(before);
+
+      a.destroy();
+      const b = world.spawn();
+      expect(b.id()).toBe(a.id());
+      expect(b.generation()).not.toBe(a.generation());
+
+      rerender(<UINode node={parentOf(childFor(b, 'b'))} storeState={{}} renderCanvas2D={renderCanvas2D} />);
+      const after = container.querySelector(`[data-entity-id="${b.id()}"]`);
+      expect(after).not.toBeNull();
+      expect(after).not.toBe(before);
+    } finally {
+      world.destroy();
     }
   });
 });

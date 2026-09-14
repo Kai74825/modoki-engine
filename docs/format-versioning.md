@@ -134,7 +134,31 @@ not writing at all, PRESERVE via `preservedVersion` — and both are subject to 
 
 PRESERVE additionally needs the unknown-field bag (`collectUnknownFields` / `mergeUnknownFields`,
 same module). ⚠️ **Do not hand-roll it.** `wordweave` rolled it twice, in the same game, and review
-still caught a real defect in the second one (#763).
+still caught a real defect in the second one (#763). **Both copies are gone as of #813** — the game
+now calls the shared helpers, so the ordering invariant lives in one place rather than in four
+comments in one game.
+
+**Import them from the narrow subpath, `@modoki/engine/runtime/core/formatVersion`, not from the
+`@modoki/engine/runtime` barrel** (#813). `formatVersion.ts` has no imports of its own, so the narrow
+entry costs nothing to load; the barrel drags the whole runtime graph in, which matters because the
+modules that need these helpers are exactly the pure format modules a game keeps loadable without a
+world, a renderer or a storage backend. Measured on wordweave's `store`+`save` suites: 1.64s before
+the de-dup, **9.07s** via the barrel, **1.67s** via the subpath.
+
+⚠️ **Swap the BAG and nothing else — do not also transfer the version rule.** The two documents in a
+game are rarely symmetric: wordweave's purchases doc has no version-GATED field, its progress doc
+does (`activeGuid` is kept only when the stored version is readable). #763's close-out caught
+`readProgress` copying `readPurchases`'s `v = max(stored, current)`, which disarmed the version floor
+for the one field the floor protects. `preservedVersion`'s own banner carries the same warning.
+
+⚠️ **Keep the reader's conditional SPREAD when you swap.** `collectUnknownFields` returns `undefined`
+rather than `{}` so the key can be omitted entirely; `unknownFields: collectUnknownFields(…)` instead
+*sets* the key to `undefined`, which `Object.keys` and a structural compare can see. This is easy to
+get wrong and easy to believe you have tested: `expect(doc.unknownFields).toBeUndefined()` passes
+either way, and a serializer built on `mergeUnknownFields` normalises the difference away, so #813's
+mutation check found the whole 76-test suite green under exactly that mistake. Assert
+`'unknownFields' in doc === false` on the READER's own result — `games/wordweave/tests/save.test.ts`
+and `store.test.ts` carry the pattern.
 
 ⚠️ **A PRESERVE writer that ALSO syncs to the cloud must carry the bag on the WIRE too, IN PLACE —
 never as a side-car field** (#760 phase G; Court's `saveSync.ts`/`systems.ts` is the worked example).
@@ -335,6 +359,248 @@ from `.meta.local.json`, which genuinely needed that. It is false: `.meta.local.
 classifies as a non-asset with or without the clause. Measured by passing a bare `.corrupt` path the
 clause does not match and getting `null` anyway. The clause stays as belt-and-braces; the claim that
 it is load-bearing does not.
+
+## 4b. A document-supplied KEY is not a safe object key — normalize at the boundary (#912)
+
+Everything above is about a document's FIELDS. This section is about its **keys** — a product id, a
+transaction id, a date string — and it is a different failure, with a different fix.
+
+**A key read out of a document can collide with `Object.prototype`.** `JSON.parse` makes `__proto__`
+an ordinary own enumerable key, so a stored or synced document really can carry one, and the other
+seven member names (`constructor`, `toString`, `valueOf`, `hasOwnProperty`, `isPrototypeOf`,
+`propertyIsEnumerable`, `toLocaleString`) become ordinary own keys the moment they are assigned.
+Two silent shapes follow:
+
+| shape | what happens |
+|---|---|
+| `bag[k] = v` | for `k === '__proto__'` this hits `Object.prototype`'s SETTER: no own key is created, the value is lost, and the prototype is replaced by document data |
+| `k in bag` | true for **all 8** names even when the key is absent, so the test takes the wrong arm — and where that arm indexes the other operand, it throws |
+
+### ⚠️ The lesson is about the FIX SHAPE, not the bug
+
+#813 fixed this the obvious way: a `putOwn()` helper (`Object.defineProperty`) called at each copy
+site. **It took four review rounds, each found more sites, and round four found that the sweep had
+fixed producers while leaving consumers on the same defect** — including a `putOwn` that was inert
+because the next hop still dropped the key. Fourteen sites later, ~14 were still live.
+
+**N sites failing one way is a missing abstraction, not a longer to-do list.** The fix that ended it
+was one line at the READ BOUNDARY: `emptyDocMap()` (`games/court/runtime/saveSync.ts`) starts every
+document-keyed bag with a **null prototype**, which fixes both shapes at once — an assignment creates
+a real own key, and `in` answers about the bag. Most remaining plain-assignment sites then needed no
+edit at all, because they became correct where they stood.
+
+⚠️ **"Needed no edit" is true only where the ACCUMULATOR is a doc map, and the close-out review found
+two sites where it is not.** `mergeDailyProgress` and `mergeDailyPurchased` build their accumulator
+with a **spread** (`{ ...A.purchased }`), which is key-safe but yields an ORDINARY prototype whatever
+the source was — so converting the readers did not reach them. Worse, converting the readers made
+their loss **newly reachable**: before, a prototype-named receipt was dropped at the read boundary and
+could never leave the device; after, it survives, uploads, and can arrive on the server side of a
+conflict merge, where these two dropped it and the `merge:false` push destroyed the server copy too.
+⚠️ **How much is lost depends on the VALUE, and the first write-up of this got it wrong** — it said
+"all 8 names" from a test that used a made-up receipt value. `__proto__` is always lost. The other
+seven reach a `mine < id` compare against an inherited function that stringifies to
+`"function toString() { [native code] }"`, so they survive whenever the value sorts before that —
+which every lowercase-hex GUID level id does. In normal play the loss is `__proto__` alone; an empty
+levelId (producible, and stored as `''`) loses all 8. **A measurement taken with an invented value is
+a measurement of the invention** — this is the second unmeasured claim this section has had to
+correct, after #813's.
+
+**The lesson generalises: a boundary fix converts the places data ENTERS, and a spread-built
+accumulator downstream is a second entry point.** Sweep for `{ ...x }` accumulators over
+document-supplied keys as well as for `{}` ones.
+
+### ⚠️ Two things that must stay true for that to be safe, and both were MEASURED
+
+**Neither was taken on trust — #813 rejected the null-prototype shape on an argument nobody had
+tested, and that inherited rejection is what kept the class alive for four rounds.**
+
+1. **Nothing null-prototyped reaches storage.** `JSON.parse(JSON.stringify(x))` and
+   `structuredClone(x)` both keep `__proto__`/`constructor` as own keys AND return an ordinary
+   prototype — so the PlayerPrefs leg and the Capacitor-bridge leg to
+   `FirebaseFirestore.setDocument` are both clean. `{ ...bag }` converts explicitly if a boundary
+   ever needs it.
+2. **Nothing calls a method ON a bag.** A null prototype genuinely breaks `bag.hasOwnProperty(...)`.
+   Court makes **zero** such calls — every site already uses `Object.prototype.hasOwnProperty.call`.
+   ⚠️ **That convention is the load-bearing part: a new direct method call on a bag is what would
+   break this**, and it will fail loudly rather than silently, which is the right way round.
+
+### Three sites still needed a hand fix, and the reason generalises
+
+A null prototype on OUR bag cannot help when the object arrives **from a caller**. Court's two
+`k in next.entitlements/passes` tests and `reconcileDailySpend`'s `key in known` all read a
+caller-supplied object, so they use `Object.prototype.hasOwnProperty.call(...)`, which is correct for
+either prototype. **Ask where the object came from before deciding which of the two fixes applies.**
+
+⚠️ **An empty early-return is a bag too.** All four of Court's normalizers returned a plain `{}` for
+a missing document; a caller doing `k in normalizeX(undefined)` inherits the same 8 names off it.
+
+### Realistic exposure, so nobody over-invests
+
+A real key named `__proto__` means a hostile or corrupted document, not ordinary play. It is worth
+the ticket because `games/court/tests/cloudFormatPreservation.test.ts`'s **T5 states an explicit
+guarantee** that an unreadable entry survives both sync legs, and these were the key shapes for
+which it did not hold — plus the `k in` shape was a live **crash** in shipped Court for every
+`Object.prototype` name until #813.
+
+Covered by `games/court/tests/docMapBoundary.test.ts` (the boundary, all 8 names) and T5d in
+`cloudFormatPreservation.test.ts` (the upload leg). ⚠️ **The two are not interchangeable, and a
+mutation check is what established that:** `nestEntryMap` runs only on the sync path, so a local
+read/write case asserting on it stays green with the mechanism deleted. That trap is the reason T5d
+lives beside the guarantee rather than with the rest of the boundary cases.
+
+### 4b-bis. The ENGINE instance, and its two primitives (#986)
+
+§ 4b above is Court's telling of this. The engine had **~18** of the same sites, and #986 fixed 15 of
+them behind two exported primitives — so a game no longer has to hand-roll a third vocabulary:
+
+```ts
+import { emptyDocMap, hasDocKey, putOwn } from '@modoki/engine/runtime'
+```
+
+| primitive | when | why |
+|---|---|---|
+| `emptyDocMap<T>()` | the bag is **ours** to build | `Object.create(null)`, so every downstream `bag[k]` / `k in bag` becomes correct **where it stands**, with no edit |
+| `hasDocKey(bag, k)` | the bag **arrives** — a caller's argument, a code-declared table, an `Object.fromEntries` result | a null prototype cannot help there; this is the `hasOwnProperty.call` form |
+| `putOwn(bag, k, v)` | the bag must stay **ordinary** but takes a document key | `defineProperty` DEFINES rather than sets, so `__proto__` round-trips *without* replacing the prototype |
+
+`emptyDocMap` takes Court's name deliberately (§ 4b). A game imports neither the engine's internals
+nor another game, so the two cannot literally share code — but one vocabulary across the repo beats
+two accurate-but-different names.
+
+**`putOwn` is the primitive § 4b did not need and the engine did.** Several engine bags cross into a
+**third-party library** — koota's `entity.set`, a TSL shader function, PixiJS's `Shader`
+constructor — where a null prototype is untested risk for no gain. `putOwn` fixes the write while
+leaving the object ordinary. Node-side callers import the granular
+`@modoki/engine/runtime/core/docKeys` subpath, never the barrel, which drags the browser runtime
+into a Node tsconfig.
+
+⚠️ **Three of the 18 are NOT this mechanism and were split out as #993** — vocab-table lookups
+(`WRAP[s.wrapS]`, `SHAPE[...]`, `COLLIDER[...]`) where the table is a code literal, fixing the guard
+alone still lets the prototype value flow, and one has no guard at all so "fixing" it means choosing
+a fallback. Bending them to fit would have been a forced family. That split turned out to be the
+larger half — **§ 4b-ter**, below.
+
+⚠️ **One #986 guard is deliberately UNTESTED, and the mutation check is why.** `mergeParamDefaults`'
+read guard changes no output: `coerceParamValue` type-checks every branch and falls back to the
+schema default, so a prototype-read function is sanitised to exactly what a correct read produces.
+Two tests were written for it and **both stayed green with the fix reverted**; they were deleted
+rather than banked, and the call site says so. Keeping a passing assertion over an unreachable
+mechanism is the shape [docs/falsifiable-tests.md](falsifiable-tests.md) exists to stop.
+
+**What makes the engine conversion safe is checkable, not assumed:** a direct `bag.hasOwnProperty(k)`
+is the one thing a null prototype breaks, and a sweep of `engine/packages/modoki/src`, `engine/app`
+and `engine/plugins` finds **zero** — the same `.call`-form convention that made § 4b safe in Court.
+⚠️ **A new direct method call on a doc map is what would break this.**
+
+Covered by `engine/packages/modoki/tests/runtime/docKeys.test.ts` (34 cases). ⚠️ **Almost every case
+uses one of the OTHER SEVEN names, not `__proto__`** — only `__proto__` goes through a setter, so a
+`__proto__`-only suite stays green against the entire read half, which is most of these sites.
+
+### 4b-ter. The READ side — a code-declared VOCABULARY TABLE indexed by a document string (#993)
+
+§ 4b-bis is about bags **we build**. This is the other half, and it is bigger: **22 sites** where a
+*code-declared literal object* is used as a vocabulary table and indexed with a string that came from
+outside the code. The table was never a bag anybody thought of as document data — it is a `const` a
+few lines up — which is exactly why the reads went unguarded.
+
+⚠️ **Every count in this section is stamped as of #993's close-out, not derived** — it went 16 → 20 →
+22 in one day as review found members, and a stale copy survived each bump. It cannot be derived:
+the fixed sites share no single greppable spelling (`loaders/primitives.ts` was fixed by asking
+`isPrimitive`, not with `hasDocKey`). If you find a member, update the count here in the same change.
+
+> **The mechanism, in one sentence:** a code-declared literal inherits `Object.prototype`, so a key
+> like `constructor`, `toString` or `valueOf` returns an inherited **FUNCTION**, and the value flows
+> on because the guard beside the read cannot see it.
+
+⚠️ **All four of the guard shapes people reach for fail, and this is the part worth memorising:**
+
+| written as | why it does not hold |
+|---|---|
+| `if (!(key in TABLE)) warn(…)` | `'toString' in TABLE` is **true** — the warning never fires |
+| `TABLE[key] ?? fallback` | a function is **not nullish** — `??` never fires |
+| `TABLE[key] \|\| fallback` | a function is **truthy** — `\|\|` never fires |
+| `const v = TABLE[key]; if (!v) return` | same: truthy, so the early return is skipped |
+
+⚠️ **`??` fails one step earlier too, on the EMPTY STRING** (#1074). `params?.bus ?? 'master'` keeps
+`''`, because `''` is not nullish either, so the fallback never runs and the empty string reaches
+whatever comes next. In `audio.setBusVolume` that was a key builder, `''[0].toUpperCase()`, which
+threw out of `dispatchUIAction`. **For a UI action's DECLARED params this is now handled once, at
+the seam** (#1075): the registry drops `''` before the handler runs — see the `UIAction` section of
+`docs/ui-system.md` — so a handler's `params.x ?? fallback` is correct again. Anywhere else, a
+document string read outside the action registry: when `''` means "unset", say so at the read
+(`raw == null || raw === '' ? undefined : raw`). When it doesn't, it is just another unknown key
+and the refusal handles it.
+
+**The fix is `hasDocKey` at the read**, never a fourth spelling:
+
+```ts
+const wrap = hasDocKey(WRAP, s.wrapS) ? WRAP[s.wrapS] : undefined
+```
+
+Why not a `Map`: `Object.hasOwn` is already a *second* spelling in the tree
+(`loaders/primitives.ts`, `haptics/patterns.ts`, Court's `saveSync.ts`), a `Map` would be a **third**,
+and it would change every declaration site — plus its iteration and spread behaviour — to repair
+a defect that lives entirely on the read.
+
+**Severity is decided by where the KEY comes from, not by what the table holds.** Ranked, as they were
+found:
+
+| key provenance | example site | what it cost |
+|---|---|---|
+| a **URL query param** | `games/scroll-demo/runtime/config.ts` | `?scene=constructor` sets `scenePath` to a function |
+| a **debug/HMR protocol payload**, and the value is **invoked** | `app/debug/agentBridge.ts` | `kind:"constructor"` calls `Object(path)` |
+| an **agent tool payload** | `runtime/core/journal.ts` | every `>=` is false → the journal returns **zero events**, which the agent reads as "nothing happened" |
+| **scene/prefab JSON**, a trait NAME | `loaders/sceneValidation.ts` (validation, every scene), `loaders/loadSceneFile.ts` (the v5→v6 migration) | `.includes` / `for…of` on a function → **TypeError** |
+| **scene JSON**, a trait FIELD | `audio/audioService.ts` (`AudioSource.bus`) | `tail.connect(Object)` → **TypeError**, that entity's audio dies |
+| an asset `.meta.json` / `.particle.json` / `.shader.json` | `textureResolver`, `gpuComputeBackend`, `shaderSchema` | a function assigned into a three.js enum or a GPU uniform |
+| a **GLB node name** | `games/3d-test/runtime/config.ts` | a stringified function as the editor's display name |
+| a **font filename** segment | `loaders/fontNaming.ts` | `match.weight` is `undefined`, so the face ships with no weight |
+| a **GLB attribute semantic**, at BUILD time | `plugins/model-convert/threeAdapter.ts` | ⚠️ **nothing, today — unreachable** (measured, #1069): gltf-transform's reader throws `prevRef.dispose is not a function` on a prototype-named semantic before the adapter runs. The guard is kept for the day that changes; `threeAdapter.test.ts` pins the premise |
+| a **scene-JSON trait name**, at BUILD time | `plugins/detect-modules.ts` | a garbage module flag in the bag handed to the build's `define`s |
+| **scene JSON**, a game config field typed `'x' as string` (#1061) | Court's `systems.ts` — `COIN_SETS[cfg.coinSet]`, `UNIT_PX[widthUnit]` | the inherited `valueOf` is **invoked** → TypeError on every piece drawn; a panel half-width of NaN |
+
+⚠️ **`'metal' as string` reads like a union at the call site, and is not one** (#1061). #993's triage
+ejected Court's tables as "keyed by TS unions the code produced" — right for `haptics.ts`,
+`accountUi.ts` and `debugTab.tsx`, wrong for `COIN_SETS`, whose key is a trait field declared
+`coinSet: 'metal' as string`. An Inspector `enum` over the same field does not narrow it either: the
+dropdown constrains ONE authoring surface, while the scene file and `modoki_mutate_scene` write any
+string. **Classify a key by its DECLARATION and every route that writes it, never by how it is used.**
+
+Three findings that generalise beyond this family:
+
+- ⚠️ **Two functions over one table, disagreeing.** `loaders/primitives.ts` had `isPrimitive` using
+  `Object.hasOwn` **three lines above** `createPrimitiveMesh` indexing the same table raw. A correct
+  guard existing nearby is not protection; it is camouflage. The fix was to make the second function
+  ask the first, not to add a third check.
+- ⚠️ **A sibling read in the same function can be the proof.** `gpuComputeBackend` had two vocab
+  fields one screen apart where an identical typo **warned and fell back** in one and was **silently
+  `undefined`** in the other. Two fields disagreeing about one class of typo is a design question,
+  not a lint fix — it went to the owner, who chose warn + fall back at runtime **and** a picker at the
+  authoring surface.
+- ⚠️ **A picker whose options are hand-listed is a second copy of the table.** The Inspector's
+  collider-shape picker already existed — with its four options typed out beside a separate four-entry
+  `COLLIDER` table, so the first shape anybody added would have appeared in one and not the other.
+  `COLLIDER_SHAPES` is now the one list, the picker spreads it, and the GPU table is typed
+  `Record<ColliderShape, number>` so a new member fails to compile until it has a shader code. This is
+  root `CLAUDE.md` § "Author values in the SCENE and the PREFAB" in its read-the-field form.
+
+⚠️ **Not every site is reachable by every name, and that decides which case is the test.**
+`fontNaming` is the worked example: `.toLowerCase()` kills six of the eight, the `split(/[-_]/)`
+kills `__proto__`, and **`constructor` alone survives both** — so seven of its eight cases pass with
+or without the fix and only one of them is evidence. Work out which names actually reach the read
+before writing the assertions, or the suite looks eight times stronger than it is.
+
+⚠️ **The reachable half is the OTHER SEVEN names, not `__proto__`.** These are all *reads*, and
+`__proto__` is the only one that goes through a setter — so a `__proto__`-only test suite stays green
+against every site in this family. `docKeys.test.ts` enumerates all eight for that reason; copy it.
+
+⚠️ **And test the ACCEPT side of every one.** A table that answers `undefined` for everything passes
+every reject case while breaking all texture wrapping and every particle emitter. The coverage
+baseline when #993 was first written up — **sixteen** sites at the time, before review found the
+other six — was that **zero of those sixteen had a test that failed**, and
+`games/3d-test/tests/tropicalIslandConfig.test.ts` asserted the right thing in a way that passed
+before *and* after the fix — [docs/falsifiable-tests.md](falsifiable-tests.md)'s shape, already in the
+tree.
 
 ## 5. Adding a new versioned document
 

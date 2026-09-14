@@ -37,6 +37,9 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  // destroy(), not just drop the reference: koota hard-caps at 16 live worlds, so this file died at
+  // `createWorld` ("Too many worlds created") the moment #1074's cases took it past 16.
+  world?.destroy();
   world = undefined;
   clearManifest();
   setPlayState(prevState);
@@ -118,6 +121,13 @@ describe('built-in audio.* actions', () => {
     expect(e.get(AudioSource)!.playing).toBe(true);
   });
 
+  it('audio.setClip with an EMPTY `clip` takes the event value (#1075)', () => {
+    const clip = mintClip();
+    const e = world!.spawn(AudioSource({ clip: '', playing: false }), EntityAttributes({ guid: newGuid() }));
+    dispatchUIAction('audio.setClip', { target: e, params: { clip: '' }, payload: clip });
+    expect(e.get(AudioSource)!.clip).toBe(clip);
+  });
+
   it('audio.setClip resolves a bank KEY → ref on the target', () => {
     const groove = mintClip(), prefunk = mintClip();
     const e = world!.spawn(
@@ -160,11 +170,60 @@ describe('built-in audio.* actions', () => {
     expect(e.get(AudioSource)!.crossfadeSec).toBe(0);
   });
 
+  it('audio.setBusVolume with an EMPTY `value` takes the slider payload (#1075)', () => {
+    // 25, not a value an earlier test in this file leaves in the (global) mixer store.
+    dispatchUIAction('audio.setBusVolume', { params: { bus: 'music', value: '' }, payload: 25 });
+    expect(useAudioMixStore.getState().audioMusic).toBe(25);
+  });
+
   it('audio.setBusVolume updates the mixer store + logs the bus change', () => {
     dispatchUIAction('audio.setBusVolume', { params: { bus: 'music' }, payload: 40 });
     expect(useAudioMixStore.getState().audioMusic).toBe(40);
     expect(useAudioMixStore.getState().audioMusicPct).toBe('40%');
     expect(getAudioLog().some((e) => e.op === 'setBusVolume' && e.bus === 'music' && e.volume === 0.4)).toBe(true);
+  });
+
+  // ── #1074 — `bus` is a DOCUMENT string (scene binding params, agent dispatch payloads), not the
+  //    Inspector's enum. Every case below goes through `dispatchUIAction`, never `setBusVolume`
+  //    directly: the service's own refusal was already tested, and the defect was the handler's
+  //    store write that ran BEFORE it (#1069 — a helper proven while its caller is not).
+  const busWrites = () => getAudioLog().filter((e) => e.op === 'setBusVolume');
+
+  it.each(['musik', 'constructor', 'toString'])('audio.setBusVolume REFUSES bus %s — the mixer store is untouched too (#1074)', (bus) => {
+    const before = { ...useAudioMixStore.getState() };
+    expect(() => dispatchUIAction('audio.setBusVolume', { params: { bus }, payload: 40 })).not.toThrow();
+    // Whole-state equality, not "no audioMusik key": a handler that wrote a KNOWN bus instead would
+    // pass a key-absence check.
+    expect(useAudioMixStore.getState()).toEqual(before);
+    expect(busWrites()).toEqual([]);
+  });
+
+  it.each([
+    // Distinct percentages per row, and neither is master's default of 100 — so a row cannot pass
+    // on a value an earlier case (or the initial store) left behind.
+    ['""', { bus: '' }, 37],
+    ['absent', {}, 53],
+  ])('audio.setBusVolume with bus %s is UNSET — it sets master, and does not throw (#1074)', (_label, params, pct) => {
+    expect(() => dispatchUIAction('audio.setBusVolume', { params, payload: pct })).not.toThrow();
+    expect(useAudioMixStore.getState().audioMaster).toBe(pct);
+    expect(useAudioMixStore.getState().audioMasterPct).toBe(`${pct}%`);
+    expect(busWrites()).toEqual([{ op: 'setBusVolume', bus: 'master', volume: pct / 100 }]);
+  });
+
+  it.each([
+    ['""', { bus: '' }],
+    ['absent', {}],
+  ])('audio.playOneShot with bus %s falls back to the TARGET\'s bus (#1074)', (_label, busParam) => {
+    // `''` is not nullish, so `params.bus ?? target.bus` used to keep the empty string, skip the
+    // target's bus, and let `resolveBus('')` warn and play it on sfx.
+    const click = mintClip();
+    const bank = world!.spawn(
+      AudioSource({ clip: '', bus: 'music', playing: false, clips: JSON.stringify([{ key: 'click', ref: click }]) }),
+      EntityAttributes({ guid: newGuid() }),
+    );
+    dispatchUIAction('audio.playOneShot', { target: bank, params: { key: 'click', ...busParam } });
+    audioSystem(world!);
+    expect(plays().filter((e) => e.clip === click).map((e) => e.bus)).toEqual(['music']);
   });
 
   it('audio.playOneShot fires a one-shot cue on the given bus', () => {

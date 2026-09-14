@@ -66,7 +66,8 @@
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { clonePort } from './clonePort.mjs';
-import { canonicalPath, pathCaseKey, samePath } from './pathIdentity.mjs';
+import { canonicalPath, pathCaseKey } from './pathIdentity.mjs';
+import { isEntryPoint } from './entryPoint.mjs';
 
 /**
  * Clone directory basename → pinned editor backend port.
@@ -167,6 +168,32 @@ export function cdpPortForBackend(backendPort) {
 }
 
 /**
+ * The CDP port the editor ACTUALLY binds on the main Mac: `9322 + (backend - 5179)`.
+ *
+ * ⚠️ This is not a second opinion about `cdpPortForBackend` — it is the OVERRIDE, and both are
+ * real. The `editor-*` shell functions set `MODOKI_CDP_PORT` to the 932x series by hand so the
+ * editor cannot collide with the `chrome-devtools` MCP's own 9222, and `launch-editor.sh` honours
+ * an explicit value ahead of its derivation. So `cdpPortForBackend` describes the fallback and
+ * this describes the environment: on `modoki-qa`, the former says 9226 and the editor is on 9326.
+ *
+ * It lives here because it was already being restated everywhere it was needed and nowhere
+ * authored (#1102) — inline arithmetic in `qaCaseReferences.test.ts`, a literal column in
+ * `qa/knowledge.md` § 1, and the shell functions themselves, which are outside the repo and are
+ * the only executable copy. A value with no home gets restated by each consumer, which is the
+ * mechanism behind #900/#1095/#1098 as well.
+ *
+ * ⚠️ The shell functions remain the real source: this cannot bind a port, only predict one. If
+ * they are ever changed, THIS is the line that has to follow them — the guard in
+ * `editorPorts.test.ts` pins the docs to this function, not to the shell.
+ *
+ * @param {number} backendPort
+ * @returns {number}
+ */
+export function editorCdpPortForBackend(backendPort) {
+  return 9322 + (backendPort - HUB_BACKEND_PORT);
+}
+
+/**
  * The CDP port for a SINGLE-INSTANCE launch with no pinned backend — i.e. an unknown
  * clone directory, which also covers the Windows machine (it holds exactly one clone,
  * so nothing there can collide; owner, 2026-08-26).
@@ -231,8 +258,11 @@ export function backendUrlForClone(repoRoot) {
 // the JS `fs.realpathSync` walk, which resolves symlinks but NOT `subst` or drive-letter case. The
 // `===` folded nothing either. `samePath` is both halves, and it is the same question: "do these
 // two spellings name one FILE?"
-const invokedDirectly =
-  !!process.argv[1] && samePath(process.argv[1], fileURLToPath(import.meta.url));
+// #910: was `samePath`, which CASE-FOLDS. The shared helper deliberately does not — both operands
+// exist by construction, so `.native` has normalised their casing already, and folding here would
+// import #905's accepted over-match into a check whose over-match means running CLI mode on a mere
+// import. This site moved OFF that hazard rather than onto it.
+const invokedDirectly = isEntryPoint(import.meta.url);
 
 if (invokedDirectly) {
   const repoRoot = process.argv[3] ?? fileURLToPath(new URL('../..', import.meta.url));
@@ -252,7 +282,9 @@ if (invokedDirectly) {
       // which is the confusion #881 was about in the first place.
       `[editor-ports] '${path.basename(canonicalPath(repoRoot))}' is not a known clone directory — ` +
         `using AUTO ports. Set MODOKI_BACKEND_PORT explicitly to pin one ` +
-        `(known: ${Object.keys(CLONE_BACKEND_PORTS).join(', ')}; see docs/clones-and-ports.md).\n`,
+        // Names the TABLE, not a doc: this file ships in the public snapshot and runs on every
+        // launch from an unknown directory, while docs/clones-and-ports.md does not ship (#907).
+        `(known: ${Object.keys(CLONE_BACKEND_PORTS).join(', ')}; table: CLONE_BACKEND_PORTS in engine/scripts/editorPorts.mjs).\n`,
     );
   } else if (cmd === 'backend') {
     process.stdout.write(String(port));
@@ -260,9 +292,15 @@ if (invokedDirectly) {
     process.stdout.write(String(vitePortForBackend(port)));
   } else if (cmd === 'cdp') {
     process.stdout.write(String(cdpPortForBackend(port)));
+  } else if (cmd === 'editor-cdp') {
+    // The port the editor ACTUALLY binds here, as opposed to `cdp`'s fallback derivation. Without
+    // this verb the 932x series was unaskable from bash — `cdp` prints a number `qa/knowledge.md`
+    // § 1 explicitly tells a runner is wrong on this clone — which is precisely why every consumer
+    // that needed it wrote the arithmetic out again (#1102).
+    process.stdout.write(String(editorCdpPortForBackend(port)));
   } else if (cmd === 'url') {
     process.stdout.write(`http://127.0.0.1:${port}`);
   } else {
-    process.stderr.write(`[editor-ports] unknown command '${cmd ?? ''}' — want: backend | vite | cdp | cdp-unpinned | url\n`);
+    process.stderr.write(`[editor-ports] unknown command '${cmd ?? ''}' — want: backend | vite | cdp | editor-cdp | cdp-unpinned | url\n`);
   }
 }

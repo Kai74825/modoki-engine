@@ -26,15 +26,15 @@
  *  ⚠️ **On Android today the keep-alive is INERT, not a leak — #514 was filed on the opposite
  *  reading.** This was verified by READING the Capacitor sources bundled in
  *  `games/3d-test/node_modules/@capacitor/android`, not by replaying the bridge:
- *  - `Bridge.java:842-845` — `Bridge.callPluginMethod` saves a call into `savedCalls` only if it
+ *  - `Bridge.callPluginMethod` saves a call into `savedCalls` only if it
  *    is kept-alive at the moment the plugin METHOD RETURNS. This plugin parks the call several
  *    async hops later (inside `queryProductDetailsAsync`'s callback), so it never reaches
  *    `savedCalls` regardless of the flag.
- *  - `MessageHandler.java:136-138` — `sendResponseMessage` reads `isKeptAlive()` to decide whether
+ *  - `MessageHandler.sendResponseMessage` reads `isKeptAlive()` to decide whether
  *    to `release()` the call, and copies the same value into the response's `save` field. This is
  *    the reason the flag MUST be cleared before, not after, resolve/reject: by the time
  *    `sendResponseMessage` runs the decision is already made.
- *  - `native-bridge.js:968-978` — a promise-style call's JS callback is deleted on settle
+ *  - `native-bridge.js`'s `cap.fromNative` — a promise-style call's JS callback is deleted on settle
  *    regardless of `save`, so there is no JS-side retention either.
  *
  *  So this guard exists for what happens the day someone parks a call SYNCHRONOUSLY (a cached
@@ -45,6 +45,7 @@
  *  Capacitor bridge, so it cannot exercise `unpark` at runtime. That verification has to happen on
  *  a device with a real Play purchase in flight. */
 import { describe, expect, it } from 'vitest';
+import { found } from '@modoki/engine/testing/inOrder';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { REPO_ROOT } from '../helpers/repoLayout';
@@ -86,6 +87,13 @@ const unparkBody = extractUnparkBody(source);
 function countOccurrences(haystack: string, needle: string): number {
   return haystack.split(needle).length - 1;
 }
+
+/* ⚠️ **Line-grained by record, not by oversight (#1179).** The two readers below judge Java one
+ * physical line at a time (a wrapped `unpark(\n call);` is not counted, a statement sharing a line is
+ * judged with it). The #1179 census moved every JS/TS and shell scanner onto a parser or onto logical
+ * commands; this repo's test helpers have no Java parser, and one file does not justify adding one.
+ * A reflow fails LOUD here rather than green: the `unpark` count is pinned at exactly 6, and every
+ * `statementLines` lookup below must find its statement. */
 
 /** Count real `unpark(...)` STATEMENTS — a line whose trimmed form starts with `unpark(` and ends
  *  with `);` — excluding the `private void unpark(...) {` declaration (which starts with
@@ -307,11 +315,9 @@ describe('ModokiIapPlugin: a parked purchase() times out instead of waiting fore
     // not have drifted into purchase(). `statementLines` needs an exact whole-line match, so these
     // anchor on declarations rather than on the two-line log statement in that branch.
     const lineOf = (needle: string): number =>
-      source.split('\n').findIndex((l) => l.includes(needle));
+      found(source.split('\n').findIndex((l) => l.includes(needle)), `the declaration "${needle}"`);
     const listenerAt = lineOf('private final PurchasesUpdatedListener purchasesUpdatedListener');
     const purchaseAt = lineOf('public void purchase(PluginCall call)');
-    expect(listenerAt, 'purchasesUpdatedListener declaration not found').toBeGreaterThan(-1);
-    expect(purchaseAt, 'purchase(PluginCall) declaration not found').toBeGreaterThan(-1);
     expect(
       armSites[0] > listenerAt && armSites[0] < purchaseAt,
       `armStrandTimeout is at line ${armSites[0] + 1}, outside the purchasesUpdated listener `
@@ -358,16 +364,14 @@ describe('ModokiIapPlugin: a parked purchase() times out instead of waiting fore
 
   it('the fire path resolves, unparks FIRST, and never rejects', () => {
     const timeoutBody = extractArmHelper(source);
-    const unparkAt = timeoutBody.indexOf('unpark(call)');
-    const resolveAt = timeoutBody.indexOf('call.resolve(');
-    expect(unparkAt, 'the fire path does not call unpark(call)').toBeGreaterThan(-1);
-    expect(resolveAt, 'the fire path does not call call.resolve(...)').toBeGreaterThan(-1);
+    const unparkAt = found(timeoutBody.indexOf('unpark(call)'), "the fire path's unpark(call)");
+    const resolveAt = found(timeoutBody.indexOf('call.resolve('), "the fire path's call.resolve(...)");
     expect(
-      unparkAt < resolveAt,
+      unparkAt,
       'the fire path resolves BEFORE unparking. unpark()\'s own docblock says the order is '
         + 'load-bearing (the keep-alive flag is read as the response is sent); every other settle '
         + 'site unparks first and this must match.',
-    ).toBe(true);
+    ).toBeLessThan(resolveAt);
     expect(
       timeoutBody.includes('call.reject('),
       'the fire path rejects — that surfaces a spurious error for a purchase that may still be '
@@ -406,9 +410,9 @@ describe('ModokiIapPlugin: a parked purchase() times out instead of waiting fore
 
 describe('ModokiIapPlugin: the reload listener is registered where it actually survives (#586)', () => {
   // ⚠️ The first #586 fix registered this listener from `Plugin.load()` and was completely INERT.
-  // Capacitor's `Bridge` constructor calls `registerAllPlugins()` (`Bridge.java:231`), which is
+  // Capacitor's `Bridge` constructor calls `registerAllPlugins()` (in the `Bridge` constructor), which is
   // what runs `Plugin.load()`; `Bridge.Builder.create()` then calls `setWebViewListeners(...)`
-  // (`:1617`) eighteen lines later, and that setter REPLACES the list (`:1465`) instead of
+  // (in `Bridge.Builder.create`) right after, and that setter REPLACES the list instead of
   // appending — so anything `load()` registered is discarded before the first navigation, and
   // `BridgeWebViewClient.onPageStarted` walks a list that never contained it.
   //

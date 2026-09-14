@@ -15,7 +15,7 @@ export type {
   IapGrant,
   ProductKind, IapProduct, IapProductInfo, StoreTransaction, PurchaseOutcome, PurchaseResult,
 } from './types';
-export { type StoreBackend, NoopStoreBackend } from './storeBackend';
+export { type StoreBackend, type StoreCancelled, NoopStoreBackend, isStoreCancelled } from './storeBackend';
 export { IapLedger, type IapLedgerStore } from './ledger';
 export { type PurchaseVerifier, LocalVerifier } from './verifier';
 export {
@@ -35,3 +35,14 @@ export {
   // removed one layer down. One reader of the plugins' reject payload, not two spellings of it.
   describeStoreError,
 } from './purchaseService';
+// The store SHELF's decisions (#925) — shared by every game with a store screen, no copy.
+export {
+  shelfProductId, sellableShelfOffers, buildShelfCatalog, shelfOfferForProduct, shelfEffectOf,
+  visibleShelfOffers, extendPassExpiry, isPassActive, noAdsActive, noAdsRemaining, shelfView, quickBuyView,
+  type ShelfOffer, type ShelfEffect, type NoAdsState, type NoAdsRemaining, type ShelfState, type ShelfRefusal,
+  type ShelfRowWords, type ShelfRowView, type ShelfNoticeWords, type ShelfInputs, type ShelfView, type QuickBuyView,
+} from './shelf';
+export {
+  ShelfSession, SHELF_WATCHDOG_MS,
+  type ShelfSessionOptions, type ShelfTimers, type ShelfBegin, type ShelfSettle,
+} from './shelfSession';

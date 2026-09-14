@@ -12,7 +12,7 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { gestureSource, configureGestures, DEFAULT_TAP_MAX_MS, DEFAULT_TAP_SLOP_PX, EMULATED_PINCH_SEED_PX } from '../../packages/modoki/src/runtime/input/gestureSource';
 import { createInputFrame, beginSample, type InputFrame } from '../../packages/modoki/src/runtime/core/inputActions';
-import { registerPointerBlocker, clearPointerBlockers } from '../../packages/modoki/src/runtime/core/pointerBlockers';
+import { registerPointerBlocker, clearPointerBlockers, setPointerIngestScope } from '../../packages/modoki/src/runtime/core/pointerBlockers';
 
 beforeEach(() => {
   configureGestures({ tapMaxMs: DEFAULT_TAP_MAX_MS, tapSlopPx: DEFAULT_TAP_SLOP_PX, mouseEmulation: false });
@@ -107,6 +107,60 @@ describe('tap', () => {
     send('pointercancel', 1, 50, 50, T0 + 30);
 
     expect(sample().gesture.tapped).toBe(false);
+  });
+});
+
+describe('the tap names the pointer set it went down in (`tapSetVersion`, #951)', () => {
+  it('equals the version a frame that sampled the press published', () => {
+    send('pointerdown', 1, 100, 100, T0 + 0);
+    const pressed = sample().gesture.pointerSetVersion;
+    send('pointerup', 1, 100, 100, T0 + 50);
+    const f = sample();
+
+    expect(f.gesture.tapped).toBe(true);
+    expect(f.gesture.pointerSetVersion, 'the lift changed the set').not.toBe(pressed);
+    expect(f.gesture.tapSetVersion).toBe(pressed);
+  });
+
+  it('a re-grip: the tap names the set sampled with the NEW finger down, not the one before the swap', () => {
+    send('pointerdown', 1, 100, 100, T0 + 0);
+    const first = sample().gesture.pointerSetVersion;
+    // Finger 1 lifts and finger 2 lands between two samples; finger 2 is then sampled, and taps.
+    send('pointerup', 1, 100, 100, T0 + 300);
+    send('pointerdown', 2, 300, 300, T0 + 310);
+    const regrip = sample().gesture.pointerSetVersion;
+    send('pointerup', 2, 300, 300, T0 + 360);
+    const f = sample();
+
+    expect(regrip, 'setup: the swap changed the set').not.toBe(first);
+    expect(f.gesture.tapped).toBe(true);
+    expect(f.gesture.tapSetVersion).toBe(regrip);
+  });
+
+  it('a tap whose press was never sampled matches no version a consumer saw', () => {
+    send('pointerdown', 1, 100, 100, T0 + 0);
+    send('pointermove', 1, 100 + DEFAULT_TAP_SLOP_PX + 5, 100, T0 + 10); // a pan, not a tap
+    const seen = sample().gesture.pointerSetVersion;
+    // Finger 1 lifts, finger 2 lands AND lifts — all between the same two samples.
+    send('pointerup', 1, 100 + DEFAULT_TAP_SLOP_PX + 5, 100, T0 + 20);
+    send('pointerdown', 2, 300, 300, T0 + 30);
+    send('pointerup', 2, 300, 300, T0 + 60);
+    const f = sample();
+
+    expect(f.gesture.tapped).toBe(true);
+    expect(f.gesture.tapSetVersion).not.toBe(seen);
+    expect(f.gesture.tapSetVersion, 'nor the set left after the lift').not.toBe(f.gesture.pointerSetVersion);
+  });
+
+  it('is 0 on a frame with no tap', () => {
+    send('pointerdown', 1, 100, 100, T0 + 0);
+    send('pointerup', 1, 100, 100, T0 + 50);
+    // ONE frame, re-sampled, as `inputSystem` does — a fresh frame per sample starts at 0 and could not
+    // tell a per-frame clear from none (mutation-checked).
+    const f = sample();
+    expect(f.gesture.tapSetVersion).toBeGreaterThan(0);
+    sample(f);
+    expect(f.gesture.tapSetVersion).toBe(0);
   });
 });
 
@@ -269,6 +323,24 @@ describe('blocking and thresholds', () => {
     const f = sample();
     expect(f.gesture.pointerCount).toBe(0);
     expect(f.gesture.tapped).toBe(false);
+  });
+
+  it('a press outside the host ingestion scope is never tracked; one inside it is (#1182)', () => {
+    const game = document.createElement('div');
+    const panel = document.createElement('div');
+    document.body.append(game, panel);
+    setPointerIngestScope((t) => t === game);
+    try {
+      send('pointerdown', 1, 100, 100, T0 + 0, { on: panel });
+      expect(sample().gesture.pointerCount).toBe(0);
+      send('pointerup', 1, 100, 100, T0 + 50, { on: panel });
+
+      // The accept side: without it, a source that tracked nothing at all would pass the line above.
+      send('pointerdown', 2, 100, 100, T0 + 100, { on: game });
+      expect(sample().gesture.pointerCount).toBe(1);
+    } finally {
+      setPointerIngestScope(null);
+    }
   });
 
   it('the thresholds are retunable, and a game is expected to author its own', () => {

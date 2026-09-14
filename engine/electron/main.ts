@@ -17,12 +17,19 @@
  * only the backend (/api) is main-hosted. Opening a project re-roots that server.
  */
 
-import { app, BrowserWindow, ipcMain, shell, dialog, nativeImage, Menu, session } from 'electron';
+// ⚠️⚠️ **FIRST IMPORT, AND THE POSITION IS THE MECHANISM** (#1043). Imports are hoisted and
+// evaluated in source order, so everything below this line — including the forty imports at the
+// bottom of this block and `require("electron")` itself — evaluates AFTER it. That is the only way
+// to have a crash handler installed during the window where `initFileLog()` has not run yet, in
+// which a throw used to produce no stdout and no main.log at all (it is how #1035 presented).
+// Moving this line down silently re-opens that window; `crashSinkOrder.test.ts` fails if you do.
+import './crashSink';
+import { app, BrowserWindow, ipcMain, shell, nativeImage, Menu, session } from 'electron';
 import path from 'node:path';
 import fs from 'node:fs';
 import { createHash } from 'node:crypto';
 import { initFileLog, getLogFilePath, logToFile } from './fileLog';
-import { resolveUserDataDir, resolveToolchainDir, shouldOverrideUserData, adoptLegacyToolchain, multiProfileKey } from './userDataDir';
+import { resolveUserDataDir, resolveToolchainDir, shouldOverrideUserData, adoptLegacyToolchain, adoptLegacyEditorState, multiProfileKey } from './userDataDir';
 
 // The app version, bundled from the root package.json at build time (the single source
 // of truth — see build-electron.mjs). Prefer this over `app.getVersion()` for DISPLAY:
@@ -46,31 +53,177 @@ const APP_VERSION = typeof __APP_VERSION__ !== 'undefined' ? __APP_VERSION__ : a
 // the first reader, not merely "before ready". Adding any userData read above this line
 // re-breaks it silently. See userDataDir.ts.
 //
-// REPO_ROOT is inlined rather than reused from below because DEV keys its profile off the
-// CLONE PATH and this must run before that declaration. (Same expression; see there.)
 // …but NEVER override an explicit `--user-data-dir`: that switch exists to isolate a
 // profile, and clobbering it is the same class of bug in reverse. (The CSP smoke launches
 // the packaged app with one.)
+//
+// ⚠️ #1036 MOVED `REPO_ROOT`, `editorIdentity()` and `setRecentsScope()` up here from further down this file.
+// They used to sit below, and this block inlined a duplicate of REPO_ROOT's expression with a
+// comment apologising for it. The decision now needs the PROJECT, which needs recents, which
+// needs the scope — so the three moved rather than being copied. All are pure path arithmetic
+// or a string store; none reads userData, which is the property that makes the move legal and
+// the property a test now guards.
+// Repo root (the npm/vite root) — owns the Vite dev-server process (dev AND
+// packaged, per C4c-3b "run Vite in prod") and resolves engine source + node_modules.
+//   • dev: engine/electron/dist/main.cjs → three levels up = the repo.
+//   • packaged: electron-builder asarUnpack's engine/** + node_modules/** into
+//     <Resources>/app.asar.unpacked (a REAL dir). __dirname would resolve to
+//     …/app.asar/… (inside the archive — Vite can't read/exec there), so point at
+//     the unpacked tree instead. See electron-builder.yml.
+const REPO_ROOT = app.isPackaged
+  ? path.join(process.resourcesPath, 'app.asar.unpacked')
+  : path.resolve(__dirname, '..', '..', '..');
+
+// Scope the recent-projects history to THIS editor instance so a packaged DMG never
+// inherits a dev clone's last project (the cross-branch skew that white-screened the
+// editor when a work-ai build auto-opened main's project). Identity = the install .app
+// path (packaged, stable across in-place upgrades) or the repo root (dev clone). The
+// toolchain stays machine-shared and layout stays per-project — only recents are scoped.
+function editorIdentity(): string {
+  if (!app.isPackaged) return REPO_ROOT;
+  const exe = app.getPath('exe');
+  const i = exe.indexOf('.app/');
+  return i >= 0 ? exe.slice(0, i + 4) : exe; // the .app bundle path
+}
+setRecentsScope(editorIdentity());
+
+// ⚠️ **Everything above this line must stay free of `app.getPath('userData')`, TRANSITIVELY.**
+// `REPO_ROOT` and `editorIdentity()` are pure path arithmetic, and `setRecentsScope` only
+// stores a string — but the recents lookup below reaches into projects.ts, which is where a
+// future `getPath('userData')` would hide. That is not hypothetical prudence: it is exactly
+// how `app.setName` was demoted to a no-op by an earlier reader (ff364b47) and went unnoticed
+// for weeks. `userDataDir.test.ts` guards main.ts's own source order; `recentsAreNotKeyedOnUserData`
+// there guards the transitive half.
+/** Where the editor's OWN state files live — `ui-prefs.json`, `instance-tokens.json`.
+ *
+ *  ⚠️ **The EDITOR-IDENTITY level, deliberately NOT `app.getPath('userData')`** (#1036). Since the
+ *  profile is keyed on the project, `getPath('userData')` now points INSIDE one project's Chromium
+ *  profile — and these files do not belong to a project. Two concrete failures if they follow it:
+ *
+ *   - `instance-tokens.json` would be minted fresh per project, so every existing `.mcp.json`
+ *     `MODOKI_TOKEN` stops matching and every MCP call 403s with `tokenMismatchError`'s
+ *     "WRONG EDITOR: this .mcp.json was written for a different editor or project" — for the SAME
+ *     editor and the SAME project. Measured during #1036: a live launch wrote a second
+ *     `instance-tokens.json` inside the project profile.
+ *   - `ui-prefs.json` (zoom) would reset per project — testboard q1k7p2hGZB9lGvYi11go, again.
+ *
+ *  The token file is DESIGNED to be shared and keyed by project root internally
+ *  (`instanceToken.ts`: "the token keys on (userData dir, project root)"), so splitting it per
+ *  project defeats a design that was already right.
+ *
+ *  Null only when `--user-data-dir` was passed and we deliberately did not decide the profile;
+ *  the accessor then falls back to whatever Chromium was told. Lazy on purpose — reading
+ *  `getPath('userData')` eagerly here is the very thing this file's header forbids. */
+let profileBaseDir: string | null = null;
+/** Editor state files adopted from the pre-#1036 profile this launch — reported once the log file
+ *  exists (see the stash note in setUserDataDir). */
+let adoptedLegacyState: string[] = [];
+
+/** WHICH PROJECT this launch opens — decided ONCE, at module load, and reused by whenReady.
+ *
+ *  ⚠️ **Memoised on purpose, and it is not an optimisation** (#1036 review F3/F5). Two things go
+ *  wrong if this is recomputed instead:
+ *
+ *  1. **The inputs get hand-copied.** They were, briefly: two six-field option objects including a
+ *     literal `path.join(REPO_ROOT, 'games', '3d-test')`. Change the default game at one site and
+ *     the profile keys on the old one while the editor opens the new one — prefs reset, gate
+ *     green. That is the shadowing-constant class CLAUDE.md names.
+ *  2. **`recents` can CHANGE underneath us.** The file is machine-wide and shared by every editor
+ *     of one identity, and `addRecentProject` is a concurrent writer from sibling processes. With
+ *     recents `[A]`, this editor keys its profile on A at module load; if the user opens B in an
+ *     already-running editor of the same clone during our startup (module load → whenReady is
+ *     hundreds of ms), a recomputed `resolveInitialProject()` reads `[B, A]` and opens **B inside
+ *     A's profile**. The next launch keys on B, whose Local Storage is empty: "my prefs reset".
+ *     Only a launch that does not hard-set `MODOKI_PROJECT` is exposed — `npm run dev` is, and
+ *     `launch-editor.sh <project>` is not.
+ *
+ *  So the profile key and the project actually opened are the SAME decision by construction,
+ *  rather than two computations that are expected to agree. */
+let initialChoice: ReturnType<typeof chooseInitialProject> | null = null;
+function initialProjectChoice(): ReturnType<typeof chooseInitialProject> {
+  initialChoice ??= chooseInitialProject({
+    envProject: process.env.MODOKI_PROJECT,
+    envDefault: process.env.MODOKI_PROJECT_DEFAULT,
+    recents: getRecentProjects(),
+    repoRoot: REPO_ROOT,
+    packaged: app.isPackaged,
+    devFallback: path.join(REPO_ROOT, 'games', '3d-test'),
+  });
+  return initialChoice;
+}
+
 if (shouldOverrideUserData(process.argv)) {
-  // §14.4: several editors run inside ONE clone under MODOKI_MULTI and would otherwise
-  // share this clone's profile → LevelDB single-writer fight. Give each its own
-  // sub-profile keyed on the project it opened (stable across relaunch, distinct between
-  // co-running editors). Only under MULTI, so the normal single-editor case is unchanged.
-  const profileSubKey = process.env.MODOKI_MULTI ? multiProfileKey(process.env.MODOKI_PROJECT) : null;
+  // §14.4, generalised (#1036): the profile is keyed on the PROJECT, always — not only under
+  // MODOKI_MULTI, and not only in dev. Two editors on two games never share a Chromium profile,
+  // whichever flavour they are, and the MULTI special case is gone.
+  //
+  // ⚠️ **The project is decided by `chooseInitialProject` — the SAME function whenReady uses**
+  // (`resolveInitialProject`), with the same inputs. Do not re-implement the priority order here.
+  // If these two ever disagree, the profile is keyed on project A while the editor opens project
+  // B, which presents as "my prefs reset" and is worse than not splitting at all.
+  //
+  // Reading recents this early is safe and deliberate: they live OUTSIDE userData on purpose
+  // (projects.ts §"All recents live under a FIXED modoki-app dir"), so they need only `appData`.
+  // `migrateLegacyRecents()` runs later, in whenReady, and cannot change this answer — it writes
+  // the GLOBAL file, while a scoped `recentsFile()` reads the per-identity one.
+  //
+  // `{ kind: 'pick' }` — a packaged first run with no recents — has no project to key on, so this
+  // launch uses the bare editor-identity profile. Nothing is stranded: a first run has no
+  // accumulated state, and the NEXT launch has a recent and lands in the project profile.
+  const profileSubKey = initialProjectChoice().kind === 'path'
+    ? multiProfileKey((initialProjectChoice() as { kind: 'path'; path: string }).path)
+    : null;
   const base = resolveUserDataDir({
     appData: app.getPath('appData'),
     isPackaged: app.isPackaged,
-    repoRoot: app.isPackaged
-      ? path.join(process.resourcesPath, 'app.asar.unpacked')
-      : path.resolve(__dirname, '..', '..', '..'),
+    repoRoot: REPO_ROOT,
     subKey: null,
   });
   app.setPath('userData', profileSubKey ? path.join(base, profileSubKey) : base);
-  // …but the UI PREFS follow the clone, not the sub-profile. The split exists for Chromium's
-  // single-writer LevelDB; a zoom level is our own atomically-written file and belongs to the
-  // human, so letting a MULTI launch strand it in a sibling directory just looks like "the
-  // persisted zoom is never restored" (testboard q1k7p2hGZB9lGvYi11go). See setUiPrefsDir.
+  // …but the UI PREFS follow the EDITOR IDENTITY, not the project sub-profile — `base` is
+  // deliberately the subKey-less path. The split exists for Chromium's single-writer LevelDB;
+  // a zoom level is our own atomically-written file and belongs to the human, so letting one
+  // project's launch strand it in a sibling directory just looks like "the persisted zoom is
+  // never restored" (testboard q1k7p2hGZB9lGvYi11go). This mattered for a MULTI launch before
+  // #1036 and matters for EVERY launch now. See setUiPrefsDir.
   setUiPrefsDir(base);
+  profileBaseDir = base;
+
+  // #1041: #1036 keyed the PACKAGED profile, so an existing install's state files are one dir up —
+  // and every reader here treats absent as "never chosen". `readCdpEnabled` fails OPEN on that, so
+  // a deliberately-closed CDP port would silently reopen once, invisibly. Adopt before the first
+  // read (the CDP decision below is module-level and runs a few hundred lines down).
+  // Packaged only: dev's dir was ALREADY keyed before #1036, so it has no legacy state to adopt.
+  if (app.isPackaged) {
+    // ⚠️ The result is STASHED, not logged here. This runs before `initFileLog()` below, where
+    // `console` is not yet teed to `main.log` and a packaged app has no terminal — so a message
+    // logged at this point is written precisely nowhere (that unlogged window is #1043). Adopting
+    // a security opt-out silently is exactly what we must not do, so it is reported after the log
+    // file exists.
+    try {
+      adoptedLegacyState = adoptLegacyEditorState(app.getPath('appData'), base, fs);
+    } catch { /* never block startup on a migration */ }
+  }
+}
+
+// ⚠️ **Declared BELOW the setPath on purpose.** It mentions `app.getPath('userData')`, and
+// `userDataDir.test.ts`'s ordering guard reads this file's SOURCE ORDER — it cannot tell a lazy
+// call inside a function from an eager read, and it must not be taught to. The guard fired on the
+// first draft of this accessor, which is the guard doing its job: that textual rule is the only
+// thing standing between this file and ff364b47, where an earlier reader silently demoted
+// `app.setName` and moved the shipped editor's whole profile for weeks. Function declarations
+// hoist, so the call site further down is unaffected.
+function editorStateDir(): string { return profileBaseDir ?? app.getPath('userData'); }
+
+/** Any live BrowserWindow, or null — the parent probe `reportFatalStartup` needs (#1034).
+ *
+ *  ⚠️ ANY window counts, the splash included. All this has to buy is that the message box is a
+ *  SHEET rather than app-modal: a parentless box runs a nested native modal loop and blocks the
+ *  event loop the armed exit timer runs on. Deliberately laxer than `autoUpdate.ts`'s `show()`,
+ *  which refuses the splash because it needs the user's ANSWER and a splash destroyed at
+ *  renderer-mount takes an open sheet down unanswered — see docs/build.md § #1034. */
+function firstLiveWindow(): BrowserWindow | null {
+  return resolveDialogParent('anyWindow');
 }
 
 // Adopt a pre-existing toolchain instead of re-fetching ~1.2GB. Pinning the toolchain dir
@@ -88,19 +241,25 @@ try {
 // attached terminal on macOS Finder-launch OR any Windows GUI launch) leaves a
 // diagnosable trail instead of failing silently. Best-effort; never throws.
 initFileLog();
+// Now that console is teed to main.log, report the #1041 adopt that ran before it.
+if (adoptedLegacyState.length) {
+  console.log(`[modoki-electron] adopted legacy editor state (#1041): ${adoptedLegacyState.join(', ')}`);
+}
 import http from 'node:http';
 import { spawn } from 'node:child_process';
 import { createAssetBackend, type ElectronAssetBackend } from './assetBackend';
 import { npmSpawnSpec, ensureNode, PINNED_NODE } from '../toolchain';
 import { startBackendServer, type BackendServerHandle, type HostRoutes } from './backendServer';
 import type { LiveReloadKind } from '../plugins/vite-asset-scanner';
-import { captureViewport, tap, drag, hover, scroll, pointerDown, pointerMove, pointerUp, pressKey, typeText, focusElement, captureGesture } from './rendererOps';
+import { captureViewport, CaptureUnavailableError, captureRefusalBody, tap, drag, hover, scroll, pointerDown, pointerMove, pointerUp, pressKey, typeText, focusElement, captureGesture } from './rendererOps';
 import type { RenderSurfaceFacts } from './rendererOps';
-import { createInputRoutes, inputDeliverability, hiddenWindowRefusal } from './inputRoutes';
+import { createInputRoutes, inputDeliverabilityResult, hiddenWindowRefusal } from './inputRoutes';
+import { reportFatalStartup } from './fatalDialog';
+import { showMessageBox, resolveDialogParent } from './mainDialog';
 import { serializeMenu, triggerMenuItem, type MenuItemLike } from './menuActions';
 import { getSsrLoadModule, closeSsrLoader } from './ssrLoader';
 import { buildProdCsp, PROD_CSP_ORIGINS } from './csp';
-import { startDevServer, stopDevServer, findFreePort, reclaimLeakedDevServer } from './devServer';
+import { startDevServer, stopDevServer, findFreePort, reclaimLeakedDevServer, devServerRoot } from './devServer';
 import { showSplash, setSplashStatus, closeSplash } from './splash';
 import { pickProjectFolder, pickNewProjectFolder, addRecentProject, getRecentProjects, migrateLegacyRecents, setRecentsScope, chooseInitialProject, projectFolderKind, installAppMenu, isEditorsOwnTree, type RendererMenuSpec } from './projects';
 import { scaffoldProject } from './newProject';
@@ -109,7 +268,9 @@ import { portCandidates, readLastPort, writeLastPort, parseBackendPort } from '.
 import { buildMcpServerEntry, buildChromeDevtoolsEntry, mergeMcpConfig, isMcpStale, mcpChromePort, isMcpTokenForeign, ensureMcpGitignored, detectClaudeCli, atomicWriteFileSync, healMcpPort, resolveMcpTarget, mcpHasModoki, mcpBackendRaw, gitTrackedState, ensureProjectClaudeMd } from './connectClaude';
 import { ensureToken } from './instanceToken';
 import { vendorEnginePlugins, writeVendorMarker, type VendorResult } from '../plugins/vendorPlugins';
-import { composeDepsInstallError, hasStaleWorkspaceLink } from './projectDeps';
+import { composeDepsInstallError, projectDepsMissing } from './projectDeps';
+import { claimProjectForOpen, createOpenSequencer, type OpenTicket } from './openClaim';
+import { acquireBuildClaim } from '../scripts/buildClaimsStore.mjs';
 import { healNativeConfig } from '../plugins/healNativeConfig';
 // The ONE 'same directory?' comparison (#869).
 import { samePath } from '../scripts/pathIdentity.mjs';
@@ -124,9 +285,11 @@ import { environmentReimportHandler } from '../plugins/reimport-environment';
 import { atlasReimportHandler } from '../plugins/reimport-atlas';
 import { videoReimportHandler } from '../plugins/reimport-video';
 import type { BackendContext } from '../plugins/backend/editorBackendRouter';
+import { forwardModuleUrl } from '../plugins/backend/moduleUrl';
 import { releaseDeviceResourcesOnExit } from '../plugins/backend/deviceConnection';
 import type { SceneSchema } from '../packages/modoki/src/runtime/loaders/sceneValidation';
 import { ENGINE_VERSION } from '../packages/modoki/src/runtime/core/version';
+import { notifyListeners } from '../packages/modoki/src/runtime/core/notifyListeners';
 
 /**
  * Find the enclosing git repo/worktree root for a project path by walking up
@@ -273,7 +436,12 @@ async function installProjectDeps(cwd: string, opts: { preferCi: boolean }): Pro
  *  it runs even for a flat game with native folders but no package.json (which made
  *  ensureProjectDeps early-return before heal); it can't silently stop if the
  *  dep-install logic is refactored; and it ALWAYS logs (a "nothing to do" line
- *  included) so heal-on-open is observable. */
+ *  included) so heal-on-open is observable.
+ *
+ *  Since #1160 "every open" means through `healAndInstallOnOpen`, under the project's build claim.
+ *  The heal can now be skipped: when a build holds the claim and a completed install is present, the
+ *  open leaves the project as it is (only a native build repairs it meanwhile). That skip is logged
+ *  too, so the heal never stops silently. */
 function healProjectOnOpen(projectRoot: string): void {
   if (isEditorsOwnTree(projectRoot, REPO_ROOT)) return; // the editor's own tree, not a game (#869)
   try {
@@ -285,7 +453,7 @@ function healProjectOnOpen(projectRoot: string): void {
   }
 }
 
-async function ensureProjectDeps(projectRoot: string): Promise<void> {
+async function ensureProjectDeps(projectRoot: string, opts: { forceInstall?: boolean } = {}): Promise<void> {
   if (isEditorsOwnTree(projectRoot, REPO_ROOT)) return; // the editor's own tree (#869)
   const pkgPath = path.join(projectRoot, 'package.json');
   if (!fs.existsSync(pkgPath)) return; // not an npm project
@@ -311,8 +479,8 @@ async function ensureProjectDeps(projectRoot: string): Promise<void> {
   // gitignored tarball, in which case node_modules must be (re)built.
   // The plain existence check misses the #215 class: node_modules present overall but one of
   // THIS project's own workspace packages missing from it (see hasStaleWorkspaceLink's comment).
-  let needsInstall = !fs.existsSync(path.join(projectRoot, 'node_modules'))
-    || hasStaleWorkspaceLink(projectRoot, pkg, fs);
+  // `projectDepsMissing` is that check, shared with the heal-on-open claim's skip-or-wait decision.
+  let needsInstall = !!opts.forceInstall || projectDepsMissing(projectRoot, fs);
   let vendorResult: VendorResult | null = null;
   let vendorError: string | null = null;
   try {
@@ -352,7 +520,8 @@ async function ensureProjectDeps(projectRoot: string): Promise<void> {
   console.log(`[modoki-electron] dependencies installed for ${projectRoot}`);
 
   // `npm install` only creates the WORKSPACE SYMLINK for a project-owned native plugin (e.g.
-  // games/court's capacitor-applovin-max) — it does not build it. Those plugins ship their JS
+  // games/3d-test's capacitor-applovin-max fork; Court's copy was promoted to engine/packages in
+  // #931 and arrives prebuilt in a vendored tarball) — it does not build it. Those plugins ship their JS
   // only in a gitignored `dist/` (bootstrap-game-deps.mjs's own comment on this exact class), so
   // an install that stops here can leave the symlink restored and the import still unresolved:
   // `Failed to resolve import "capacitor-applovin-max"`, now AFTER a log line that reads as
@@ -369,6 +538,52 @@ async function ensureProjectDeps(projectRoot: string): Promise<void> {
     }
   }
 }
+
+/** The open-time repair, `healProjectOnOpen` then `ensureProjectDeps`, run under the project's build
+ *  claim (#1160). Both write the files a native build heals, and this runs in Electron main, a
+ *  different pid from the Vite child that holds the editor's own build claims. Without it, opening a
+ *  project while a CLI build healed it raced that build.
+ *
+ *  When something else holds the claim, `claimProjectForOpen` decides: skip if a completed install is
+ *  present, wait for the claim otherwise (the owner's hybrid, #1160). The claim is released before
+ *  the caller spawns Vite, so that child does not inherit a token for a claim that is already gone.
+ *  Every branch logs, which keeps the heal observable the way `healProjectOnOpen`'s doc requires.
+ *
+ *  ⚠️ The wait can outlast a user's patience, so a second Open Project can land mid-wait. Opens run
+ *  one at a time through `opens` (`createOpenSequencer`, whose header has the why), and a newer
+ *  request supersedes this one's `ticket` at once: the wait stops before its next acquire, and this
+ *  returns false so the caller starts no dev server. Returns `ticket.isCurrent()`.
+ *
+ *  Both callers provision Node BEFORE this, outside the claim. Provisioning writes no project file,
+ *  and a first-launch download held under the claim would refuse a CLI build for its whole length.
+ *  (`ensureProjectDeps`' own `ensureNodeProvisioned` call is then a cheap stat.) */
+async function healAndInstallOnOpen(projectRoot: string, ticket: OpenTicket, status: (line: string) => void): Promise<boolean> {
+  if (isEditorsOwnTree(projectRoot, REPO_ROOT)) return ticket.isCurrent(); // the editor's own tree, not a game (#869)
+  const plan = await claimProjectForOpen(path.basename(projectRoot), {
+    acquire: () => acquireBuildClaim(projectRoot, 'editor open: native heal + deps install', { kind: 'editor' }),
+    depsMissing: () => projectDepsMissing(projectRoot, fs, { completedInstall: true }),
+    superseded: () => !ticket.isCurrent(),
+    sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+    status,
+    log: (line) => console.log(`[modoki-electron] ${line}`),
+    warn: (line) => console.warn(`[modoki-electron] ${line}`),
+  });
+  if (!plan.heal) return ticket.isCurrent();
+  try {
+    healProjectOnOpen(projectRoot);
+    // A holder that died mid-install leaves `node_modules` without npm's hidden lockfile, which
+    // `ensureProjectDeps`' own bare existence check reads as installed. Only after a wait: an
+    // uncontended open keeps that check's cheaper answer.
+    const forceInstall = plan.waited && projectDepsMissing(projectRoot, fs, { completedInstall: true });
+    await ensureProjectDeps(projectRoot, { forceInstall });
+  } finally {
+    plan.release();
+  }
+  return ticket.isCurrent();
+}
+
+/** Every project open, the launch's included, runs through this one queue (#1160). */
+const opens = createOpenSequencer();
 
 // The Vite dev-server origin the renderer loads from. Resolved at startup:
 // MODOKI_DEV_URL PINS the origin explicitly — findFreePort is skipped entirely, so
@@ -396,16 +611,6 @@ const PROD = app.isPackaged || process.env.MODOKI_PROD === '1';
 // through three call sites — see the default in vendorPlugins.ts for what that cost.
 if (app.isPackaged) process.env.MODOKI_PACKAGED = '1';
 
-// Repo root (the npm/vite root) — owns the Vite dev-server process (dev AND
-// packaged, per C4c-3b "run Vite in prod") and resolves engine source + node_modules.
-//   • dev: engine/electron/dist/main.cjs → three levels up = the repo.
-//   • packaged: electron-builder asarUnpack's engine/** + node_modules/** into
-//     <Resources>/app.asar.unpacked (a REAL dir). __dirname would resolve to
-//     …/app.asar/… (inside the archive — Vite can't read/exec there), so point at
-//     the unpacked tree instead. See electron-builder.yml.
-const REPO_ROOT = app.isPackaged
-  ? path.join(process.resourcesPath, 'app.asar.unpacked')
-  : path.resolve(__dirname, '..', '..', '..');
 
 // CDP (renderer remote-debugging) for "Connect Claude Code". Chromium requires the
 // switch BEFORE app.ready, so decide it here at module load. Packaged: ON BY DEFAULT
@@ -416,11 +621,17 @@ const REPO_ROOT = app.isPackaged
 // CLI arg, so we only report the port. See cdp.ts. Read by the status/connect handlers (C2).
 const CDP = resolveCdpConfig({
   isPackaged: app.isPackaged,
-  // userData is set just above, so this reads the RIGHT dir (valid before ready).
-  prefEnabled: app.isPackaged ? readCdpEnabled(app.getPath('userData')) : false,
+  // ⚠️ `editorStateDir()`, NOT `getPath('userData')` (#1036 review F1). This is an EDITOR
+  // preference, and userData is now keyed on the PROJECT — so a write under project A and a read
+  // under project B are different files. `readCdpEnabled` defaults to ON when the file is absent
+  // (opt-out model, cdp.ts's readCdpEnabled), so the miss does not fail safe: a user who switched the
+  // remote-debugging port OFF gets it back ON at the next launch that keys differently, with the
+  // checkbox still showing their choice. Deterministic on a fresh packaged install, whose FIRST
+  // launch has no recents and so no sub-key at all.
+  prefEnabled: app.isPackaged ? readCdpEnabled(editorStateDir()) : false,
   // Sticky ladder (§12.2 item 5): last launch's port + whether it bound ours, so a 9222
   // collision advances instead of dead-ending. Packaged only (dev's port is launcher-pinned).
-  memo: app.isPackaged ? readCdpPortMemo(app.getPath('userData')) : null,
+  memo: app.isPackaged ? readCdpPortMemo(editorStateDir()) : null,   // editor-level (F1)
   // What Chromium ACTUALLY got, read from its own command line rather than from our env
   // (#356). This is read BEFORE the appendSwitch below, so in the packaged app it sees only
   // a switch that came from the OS/CLI — never our own. `getSwitchValue` returns '' when
@@ -449,18 +660,6 @@ app.commandLine.appendSwitch('disable-backgrounding-occluded-windows');
 // Minted once per process; loadURL uses it and cdpStatus() matches it.
 const CDP_NONCE = newCdpNonce();
 
-// Scope the recent-projects history to THIS editor instance so a packaged DMG never
-// inherits a dev clone's last project (the cross-branch skew that white-screened the
-// editor when a work-ai build auto-opened main's project). Identity = the install .app
-// path (packaged, stable across in-place upgrades) or the repo root (dev clone). The
-// toolchain stays machine-shared and layout stays per-project — only recents are scoped.
-function editorIdentity(): string {
-  if (!app.isPackaged) return REPO_ROOT;
-  const exe = app.getPath('exe');
-  const i = exe.indexOf('.app/');
-  return i >= 0 ? exe.slice(0, i + 4) : exe; // the .app bundle path
-}
-setRecentsScope(editorIdentity());
 
 /** The backend's real port, filled in once it binds. Read by `/api/identity`, whose whole
  *  job is to let a client confirm it is talking to the editor it meant to. */
@@ -507,14 +706,9 @@ function gitBranch(root: string): string | null {
  * Runs inside whenReady (needs app.getPath for the recents file).
  */
 async function resolveInitialProject(): Promise<string | null> {
-  const choice = chooseInitialProject({
-    envProject: process.env.MODOKI_PROJECT,
-    envDefault: process.env.MODOKI_PROJECT_DEFAULT,
-    recents: getRecentProjects(),
-    repoRoot: REPO_ROOT,
-    packaged: app.isPackaged,
-    devFallback: path.join(REPO_ROOT, 'games', '3d-test'),
-  });
+  // The SAME decision the profile was keyed on — see `initialProjectChoice`. Never recompute:
+  // the profile key and the project opened must be one decision, not two that agree.
+  const choice = initialProjectChoice();
   if (choice.kind === 'path') return choice.path;
 
   // First-run pick (packaged, no recents): the user has NO project to reopen, so the
@@ -528,7 +722,7 @@ async function resolveInitialProject(): Promise<string | null> {
     const kind = projectFolderKind(dir);
     if (kind === 'project') return dir;
     if (kind === 'occupied') {
-      await dialog.showMessageBox({
+      await showMessageBox({
         type: 'error',
         title: 'New Project',
         message: 'That folder can’t be used for a new project.',
@@ -544,7 +738,7 @@ async function resolveInitialProject(): Promise<string | null> {
     } catch (e) {
       const detail = e instanceof Error ? e.message : String(e);
       console.error('[modoki-electron] first-run scaffold failed:', detail);
-      await dialog.showMessageBox({
+      await showMessageBox({
         type: 'error', title: 'New Project', message: 'Could not create the project.',
         detail, buttons: ['Choose Again'],
       });
@@ -573,22 +767,34 @@ let resetHeldPointerOnReload: (() => void) | null = null;
 let cachedSchema: SceneSchema | undefined;
 
 // ── M→R: pending requestRenderer() calls keyed by a monotonic id. ──
-const pendingRenderer = new Map<number, { resolve: (v: unknown) => void; reject: (e: Error) => void; timer: NodeJS.Timeout }>();
+const pendingRenderer = new Map<number, { resolve: (v: unknown) => void; reject: (e: Error) => void; timer: NodeJS.Timeout; op: string }>();
 let nextRequestId = 1;
 
 /** Reject + clear every in-flight requestRenderer call (on window close or a
  *  project reload that swaps the renderer out from under them). Without this they
  *  only resolve via their timeout and leak the timer until then (P1-4). */
 function failPendingRenderer(reason: string): void {
-  for (const { reject, timer } of pendingRenderer.values()) {
-    clearTimeout(timer);
-    reject(new Error(reason));
-  }
+  // Isolated per call (#953), for uniformity with every other fan-out: `clearTimeout` and a Promise
+  // `reject` cannot throw today, but that is a fact about the callee, which nothing enforces.
+  notifyListeners(
+    [...pendingRenderer.values()].map(({ reject, timer }) => () => { clearTimeout(timer); reject(new Error(reason)); }),
+    'electron:pendingRenderer',
+    [],
+  );
   pendingRenderer.clear();
 }
 
-/** Forward an op to the editor renderer over IPC and await its reply. The
- *  renderer-side dispatcher is agentBridge.handleOp (same as the HMR path). */
+/** Forward an op to the editor renderer over IPC and await its reply.
+ *
+ *  The renderer-side dispatcher is `agentBridge`'s `handleOp` — reached DIRECTLY here, unlike the
+ *  HMR path, which since #1030 goes through `relayResponseFor`. ⚠️ **That asymmetry is correct and
+ *  must not be "made consistent".** #1030 exists because Vite BROADCASTS to every HMR client, so a
+ *  tab without the editor ops could answer on the editor's behalf; this transport sends to exactly
+ *  one `webContents`, so there is no race and nothing to count. Routing it through
+ *  `relayResponseFor` would emit `{declined:true}` replies that the handler below would resolve as
+ *  `undefined` — turning every unregistered op on Electron from a `504 NOT_AVAILABLE_HERE` into a
+ *  fabricated `200 {}` across ~30 relayed routes. The handler rejects on `declined` anyway, so the
+ *  trap is closed from both ends. */
 function requestRenderer(op: string, params: unknown, timeoutMs = 3000): Promise<unknown> {
   return new Promise((resolve, reject) => {
     if (!mainWindow || mainWindow.webContents.isDestroyed()) {
@@ -600,7 +806,7 @@ function requestRenderer(op: string, params: unknown, timeoutMs = 3000): Promise
       pendingRenderer.delete(id);
       reject(new Error('timed out waiting for the renderer — is the editor window open?'));
     }, timeoutMs);
-    pendingRenderer.set(id, { resolve, reject, timer });
+    pendingRenderer.set(id, { resolve, reject, timer, op });
     mainWindow.webContents.send('modoki:bridge-request', { id, op, params });
   });
 }
@@ -665,7 +871,15 @@ function revealMainWindow(): void {
 // and an unbounded dump on every repeat would bury the first (most useful) one under noise.
 let killForensicsLogged = 0;
 const KILL_FORENSICS_MAX = 3;
-const KILL_FORENSICS_CANDIDATES = /pkill|test-packaged|assert-app-renders|launch-editor|stop-dev|vitest|electron-builder|npm run verify/;
+// ⚠️ **This list is the difference between evidence and a false conclusion** (#944). The empty
+// case below used to be PRINTED AS positive evidence that the killer had already exited — an
+// inference stated as a fact, which is the strongest form of the "empty result reported as an
+// outcome" defect because the output actively asserts the wrong thing rather than omitting the
+// right one. It was also missing the repo's own sanctioned stop path: `stop-editor`, the
+// `repo-reap` helper behind it, `stopDevServer`, `clean-packaged-cache`, `smoke-packaged` and
+// `powershell` (the Windows reap) were all structurally invisible, so a LIVE stop-editor.sh
+// produced exactly the same empty list as no killer at all.
+const KILL_FORENSICS_CANDIDATES = /pkill|pgrep|test-packaged|assert-app-renders|launch-editor|stop-editor|repo-reap|stopDevServer|stop-dev|clean-packaged-cache|smoke-packaged|powershell|vitest|electron-builder|npm run verify/;
 function logKillForensics(context: string): void {
   if (killForensicsLogged >= KILL_FORENSICS_MAX) return;
   killForensicsLogged += 1;
@@ -681,20 +895,34 @@ function logKillForensics(context: string): void {
   try {
     const ps = spawn('ps', ['-Ao', 'pid,ppid,lstart,command'], { stdio: ['ignore', 'pipe', 'ignore'] });
     let out = '';
+    // ⚠️ Node emits 'close' AFTER a spawn 'error', so without this the failure path prints its
+    // "nothing was looked at" line and is then immediately contradicted by the empty-list report
+    // below — the defect this whole function is being fixed for, reintroduced one handler apart.
+    let looked = true;
     const timer = setTimeout(() => { try { ps.kill(); } catch { /* best effort */ } }, 2000);
     ps.stdout.on('data', (d: Buffer) => { out += d.toString(); });
     ps.on('close', () => {
       clearTimeout(timer);
+      if (!looked) return;
       try {
         const lines = out.split('\n').filter((l) => KILL_FORENSICS_CANDIDATES.test(l)).slice(0, 20);
         console.error(
           `[modoki-electron] kill forensics: ${lines.length} candidate process(es) still running ` +
-          '(empty means the killer had already exited by the time this ran):\n' +
+          '(empty means EITHER the killer had already exited, OR it is not in the candidate list — ' +
+          'these are indistinguishable from here, so do not read an empty list as a conclusion):\n' +
           lines.join('\n'),
         );
       } catch { /* best effort — never throw out of a diagnostic */ }
     });
-    ps.on('error', () => { clearTimeout(timer); /* ps missing/failed — nothing to log */ });
+    // A failed `ps` used to be silent, which produced the SAME output as a successful ps that
+    // matched nothing — so the one case where the snapshot is worthless looked like the case where
+    // it is informative (#944).
+    ps.on('error', (e: Error) => {
+      clearTimeout(timer);
+      looked = false;
+      console.error(`[modoki-electron] kill forensics: \`ps\` failed (${e.message}) — no snapshot was `
+        + 'taken. This is NOT an empty candidate list; nothing was looked at.');
+    });
   } catch { /* best effort — never throw out of a diagnostic */ }
 }
 
@@ -793,14 +1021,12 @@ async function createWindow(backendBase: string) {
   // (the developer's own trusted machine). Navigation + window-open hardening
   // above is the primary protection in both.
   //
-  // `script-src`/`worker-src` include `https:` so an on-device-LLM game (chess,
-  // llm-test) can load MediaPipe's GenAI wasm loader `<script>` + inference worker
-  // from its CDN (jsdelivr) — the ONLY external-script need in the tree (the KTX2
-  // transcoder self-hosts libktx to avoid its CDN). This does NOT weaken the posture:
-  // `script-src` already carries `'unsafe-inline' 'unsafe-eval'`, so arbitrary code
-  // is already permitted; the bound that matters is loopback+https, matching the
-  // `https:` already granted to img/media/connect. Without it the CDN `<script>` is
-  // blocked → "Resource load error: genai_wasm_internal.js" and the game never loads.
+  // `script-src`/`worker-src` grant NO remote origin (#1191): code comes only from
+  // loopback or a blob. They used to carry `https:` for exactly one consumer —
+  // MediaPipe's GenAI wasm loader for the on-device-LLM games — and that grant went
+  // with those games. `https:` stays on img/media/connect for remote asset refs and
+  // fetches. A game needing a remote script should self-host it (three's Basis transcoder
+  // and Pixi's KTX transcoder already do) rather than widen this. Contract: csp.ts.
   if (PROD) {
     const csp = buildProdCsp(PROD_CSP_ORIGINS);
     win.webContents.session.webRequest.onHeadersReceived((details, cb) => {
@@ -920,7 +1146,7 @@ const onSceneChanged = (urlPath: string, kind: LiveReloadKind, viaSibling: boole
 let instanceToken: string | null = null;
 function refreshInstanceToken(): void {
   try {
-    instanceToken = state.root ? ensureToken(app.getPath('userData'), state.root) : null;
+    instanceToken = state.root ? ensureToken(editorStateDir(), state.root) : null;
   } catch (e) {
     // An unwritable userData must not break the editor — it just means no token gate.
     console.warn('[modoki-electron] could not mint an instance token:', e instanceof Error ? e.message : e);
@@ -974,7 +1200,7 @@ function rememberCdpPort(probe: CdpProbe): void {
   const verdict = cdpMemoVerdict(probe);
   if (verdict === null || _cdpMemoWrittenOurs === verdict) return;
   _cdpMemoWrittenOurs = verdict;
-  writeCdpPortMemo(app.getPath('userData'), { port: CDP.port, ours: verdict });
+  writeCdpPortMemo(editorStateDir(), { port: CDP.port, ours: verdict });  // pairs with the read (F1)
 }
 
 /** Auto-heal the open project's `.mcp.json` when the editor's backend port changed under
@@ -1031,14 +1257,30 @@ async function healConnectedMcp(): Promise<void> {
       detail: `${r.mcpPath} now matches this editor${portChanged ? ` (port ${r.newPort})` : ''}.\n\nIf you have “claude” running in ${claudeDir}, quit and restart it so it picks up the change.`,
       buttons: ['OK'],
     };
-    void (mainWindow ? dialog.showMessageBox(mainWindow, box) : dialog.showMessageBox(box));
+    void showMessageBox(box, mainWindow);
   } catch (e) {
     // Best-effort: a heal failure must never block opening a project.
     console.warn('[modoki-electron] .mcp.json heal failed:', e instanceof Error ? e.message : e);
   }
 }
 
-async function setProject(newRoot: string, opts?: { openSettingsAfter?: boolean }): Promise<void> {
+function setProject(newRoot: string, opts?: { openSettingsAfter?: boolean }): Promise<void> {
+  // Queued synchronously, so the order of opens is the order of requests (#1160).
+  requestedRoot = newRoot;
+  return opens.open((ticket) => openProject(newRoot, ticket, opts));
+}
+
+/** The root of the NEWEST open requested, launch included (#1160). Open Project and Open Recent skip
+ *  a pick equal to it. `state.root` would be wrong for that: with opens queued it holds the last
+ *  root an open STARTED, so re-picking a project while a different one is queued would be dropped. */
+let requestedRoot = '';
+
+async function openProject(newRoot: string, ticket: OpenTicket, opts?: { openSettingsAfter?: boolean }): Promise<void> {
+  // A newer open was requested while this one queued: it owns the editor now, so touch nothing.
+  if (!ticket.isCurrent()) {
+    console.log(`[modoki-electron] open of ${newRoot} superseded before it started`);
+    return;
+  }
   await state.backend.stop().catch(() => {});
   state.root = newRoot;
   refreshInstanceToken(); // the token is per-project — a new root means a new expected token
@@ -1057,12 +1299,28 @@ async function setProject(newRoot: string, opts?: { openSettingsAfter?: boolean 
       // an in-repo game never installed). Show progress in the title — npm install
       // can take several seconds and the window is already visible.
       mainWindow?.setTitle(`Modoki Editor ${APP_VERSION} — installing ${path.basename(newRoot)}…`);
-      healProjectOnOpen(newRoot);
       if (app.isPackaged) await ensureNodeProvisioned(); // Core before Vite spawn (see whenReady)
-      await ensureProjectDeps(newRoot);
+      // False when a later open replaced this one while it waited on a build claim (#1160). That
+      // open owns the dev server and the title now, so this one must not touch either.
+      // Progress goes to the title bar, or to the splash when this open runs queued behind a launch
+      // that has no window yet (macOS: the menu is live first). Otherwise a claim wait would sit
+      // behind a silent splash (#1160 review).
+      const openStatus = (line: string) => {
+        if (mainWindow) mainWindow.setTitle(`Modoki Editor ${APP_VERSION} — ${line}`);
+        else setSplashStatus(line);
+      };
+      if (!(await healAndInstallOnOpen(newRoot, ticket, openStatus))) {
+        console.log(`[modoki-electron] open of ${newRoot} superseded by ${state.root}, not starting its dev server`);
+        return;
+      }
       await startDevServer({ repoRoot: REPO_ROOT, projectRoot: newRoot, url: DEV_URL });
     } catch (e) {
       const detail = e instanceof Error ? e.message : String(e);
+      // A failure of an open the user has already moved on from is not theirs to dismiss (#1160).
+      if (!ticket.isCurrent()) {
+        console.warn(`[modoki-electron] superseded open of ${newRoot} failed (not shown): ${detail}`);
+        return;
+      }
       console.error('[modoki-electron] open project failed:', detail);
       mainWindow?.setTitle(titleFor(state.root));
       const opts = {
@@ -1072,7 +1330,7 @@ async function setProject(newRoot: string, opts?: { openSettingsAfter?: boolean 
         detail: `${detail}\n\nThe editor may be in an inconsistent state — relaunch:\n  scripts/launch-editor.sh "${newRoot}"`,
         buttons: ['OK'],
       };
-      if (mainWindow) await dialog.showMessageBox(mainWindow, opts); else await dialog.showMessageBox(opts);
+      await showMessageBox(opts, mainWindow);
       return;
     }
   }
@@ -1112,7 +1370,7 @@ function rebuildMenu(): void {
         const detail = e instanceof Error ? e.message : String(e);
         console.error('[modoki-electron] new project failed:', detail);
         const errOpts = { type: 'error' as const, title: 'New Project failed', message: 'Could not create the project.', detail, buttons: ['OK'] };
-        if (mainWindow) await dialog.showMessageBox(mainWindow, errOpts); else await dialog.showMessageBox(errOpts);
+        await showMessageBox(errOpts, mainWindow);
         return;
       }
       // Open it, then show Project Settings so the user can fill in identity/build info.
@@ -1120,12 +1378,12 @@ function rebuildMenu(): void {
     },
     onOpenProject: async () => {
       const chosen = await pickProjectFolder(mainWindow);
-      if (chosen && !samePath(chosen, state.root)) await setProject(chosen);
+      if (chosen && !samePath(chosen, requestedRoot)) await setProject(chosen);
     },
     // (#869) samePath, not `!==`: a recents entry is one of the two untrusted spelling
     // sources, so a differently-cased entry re-opened the project ALREADY open — a full
     // setProject, discarding whatever unsaved scene state that costs.
-    onOpenRecent: (root) => { if (!samePath(root, state.root)) void setProject(root); },
+    onOpenRecent: (root) => { if (!samePath(root, requestedRoot)) void setProject(root); },
     rendererMenus: rendererMenuSpec,
     // Relay an OS-menu click to the renderer, which dispatches the editor action.
     onMenuAction: (id) => mainWindow?.webContents.send('modoki:bridge-menu-action', id),
@@ -1143,8 +1401,8 @@ function rebuildMenu(): void {
 // panel (matching the navy app icon) rather than a plain OS message box. Shows the
 // icon, name + ™, engine/runtime versions, copyright, and a link to the site.
 // The icon is sourced from the editor favicon (which ships inside the packaged
-// engine tree) so it renders in dev AND packaged; build/icon.png is the dev
-// fallback. Reuses a single window (focuses it if already open).
+// engine tree) so it renders in dev AND packaged; engine/assets/app-icon-default.png
+// is the fallback. Reuses a single window (focuses it if already open).
 let aboutWindow: BrowserWindow | null = null;
 
 function showAboutDialog(): void {
@@ -1152,7 +1410,7 @@ function showAboutDialog(): void {
 
   const iconFile = [
     path.join(REPO_ROOT, 'engine', 'packages', 'modoki', 'src', 'runtime', 'assets', 'favicon.png'),
-    path.join(REPO_ROOT, 'build', 'icon.png'),
+    path.join(REPO_ROOT, 'engine', 'assets', 'app-icon-default.png'),
     process.resourcesPath ? path.join(process.resourcesPath, 'icon.png') : '',
   ].find((p) => { try { return !!p && fs.existsSync(p); } catch { return false; } });
   let iconSrc = '';
@@ -1242,7 +1500,7 @@ app.whenReady().then(async () => {
   // menu — no native about panel (setAboutPanelOptions) is used anymore.
   // Dev: show the Modoki icon in the Dock (packaged builds get it from the bundle).
   if (process.platform === 'darwin' && !app.isPackaged && app.dock) {
-    try { app.dock.setIcon(path.join(REPO_ROOT, 'build', 'icon.png')); } catch { /* best-effort */ }
+    try { app.dock.setIcon(path.join(REPO_ROOT, 'engine', 'assets', 'app-icon-default.png')); } catch { /* best-effort */ }
   }
 
   // Packaged: prefer bundled native CLIs (extraResources/bin) over PATH. No-op
@@ -1299,6 +1557,11 @@ app.whenReady().then(async () => {
   const initialRoot = await resolveInitialProject();
   if (!initialRoot) { app.quit(); return; } // packaged first-launch picker cancelled
   state.root = initialRoot;
+  requestedRoot = initialRoot;
+  // The launch takes its place in the open sequence HERE, before `rebuildMenu` makes Open Project
+  // reachable, so an open picked during provisioning queues behind the launch instead of being
+  // superseded by it (#1160). Its body is supplied at the launch heal below, on every path.
+  const launchOpen = opens.reserve<boolean>();
   refreshInstanceToken(); // before the backend binds, so the token gate is never unarmed
   addRecentProject(initialRoot);
 
@@ -1339,6 +1602,10 @@ app.whenReady().then(async () => {
     invalidateProjectConfig: () => {
       fetch(`${DEV_URL}/api/invalidate-project-config`, { method: 'POST' }).catch(() => { /* Vite unreachable — self-heals on relaunch */ });
     },
+    // #1155: main has no module graph either, and the one that matters is the child Vite's — it
+    // wrote the URLs the renderer imported. Forward to the same route there (status-preserving and
+    // bounded — see forwardModuleUrl).
+    resolveModuleUrl: (spec) => forwardModuleUrl(DEV_URL, spec),
   };
 
   // ── Trusted-input routes. `ops` binds each primitive to the live window lazily —
@@ -1415,11 +1682,24 @@ app.whenReady().then(async () => {
       // The probe runs ONLY if the compositor refuses a frame — it is what lets the error say
       // "no viewport is mounted, nothing to capture" instead of blaming a wedged renderer for a
       // supported layout. Short timeout: a diagnostic must not out-wait the thing it explains.
-      const result = await captureViewport(mainWindow, {
-        ...opts,
-        probe: () => requestRenderer('editor-state', {}, 1500) as Promise<RenderSurfaceFacts | null>,
-      });
-      return { kind: 'json', body: result };
+      try {
+        const result = await captureViewport(mainWindow, {
+          ...opts,
+          probe: () => requestRenderer('editor-state', {}, 1500) as Promise<RenderSurfaceFacts | null>,
+        });
+        return { kind: 'json', body: result };
+      } catch (e) {
+        // A compositor that cannot produce a frame is a §5 NO_RENDERER refusal, not a transport
+        // failure (#994). Uncaught it reaches `backendServer.ts`'s catch-all as a 500, which the
+        // MCP client reads as NOT_AVAILABLE_HERE — "the route is absent" — for an ordinary editor
+        // state (window minimised, no viewport mounted). 503 matches the status this router's
+        // sibling envelopes already use for NO_RENDERER; the CODE is what the agent reacts to.
+        // Anything else still throws: an unwritable temp dir is not a renderer fact.
+        if (e instanceof CaptureUnavailableError) {
+          return { kind: 'json', status: 503, body: captureRefusalBody(e) };
+        }
+        throw e;
+      }
     }
     // ── Trusted input (`/api/input/*`), incl. selector-aware aiming. Extracted so the
     //    resolve-then-dispatch ordering is unit-testable. ──
@@ -1460,7 +1740,10 @@ app.whenReady().then(async () => {
       // The same gate `/api/input/*` applies, reached through the shared helper rather than a
       // second copy of the rule (this route drives its own drag through rendererOps, so it does
       // not pass through createInputRoutes).
-      const gestureRefusal = hiddenWindowRefusal(await inputDeliverability(requestRenderer), 'the drag this samples');
+      // #1096: the Result twin, so a probe that could not answer is distinguishable here too — this
+      // is the one trusted-input path that does NOT go through `/api/input/*`'s chokepoint.
+      const gestureProbe = await inputDeliverabilityResult(requestRenderer);
+      const gestureRefusal = hiddenWindowRefusal(gestureProbe.live, 'the drag this samples');
       if (gestureRefusal) return gestureRefusal;
       // …and for the same reason it borrows that gate: this drag is a mouse gesture, so it cannot
       // coexist with a sustained `/api/input/pointer` press. The routes that DO flow through
@@ -1568,7 +1851,10 @@ app.whenReady().then(async () => {
   const pinnedBackend = pinned != null;
   const candidates = portCandidates({
     pinned,
-    lastPort: pinnedBackend ? null : readLastPort(app.getPath('userData')),
+    // Editor-level (#1036 review F1): C5 relies on this surviving a relaunch so a baked-in
+    // MODOKI_BACKEND keeps working. Per-project, a project switch drops the memo and an
+    // unpinned editor can re-drift to a different port.
+    lastPort: pinnedBackend ? null : readLastPort(editorStateDir()),
   });
 
   // Bind by ACTUALLY LISTENING on each candidate — never probe-then-rebind. A
@@ -1610,8 +1896,17 @@ app.whenReady().then(async () => {
       ? `MODOKI_BACKEND_PORT=${pinned} is already in use — refusing to drift (the MCP target must stay stable). Free that port or unset MODOKI_BACKEND_PORT.`
       : `Could not start the local backend on any port.\n\n${why}`;
     console.error(`[modoki-electron] ${msg}`);
-    dialog.showErrorBox('Modoki Editor', msg); // fail LOUD — a windowless live process is worse
-    app.exit(1);
+    logToFile('error', `[startup] ${msg}`);
+    // fail LOUD — a windowless live process is worse. #1034: the exit is ARMED FIRST, so an
+    // unattended launch cannot be parked forever in a modal nobody can answer.
+    reportFatalStartup(
+      { title: 'Modoki Editor', message: msg },
+      {
+        parentWindow: firstLiveWindow,
+        showMessageBox: (parent, o) => showMessageBox(o, parent as BrowserWindow),
+        terminate: () => app.exit(1),
+      },
+    );
     return;
   }
   resolvedBackendPort = backendHandle.port; // the port that actually bound — what /api/identity reports
@@ -1620,7 +1915,7 @@ app.whenReady().then(async () => {
   // Remember it so the NEXT launch prefers the same port and the user's baked
   // .mcp.json keeps working without a Claude restart (C5). Pinned ports aren't
   // remembered — the env is already the source of truth for those.
-  if (!pinnedBackend) writeLastPort(app.getPath('userData'), backendHandle.port);
+  if (!pinnedBackend) writeLastPort(editorStateDir(), backendHandle.port);  // pairs with the read (F1)
   // If this launch DID land on a different port than the open project's .mcp.json bakes,
   // rewrite it now and tell the user to restart Claude (C5).
   void healConnectedMcp();
@@ -1665,12 +1960,20 @@ app.whenReady().then(async () => {
       // handleZoom directly in rebuildMenu). Whole-app UI zoom via webContents.
       handleZoom(mainWindow, msg.data as { dir?: 'in' | 'out' | 'reset'; deltaY?: number });
     } else if (msg.event === 'response') {
-      const { id, result, error } = msg.data as { id: number; result?: unknown; error?: string };
+      const { id, result, error, declined } = msg.data as
+        { id: number; result?: unknown; error?: string; declined?: boolean };
       const p = pendingRenderer.get(id);
       if (!p) return;
       clearTimeout(p.timer);
       pendingRenderer.delete(id);
-      if (error) p.reject(new Error(error)); else p.resolve(result);
+      // ⚠️ A `declined` reply (the renderer has no handler for that op) must REJECT, not resolve
+      // (#1030 close-out F6). This transport does not produce one today — `requestRenderer`'s
+      // docblock says why, and why it must not start — but the destructure above used to drop the
+      // field entirely, so if one ever arrived it fell through to `resolve(undefined)` and every
+      // relayed route reported a fabricated `200 {}` instead of `504 NOT_AVAILABLE_HERE`. Rejecting
+      // with the string the classifiers already key on costs nothing and removes the trap.
+      if (declined) p.reject(new Error(`unknown agent op '${p.op}'`));
+      else if (error) p.reject(new Error(error)); else p.resolve(result);
     }
   });
 
@@ -1851,7 +2154,7 @@ app.whenReady().then(async () => {
     // The remote-debugging switch is applied at STARTUP only (cdp.ts), so a change
     // needs a relaunch. Packaged only — in dev the launcher owns the port via env.
     if (!app.isPackaged) return { ok: false, error: 'In dev, CDP is controlled by MODOKI_CDP_PORT in launch-editor.sh.' };
-    writeCdpEnabled(app.getPath('userData'), !!enabled);
+    writeCdpEnabled(editorStateDir(), !!enabled);   // editor-level — pairs with the read (F1)
     app.relaunch();
     app.exit(0);
     return { ok: true };
@@ -1930,19 +2233,46 @@ app.whenReady().then(async () => {
     // and an extra window would just get in the way of the HMR/MCP loop.
     if (app.isPackaged) showSplash();
     try {
-      setSplashStatus('Preparing the editor runtime…');
-      healProjectOnOpen(state.root);
-      // Core toolchain: ALWAYS provision the pinned Node on a packaged launch — even
-      // for a deps-less / no-package.json project (ensureProjectDeps would skip it) —
-      // AND before the Vite child spawns, so it inherits MODOKI_NODE/MODOKI_NPM_CLI
-      // and the Build-Support install SSE (which runs IN that child) can npm-install
-      // the model tools. Also makes "Core (Node / npm)" show present out of the box.
-      // Idempotent (cheap stat when already provisioned).
-      if (app.isPackaged) { setSplashStatus('Preparing Node runtime…'); await ensureNodeProvisioned(); }
-      setSplashStatus('Installing dependencies…');
-      await ensureProjectDeps(state.root);
-      setSplashStatus('Starting editor…');
-      await startDevServer({ repoRoot: REPO_ROOT, projectRoot: state.root, url: DEV_URL });
+      const launched = await launchOpen.run(async (ticket) => {
+        const launchRoot = state.root;
+        try {
+          setSplashStatus('Preparing the editor runtime…');
+          // Core toolchain: ALWAYS provision the pinned Node on a packaged launch — even
+          // for a deps-less / no-package.json project (ensureProjectDeps would skip it) —
+          // AND before the Vite child spawns, so it inherits MODOKI_NODE/MODOKI_NPM_CLI
+          // and the Build-Support install SSE (which runs IN that child) can npm-install
+          // the model tools. Also makes "Core (Node / npm)" show present out of the box.
+          // Idempotent (cheap stat when already provisioned).
+          if (app.isPackaged) { setSplashStatus('Preparing Node runtime…'); await ensureNodeProvisioned(); }
+          setSplashStatus('Installing dependencies…');
+          // Heal + install under the project's build claim; skips or waits if a build holds it (#1160).
+          if (!(await healAndInstallOnOpen(launchRoot, ticket, setSplashStatus))) return false;
+          setSplashStatus('Starting editor…');
+          await startDevServer({ repoRoot: REPO_ROOT, projectRoot: launchRoot, url: DEV_URL });
+          return true;
+        } catch (e) {
+          // Superseded: the open that replaced the launch owns the editor, so its failure is not fatal.
+          if (!ticket.isCurrent()) {
+            console.warn(`[modoki-electron] superseded launch open of ${launchRoot} failed (continuing): ${e instanceof Error ? e.message : e}`);
+            return false;
+          }
+          throw e;
+        }
+      });
+      // An Open Project picked during the launch runs after the launch's turn and restarts the dev
+      // server for ITS root. Creating the window before it settles would load a server that is about
+      // to stop, so wait for every queued open. Superseded covers both "the launch never started
+      // Vite" and "it did, and an open queued behind it".
+      if (!launched || !launchOpen.ticket.isCurrent()) {
+        console.log(`[modoki-electron] launch open superseded by ${requestedRoot}; waiting for the queued open(s)`);
+        await opens.idle();
+        const viteRoot = devServerRoot();
+        // Rooted at state.root, not merely running: a later open that failed before its own
+        // startDevServer leaves the previous project's Vite up under a backend now rooted elsewhere.
+        if (!viteRoot || !samePath(viteRoot, state.root)) {
+          throw new Error(`the project opened during launch (${state.root}) did not open, so there is no editor to show. Its own dialog named the cause.`);
+        }
+      }
     } catch (e) {
       const msg = e instanceof Error ? (e.stack || e.message) : String(e);
       console.error('[modoki-electron] failed to start dev server:', msg);
@@ -1952,18 +2282,31 @@ app.whenReady().then(async () => {
       // Show the dialog (modal, sits above the frameless splash) BEFORE closing the
       // splash — destroying the last window first would trip window-all-closed →
       // app.quit() and race the dialog away.
-      try {
-        const logHint = getLogFilePath() ? `\n\nFull log: ${getLogFilePath()}` : '';
-        dialog.showErrorBox(
-          'Modoki could not open the project',
-          `Opening:\n${state.root}\n\nfailed while starting the editor:\n\n${msg}${logHint}`,
-        );
-      } catch { /* pre-window dialog best-effort */ }
-      closeSplash();
-      quitExitCode = 1; // a failed launch must not exit 0 — see quitExitCode (#68)
-      app.quit();
+      const logHint = getLogFilePath() ? `\n\nFull log: ${getLogFilePath()}` : '';
+      // #1034: exit armed before the dialog. ⚠️ This site must NOT become `app.exit(1)` — it goes
+      // through the deferred before-quit teardown, and `quitExitCode` is what keeps a failed launch
+      // from reporting 0 (#68).
+      reportFatalStartup(
+        {
+          title: 'Modoki could not open the project',
+          message: `Opening:\n${state.root}\n\nfailed while starting the editor:\n\n${msg}${logHint}`,
+        },
+        {
+          parentWindow: firstLiveWindow,
+          showMessageBox: (parent, o) => showMessageBox(o, parent as BrowserWindow),
+          terminate: () => {
+            closeSplash();
+            quitExitCode = 1; // a failed launch must not exit 0 — see quitExitCode (#68)
+            app.quit();
+          },
+        },
+      );
       return;
     }
+  } else {
+    // No dev server to prepare, but the launch's reserved turn must still end, or every later
+    // Open Project would queue behind it forever (#1160).
+    void launchOpen.run(async () => true);
   }
 
   await createWindow(backendBase);
@@ -1971,9 +2314,10 @@ app.whenReady().then(async () => {
   // menu-structure IPC → revealMainWindow), or the createWindow timeout fallback —
   // so the hand-off is splash → painted editor, with no black window in between.
 
-  // Self-update from the GitHub Releases feed (packaged + signed builds only;
-  // no-op in dev). Silent on launch — surfaces only a "restart to install" prompt
-  // once a newer signed build has downloaded.
+  // Self-update from the GitHub Releases feed (packaged + signed builds only; no-op in
+  // dev). NOT silent when an update exists (#1032): it ASKS before downloading a few
+  // hundred MB, on this launch path as well as the menu one, then shows dock progress
+  // and a "restart to install" prompt. Only "you're up to date" stays quiet here.
   setupAutoUpdate();
 
   app.on('activate', () => {
@@ -1987,8 +2331,19 @@ app.whenReady().then(async () => {
   const why = e instanceof Error ? (e.stack ?? e.message) : String(e);
   console.error('[modoki-electron] startup failed:', why);
   logToFile('error', `[startup] ${why}`);
-  try { dialog.showErrorBox('Modoki Editor — startup failed', `${e instanceof Error ? e.message : String(e)}\n\nLog: ${getLogFilePath()}`); } catch { /* pre-ready */ }
-  app.exit(1);
+  // #1034: the exit is armed before the dialog, so this handler terminates even when nobody can
+  // answer the modal — which is every unattended launch, and is the state it exists to prevent.
+  reportFatalStartup(
+    {
+      title: 'Modoki Editor — startup failed',
+      message: `${e instanceof Error ? e.message : String(e)}\n\nLog: ${getLogFilePath()}`,
+    },
+    {
+      parentWindow: firstLiveWindow,
+      showMessageBox: (parent, o) => showMessageBox(o, parent as BrowserWindow),
+      terminate: () => app.exit(1),
+    },
+  );
 });
 
 app.on('window-all-closed', () => {

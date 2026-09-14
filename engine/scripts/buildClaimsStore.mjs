@@ -20,7 +20,7 @@
  * DEVICE claim:
  *
  *  1. **`withLock` here THROWS on a lock timeout instead of proceeding unlocked.**
- *     `deviceClaimsStore.mjs:264` gives up and proceeds WITHOUT the lock — "never block hardware
+ *     `deviceClaimsStore.mjs`'s `withLock` gives up and proceeds WITHOUT the lock — "never block hardware
  *     on a lock" — which is correct for a device (losing that race just means retrying a tap
  *     moments later) and WRONG here: proceeding unlocked risks losing a write in the
  *     read-modify-write, and a lost build claim is exactly the torn-dist race this module exists
@@ -58,7 +58,7 @@
  *     ENTIRE hold: the CLI process does not exit until the build/publish/scaffold it is guarding
  *     is actually done. So plain pid liveness is the right PRIMARY signal, with the TTL only as a
  *     backstop for what pid liveness cannot see (a claim written by a machine whose clock jumped).
- *     See `isStale` below — same dual rule as `deviceClaimsStore.mjs:202-215`, including treating
+ *     See `isStale` below — same dual rule as `deviceClaimsStore.mjs`'s `isStale`, including treating
  *     a NEGATIVE age (a claim stamped in the future) as a live claim with a bad clock, never an
  *     expiry.
  *
@@ -68,7 +68,7 @@
  * build") — there is no self-reconnect case there, so this mirrors it exactly: one live claim per
  * project root, no exceptions. Release identity instead comes from a per-acquisition `token`
  * (below), because a FILE-based claim has no in-memory object to compare by reference the way
- * `buildLock.ts:64`'s `if (active === mine)` does — see `acquireBuildClaim`'s own comment.
+ * `buildLock.ts`'s `acquireBuild` release closure's `if (active === mine)` does — see `acquireBuildClaim`'s own comment.
  *
  * ── Re-entrancy through a CHILD PROCESS (deadlock fix) ──
  * `/api/build`, `/api/ota/publish` and `/api/add-native-target` each hold the claim for their
@@ -157,15 +157,15 @@ export function isStale(claim, opts = {}) {
   // A NEGATIVE age (a claim stamped in the future — clock skew between two machines sharing a
   // network home dir) is not an expiry: it is a live claim with a bad clock, and expiring it would
   // hand a project's dist to a second process mid-build. Only genuine age counts. Same rule, same
-  // reasoning, as deviceClaimsStore.mjs:212-215.
+  // reasoning, as deviceClaimsStore.mjs's `isStale` (its negative-age rule).
   return now - claim.at > BUILD_CLAIM_TTL_MS;
 }
 
 // ── File I/O ─────────────────────────────────────────────────────────────────
 
 /** Read the on-disk claims file, distinguishing "not created yet" from "exists but I can't tell
- *  what's in it" — the three-way MATCH/MISMATCH/UNKNOWN doctrine `device.mjs:348-361`
- *  (`checkIosPhoneCollision`) sets out for exactly this shape, cited by #731's design too:
+ *  what's in it" — the three-way MATCH/MISMATCH/UNKNOWN doctrine that `device.mjs`'s
+ *  `checkIosPhoneCollision` docblock sets out for exactly this shape, cited by #731's design too:
  *
  *   - **Absent (`ENOENT`)** → `{ ok: true, claims: [] }`. The ordinary first-run case — nothing has
  *     ever claimed anything on this machine — and it must stay exactly this silent.
@@ -280,7 +280,7 @@ function writeClaims(claims) {
 }
 
 /** Serialize read-modify-write across PROCESSES with an O_EXCL lock dir — same primitive as
- *  `deviceClaimsStore.mjs:239-276`, but see divergence 1 in the header for why it THROWS instead
+ *  `deviceClaimsStore.mjs`'s `withLock`, but see divergence 1 in the header for why it THROWS instead
  *  of proceeding once `deadlineMs` passes.
  *
  *  `deadlineMs` is deliberately a SEPARATE knob from `LOCK_STALE_MS` (not exposed on the public
@@ -315,7 +315,7 @@ function withLock(fn, opts = {}) {
       try { age = Date.now() - fs.statSync(lock).mtimeMs; } catch { continue; /* vanished — retry */ }
       if (age > LOCK_STALE_MS) { try { fs.rmSync(lock, { recursive: true, force: true }); } catch { /* raced */ } continue; }
       if (Date.now() > deadline) {
-        // DIVERGES FROM deviceClaimsStore.mjs:264 ON PURPOSE. That one gives up and proceeds
+        // DIVERGES FROM deviceClaimsStore.mjs's `withLock` ON PURPOSE. That one gives up and proceeds
         // WITHOUT the lock ("never block hardware on a lock") — right for a device, where losing
         // the race just means retrying a tap. Here the critical section guards a build CLAIM, and
         // proceeding unlocked risks losing a write in the read-modify-write — exactly the
@@ -498,6 +498,29 @@ export function readBuildClaim(projectRoot, opts = {}) {
   return result.claims.filter((c) => !isStale(c, opts)).find((c) => sameProjectRoot(c, root)) ?? null;
 }
 
+/** Does THIS process — or an ancestor that spawned it while holding the claim — hold the live build
+ *  claim on `projectRoot`? The gate a MUTATING step asks before it touches a project (#827):
+ *  `healNativeProject` refuses unless this is true, so "claim before mutate" is enforced at the
+ *  mutation instead of being a line-ordering convention each entry point re-argues.
+ *
+ *  Held means a live claim on the same resolved root whose pid is this process (the route took it
+ *  through `acquireBuildSlot`, the CLI through `acquireBuildClaim`) or whose token this process
+ *  inherited on `BUILD_CLAIM_ENV_VAR` (a build step the claim holder spawned — `build-web.mjs` run
+ *  by `/api/build`). The token clause is the same one `acquireBuildClaim`'s re-entrancy grant keys
+ *  on, minus its `pid !==` half: here the holder asking about its own claim is the normal case.
+ *
+ *  ⚠️ UNKNOWN reads as NOT held. An unreadable claims file cannot prove the caller holds anything,
+ *  and this answers a gate, not a report — the opposite disposition from `readBuildClaim`'s. */
+export function holdsBuildClaim(projectRoot, opts = {}) {
+  const root = path.resolve(projectRoot);
+  const envToken = opts.envToken !== undefined ? opts.envToken : process.env[BUILD_CLAIM_ENV_VAR];
+  const result = readClaimsResult();
+  if (!result.ok) return false;
+  const claim = result.claims.filter((c) => !isStale(c, opts)).find((c) => sameProjectRoot(c, root));
+  if (!claim) return false;
+  return claim.pid === process.pid || (!!envToken && claim.token === envToken);
+}
+
 /** The refusal text — names the project, the label, the holder's kind and pid, and how long ago.
  *  Used verbatim by every caller: the three CLI scripts print it straight to stderr, and
  *  `buildLock.ts`'s `acquireBuildSlot` forwards it as-is for a cross-process refusal (its OWN
@@ -523,10 +546,10 @@ let heldDir = null;
 
 /** Give every claim back when this process exits — registered LAZILY, on the first successful
  *  claim, so a process that never claims anything never touches the claims file. `exit` only,
- *  deliberately, same reasoning as `deviceClaimsStore.mjs:450-457`: the uncovered cases (a
+ *  deliberately, same reasoning as `deviceClaimsStore.mjs`'s `installExitHook`: the uncovered cases (a
  *  signal, a crash, `kill -9`) are exactly what pid-liveness expiry (`isStale`) is for.
  *
- *  Pinned to `heldDir` for exactly the reason `deviceClaimsStore.mjs:443-446` documents:
+ *  Pinned to `heldDir` for exactly the reason `deviceClaimsStore.mjs`'s `held`/`heldDir` comment documents:
  *  `claimsDir()` is resolved dynamically from `MODOKI_HOME`/`VITEST`, and a long-lived vitest
  *  WORKER process runs many tests before it actually exits — by then `MODOKI_HOME` could be
  *  whatever the LAST test left it as, not what it was when THIS claim was taken. Re-resolving at

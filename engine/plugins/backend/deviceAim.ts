@@ -1,3 +1,4 @@
+import type { AimGesture } from '../../app/debug/domPointContract';
 /**
  * The bits every TRUSTED device-input route shares, regardless of transport (#32).
  *
@@ -107,6 +108,34 @@ export function aimAsResolved(label: string): string {
   return `${label} (aim as resolved; not re-checked at dispatch)`;
 }
 
+/** ⚠️ **`gesture` is supplied HERE, by the route — it is NOT in `params`** (#1016 close-out). The
+ *  raw MCP payload is the tool's own schema, and `device_tap`'s is `{selector, x, y}` with no
+ *  gesture field, so forwarding `...params` and hoping carried nothing: `handleResolveAim` saw
+ *  `undefined` on 100% of production calls and fell to the strict reading. The result was #1016's
+ *  original symptom, still live, on precisely the trusted surface the fix existed for — a
+ *  `device_tap` at a point a real finger reaches, refused, on the S22 over CDP and the iPad mini /
+ *  iPhone Air over WDA. It only ever LOOKED fixed because the fallback path (`handleTap`, synthetic
+ *  input, already banner-flagged) does carry one — so the fix landed exactly where it was least
+ *  needed.
+ *
+ *  Only `tap` is click-shaped, so `drag`/`hover`/`scroll` were unaffected by the gap: their
+ *  intended gesture and the absent default agree. `tap` was the whole hole.
+ *
+ *  ⚠️ **No default — and an earlier version of this banner argued for one.** It said a route
+ *  forgetting its gesture "is a bug this file's callers can be read for", which is true and is not
+ *  a reason: the default it justified was `'tap'`, the PERMISSIVE value, sitting on the TRUSTED
+ *  surface — the one that drives a real phone, where a false success is most expensive. A
+ *  `device_dnd` or `device_long_press` added to `tryDeviceCdpInput` later would inherit
+ *  click-shaped semantics by omission, which is the exact back door `75ba25601` was reverted for.
+ *  It also contradicted the rule this change states twice elsewhere (`isClickShaped`'s banner,
+ *  `docs/enact.md`): required parameter, no default.
+ *
+ *  Every call site passes one explicitly — five route branches in `deviceCdp.ts` and three in
+ *  `deviceWda.ts` — so the parameter costs nothing and the compiler asks the next one. ⚠️ Counted,
+ *  not estimated: an earlier draft said "four callers", which is `tryDeviceCdpInput`'s branches
+ *  alone and silently omits the WDA surface — the one the paragraph above singles out as where this
+ *  matters (the iPad mini / iPhone Air). A reader auditing "did every caller get updated?" against
+ *  "four" stops after the CDP file. */
 export async function resolveAimViaDevice(
   deps: AimProxyDeps,
   params: Record<string, unknown>,
@@ -114,7 +143,10 @@ export async function resolveAimViaDevice(
   xKey: string,
   yKey: string,
   center = false,
+  gesture: AimGesture,
 ): Promise<AimOutcome> {
-  const raw = await deps.proxy('resolve-aim', { ...params, selKey, xKey, yKey, ...(center ? { center: true } : {}) });
+  const raw = await deps.proxy('resolve-aim', {
+    ...params, selKey, xKey, yKey, gesture, ...(center ? { center: true } : {}),
+  });
   return decodeAimReply(raw);
 }

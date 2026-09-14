@@ -13,6 +13,7 @@
  *  docs/mcp-tool-conventions.md §9. */
 
 import { buildUiCreateSpecs, type UiPreset } from '../ui/uiAuthoring';
+import { hasDocKey } from '../core/docKeys';
 
 /** One trait to put on a new entity. Defined HERE rather than in the editor's undo layer so both
  *  the undoable editor path and the undo-free runtime/device path name the same shape. */
@@ -79,12 +80,45 @@ export function cameraSpecs(parentId: number): CreateSpecs {
   ] };
 }
 
+/** The valid `kind` values, DERIVED from the table rather than re-listed — same rule as
+ *  `PRIMITIVE_NAMES` beside it and `COLLIDER_SHAPES` in particles/types.ts. */
+export const LIGHT_KINDS = Object.keys(LIGHT_DEFAULTS) as ReadonlyArray<LightKind>;
+
+/** Membership in `LIGHT_DEFAULTS` — own keys only, so `"constructor"` is not a light kind (#993).
+ *  The one test both `lightDefaults` below and `resolveCreateEntitySpec`'s agent refusal use. */
+export function isLightKind(kind: string): kind is LightKind {
+  return hasDocKey(LIGHT_DEFAULTS, kind);
+}
+
+/** ⚠️ `hasDocKey`, and a THROW rather than a fallback (#993). `kind` is `spec.light` off the
+ *  `create-entity` agent payload, and `LIGHT_DEFAULTS` is a code-declared literal — so
+ *  `light: "constructor"` handed the inherited FUNCTION to the `Light` trait's `data`, the op
+ *  answered `{ok: true}`, and the entity spawned with no light fields at all.
+ *
+ *  Loud, because that is what the two sibling fields in this same payload already do:
+ *  `agentEditorOps.ts` rejects an unknown `spec.mesh`/`spec.shape` by name. Throwing HERE rather
+ *  than adding a third check beside those two means every caller of `buildEntityCreateSpecs` is
+ *  covered, not only the op — and it runs before anything is created, so "nothing was created"
+ *  stays true. */
+function lightDefaults(kind: LightKind): Record<string, unknown> {
+  if (!isLightKind(kind)) {
+    throw new Error(`create-entity: unknown light kind "${kind}" — nothing was created. Valid: ${LIGHT_KINDS.join(', ')}.`);
+  }
+  return LIGHT_DEFAULTS[kind];
+}
+
 export function lightSpecs(kind: LightKind, parentId: number): CreateSpecs {
+  // ⚠️ Validate BEFORE `cap(kind)` (#993 close-out § 2d). `cap` is `s.charAt(0)…`, so
+  // `{kind:'light'}` with no `light` field — the obvious agent payload — died with a raw
+  // "Cannot read properties of undefined (reading 'charAt')" and never reached the message that
+  // names the valid values. `uiSpecs` did not have this problem because it goes straight to its
+  // own lookup.
+  const data = lightDefaults(kind);
   const name = `${cap(kind)} Light`;
   return { name, specs: [
     { name: 'Transform', data: kind === 'directional' ? { x: 5, y: 10, z: 5 } : {} },
     { name: 'EntityAttributes', data: { name, parentId, layer: '3d' } },
-    { name: 'Light', data: LIGHT_DEFAULTS[kind] },
+    { name: 'Light', data },
   ] };
 }
 
@@ -123,6 +157,20 @@ export type CreateEntitySpec =
   | { kind: 'environment' }
   | { kind: 'particle' };
 
+/** Every `kind` the builders below handle. `satisfies` makes the compiler hold this to the union
+ *  both ways — a kind added to `CreateEntitySpec` without a row here, or a stray row, fails to type
+ *  check — so the list an agent is offered cannot drift from the switch. */
+const CREATE_ENTITY_KIND_TABLE = {
+  empty: true, primitive: true, '2d': true, canvas2d: true, ui: true,
+  camera: true, light: true, environment: true, particle: true,
+} as const satisfies Record<CreateEntitySpec['kind'], true>;
+
+export const CREATE_ENTITY_KINDS = Object.keys(CREATE_ENTITY_KIND_TABLE) as ReadonlyArray<CreateEntitySpec['kind']>;
+
+export function isCreateEntityKind(kind: string): kind is CreateEntitySpec['kind'] {
+  return hasDocKey(CREATE_ENTITY_KIND_TABLE, kind);
+}
+
 export function buildEntityCreateSpecs(spec: CreateEntitySpec, parentId: number): CreateSpecs {
   switch (spec.kind) {
     case 'empty': return emptySpecs(parentId);
@@ -134,5 +182,12 @@ export function buildEntityCreateSpecs(spec: CreateEntitySpec, parentId: number)
     case 'light': return lightSpecs(spec.light, parentId);
     case 'environment': return environmentSpecs(parentId);
     case 'particle': return particleSpecs(parentId);
+    default: {
+      // A programming-error backstop: a typed caller cannot get here, and both agent ops refuse an
+      // unknown kind first, with options, via `resolveCreateEntitySpec`. Without it an unknown kind
+      // returned `undefined` and the caller's destructuring died with a raw TypeError (#1070).
+      const kind = (spec as { kind?: unknown }).kind;
+      throw new Error(`create-entity: unknown entity kind ${JSON.stringify(kind)} — nothing was created. Valid: ${CREATE_ENTITY_KINDS.join(', ')}.`);
+    }
   }
 }

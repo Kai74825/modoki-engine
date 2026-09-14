@@ -7,6 +7,7 @@ import { measureSafeAreaInsets } from './safeArea';
 import type { ReactNode } from 'react';
 import { useUIEntities } from './useUIEntities';
 import { UINode } from './UINode';
+import { uiNodeKey } from './uiNodeKey';
 import { markUIDirty, useUITreeStore } from './uiTreeStore';
 import { onPlayStateChange } from '../core/playState';
 import { useFocusStore, consumePendingActivation } from './focusManager';
@@ -14,6 +15,10 @@ import { getCurrentWorld } from '../core/ecs/world';
 import { registerPointerBlocker } from '../core/pointerBlockers';
 import { installPressOriginTracking } from './pressOrigin';
 import { UI_ROOT_ATTR } from '../traits/TouchControl';
+import { VIEWPORT_LENGTH_UNITS, VIEWPORT_UNIT_AXIS, viewportUnitVar } from '../traits/uiLength';
+import { reservedEdgeVar } from './anchorCss';
+import { isUIOverflowCheckEnabled } from './uiOverflow';
+import { installUIOverflowScan } from './uiOverflowScan';
 
 interface UIRendererProps {
   /** Store state object for binding resolution (typically from useGameStore) */
@@ -34,6 +39,10 @@ export function UIRenderer({ storeState = {}, onSelectEntity, renderCanvas2D, ui
   // one container all roots share. '' when unset, so the container carries no fontFamily at
   // all and App.css's body rule (or any ambient default) still wins.
   const rootFontFamily = useUITreeStore(s => s.rootFontFamily);
+  // Reserved edge bands (#1159) — published on the one container every root shares, beside the
+  // viewport vars, so a `clearsReservedEdges` container anywhere below resolves them by cascade.
+  const reserveTop = useUITreeStore(s => s.reserveTop);
+  const reserveBottom = useUITreeStore(s => s.reserveBottom);
   const [vpVars, setVpVars] = useState<Record<string, string>>({});
   const roRef = useRef<ResizeObserver | null>(null);
   /** The queued `update()` frame, so the callback ref's cleanup can CANCEL it rather than let it
@@ -82,6 +91,11 @@ export function UIRenderer({ storeState = {}, onSelectEntity, renderCanvas2D, ui
   // UINode's click handler can refuse a click the browser resolved to an ancestor a swipe merely
   // passed through. Same runtime-only gating as unblockRef, and disposed alongside it.
   const pressOriginRef = useRef<(() => void) | null>(null);
+  // #1126 — the text-overflow scan (`uiOverflowScan.ts`). Same runtime-only gating again: SceneView's
+  // authoring preview is a second mount of the SAME tree, and scanning both would measure every
+  // element twice, once at the preview's simulated size, into one per-world findings store. Also
+  // gated on `isUIOverflowCheckEnabled()` (editor + debug builds), read at mount.
+  const overflowScanRef = useRef<(() => void) | null>(null);
 
   const measureRef = useCallback((el: HTMLDivElement | null) => {
     roRef.current?.disconnect();
@@ -91,21 +105,24 @@ export function UIRenderer({ storeState = {}, onSelectEntity, renderCanvas2D, ui
     unblockRef.current = null;
     pressOriginRef.current?.();
     pressOriginRef.current = null;
+    overflowScanRef.current?.();
+    overflowScanRef.current = null;
     if (!el) return;
     if (!onSelectEntity) unblockRef.current = registerPointerBlocker(el);
     if (!onSelectEntity) pressOriginRef.current = installPressOriginTracking(el.ownerDocument);
+    if (!onSelectEntity && isUIOverflowCheckEnabled()) {
+      overflowScanRef.current = installUIOverflowScan(el, () => useUITreeStore.getState().tree, (cb) => useUITreeStore.subscribe(cb));
+    }
     const update = () => {
       const w = el.clientWidth;
       const h = el.clientHeight;
       if (w > 0 && h > 0) {
-        const vw = w / 100;
-        const vh = h / 100;
-        setVpVars({
-          '--ui-vw': `${vw}px`,
-          '--ui-vh': `${vh}px`,
-          '--ui-vmin': `${Math.min(vw, vh)}px`,
-          '--ui-vmax': `${Math.max(vw, vh)}px`,
-        });
+        // One var per viewport unit, from the SAME table every resolver reads (#1064). A unit added
+        // there is published here by construction — the hand-written four this replaced were the
+        // one copy the old "update these files" comment forgot, and a reader of an unpublished var
+        // silently falls back to the browser's own `1vw`, a different number in the editor preview.
+        setVpVars(Object.fromEntries(VIEWPORT_LENGTH_UNITS.map((u) =>
+          [viewportUnitVar(u), `${VIEWPORT_UNIT_AXIS[u](w, h) / 100}px`])));
       }
       // Safe-area insets for GAME CODE (`runtime/ui/safeArea.ts`) — REGISTERED from here, so the
       // measurement happens inside THIS container's cascade and reads the editor preview's
@@ -175,6 +192,8 @@ export function UIRenderer({ storeState = {}, onSelectEntity, renderCanvas2D, ui
         // override an ambient default (e.g. App.css's body rule) with nothing.
         ...(rootFontFamily ? { fontFamily: rootFontFamily } : {}),
         ...vpVars as any,
+        [reservedEdgeVar('top')]: reserveTop,
+        [reservedEdgeVar('bottom')]: reserveBottom,
       }}
     >
       {/* The scene-wide default IS what a root inherits — there is no ancestor above it but this
@@ -185,7 +204,7 @@ export function UIRenderer({ storeState = {}, onSelectEntity, renderCanvas2D, ui
           an `else` after `if (node.fontFamily)` — and wrong the moment a second consumer reads it
           above that branch. */}
       {tree.map(node => (
-        <UINode key={node.entityId} node={node} storeState={storeState} onSelectEntity={onSelectEntity} renderCanvas2D={renderCanvas2D} uiVisualsHidden={uiVisualsHidden} inheritedFontFamily={rootFontFamily} />
+        <UINode key={uiNodeKey(node)} node={node} storeState={storeState} onSelectEntity={onSelectEntity} renderCanvas2D={renderCanvas2D} uiVisualsHidden={uiVisualsHidden} inheritedFontFamily={rootFontFamily} />
       ))}
     </div>
   );

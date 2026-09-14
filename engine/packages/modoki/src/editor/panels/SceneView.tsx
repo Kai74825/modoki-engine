@@ -11,16 +11,16 @@ import * as THREE from 'three';
 import { WebGPURenderer } from 'three/webgpu';
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
 import { TransformControls } from 'three/examples/jsm/controls/TransformControls.js';
-import { getCurrentWorld, onWorldSwap } from '../../runtime/core/ecs/world';
+import { getCurrentWorld, peekCurrentWorld, onWorldSwap } from '../../runtime/core/ecs/world';
 import { isSimRunning, onPlayStateChange, inPreviewSession } from '../../runtime/core/playState';
 import { setSkeletalPreview } from '../../runtime/core/skeletalPreview';
 import { clearSkeletalSeeks } from '../../runtime/core/skeletalSeek';
 import { getAllTraits } from '../../runtime/core/ecs/traitRegistry';
 import { worldTransforms, deactivatedEntities } from '../../runtime/core/ecs/transformPropagationSystem';
 import { decomposeTrs } from '../../runtime/core/ecs/decomposeTrs';
-import { findEntity, fireDirtyListeners, addDirtyListener, onStructureDirty, getAllEntities, subtreeIds } from '../../runtime/core/ecs/entityUtils';
+import { findEntity, fireDirtyListeners, addDirtyListener, onStructureDirty, getAllEntities, subtreeIds, entityDisplayName } from '../../runtime/core/ecs/entityUtils';
 import { markOverrideIfInstance } from '../undo/entityActions';
-import { Transform, EntityAttributes, Collider3D, clampAngle, Bone2D, Billboard3D, CameraFrame, Zone3D } from '../../runtime/traits';
+import { Transform, EntityAttributes, Collider2D, Collider3D, clampAngle, Bone2D, Billboard3D, CameraFrame, Zone3D } from '../../runtime/traits';
 import { colliderWireframeGeometry, colliderOutlineSig3D, colliderWorldScale3D, type ColliderOutline3DParams } from '../../runtime/rendering/colliderOutline3D';
 import {
   syncEnvironment, syncFog, syncLights, syncSceneRenderables3D, orientBillboards, reconcileToneExposure,
@@ -38,7 +38,7 @@ import {
 import { createParticleSyncState, syncParticles, disposeParticleSyncState } from '../../runtime/rendering/particleSync';
 import { registerBoundsProvider } from '../../runtime/core/screenBounds';
 import { createTeardownScope } from '../../runtime/core/teardownScope';
-import { computeEntityScreenBounds } from '../../runtime/rendering/entityScreenBounds';
+import { computeEntityScreenBounds, boundsSourcesOf, isLiveOwner } from '../../runtime/rendering/entityScreenBounds';
 import { registerPickProvider } from '../../runtime/core/screenPick';
 import { registerHandleProvider, type InteractionHandle } from '../../runtime/rendering/interactionHandles';
 import { createFlameMeshSyncState, syncFlameMeshes, disposeFlameMeshSyncState } from '../../runtime/rendering/flameMeshSync';
@@ -52,6 +52,8 @@ import {
 } from '../../runtime/core/activeRenderer';
 import { attachRendererLossHandling } from '../../runtime/rendering/rendererLossHandling';
 import { createRendererRecovery } from '../../runtime/rendering/rendererRecovery';
+import { createViewportBringUp, type BringUpKind } from '../../runtime/rendering/viewportBringUp';
+import type { LivenessCheck } from '../../runtime/core/liveness';
 import { acquireRenderer, releaseRenderer, discardRenderer } from './rendererLease';
 import { disposeSceneViewEntityObjects } from './sceneViewResources';
 import { drawColliderOutline, drawSkinnedMeshFlat2D, drawSkinnedMeshWireframe2D, drawWeightHeatmap2D, drawDominantBoneMap2D, computePivotOffset, COLLIDER_SPRITE } from '../../runtime/rendering/render2DUtils';
@@ -67,11 +69,11 @@ import {
   marqueeExceededThreshold, marqueeOverlayBox, marqueeRect, enclosedByMarquee, mergeMarqueeSelection,
   type MarqueeCandidate,
 } from '../scene/marqueeSelect';
-import { resolvePickSelection, type PickModifiers } from '../scene/pickSelection';
+import { resolvePickSelection, pickRequestsReveal, type PickModifiers } from '../scene/pickSelection';
 import { computePaintOrder } from '../../runtime/rendering/paintOrder';
 import { UIRenderer } from '../../runtime/ui/UIRenderer';
 import { useEditorStore } from '../store/editorStore';
-import { register } from '../input/keymap';
+import { register, registerBindings } from '../input/keymap';
 import { useHmrEpoch } from '../input/hmrEpoch';
 import { isTextEditable } from '../input/focusScope';
 import { worldToLocalTransform, clampScaleCrossingPivot, scaleCrossedPivot, scaleFromGizmoRatio, type ScaleSigns } from '../scene/gizmoTransform';
@@ -79,7 +81,7 @@ import { boneRelToProxyLocal, proxyLocalToBoneLocal } from '../scene/billboardBo
 import { setEditorViewportCamera, setFocusEntityHandler, focusEntityInSceneView, canFrameSelected, setViewportController, setEcsObjectsRegistry } from '../scene/sceneViewBus';
 import { withWarnFilter } from '../scene/warnFilter';
 import { mintEditor3DFrameKey, editor2DChromeFrameKey } from '../scene/frameKeys';
-import { computeUIModeNDC, computeFullNDC, computeCamFrustumPositions, computeLetterbox, frameCameraToBox, gameAspectFromRect, createSelectGesture, outlineSourceGeometry, resolveFocusTarget, axisSnapCameraPosition, slerpCameraOffset, perspHalfHeightAtDistance, perspDistanceForHalfHeight, orthoFrustumForHalfHeight, shouldHideMeshesForColliderMode } from '../scene/sceneViewMath';
+import { computeUIModeNDC, computeFullNDC, computeCamFrustumPositions, computeLetterbox, frameCameraToBox, gameAspectFromRect, createSelectGesture, outlineSourceGeometry, resolveFocusTarget, axisSnapCameraPosition, slerpCameraOffset, perspHalfHeightAtDistance, perspDistanceForHalfHeight, orthoFrustumForHalfHeight, shouldHideMeshesForColliderMode, hiddenContentNotice, colliderModeToast } from '../scene/sceneViewMath';
 import { sceneManager } from '../../runtime/scene/SceneManager';
 import { PREFAB_EDIT_SCENE_PREFIX, PREFAB_EDIT_ROOT_GUID, exitPrefabEditing } from '../scene/prefabEdit';
 import { pushAction, subscribeUndo } from '../undo/undoManager';
@@ -92,7 +94,7 @@ import {
   nearestEdgeInsertion, minPointsForShape, type Pt,
 } from '../../runtime/core/colliderPoints';
 import { colliderEditInfo, worldPointToLocal, localToWorld, pickVertex, colliderPickHalfExtents } from './colliderEdit2D';
-import { descendantUnionGizmoBox2D } from './gizmoBounds';
+import { descendantUnionGizmoBox2D, type GizmoBoundsEntity } from './gizmoBounds';
 import { gizmoWorldScale, rotateRingAim, scaleCenterAim, axisPickAim, ROTATE_RING_RADIUS, SCALE_XYZ_HALF_EXTENT, AXIS_PICKER_CENTER } from './gizmo3dAim';
 import { drawGizmo2D, hitTestGizmo2D, cursorForHandle, applyGizmoDrag2D, snapDragResult, DEFAULT_GIZMO_SNAP, worldToLocal2D, type GizmoHandle } from './Gizmo2D';
 import { layoutText } from '../../runtime/rendering/text/layoutText';
@@ -105,10 +107,10 @@ import { onMaterial3DDirty } from '../../runtime/rendering/materialDirty';
  *  text's anchor as the pivot. Returns null if the entity isn't a visible Text2D or
  *  its font hasn't loaded yet (gizmo just waits a frame, like the text render does).
  *  Lets the 2D gizmo target text — it has a Transform but no Renderable2D box. */
-function text2DGizmoBox(entity: { has: (t: unknown) => boolean; get: (t: unknown) => Record<string, unknown> } | null, text2dMeta: { trait: unknown } | undefined): { halfW: number; halfH: number; pivotX: number; pivotY: number } | null {
+function text2DGizmoBox(entity: GizmoBoundsEntity | null, text2dMeta: { trait: unknown } | undefined): { halfW: number; halfH: number; pivotX: number; pivotY: number } | null {
   if (!text2dMeta || !entity || !entity.has(text2dMeta.trait)) return null;
-  const t = entity.get(text2dMeta.trait) as Record<string, unknown>;
-  if (t.isVisible === false || !t.text) return null;
+  const t = entity.get(text2dMeta.trait);
+  if (!t || t.isVisible === false || !t.text) return null;
   const provider = getLoadedFont(t.font as string);
   if (!provider) return null;
   const layout = layoutText(provider, t.text as string, {
@@ -119,7 +121,7 @@ function text2DGizmoBox(entity: { has: (t: unknown) => boolean; get: (t: unknown
   return { halfW: layout.width / 2, halfH: layout.height / 2, pivotX: (t.anchorX as number) ?? 0.5, pivotY: (t.anchorY as number) ?? 0.5 };
 }
 import { pick2D, pick3D, type Pick2DCandidate, type Pick3DEntry } from './picking';
-import { resolvePreviewPick, readPreviewStack } from './uiPreviewPick';
+import { resolvePreviewPick, readPreviewStack, resolveHostBoundedPick, hostRelationOf } from './uiPreviewPick';
 import { safeAreaCssVars } from '../scene/devicePresets';
 import SafeAreaOverlay from '../rendering/SafeAreaOverlay';
 import { UIResizeOverlay } from './UIResizeOverlay';
@@ -131,6 +133,7 @@ import { mark2DDirty, get2DDirtyVersion, ensureCanvas2DListeners } from '../stor
 import { Canvas2DMount } from '../../runtime/rendering/Canvas2DMount';
 import { editorCanvas2DPool, editorScene2DRenderer, editorMarkScene2DDirty } from '../rendering/editorScene2D';
 import { loadSceneViewPrefs, saveSceneViewPrefs, type SceneViewLayers } from './sceneViewPrefs';
+import { bindDragPointerCapture } from './dragPointerCapture';
 
 // Bridge so the 2D Canvas overlay can raycast-pick 2.5D billboards. A billboard renders as a
 // THREE mesh via the game camera in BOTH 3D and 2D mode, so its screen position is a 3D
@@ -203,11 +206,14 @@ function applyPickSelection(entityId: number | null, mods: PickModifiers) {
   const cmd = resolvePickSelection(entityId, mods, st.selectedEntityIds);
   switch (cmd.kind) {
     case 'keep': return;
-    case 'clear': st.selectEntity(null); return;
-    case 'toggle': st.toggleEntitySelection(cmd.id); return;
-    case 'set': st.setSelectedEntities(cmd.ids, cmd.primary); return;
-    case 'select': st.selectEntity(cmd.id); return;
+    case 'clear': st.selectEntity(null); break;
+    case 'toggle': st.toggleEntitySelection(cmd.id); break;
+    case 'set': st.setSelectedEntities(cmd.ids, cmd.primary); break;
+    case 'select': st.selectEntity(cmd.id); break;
   }
+  // #1156: a pick that means "select this" asks the Hierarchy to reveal the lead, which a click on
+  // the lead of a multi-selection needs because it leaves the lead unchanged.
+  if (pickRequestsReveal(cmd)) st.requestEntityReveal();
 }
 
 /** Shared gizmo mode + space toggle buttons used in both 3D and 2D modes. */
@@ -311,7 +317,7 @@ function findSkinnedRootId(selectedId: number | null): number | null {
     const ent = findEntity(cur);
     if (!ent) break;
     if (ent.has(ssMeta.trait)) return cur;
-    cur = ent.has(EntityAttributes) ? (ent.get(EntityAttributes).parentId as number) : 0;
+    cur = ent.get(EntityAttributes)?.parentId ?? 0;
   }
   return null;
 }
@@ -434,6 +440,50 @@ export default function SceneView() {
   const [showGrid, setShowGridState] = useState(initialViewPrefsRef.current.showGrid);
   const [showColliders, setShowCollidersState] = useState(initialViewPrefsRef.current.showColliders);
   const [colliders2DOnly, setColliders2DOnlyState] = useState(initialViewPrefsRef.current.colliders2DOnly);
+  // `undefined` = not measured. Deliberately NOT defaulted to 0: `hiddenContentNotice` words the
+  // zero case as "this scene has NO colliders", and asserting that about an unmeasured scene is the
+  // false-notice this feature exists to avoid.
+  const [colliderCount, setColliderCount] = useState<number | undefined>(undefined);
+
+  // ── #1003: is there anything for collider-only mode to DRAW? ──
+  // Counted from the live world rather than assumed, because the whole complaint is a viewport that
+  // is empty with no explanation, and "empty because the scene has no colliders" is a different
+  // message from "empty because sprites are hidden".
+  // ⚠️ `peekCurrentWorld`, NOT `getCurrentWorld` — the latter LAZILY CREATES a world
+  // (`worldRegistry.ts`'s `getCurrentWorld`), and this runs from a 500ms poll that can start before any scene has
+  // loaded, because the flag PERSISTS (#399) and is restored at mount. Allocating a world there and
+  // then reporting 0 would put "this scene has NO colliders" on screen about a scene that has not
+  // loaded yet — the exact false notice this feature exists to prevent. `undefined` = unmeasured.
+  //
+  // ⚠️ `.length`, NOT `updateEach` — koota's `updateEach` WRITES every trait value back, so using it
+  // as a read is a 2 Hz write storm waiting for the first tracker registered on either Collider trait.
+  // Inert today (nothing in engine/ registers one) which is why this is a latent hazard, not a bug.
+  //
+  // ⚠️ KNOWN BOUND, stated rather than over-engineered: this counts trait PRESENCE, not what either
+  // renderer actually draws. The 2D overlay additionally needs a live Canvas2D ancestor and skips
+  // deactivated entities; the 3D path skips deactivated ones and bails when the wireframe geometry is
+  // empty. So a scene whose colliders are all deactivated reports a non-zero count and gets the GENERIC
+  // notice instead of the sharper zero one. That degrades the signal; it never makes it false, which is
+  // the property that matters — and narrowing it properly means reimplementing both draw predicates.
+  const countColliders = useCallback((): number | undefined => {
+    const w = peekCurrentWorld();
+    if (!w) return undefined;
+    return (mode === 'ui' ? w.query(Collider2D) : w.query(Collider3D)).length;
+  }, [mode]);
+
+  // Raised on the OFF→ON TRANSITION, not per frame — that is what makes a toast usable at all, and
+  // what makes its count worth trusting. ⚠️ Not strictly "on the user action": it fires from an effect
+  // over derived state, so a MODE SWITCH that brings a restored `showColliders` into effect (2D→3D)
+  // also counts as a transition. That is correct — the viewport does empty at that moment — but it is
+  // not a click on the collider option, and an earlier version of this comment claimed it was.
+  // The decision lives in `colliderModeToast` so the rule is unit-testable.
+  const toastIfNothingToDraw = useCallback((turningOn: boolean) => {
+    const n = countColliders();
+    if (n === undefined) return;   // no world yet — say nothing rather than warn about an unknown scene
+    const msg = colliderModeToast(turningOn, n);
+    if (msg) useEditorStore.getState().showToast(msg, 'warn');
+  }, [countColliders]);
+
   const setShowGrid = (next: boolean | ((prev: boolean) => boolean)) => {
     setShowGridState((prev) => { const on = typeof next === 'function' ? next(prev) : next; saveSceneViewPrefs({ showGrid: on }); return on; });
   };
@@ -447,6 +497,41 @@ export default function SceneView() {
   // mirrors into editorScene2DRenderer (the actual render-loop flag Scene2D reads every
   // frame) — there's no other consumer of this React state, so a plain setter call is enough.
   const setColliders2DOnly = (on: boolean) => { setColliders2DOnlyState(on); editorScene2DRenderer.setCollidersOnly(on); saveSceneViewPrefs({ colliders2DOnly: on }); };
+  // #1003 — what the viewport is currently hiding, if anything. Keyed to the SAME predicate the
+  // renderer gates on, so it cannot claim content is hidden when it is not.
+  const hiddenNotice = hiddenContentNotice(mode, showColliders, colliders2DOnly, colliderCount);
+  const hidingContent = hiddenContentNotice(mode, showColliders, colliders2DOnly) !== null;
+
+  // Re-count while (and ONLY while) content is hidden. A one-shot count taken at toggle time would go
+  // stale the moment somebody adds a collider with the mode still on, leaving the notice asserting
+  // "no colliders" about a scene that now has one — and there is no scene-version signal in the store
+  // to react to instead. Cheap because it is gated on `hidingContent`, and `setColliderCount` returns
+  // `prev` unchanged when the count has not moved, so a steady scene causes no re-renders at all.
+  useEffect(() => {
+    if (!hidingContent) { setColliderCount(undefined); return; }
+    const tick = () => setColliderCount((prev) => { const n = countColliders(); return n === prev ? prev : n; });   // `undefined` propagates as unmeasured
+    tick();
+    const h = setInterval(tick, 500);
+    return () => { clearInterval(h); };
+  }, [hidingContent, countColliders]);
+
+  // The toast, on the OFF→ON transition only (#1003).
+  // ⚠️ In an EFFECT, not inside either setter. The first version fired it from inside a
+  // `setState` updater, and it never appeared live: React may defer or double-invoke an updater, and
+  // side effects there are unsupported. Reading `prev` in the setters is no better — `showCollidersRef`
+  // is declared ~2000 lines below them, and the `C` keymap closure can hold a stale `showColliders`
+  // (its effect re-registers on `mode` alone, by design). One effect over the derived `hidingContent`
+  // has neither problem and covers the 2D and 3D flags through the same path.
+  const prevHidingRef = useRef<boolean | null>(null);
+  useEffect(() => {
+    const was = prevHidingRef.current;
+    prevHidingRef.current = hidingContent;
+    // `null` is mount, not a transition: the flag PERSISTS (#399), so toasting here would fire on
+    // every editor launch that restored it. The corner notice is what covers the restored case.
+    if (was === null || !hidingContent || was) return;
+    toastIfNothingToDraw(true);
+  }, [hidingContent, toastIfNothingToDraw]);
+
   const showFocusGraph = useEditorStore((s) => s.showFocusGraph);
   const setShowFocusGraph = useEditorStore((s) => s.setShowFocusGraph);
   // editorScene2DRenderer is a module-level singleton (outlives this component across
@@ -571,15 +656,24 @@ export default function SceneView() {
       e.stopPropagation();
     }
 
+    // #1161's sibling: the pan ends only in this container's pointerup, so without capture a
+    // release outside the viewport left it live — the view kept panning on a buttonless hover.
+    const panCapture = bindDragPointerCapture(container, () => !!panDragRef.current, onPointerUp);
+    function onPointerDownCapturing(e: PointerEvent) {
+      onPointerDown(e);
+      panCapture.afterPress(e);
+    }
+
     container.addEventListener('wheel', onWheel, { passive: false });
-    container.addEventListener('pointerdown', onPointerDown, { capture: true });
+    container.addEventListener('pointerdown', onPointerDownCapturing, { capture: true });
     container.addEventListener('pointermove', onPointerMove, { capture: true });
     container.addEventListener('pointerup', onPointerUp, { capture: true });
     return () => {
       container.removeEventListener('wheel', onWheel);
-      container.removeEventListener('pointerdown', onPointerDown, { capture: true });
+      container.removeEventListener('pointerdown', onPointerDownCapturing, { capture: true });
       container.removeEventListener('pointermove', onPointerMove, { capture: true });
       container.removeEventListener('pointerup', onPointerUp, { capture: true });
+      panCapture.dispose();
     };
   }, [mode, updateViewTransform]);
 
@@ -588,10 +682,7 @@ export default function SceneView() {
     if (selectedId === null) return false;
     const entity = findEntity(selectedId);
     if (!entity) return false;
-    if (entity.has(EntityAttributes)) {
-      const layer = entity.get(EntityAttributes).layer;
-      if (layer === '2d') return true;
-    }
+    if (entity.get(EntityAttributes)?.layer === '2d') return true;
     // Also check Canvas2D entities (parent containers)
     const c2d = getAllTraits().find(t => t.name === 'Canvas2D');
     return !!(c2d && entity.has(c2d.trait));
@@ -610,11 +701,11 @@ export default function SceneView() {
   // from the Assets panel or a running game, so it only fires when the Scene view itself
   // owns the keyboard. Hierarchy registers the same chord (`hierarchy.frameSelected`,
   // scope 'hierarchy') since users also press it right after clicking an entity there
-  // (editor-hierarchy.spec.ts:84) — the two share `canFrameSelected` (sceneViewBus.ts) so
+  // (editor-hierarchy.spec.ts's "F key frames the selected entity" test) — the two share `canFrameSelected` (sceneViewBus.ts) so
   // they can't drift. Everywhere else — Game view, Inspector, nothing focused — yields,
   // for free, via keymap scope priority; no `focusedPanel` check needed here at all.
   useEffect(() => {
-    const offs = [
+    const offBindings = registerBindings(() => [
       register({
         id: 'scene.gizmoSpace', keys: 'x', scope: 'scene',
         run: () => setGizmoSpace(useEditorStore.getState().gizmoSpace === 'world' ? 'local' : 'world'),
@@ -663,8 +754,8 @@ export default function SceneView() {
         id: `scene.gizmo.${m.value}`, keys: m.key, scope: 'scene',
         run: () => setGizmoMode(m.value),
       })),
-    ];
-    return () => { for (const off of offs) off(); };
+    ]);
+    return offBindings;
   }, [setGizmoMode, setGizmoSpace, setParticlePreview, mode, updateViewTransform, hmrEpoch]);
 
   const handleViewportContextMenu = useCallback((e: React.MouseEvent) => {
@@ -699,14 +790,14 @@ export default function SceneView() {
           <ViewOptionsMenu uiId="sceneView.toolbar.viewOptions3d" items={[
             { key: 'fx', label: 'FX', checked: particlePreview, onToggle: () => setParticlePreview(!particlePreview), title: 'Preview particle effects in the scene (P)', uiId: 'sceneView.toolbar.fx-preview' },
             { key: 'grid', label: 'Grid', checked: showGrid, onToggle: () => setShowGrid(!showGrid), title: 'Show/hide the ground grid (G)', uiId: 'sceneView.toolbar.grid' },
-            { key: 'colliders', label: 'Colliders', checked: showColliders, onToggle: () => setShowColliders(!showColliders), title: 'Show only colliders, hiding regular meshes (C)', uiId: 'sceneView.toolbar.colliders' },
+            { key: 'colliders', label: 'Colliders', notable: true, checked: showColliders, onToggle: () => setShowColliders(!showColliders), title: 'Show only colliders, hiding regular meshes (C)', uiId: 'sceneView.toolbar.colliders' },
           ]} />
         </>}
         {mode === 'ui' && <>
           <ViewOptionsMenu uiId="sceneView.toolbar.viewOptionsUi" items={[
             { key: 'fx', label: 'FX', checked: particlePreview, onToggle: () => setParticlePreview(!particlePreview), title: 'Preview particle effects in the scene (P)', uiId: 'sceneView.toolbar.fx-preview' },
             { key: 'focus', label: 'Focus', checked: showFocusGraph, onToggle: () => setShowFocusGraph(!showFocusGraph), title: 'Show the UIFocusable navigation graph: solid = explicit navUp/Down/Left/Right link, dashed = spatial fallback the runtime would pick · number = focusOrder · gold ring = autoFocus', uiId: 'sceneView.toolbar.focus' },
-            { key: 'colliders', label: 'Colliders', checked: colliders2DOnly, onToggle: () => setColliders2DOnly(!colliders2DOnly), title: 'Show only colliders, hiding sprites (C)', uiId: 'sceneView.toolbar.colliders2d' },
+            { key: 'colliders', label: 'Colliders', notable: true, checked: colliders2DOnly, onToggle: () => setColliders2DOnly(!colliders2DOnly), title: 'Show only colliders, hiding sprites (C)', uiId: 'sceneView.toolbar.colliders2d' },
           ]} />
           <div style={{ width: 1, height: 18, background: '#444', margin: '0 6px' }} />
           {(['show3D', 'show2D', 'showUI'] as const).map((key, i) => {
@@ -740,6 +831,17 @@ export default function SceneView() {
         </div>
         {/* Orientation gizmo: pinned to the corner OUTSIDE the pan/zoom transform, 3D mode only. */}
         {mode === '3d' && <SceneViewGizmo />}
+        {/* "content is hidden" notice (#1003) — also OUTSIDE the transform, so it stays legible at
+            any zoom. An empty authoring viewport is indistinguishable from a broken one; this is the
+            thing that makes the difference visible without the user having to open the View menu. */}
+        {hiddenNotice && (
+          <div data-ui-id="sceneView.hiddenContentNotice" data-ui-kind="status" data-ui-label={hiddenNotice}
+            style={{
+              position: 'absolute', bottom: 8, left: 8, zIndex: 20, pointerEvents: 'none',
+              background: '#12121e', border: '1px solid #3a3a4a', borderRadius: 3,
+              padding: '2px 6px', fontSize: 10, fontFamily: 'monospace', color: '#c9a227',
+            }}>{hiddenNotice}</div>
+        )}
       </div>
     </div>
   );
@@ -856,8 +958,20 @@ function getPaintOrder(): Map<number, number> {
  *  pick overlay div (`data-2d-pick`, Phase 2) — otherwise elementFromPoint returns
  *  the overlay itself, whose ancestor is the Canvas2D UINode wrapper (which carries
  *  `data-entity-id`), and every 2D miss would mis-select the Canvas2D root instead
- *  of falling through to deselect / Three.js / the true underlying UI child. */
-function pickUnderlyingUIEntity(clientX: number, clientY: number): number | null {
+ *  of falling through to deselect / Three.js / the true underlying UI child.
+ *
+ *  ⚠️ #999/#1001 — `hostEntityId` STOPS THE UPWARD ESCAPE. A Canvas2D UINode is a leaf in the
+ *  UI tree (its 2D children are not UI nodes), so `UINode` gives it `pointerEvents:'none'` and
+ *  no `onClick` at all. `elementFromPoint` therefore skips straight PAST the canvas host to its
+ *  nearest ancestor that does paint/handle — in practice the UI ROOT — and a click on empty
+ *  board space selected the whole screen's root container. Measured in three games (wordweave
+ *  #999, court #1001, chess): winner `ChessRoot`/`GameRoot`, canvas host skipped, and the
+ *  winner's own opacity was irrelevant (court's painted nothing, chess's was opaque).
+ *  Owner ruling 2026-09-09: an empty-canvas click selects THE CANVAS HOST — the thing actually
+ *  under the cursor — rather than escaping upward. A genuine UI element INSIDE the host (a
+ *  child showing through the transparent canvas) is unaffected, which is the case the
+ *  neutralization above exists for. */
+function pickUnderlyingUIEntity(clientX: number, clientY: number, hostEntityId?: number): number | null {
   const surfaces = Array.from(document.querySelectorAll<HTMLElement>('canvas[data-2d-overlay], [data-2d-pick], [data-canvas2d-mount]'));
   const prev = surfaces.map((c) => c.style.pointerEvents);
   surfaces.forEach((c) => { c.style.pointerEvents = 'none'; });
@@ -867,7 +981,11 @@ function pickUnderlyingUIEntity(clientX: number, clientY: number): number | null
   const uiEl = el?.closest('[data-entity-id]') as HTMLElement | null;
   if (!uiEl) return null;
   const id = Number(uiEl.getAttribute('data-entity-id'));
-  return Number.isFinite(id) ? id : null;
+  if (!Number.isFinite(id)) return null;
+  if (hostEntityId == null) return id;
+  // The rule itself lives in uiPreviewPick.ts, pure and unit-tested (this is a .tsx, so its
+  // decisions belong in a plain .ts beside it — docs/editor.md § Panels).
+  return resolveHostBoundedPick(id, hostEntityId, hostRelationOf(uiEl, id, hostEntityId));
 }
 
 /** #337 — predicts what a real click at a viewport point would select in the "ui" preview mode,
@@ -881,7 +999,22 @@ function pickUnderlyingUIEntity(clientX: number, clientY: number): number | null
 function resolvePreviewPickAt(clientX: number, clientY: number): number | null {
   const stack = readPreviewStack(clientX, clientY);
   const pick2DAt = (canvasEntityId: number) => _pick2DByCanvas.get(canvasEntityId)?.(clientX, clientY) ?? null;
-  const pick = resolvePreviewPick(stack, pick2DAt);
+  // ⚠️ #999/#1001 — this MUST carry the same host bound as `pickEntityAtViewportPoint`, or the
+  // two picking paths registered under 'scene-view' become two POLICIES. This one is priority 20
+  // and therefore owns `modoki_tap`'s prediction, while a real click on the canvas runs the
+  // priority-10 one — so an unbounded resolver here means the tool predicts the UI ancestor for a
+  // point where a real click selects the canvas host: `modoki_tap` refuses a reachable entity as
+  // "occluded", and reports ok for one the click never lands on. `screenPick.ts`'s header is the
+  // rule being honoured — a provider must answer for the same code path a real click runs.
+  const frame = document.querySelector('[data-ui-preview-frame]');
+  const isAncestorOfCanvasHost = (uiEntityId: number, canvasEntityId: number) => {
+    // Scoped to the preview frame, never document-wide: the same UI host is mounted in BOTH the
+    // SceneView preview and the Game panel, so a document-wide lookup can answer with the other
+    // panel's copy (the same trap `hostRelationOf` documents).
+    const uiEl = frame?.querySelector(`[data-entity-id="${uiEntityId}"]`);
+    return !!uiEl && hostRelationOf(uiEl, uiEntityId, canvasEntityId) === 'ancestor-of-host';
+  };
+  const pick = resolvePreviewPick(stack, pick2DAt, isAncestorOfCanvasHost);
   return pick ? pick.id : null;
 }
 
@@ -1023,22 +1156,25 @@ interface Scene2DInteractionOpts {
 // A Canvas2D's reference resolution + scale mode (trait defaults), independent of any renderer.
 // Used by computeScale2DFor AND the chrome overlay's boundary rect. ⚠️ The boundary must be
 // stroked from `CanvasScale.refW/refH` (the EFFECTIVE box), never from the raw pair this
-// returns — those differ the moment `maxReferenceWidth` adapts the box (#774), and the overlay
-// would then outline the box the scene USED to have while the content fills the real one.
-function readCanvas2DRefDims(canvasEntityId: number, fallbackW: number, fallbackH: number): { refW: number; refH: number; scaleMode: 'fitW' | 'fitH' | 'fill' | 'none'; maxRefW: number } {
+// returns — those differ the moment `maxReferenceWidth` adapts the box (#774) or
+// `maxReferenceHeight` grows it (#1087), and the overlay would then outline the box the scene
+// USED to have while the content fills the real one.
+function readCanvas2DRefDims(canvasEntityId: number, fallbackW: number, fallbackH: number): { refW: number; refH: number; scaleMode: 'fitW' | 'fitH' | 'fill' | 'none'; maxRefW: number; maxRefH: number } {
   let refW = fallbackW || 1, refH = fallbackH || 1;
   let scaleMode: 'fitW' | 'fitH' | 'fill' | 'none' = 'fitH';
   let maxRefW = 0;
+  let maxRefH = 0;
   const c2dMeta = getAllTraits().find((t) => t.name === 'Canvas2D');
   const canvasEntity = findEntity(canvasEntityId);
   if (c2dMeta && canvasEntity?.has(c2dMeta.trait)) {
-    const c2d = canvasEntity.get(c2dMeta.trait) as { referenceWidth?: number; referenceHeight?: number; scaleMode?: 'fitW' | 'fitH' | 'fill' | 'none'; maxReferenceWidth?: number };
+    const c2d = canvasEntity.get(c2dMeta.trait) as { referenceWidth?: number; referenceHeight?: number; scaleMode?: 'fitW' | 'fitH' | 'fill' | 'none'; maxReferenceWidth?: number; maxReferenceHeight?: number };
     refW = c2d.referenceWidth || 1080;
     refH = c2d.referenceHeight || 1920;
     scaleMode = c2d.scaleMode || 'fitH';
     maxRefW = c2d.maxReferenceWidth || 0;
+    maxRefH = c2d.maxReferenceHeight || 0;
   }
-  return { refW, refH, scaleMode, maxRefW };
+  return { refW, refH, scaleMode, maxRefW, maxRefH };
 }
 
 // Install the capture-phase 2D pointer handlers on opts.getTargetEl(). Returns a cleanup fn.
@@ -1142,7 +1278,7 @@ function installScene2DInteraction(canvasEntityId: number, opts: Scene2DInteract
       const ent = findEntity(entityId);
       if (!ent) return;
       ent.set(colMeta.trait as any, { ...(ent.get(colMeta.trait as any) as object), points: str });
-      mark2DDirty();
+      mark2DDirty(); fireDirtyListeners(); // direct ECS write — see the gizmo drag below
     }
     // Commit a points edit (before→after) as one undo entry, applying `after` now.
     function commitPoints(entityId: number, colMeta: { trait: unknown }, beforeStr: string, afterPts: Pt[]) {
@@ -1286,8 +1422,10 @@ function installScene2DInteraction(canvasEntityId: number, opts: Scene2DInteract
       if (id2d !== null) return id2d;
       // No 2D entity here. This canvas (pointerEvents:'auto') sits above the DOM
       // UI layer, so without this it would swallow clicks meant for a UI element
-      // showing through the transparent canvas. Select the UI node beneath, if any.
-      return pickUnderlyingUIEntity(clientX, clientY);
+      // showing through the transparent canvas. Select the UI node beneath, if any —
+      // bounded by THIS canvas's host (#999/#1001), so a miss cannot escape upward
+      // past it to the UI root.
+      return pickUnderlyingUIEntity(clientX, clientY, canvasEntityId);
     }
 
     // Registered so the "ui" preview mode's paint-order arbiter (`UIEditorOverlay`,
@@ -1453,7 +1591,7 @@ function installScene2DInteraction(canvasEntityId: number, opts: Scene2DInteract
             const d = Math.hypot(px - wx, py - wy);
             if (d <= rGame && d < bestBoneD) { bestBoneD = d; bestBone = eid; }
           });
-          if (bestBone !== null) { selectEntity(bestBone); e.stopPropagation(); e.preventDefault(); return; }
+          if (bestBone !== null) { selectEntity(bestBone); useEditorStore.getState().requestEntityReveal(); e.stopPropagation(); e.preventDefault(); return; }
         }
       }
 
@@ -1516,7 +1654,7 @@ function installScene2DInteraction(canvasEntityId: number, opts: Scene2DInteract
           // write position too, because a rigid group transform orbits the members.
           me.set(Transform, { ...me.get(Transform), ...groupMemberFields(mode, localNew, clampAngle) });
         });
-        mark2DDirty();
+        mark2DDirty(); fireDirtyListeners(); // direct ECS writes — see the gizmo drag below
         return;
       }
 
@@ -1545,7 +1683,15 @@ function installScene2DInteraction(canvasEntityId: number, opts: Scene2DInteract
         const localDelta: Record<string, number> = {};
         for (const k of Object.keys(worldDelta) as (keyof typeof worldDelta)[]) localDelta[k] = localNew[k];
         entity.set(Transform, { ...entity.get(Transform), ...localDelta });
-        mark2DDirty(); // Direct ECS write bypasses writeTraitField
+        // A direct ECS write bypasses writeTraitField, which is what fires the dirty broadcast — so
+        // fire it, as the 3D gizmo drag does. `mark2DDirty` (this interaction's markDirty) reaches
+        // only the SceneView's two gates, and on its own the Game view stayed at the pre-drag
+        // position through the drag AND after release until an unrelated edit woke it (#1141
+        // sibling, observed live: ECS x 515.42, Game view sprite x 110). The SceneView wake stays
+        // explicit rather than riding the broadcast, so the overlay does not depend on
+        // `ensureCanvas2DListeners` having been installed.
+        mark2DDirty();
+        fireDirtyListeners();
         return;
       }
 
@@ -1620,14 +1766,13 @@ function installScene2DInteraction(canvasEntityId: number, opts: Scene2DInteract
         const mode = useEditorStore.getState().gizmoMode;
         const recFields = mode === 'translate' ? ['x', 'y'] : mode === 'rotate' ? ['x', 'y', 'rz'] : ['x', 'y', 'sx', 'sy'];
         const actions = g.members.map((m) => {
-          const me = findEntity(m.id);
-          if (!me || !me.has(Transform)) return null;
-          const tf = me.get(Transform);
+          const tf = findEntity(m.id)?.get(Transform);
+          if (!tf) return null;
           const after = { x: tf.x, y: tf.y, rz: tf.rz, sx: tf.sx, sy: tf.sy };
           const ref = entityRef(m.id);
           for (const k of recFields) { notifyFieldEdited(m.id, 'Transform', k, (after as Record<string, number>)[k]); markOverrideIfInstance(m.id, 'Transform', k); }
           return buildTransformUndoAction({
-            label: `Transform "${me.name || `Entity ${m.id}`}"`,
+            label: `Transform "${entityDisplayName(m.id)}"`,
             trait: Transform, resolve: () => ref.resolve(), findEntity, before: { ...m.local }, after,
             entityGuid: ref.guid || String(m.id),
           });
@@ -1639,9 +1784,8 @@ function installScene2DInteraction(canvasEntityId: number, opts: Scene2DInteract
       e.stopPropagation();
       e.preventDefault();
       const { entityId, localStart } = dragRef.current;
-      const entity = findEntity(entityId);
-      if (entity && entity.has(Transform)) {
-        const tf = entity.get(Transform);
+      const tf = findEntity(entityId)?.get(Transform);
+      if (tf) {
         const after = { x: tf.x, y: tf.y, rz: tf.rz, sx: tf.sx, sy: tf.sy };
         // before = the LOCAL transform at drag start (startTransform is world now).
         const before = { ...localStart };
@@ -1651,7 +1795,7 @@ function installScene2DInteraction(canvasEntityId: number, opts: Scene2DInteract
         // the world is rebuilt (Play→Stop). The ref tolerates all three.
         const ref = entityRef(eid);
         pushAction(buildTransformUndoAction({
-          label: `Transform "${entity.name || `Entity ${eid}`}"`,
+          label: `Transform "${entityDisplayName(eid)}"`,
           trait: Transform, resolve: () => ref.resolve(), findEntity, before, after,
           entityGuid: ref.guid || String(eid),
         }));
@@ -1671,7 +1815,19 @@ function installScene2DInteraction(canvasEntityId: number, opts: Scene2DInteract
       dragRef.current = null;
     }
 
-    container.addEventListener('pointerdown', onPointerDown, { capture: true });
+    // #1161: capture the pointer once a press claims a drag, so the release that commits it
+    // reaches this canvas wherever it lands — see dragPointerCapture.ts.
+    const dragCapture = bindDragPointerCapture(
+      container,
+      () => !!(dragRef.current || groupDragRef.current || vertexDragRef.current),
+      onPointerUp,
+    );
+    function onPointerDownCapturing(e: PointerEvent) {
+      onPointerDown(e);
+      dragCapture.afterPress(e);
+    }
+
+    container.addEventListener('pointerdown', onPointerDownCapturing, { capture: true });
     container.addEventListener('pointermove', onPointerMove, { capture: true });
     container.addEventListener('pointerup', onPointerUp, { capture: true });
     // Pick provider (F15 — docs/enact.md): `pickEntityAtViewportPoint` (defined above,
@@ -1683,9 +1839,10 @@ function installScene2DInteraction(canvasEntityId: number, opts: Scene2DInteract
     // must win when both answer for the same point — higher than the 3D provider's default 0.
     const unregPick2D = registerPickProvider(pickEntityAtViewportPoint, 'scene-view', 10);
     return () => {
-      container.removeEventListener('pointerdown', onPointerDown, { capture: true });
+      container.removeEventListener('pointerdown', onPointerDownCapturing, { capture: true });
       container.removeEventListener('pointermove', onPointerMove, { capture: true });
       container.removeEventListener('pointerup', onPointerUp, { capture: true });
+      dragCapture.dispose();
       window.removeEventListener('pointermove', marquee2dMove);
       window.removeEventListener('pointerup', marquee2dUp);
       marqueeEl2d.remove();
@@ -1930,7 +2087,7 @@ function drawScene2D(ctx: CanvasRenderingContext2D, canvasEntityId: number, o: S
           ctx.setLineDash([]);
           for (const [eid, p] of bonePos) {
             const ent = findEntity(eid);
-            const pid = ent?.has(EntityAttributes) ? (ent.get(EntityAttributes).parentId as number) : 0;
+            const pid = ent?.get(EntityAttributes)?.parentId ?? 0;
             const pp = pid ? bonePos.get(pid) : undefined;
             if (pp) { ctx.beginPath(); ctx.moveTo(pp.x, pp.y); ctx.lineTo(p.x, p.y); ctx.stroke(); }
           }
@@ -2276,8 +2433,8 @@ function Scene2DChromeOverlay({ canvasEntityId, showBoundary = false, viewZoom =
       const ctx = canvas.getContext('2d');
       if (!ctx) return;
       ctx.clearRect(0, 0, pw, ph);
-      const { refW, refH, scaleMode, maxRefW } = readCanvas2DRefDims(canvasEntityId, pw, ph);
-      const cs = computeCanvasScale(refW, refH, pw, ph, scaleMode, maxRefW);
+      const { refW, refH, scaleMode, maxRefW, maxRefH } = readCanvas2DRefDims(canvasEntityId, pw, ph);
+      const cs = computeCanvasScale(refW, refH, pw, ph, scaleMode, maxRefW, maxRefH);
       canvasScaleRef.current = cs;
       const rectW = canvas.getBoundingClientRect().width;
       gizmoScreenScaleRef.current = (rectW > 0 && cs.scale > 0) ? pw / (cs.scale * rectW) : 1;
@@ -2400,11 +2557,29 @@ function UIEditorOverlay({ viewZoom = 1, showUI = true, show2D = false, selected
       // Not on a UI-attributed element at all (empty space, a resize handle, a raw click on the
       // pick canvas itself) — leave normal DOM routing / the canvas's own handler untouched.
       if (!uiTarget) return;
-      if (target?.closest('[data-2d-pick]')) return; // landed on the pick canvas — its own handler owns this
+      if (target?.closest('[data-2d-pick]')) {
+        // ⚠️ #999/#1001 — ABSTAINING IS NOT ENOUGH, and this bare `return` was the whole defect.
+        // The pick canvas's own capture handler (`installScene2DInteraction`) DOES select
+        // correctly on this very pointerdown, and stops propagation of it — but the browser then
+        // dispatches a SEPARATE `click` for the same gesture. A Canvas2D host is a leaf in the UI
+        // tree, so `UINode` gives it neither an `onClick` nor pointer events; that click therefore
+        // bubbles past it to the nearest ancestor UI node that DOES have a handler — in practice
+        // the UI root — which re-selects itself and silently overwrites the correct pick a few ms
+        // later. Nothing logs, so it reads as "2D is unpickable" rather than "picked, then undone".
+        // Measured in chess (2026-09-09): dispatching pointerdown+pointerup alone at a cell's
+        // centre selects `sq_e4`; replaying the identical pair WITH the trailing click yields
+        // `ChessRoot`. The header above already states the rule this branch needs — "swallow BOTH
+        // this pointerdown and the `click` React dispatches after it" — it was simply never
+        // applied to the one target that cannot defend itself.
+        overrodeClickRef.current = true;
+        swallowGenRef.current++;
+        return; // the canvas's own handler owns the SELECTION; we only shield it from the click
+      }
       const winner = resolvePreviewPickAt(e.clientX, e.clientY);
       const domId = Number(uiTarget.getAttribute('data-entity-id'));
       if (winner === null || winner === domId) return; // arbiter agrees with default DOM routing
       selectEntity(winner);
+      useEditorStore.getState().requestEntityReveal(); // a UI-preview pick means "select this" (#1156)
       e.stopPropagation();
       e.preventDefault();
       overrodeClickRef.current = true;
@@ -2459,7 +2634,7 @@ function UIEditorOverlay({ viewZoom = 1, showUI = true, show2D = false, selected
       ...safeAreaCssVars(gameViewSafeArea),
     }}>
       <UIRenderer
-        onSelectEntity={(id) => selectEntity(id)}
+        onSelectEntity={(id) => { selectEntity(id); useEditorStore.getState().requestEntityReveal(); }}
         renderCanvas2D={renderCanvas2D}
         uiVisualsHidden={!showUI}
       />
@@ -2525,29 +2700,12 @@ function ThreeJSViewport({ mode, layers, showGrid = true, showColliders = false,
 
     noteRendererProgress('viewport effect entered; renderer init starting');
 
-    const setup = async () => {
-    // #858: THE FIRST STATEMENT, and it is load-bearing. Everything below registers into module
-    // scope or takes a GPU resource long before the big teardown closure at the end of this
-    // function exists, and a throw in between used to leave `cleanup` undefined — so
-    // `teardownViewport()`'s `fn?.()` released NOTHING and every slot taken so far dangled into a
-    // viewport that was never finished. Seeding the scope here makes a PARTIAL teardown possible:
-    // each acquisition below pushes its own release the moment it takes the thing, so whatever
-    // this run managed to take is released whether or not it reached the end.
-    // A fresh scope per run, because the context-loss rebuild calls `setup()` again.
-    const scope = createTeardownScope('SceneView');
-    cleanup = scope.dispose;
-    // Three.js r183 WebGPU's node system warns 'Light node not found' for
-    // dynamically-added lights (they still work — a Three.js internal issue). It's
-    // emitted at render time, so it's suppressed via the SCOPED `withWarnFilter`
-    // wrapped around the per-frame `renderer.render` (F9) — NOT a lifetime-long
-    // global `console.warn` patch that would swallow every other warning in the app.
-
     // ── Renderer (WebGPU when available, else WebGL2 via forceWebGL — matches
     //    the game renderer, including the WebGPU-init-failure → WebGL2 fallback) ──
     // makeWebGPURenderer creates + inits the renderer (and appends its canvas),
-    // so the backend is fully settled BEFORE we bind OrbitControls /
-    // TransformControls and pointer listeners to renderer.domElement below.
-    // Renderer creation is RETRIED, not attempted once. The old code gave up permanently on
+    // so the backend is fully settled BEFORE install binds OrbitControls /
+    // TransformControls and pointer listeners to renderer.domElement.
+    // A BOOT's renderer creation is RETRIED, not attempted once. The old code gave up permanently on
     // the first throw — and because the effect has `[]` deps and is latched by `initedRef`, a
     // mounted-but-failed viewport could never try again. Since nothing then ever called
     // `setActiveRenderer`, the scene-load gate sat on its full 120s cold-start budget before
@@ -2587,38 +2745,40 @@ function ThreeJSViewport({ mode, layers, showGrid = true, showColliders = false,
         }
       }
     };
-
-    let created: WebGPURenderer;
-    try {
+    // #1052 — a REBUILD makes ONE attempt and leaves retrying to `rendererRecovery`, which already
+    // retries a rejected rebuild with backoff. Retrying here as well would make the bring-up bound
+    // (`REBUILD_BRINGUP_TIMEOUT_MS`) measure four attempts plus 4.25 s of sleeps rather than one
+    // bring-up — and Scene3D's rebuild has no inner retry either.
+    // `bootCreateFailed` tells the boot's `.catch` below "creation failed" from "install threw".
+    let bootCreateFailed = false;
+    const createRenderer = (kind: BringUpKind): Promise<WebGPURenderer> => {
       // Leased per container, so a StrictMode remount reuses this renderer rather than racing
       // a second GPU device into existence while the first is still releasing.
-      created = await acquireRenderer(container, createWithRetry,
+      const leased = acquireRenderer(container, kind === 'boot' ? createWithRetry : () => makeWebGPURenderer(container),
         () => noteRendererProgress('reusing the renderer already leased to this container'));
-    } catch (e) {
-      if (outerDisposed) return; // unmounted mid-attempt — nothing to recover for
-      const err = e instanceof Error ? e : new Error(String(e));
-      noteRendererProgress(`renderer init failed after ${RETRY_DELAYS_MS.length + 1} attempts: ${err.message}`);
-      // ERROR, not warn. This was logged at warn level while the timeout message told the
-      // reader to "check the console for a WebGPU/WebGL init error" — so anyone filtering
-      // to `error`, exactly as instructed, saw an empty console and blamed their own code.
-      console.error(
-        `[SceneView] renderer init FAILED after ${RETRY_DELAYS_MS.length + 1} attempts — the 3D ` +
-        `viewport cannot render and no scene will load. This does not recover on its own; ` +
-        `relaunch the editor once the cause below is addressed.`, err,
-      );
-      initedRef.current = false;
-      // Unblock every scene-load waiter NOW rather than leaving them on the 120s budget.
-      reportRendererInitFailure(err);
-      return;
-    }
+      return kind === 'boot' ? leased.catch((e: unknown) => { bootCreateFailed = true; throw e; }) : leased;
+    };
+
+    const install = async (created: WebGPURenderer, stillCurrent: LivenessCheck) => {
+    // #858: THE FIRST STATEMENT, and it is load-bearing. Everything below registers into module
+    // scope or takes a GPU resource long before the big teardown closure at the end of this
+    // function exists, and a throw in between used to leave `cleanup` undefined — so
+    // `teardownViewport()`'s `fn?.()` released NOTHING and every slot taken so far dangled into a
+    // viewport that was never finished. Seeding the scope here makes a PARTIAL teardown possible:
+    // each acquisition below pushes its own release the moment it takes the thing, so whatever
+    // this run managed to take is released whether or not it reached the end.
+    // A fresh scope per install, because a context-loss rebuild installs again.
+    const scope = createTeardownScope('SceneView');
+    cleanup = scope.dispose;
+    // Three.js r183 WebGPU's node system warns 'Light node not found' for
+    // dynamically-added lights (they still work — a Three.js internal issue). It's
+    // emitted at render time, so it's suppressed via the SCOPED `withWarnFilter`
+    // wrapped around the per-frame `renderer.render` (F9) — NOT a lifetime-long
+    // global `console.warn` patch that would swallow every other warning in the app.
+
     const renderer: WebGPURenderer = created;
-    // The component may have unmounted while init was in flight. Release our hold rather than
-    // disposing directly — a StrictMode remount is about to re-acquire this very renderer.
-    if (outerDisposed) {
-      noteRendererProgress('viewport unmounted before the renderer could be registered');
-      releaseRenderer(container);
-      return;
-    }
+    // Nothing to check before the first await: a renderer that arrived after unmount, or that a newer
+    // bring-up superseded, never reaches install — `viewportBringUp`'s `discard` takes it (#1052).
     const disposeActiveRenderer = await setActiveRenderer(renderer); // KTX2Loader GPU-format detection (async since #254)
     // Compose onto the renderer's own `dispose()` rather than adding a second teardown path:
     // `rendererLease.ts`'s `releaseRenderer`/`discardRenderer` are the only callers of
@@ -2630,12 +2790,21 @@ function ThreeJSViewport({ mode, layers, showGrid = true, showColliders = false,
       return priorDispose(...args);
     };
     noteRendererProgress('renderer registered (setActiveRenderer called)');
-    // RE-CHECK, and it is the SECOND await in this body, not the first. #254 made
-    // `setActiveRenderer` genuinely async (it fetches the KTX2Loader chunk on a cold boot), so
-    // an unmount can land here — past the guard above. `cleanup` is not assigned until the very
-    // END of setup(), ~2000 lines down, so bailing without this check makes the effect's
-    // teardown a no-op while setup runs on to `startFrameDriver()`: a zombie renderer animating
-    // a detached canvas, its container lease never released, one per open/close cycle.
+    // RE-CHECK after install's ONLY await (the acquire moved out to `createRenderer`, #1052). #254 made
+    // `setActiveRenderer` genuinely async (it fetches the KTX2Loader chunk on a cold boot), so two
+    // things can land here, and bailing without these checks runs on to `startFrameDriver()`: a
+    // zombie renderer animating a detached canvas, its container lease never released.
+    //  - A NEWER bring-up — a context loss during the await starts a rebuild. Its teardown already
+    //    `discardRenderer`ed this container's lease, which DISPOSED this renderer (the lease held
+    //    it) before the dispose wrap above existed, so only the active-renderer registration taken
+    //    just above is still ours to drop. `releaseRenderer` here would decrement the SUCCESSOR's
+    //    lease, which is why this is checked FIRST, even when the viewport has also unmounted.
+    //  - An unmount — release our hold, since a StrictMode remount may be re-acquiring this renderer.
+    if (!stillCurrent()) {
+      noteRendererProgress('a newer bring-up overtook this one while the KTX2 loader chunk was in flight');
+      disposeActiveRenderer();
+      return;
+    }
     if (outerDisposed) {
       noteRendererProgress('viewport unmounted while the KTX2 loader chunk was in flight');
       releaseRenderer(container);
@@ -2689,7 +2858,7 @@ function ThreeJSViewport({ mode, layers, showGrid = true, showColliders = false,
     // Released from the scope rather than only from the closure below, so a throw in the ~2,200
     // lines between here and there still detaches them. They now run AFTER that closure's GPU
     // disposal instead of before it, which is safe for a reason worth stating: every event path in
-    // `rendererLossHandling.ts` consults `isStale()` first (`:89`, `:106`, `:136`), and `isStale`
+    // `rendererLossHandling.ts` consults `isStale()` first (in `attachContextLossListeners` and `attachDeviceLostListener`), and `isStale`
     // reads `disposed`, which that closure sets as its FIRST statement.
     scope.add(detachUncapturedError);
     scope.add(detachRendererLoss);
@@ -2853,7 +3022,7 @@ function ThreeJSViewport({ mode, layers, showGrid = true, showColliders = false,
         return !!el && (el === renderer.domElement || renderer.domElement.contains(el));
       };
       // three's OWN `eye`, and the branch matters: for an ORTHOGRAPHIC camera it is the negated
-      // view direction, NOT the direction to the camera's position (TransformControls.js:1113).
+      // view direction, NOT the direction to the camera's position (TransformControls' gizmo updateMatrixWorld, orthographic branch).
       // The editor has an orthographic sibling camera, so getting this wrong there would hide an
       // axis three kept (dropping a usable handle) or publish one three collapsed to 1e-10 —
       // reintroducing the exact miss this module exists to prevent, in ortho only.
@@ -2990,7 +3159,7 @@ function ThreeJSViewport({ mode, layers, showGrid = true, showColliders = false,
      *  ancestor are dropped so a parent+child selection moves the child once (Unity). */
     const groupMemberIds = (): number[] => filterOutDescendants(
       useEditorStore.getState().selectedEntityIds,
-      (id) => { const e = findEntity(id); return e?.has(EntityAttributes) ? (e.get(EntityAttributes).parentId as number) : 0; },
+      (id) => findEntity(id)?.get(EntityAttributes)?.parentId ?? 0,
     );
 
     // ── 2.5D billboard bone posing ──
@@ -3015,7 +3184,7 @@ function ThreeJSViewport({ mode, layers, showGrid = true, showColliders = false,
         groupProxy.updateMatrixWorld(true);
         const members = groupMemberIds().map((id) => {
           const e = findEntity(id);
-          const parentId = e?.has(EntityAttributes) ? (e.get(EntityAttributes).parentId as number) : 0;
+          const parentId = e?.get(EntityAttributes)?.parentId ?? 0;
           const w = worldTransforms.get(id) ?? { x: 0, y: 0, z: 0, rx: 0, ry: 0, rz: 0, sx: 1, sy: 1, sz: 1 };
           const tf = e?.has(Transform) ? e.get(Transform) : null;
           const before: Record<string, number> = tf ? { x: tf.x, y: tf.y, z: tf.z, rx: tf.rx, ry: tf.ry, rz: tf.rz, sx: tf.sx, sy: tf.sy, sz: tf.sz } : {};
@@ -3026,9 +3195,8 @@ function ThreeJSViewport({ mode, layers, showGrid = true, showColliders = false,
         return;
       }
       if (gizmoEntityId === null) return;
-      const entity = findEntity(gizmoEntityId);
-      if (!entity || !entity.has(Transform)) return;
-      const tf = entity.get(Transform);
+      const tf = findEntity(gizmoEntityId)?.get(Transform);
+      if (!tf) return;
       gizmoDragStart = { x: tf.x, y: tf.y, z: tf.z, rx: tf.rx, ry: tf.ry, rz: tf.rz, sx: tf.sx, sy: tf.sy, sz: tf.sz };
       const o = gizmo.object;
       gizmoScaleStartSign = o ? { x: Math.sign(o.scale.x), y: Math.sign(o.scale.y), z: Math.sign(o.scale.z) } : null;
@@ -3106,7 +3274,7 @@ function ThreeJSViewport({ mode, layers, showGrid = true, showColliders = false,
         const entity = findEntity(gizmoEntityId);
         if (!entity || !entity.has(Transform)) return;
         const mode = gizmo.getMode();
-        const pid = entity.has(EntityAttributes) ? (entity.get(EntityAttributes).parentId as number) : 0;
+        const pid = entity.get(EntityAttributes)?.parentId ?? 0;
         let parentRel: { x: number; y: number; rz: number; sx: number; sy: number } | null = null;
         if (pid && pid !== boneGizmo.spriteId) {
           const pEnt = findEntity(pid);
@@ -3131,7 +3299,7 @@ function ThreeJSViewport({ mode, layers, showGrid = true, showColliders = false,
 
       const entity = findEntity(gizmoEntityId);
       if (!entity || !entity.has(Transform)) return;
-      const parentId = entity.has(EntityAttributes) ? entity.get(EntityAttributes).parentId : 0;
+      const parentId = entity.get(EntityAttributes)?.parentId ?? 0;
       const local = worldToLocal(obj, parentId);
       const mode = gizmo.getMode();
       const current = entity.get(Transform);
@@ -3167,9 +3335,8 @@ function ThreeJSViewport({ mode, layers, showGrid = true, showColliders = false,
         const recFields = mode === 'translate' ? ['x', 'y', 'z']
           : mode === 'rotate' ? ['x', 'y', 'z', 'rx', 'ry', 'rz'] : ['x', 'y', 'z', 'sx', 'sy', 'sz'];
         const actions = groupDrag.members.map((m) => {
-          const e = findEntity(m.id);
-          if (!e || !e.has(Transform)) return null;
-          const tf = e.get(Transform);
+          const tf = findEntity(m.id)?.get(Transform);
+          if (!tf) return null;
           const after = { x: tf.x, y: tf.y, z: tf.z, rx: tf.rx, ry: tf.ry, rz: tf.rz, sx: tf.sx, sy: tf.sy, sz: tf.sz };
           const ref = entityRef(m.id);
           // Record-mode + prefab-override hooks per member (mirrors the single-entity path).
@@ -3178,7 +3345,7 @@ function ThreeJSViewport({ mode, layers, showGrid = true, showColliders = false,
             markOverrideIfInstance(m.id, 'Transform', k);
           }
           return buildTransformUndoAction({
-            label: `Transform "${e.name || `Entity ${m.id}`}"`,
+            label: `Transform "${entityDisplayName(m.id)}"`,
             trait: Transform, resolve: () => ref.resolve(), findEntity, before: m.before, after,
             entityGuid: ref.guid || String(m.id),
           });
@@ -3190,9 +3357,8 @@ function ThreeJSViewport({ mode, layers, showGrid = true, showColliders = false,
         return;
       }
       if (gizmoEntityId === null || !gizmoDragStart) return;
-      const entity = findEntity(gizmoEntityId);
-      if (!entity || !entity.has(Transform)) return;
-      const tf = entity.get(Transform);
+      const tf = findEntity(gizmoEntityId)?.get(Transform);
+      if (!tf) return;
       const after = { x: tf.x, y: tf.y, z: tf.z, rx: tf.rx, ry: tf.ry, rz: tf.rz, sx: tf.sx, sy: tf.sy, sz: tf.sz };
       const before = { ...gizmoDragStart };
       const eid = gizmoEntityId;
@@ -3201,7 +3367,7 @@ function ThreeJSViewport({ mode, layers, showGrid = true, showColliders = false,
       // handle/raw id goes stale on delete/restore or a world rebuild (Play→Stop).
       const ref = entityRef(eid);
       pushAction(buildTransformUndoAction({
-        label: `Transform "${entity.name || `Entity ${eid}`}"`,
+        label: `Transform "${entityDisplayName(eid)}"`,
         trait: Transform, resolve: () => ref.resolve(), findEntity, before, after,
         entityGuid: ref.guid || String(eid),
       }));
@@ -3354,12 +3520,13 @@ function ThreeJSViewport({ mode, layers, showGrid = true, showColliders = false,
       };
       // Same selectable set as click-picking (the `entries` array above `pick3D`): meshes, text,
       // and flame groups are gated behind the `show3D` layer toggle; billboards + gizmos are not.
+      // A dead owner's object awaiting the next sweep is skipped, as in the click pick (#1197).
       const { show3D } = layersRef.current;
-      if (show3D) for (const [id, obj] of renderState.ecsObjects) consider(id, obj);
-      for (const [id, e] of renderState.billboards) if (e.group.visible) consider(id, e.group);
-      if (show3D) for (const [id, e] of renderState.textMeshes) if (e.group.visible) consider(id, e.group);
-      for (const [id, obj] of ecsGizmos) consider(id, obj);
-      if (show3D) for (const [id, rec] of flameState.recs) consider(id, rec.group as THREE.Object3D);
+      if (show3D) for (const [id, obj] of renderState.ecsObjects) if (isLiveOwner(renderState.ecsOwners.get(id))) consider(id, obj);
+      for (const [id, e] of renderState.billboards) if (e.group.visible && isLiveOwner(e.owner)) consider(id, e.group);
+      if (show3D) for (const [id, e] of renderState.textMeshes) if (e.group.visible && isLiveOwner(e.owner)) consider(id, e.group);
+      for (const [id, obj] of ecsGizmos) if (isLiveOwner(gizmoOwners.get(id))) consider(id, obj);
+      if (show3D) for (const [id, rec] of flameState.recs) if (isLiveOwner(rec.owner)) consider(id, rec.group as THREE.Object3D);
       if (inside.length === 0) return;
       const cur = useEditorStore.getState().selectedEntityIds;
       const union = Array.from(new Set([...cur, ...inside]));
@@ -3421,25 +3588,32 @@ function ThreeJSViewport({ mode, layers, showGrid = true, showColliders = false,
         }
       }
       const { show3D } = layersRef.current;
-      // Meshes listed before gizmos so a mesh wins the tie at a shared ancestor.
+      // Meshes listed before gizmos so a mesh wins the tie at a shared ancestor. Every map is keyed by
+      // entity id and swept on the next pass, so an entry whose owner is dead is left out: its id may
+      // already name a newcomer, and `pickAt` would report that newcomer at the dead entity's spot —
+      // the same window the bounds provider closes (#1197, `isLiveOwner`).
       const entries: Pick3DEntry[] = [
-        ...(show3D ? Array.from(renderState.ecsObjects, ([id, object]) => ({ id, object })) : []),
+        ...(show3D ? Array.from(renderState.ecsObjects)
+          .filter(([id]) => isLiveOwner(renderState.ecsOwners.get(id)))
+          .map(([id, object]) => ({ id, object })) : []),
         // Flame meshes render on the particle layer (not in ecsObjects); add them so they're
         // click-selectable in the viewport like any other object.
-        ...(show3D ? Array.from(flameState.recs, ([id, rec]) => ({ id, object: rec.group as THREE.Object3D })) : []),
+        ...(show3D ? Array.from(flameState.recs)
+          .filter(([, rec]) => isLiveOwner(rec.owner))
+          .map(([id, rec]) => ({ id, object: rec.group as THREE.Object3D })) : []),
         // 2.5D billboards (SkinnedSprite2D + Billboard3D) render as camera-facing THREE meshes
         // but live in neither ecsObjects nor ecsGizmos — add their group so the character is
         // click-selectable in the 3D view. A hit on a part-mesh resolves up to the group's id.
         // Gate on group.visible so picking matches what's actually drawn.
         ...Array.from(renderState.billboards)
-          .filter(([, entry]) => entry.group.visible)
+          .filter(([, entry]) => entry.group.visible && isLiveOwner(entry.owner))
           .map(([id, entry]) => ({ id, object: entry.group as THREE.Object3D })),
         // SDF text meshes (Text3D) live in their own map, not ecsObjects — add them so
         // they're click-selectable like any other object.
         ...(show3D ? Array.from(renderState.textMeshes)
-          .filter(([, entry]) => entry.group.visible)
+          .filter(([, entry]) => entry.group.visible && isLiveOwner(entry.owner))
           .map(([id, entry]) => ({ id, object: entry.group as THREE.Object3D })) : []),
-        ...Array.from(ecsGizmos, ([id, object]) => ({ id, object })),
+        ...Array.from(ecsGizmos).filter(([id]) => isLiveOwner(gizmoOwners.get(id))).map(([id, object]) => ({ id, object })),
       ];
       return pick3D(mx, my, activeCam, entries, raycaster);
     }
@@ -3509,7 +3683,7 @@ function ThreeJSViewport({ mode, layers, showGrid = true, showColliders = false,
     let gameActiveCam: THREE.PerspectiveCamera | THREE.OrthographicCamera = gameCam;
 
     // Publish the game-camera billboard raycast for the 2D overlay's pointer handler. Uses the
-    // SAME letterboxed NDC + gameCam as the in-viewport pick3D (line ~2263) so 2D-mode picking
+    // SAME letterboxed NDC + gameCam as the in-viewport pick3D (`pickEntityAtViewportPoint`'s UI-mode path) so 2D-mode picking
     // can't drift from what's drawn. Only billboards — 3D meshes aren't the target in 2D mode.
     scope.add(() => { _pickBillboardInUI = null; }); // drop the 2D-overlay picking bridge
     _pickBillboardInUI = (clientX, clientY) => {
@@ -3702,6 +3876,13 @@ function ThreeJSViewport({ mode, layers, showGrid = true, showColliders = false,
     // Icon gizmos for Camera/Light/Environment/empty entities — the objects that make an
     // otherwise-invisible entity clickable in the viewport.
     const ecsGizmos = new Map<number, THREE.Object3D>();
+    // The packed entity (`entity.valueOf()`) that last KEPT the gizmo at an id — stamped by the loop
+    // below that owns that gizmo, at the point it creates or poses it, and nowhere else. The bounds
+    // provider and the picker refuse an id whose stamp is missing or dead (#1197). ⚠️ Never stamp from
+    // a loop that merely VISITS the id: the Transform (empty) loop visits every entity, and Camera and
+    // Environment gizmos were never reaped, so a top-of-loop stamp let a newcomer on a dead camera's
+    // index vouch for the dead camera's icon — measured, permanently. Those two are reaped now too.
+    const gizmoOwners = new Map<number, number>();
 
     const unregBounds = registerBoundsProvider((ids) => {
       const r = renderer.domElement.getBoundingClientRect();
@@ -3709,13 +3890,7 @@ function ThreeJSViewport({ mode, layers, showGrid = true, showColliders = false,
       // `editor/scene/sceneViewBounds.ts`, where it is unit-tested. Only the live inputs —
       // this renderer's viewport rect and the active editor camera — belong here.
       return computeEntityScreenBounds(
-        {
-          ecsObjects: renderState.ecsObjects,
-          skinned: renderState.skinned,
-          billboards: renderState.billboards,
-          textMeshes: renderState.textMeshes,
-          gizmos: ecsGizmos,
-        },
+        boundsSourcesOf(renderState, { objects: ecsGizmos, owners: gizmoOwners }),
         activeEditorCam,
         { left: r.left, top: r.top, width: r.width, height: r.height },
         'scene-view',
@@ -3886,6 +4061,14 @@ function ThreeJSViewport({ mode, layers, showGrid = true, showColliders = false,
     // seen becomes next frame's previous.
     let particleGizmoIds = new Set<number>();
     let particleScratchIds = new Set<number>();
+    // Camera + Environment icon rows, previous frame / scratch — the same swap as the particle pair.
+    // These two kinds were never reaped: a deleted Camera left `camGizmoPivot` in `ecsGizmos` at its
+    // index, so an entity reclaiming that index got no marker of its own, and a Light / Environment
+    // there adopted the shared pivot (#1197 close-out review).
+    let cameraGizmoIds = new Set<number>();
+    let cameraScratchIds = new Set<number>();
+    let envGizmoIds = new Set<number>();
+    let envScratchIds = new Set<number>();
     let emptyGizmoIds = new Set<number>();
     let emptyScratchIds = new Set<number>();
     let frameGizmoIds = new Set<number>();     // CameraFrame boxes shown last frame
@@ -3910,8 +4093,13 @@ function ThreeJSViewport({ mode, layers, showGrid = true, showColliders = false,
       // descOutlineMeshes on swap (previously left to the next frame's prune) — a strict
       // improvement, not a behaviour this issue asked for.
       disposeSceneViewEntityObjects(scene, { outlineMeshes, descOutlineMeshes, colliderWires, colliderWireSigs, ecsGizmos, ecsLights }, camGizmoPivot);
+      gizmoOwners.clear();
       particleGizmoIds.clear();
       particleScratchIds.clear();
+      cameraGizmoIds.clear();
+      cameraScratchIds.clear();
+      envGizmoIds.clear();
+      envScratchIds.clear();
       emptyGizmoIds.clear();
       emptyScratchIds.clear();
       frameGizmoIds.clear();
@@ -3994,8 +4182,13 @@ function ThreeJSViewport({ mode, layers, showGrid = true, showColliders = false,
       // looking-down-(-Z) construction defaults → UI-mode 3D render + picking break.
       let cameraMatched = false;
       if (transformMeta && cameraMeta) {
+        const seenCam = cameraScratchIds;
+        seenCam.clear();
         getCurrentWorld().query(transformMeta.trait, cameraMeta.trait).updateEach(([tf, cam], entity) => {
           const id = entity.id();
+          // Seen BEFORE the deactivation return: only a Camera that left the query (deleted, or lost
+          // the trait) has its row reaped below, so a deactivated one stays selectable as before.
+          seenCam.add(id);
           if (deactivatedEntities.has(id)) return; // a deactivated camera is not active
           cameraMatched = true;
           // World-space pose (respects parenting), matching runtime
@@ -4058,8 +4251,18 @@ function ThreeJSViewport({ mode, layers, showGrid = true, showColliders = false,
           // Visibility is owned by the selection block below — hidden by default.
           updateCamFrustum(cam.fov, getGameAspect(), cam.near, Math.min(cam.far, 20));
           ecsGizmos.set(id, camGizmoPivot);
+          gizmoOwners.set(id, entity.valueOf());
 
         });
+        // Drop the ROW only — the pivot is shared by every Camera and outlives them all. A row that
+        // another loop has since replaced with its own gizmo is left to that loop.
+        for (const id of cameraGizmoIds) {
+          if (seenCam.has(id) || ecsGizmos.get(id) !== camGizmoPivot) continue;
+          ecsGizmos.delete(id);
+          gizmoOwners.delete(id);
+        }
+        cameraScratchIds = cameraGizmoIds;
+        cameraGizmoIds = seenCam;
       }
 
       // F1 fallback: no active Camera entity → drive gameCam from the editor orbit
@@ -4128,7 +4331,10 @@ function ThreeJSViewport({ mode, layers, showGrid = true, showColliders = false,
       const envMeta = allTraits.find((t) => t.name === 'Environment');
       if (envMeta) {
         let envActive = false;
+        const seenEnv = envScratchIds;
+        seenEnv.clear();
         getCurrentWorld().query(envMeta.trait).updateEach(([env], entity) => {
+          seenEnv.add(entity.id()); // before the deactivation return — see the Camera reap above
           if (deactivatedEntities.has(entity.id())) return;
           envActive = true;
           const envId = entity.id();
@@ -4140,6 +4346,7 @@ function ThreeJSViewport({ mode, layers, showGrid = true, showColliders = false,
             ecsGizmos.set(envId, g);
           }
           if (ecsGizmos.has(envId)) {
+            gizmoOwners.set(envId, entity.valueOf());
             poseIconGizmo(ecsGizmos.get(envId)!, envId, gizmoEntityId === envId && !!(gizmo as { dragging?: boolean }).dragging);
           }
           // Editor background: show editor bg color when env doesn't show as background
@@ -4150,6 +4357,18 @@ function ThreeJSViewport({ mode, layers, showGrid = true, showColliders = false,
         if (!envActive) {
           scene.background = _editorBgColor;
         }
+        // Remove the icon of an Environment that left the query. Only an environment icon is
+        // disposed: any other gizmo at that id belongs to the loop that made it.
+        for (const id of envGizmoIds) {
+          if (seenEnv.has(id)) continue;
+          const g = ecsGizmos.get(id) as THREE.Mesh | undefined;
+          if (!g || g.geometry !== GIZMO_SHAPES.environment) continue;
+          scene.remove(g); (g.material as THREE.Material | undefined)?.dispose();
+          ecsGizmos.delete(id);
+          gizmoOwners.delete(id);
+        }
+        envScratchIds = envGizmoIds;
+        envGizmoIds = seenEnv;
       }
 
       // Sync ECS lights (shared runtime logic handles creation, update, and removal)
@@ -4173,6 +4392,7 @@ function ThreeJSViewport({ mode, layers, showGrid = true, showColliders = false,
             ecsGizmos.set(id, g);
           }
           const g = ecsGizmos.get(id)!;
+          gizmoOwners.set(id, entity.valueOf());
           ((g as THREE.Mesh).material as THREE.MeshBasicMaterial).color.setHex(light.color);
           poseIconGizmo(g, id, gizmoEntityId === id && !!(gizmo as { dragging?: boolean }).dragging);
           // Shadow-frustum viz: outline the shadow-camera coverage for a flagged
@@ -4211,6 +4431,7 @@ function ThreeJSViewport({ mode, layers, showGrid = true, showColliders = false,
             scene.add(g);
             ecsGizmos.set(id, g);
           }
+          gizmoOwners.set(id, entity.valueOf());
           poseIconGizmo(ecsGizmos.get(id)!, id, gizmoEntityId === id && !!(gizmo as { dragging?: boolean }).dragging);
         });
         // Remove icons for emitters deleted within the current scene.
@@ -4282,6 +4503,7 @@ function ThreeJSViewport({ mode, layers, showGrid = true, showColliders = false,
             scene.add(g);
             ecsGizmos.set(id, g);
           }
+          gizmoOwners.set(id, entity.valueOf());
           // Don't fight the transform gizmo while this box is being dragged.
           const isDragging = gizmoEntityId === id && (gizmo as unknown as { dragging?: boolean }).dragging;
           const wt = worldTransforms.get(id);
@@ -4351,6 +4573,7 @@ function ThreeJSViewport({ mode, layers, showGrid = true, showColliders = false,
             scene.add(g);
             ecsGizmos.set(id, g);
           }
+          gizmoOwners.set(id, entity.valueOf());
           (g.material as THREE.MeshBasicMaterial).color.set(zone.color);
           const isDragging = gizmoEntityId === id && (gizmo as unknown as { dragging?: boolean }).dragging;
           if (wt && !isDragging) {
@@ -4421,6 +4644,7 @@ function ThreeJSViewport({ mode, layers, showGrid = true, showColliders = false,
           if (renderState.textMeshes.has(id)) return; // has a text mesh → not an "empty"
           if (ecsGizmos.has(id) && !emptyGizmoIds.has(id)) return;
           seenEmpty.add(id);
+          gizmoOwners.set(id, entity.valueOf());
           let g = ecsGizmos.get(id);
           if (!g) {
             const mat = new THREE.MeshBasicMaterial({ color: 0x9aa7b4, wireframe: true });
@@ -4519,7 +4743,7 @@ function ThreeJSViewport({ mode, layers, showGrid = true, showColliders = false,
             if (renderState.billboards.has(anc)) { spriteId = anc; break; }
             seenAnc.add(anc);
             const e = findEntity(anc);
-            anc = e?.has(EntityAttributes) ? (e.get(EntityAttributes).parentId as number) : 0;
+            anc = e?.get(EntityAttributes)?.parentId ?? 0;
           }
           const entry = spriteId ? renderState.billboards.get(spriteId) : undefined;
           const sEnt = spriteId ? findEntity(spriteId) : null;
@@ -4977,54 +5201,73 @@ function ThreeJSViewport({ mode, layers, showGrid = true, showColliders = false,
       scene.clear();
       initedRef.current = false;
     });
-    }; // end setup
+    // RE-ARM THE DIRTY GATE — without this a rebuild completes and the viewport stays BLACK.
+    // Measured, not theorised: after a live rebuild the Scene panel rendered nothing until the
+    // camera was nudged. This surface is render-on-demand, and the gate is a component-level
+    // `useRef` created at MOUNT, so a rebuild inherits it with its grace window already decayed to
+    // 0 — every event that would normally re-arm it (scene load, world swap) belongs to a mount
+    // that already happened. It used to run after `await setup()` in the rebuild; it lives HERE
+    // since #1052 because a rebuild's renderer can now be adopted LATE, after the bound, with no
+    // caller left to run a line after any await. A black viewport after recovery is
+    // indistinguishable from recovery having failed.
+    gateRef.current.markDirty();
+    }; // end install
 
     // ── GPU context-loss recovery (#121 P1) ────────────────────────────────────────────────
-    // Same shape as the runtime viewport (`runtime/rendering/Scene3D.tsx`): `setup()` builds
-    // everything and installs one `cleanup`, so recovery is teardown + a second `setup()`
-    // rather than re-pointing a renderer through ~2000 lines of wiring. A lost three renderer
-    // cannot be revived — see `core/activeRenderer.ts` for why this rebuilds instead.
+    // Same shape as the runtime viewport (`runtime/rendering/Scene3D.tsx`), and since #1052 the SAME
+    // decisions: `viewportBringUp.ts` bounds a rebuild's bring-up (`REBUILD_BRINGUP_TIMEOUT_MS`),
+    // adopts a late renderer nothing superseded, and discards one that lost its race. Before #1052
+    // the rebuild was `teardownViewport(); discardRenderer(container); await setup();` with no bound,
+    // so a WebGPU init that never settled latched `rendererRecovery`'s `inFlight` forever — no retry,
+    // no report, a Scene panel black until relaunch. `install()` builds everything and installs one
+    // `cleanup`, so recovery is teardown + a second install rather than re-pointing a renderer
+    // through ~2000 lines of wiring. A lost three renderer cannot be revived — see
+    // `core/activeRenderer.ts` for why this rebuilds instead.
     //
-    // `discardRenderer` is LOAD-BEARING and not obvious. `cleanup` still ENDS in
-    // `releaseRenderer(container)` — it is the scope's first-pushed release, so LIFO drains it
-    // last (#858) — and that defers teardown to a macrotask precisely so a
-    // StrictMode remount can re-acquire the SAME renderer. This rebuild is `cleanup(); setup();`
-    // in one task, so without the discard its `acquireRenderer` would cancel that timer and be
-    // handed the DEAD renderer straight back — recovery silently doing nothing, no error
-    // anywhere, viewport black forever. A dead renderer must never be leasable.
+    // `discardRenderer` in the bring-up's `teardown` is LOAD-BEARING and not obvious. `cleanup` still
+    // ENDS in `releaseRenderer(container)` — it is the scope's first-pushed release, so LIFO drains it
+    // last (#858) — and that defers teardown to a macrotask precisely so a StrictMode remount can
+    // re-acquire the SAME renderer. A rebuild's teardown and its `createRenderer` run in one task, so
+    // without the discard the acquire would cancel that timer and be handed the DEAD renderer straight
+    // back — recovery silently doing nothing, no error anywhere, viewport black forever. A dead
+    // renderer must never be leasable.
     //
     // The editor is the lower-stakes half of this phase (a human can relaunch it; a player on a
     // phone cannot), but it is the surface where a context loss is most likely to be SEEN.
     const teardownViewport = () => {
       const fn = cleanup;
-      cleanup = undefined; // a failed re-setup must not leave the unmount path on a stale closure
+      cleanup = undefined; // a failed re-install must not leave the unmount path on a stale closure
       fn?.();
     };
-    const recovery = createRendererRecovery({
-      rebuild: async () => {
-        teardownViewport();
-        discardRenderer(container);
-        initedRef.current = true; // cleanup released the latch; this viewport is still live
-        await setup();
-        // RE-ARM THE DIRTY GATE — without this the rebuild completes and the viewport stays
-        // BLACK. Measured, not theorised: after a live rebuild the Scene panel rendered nothing
-        // until the camera was nudged. This surface is render-on-demand, and the gate is a
-        // component-level `useRef` created at MOUNT, so a rebuild inherits it with its grace
-        // window already decayed to 0 — every event that would normally re-arm it (scene load,
-        // world swap) belongs to a mount that already happened. The runtime viewport does not
-        // have this bug because its counter is re-initialised inside the bring-up closure.
-        // A black viewport after recovery is indistinguishable from recovery having failed.
-        gateRef.current.markDirty();
+    const bringUp = createViewportBringUp<WebGPURenderer>({
+      createRenderer: (kind) => createRenderer(kind),
+      isDisposed: () => outerDisposed,
+      install: (r, stillCurrent) => install(r, stillCurrent),
+      teardown: () => { teardownViewport(); discardRenderer(container); initedRef.current = true; },
+      // A renderer that will not be installed. After UNMOUNT it goes back through the lease, since a
+      // StrictMode remount may be re-acquiring it. SUPERSEDED, its lease was already discarded by
+      // the rebuild that overtook it, so a release here would decrement the SUCCESSOR's hold.
+      discard: (r, reason) => {
+        if (reason === 'disposed') releaseRenderer(container);
+        else { r.dispose(); r.domElement.remove(); }
       },
+    });
+    const recovery = createRendererRecovery({
+      rebuild: bringUp.rebuild,
       isDisposed: () => outerDisposed,
       // `description` first, then the raw value — see the twin in Scene3D.tsx for why both.
-      onError: (e, { description, attempt, willRetry }) => console.error(
-        `[SceneView] renderer rebuild after context loss FAILED (attempt ${attempt}) — ` +
-        (willRetry
-          ? 'retrying after a backoff:'
-          : 'giving up; the 3D viewport stays black. Relaunch the editor once the cause below is addressed:'),
-        description, e,
-      ),
+      onError: (e, { description, attempt, willRetry }) => {
+        console.error(
+          `[SceneView] renderer rebuild after context loss FAILED (attempt ${attempt}) — ` +
+          (willRetry
+            ? 'retrying after a backoff:'
+            : 'giving up; the 3D viewport stays black. Relaunch the editor once the cause below is addressed:'),
+          description, e,
+        );
+        // Deliberately NO `reportRendererInitFailure` here, although a failed boot calls it: it returns
+        // at once once any renderer has fired ready, and a rebuild only ever follows a loss on a renderer
+        // that already did — so from a rebuild it could never unblock a waiter (#1052 close-out review).
+      },
     });
     // Only OUR renderer's death is ours to act on — GameView mounts a second viewport with its
     // own renderer, and rebuilding a healthy one costs a prewarm stall for nothing.
@@ -5034,15 +5277,35 @@ function ThreeJSViewport({ mode, layers, showGrid = true, showColliders = false,
       recovery.request();
     });
 
-    // Fire-and-forget; the async body guards on `outerDisposed` after EACH of its awaits
-    // (renderer acquire, then `setActiveRenderer` — #254 added the second one).
-    // The `.catch` is load-bearing, not hygiene: `setup()` registers the frame callback and
-    // calls startFrameDriver() at its very END, after ~2000 lines of synchronous scene/gizmo
-    // wiring. A throw anywhere in there leaves the renderer ALREADY registered (so
-    // `rendererReady` resolved and the scene loaded normally) while the frame loop was never
-    // started — the exact "playing, advancing, entityCount correct, fps 0, nothing renders"
-    // wedge. Unhandled, the reason went nowhere useful. Report it as a viewport failure.
-    void setup().catch((e) => {
+    // The FIRST bring-up — unbounded by design (`viewportBringUp.ts` rule 1). Fire-and-forget: an
+    // unmount during the acquire is the bring-up's `discard`, and one during `setActiveRenderer` is
+    // install's own re-check (#254). The `.catch` is load-bearing, not hygiene, and has two cases:
+    //  - creation failed after every retry (`bootCreateFailed`) — the renderer-init failure report.
+    //  - install threw — it registers the frame callback and calls startFrameDriver() at its very
+    //    END, after ~2000 lines of synchronous scene/gizmo wiring, so a throw anywhere in there leaves
+    //    the renderer ALREADY registered (`rendererReady` resolved and the scene loaded normally)
+    //    while the frame loop never started — the exact "playing, advancing, entityCount correct,
+    //    fps 0, nothing renders" wedge. Unhandled, the reason went nowhere useful.
+    bringUp.boot().catch((e) => {
+      if (bootCreateFailed) {
+        // Unmounted mid-attempt — nothing to recover for. And if a rebuild overtook this boot and
+        // already installed its own renderer, a stale boot failure must not report the viewport dead.
+        if (outerDisposed || rendererRef.current) return;
+        const err = e instanceof Error ? e : new Error(String(e));
+        noteRendererProgress(`renderer init failed after ${RETRY_DELAYS_MS.length + 1} attempts: ${err.message}`);
+        // ERROR, not warn. This was logged at warn level while the timeout message told the
+        // reader to "check the console for a WebGPU/WebGL init error" — so anyone filtering
+        // to `error`, exactly as instructed, saw an empty console and blamed their own code.
+        console.error(
+          `[SceneView] renderer init FAILED after ${RETRY_DELAYS_MS.length + 1} attempts — the 3D ` +
+          `viewport cannot render and no scene will load. This does not recover on its own; ` +
+          `relaunch the editor once the cause below is addressed.`, err,
+        );
+        initedRef.current = false;
+        // Unblock every scene-load waiter NOW rather than leaving them on the 120s budget.
+        reportRendererInitFailure(err);
+        return;
+      }
       initedRef.current = false; // let a remount retry rather than latching the panel dead
       console.error(
         '[SceneView] viewport setup FAILED after the renderer was created — the 3D viewport ' +

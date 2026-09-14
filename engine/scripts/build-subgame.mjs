@@ -13,6 +13,9 @@ import { writeFileSync, existsSync } from 'node:fs';
 import path from 'node:path';
 import { chooseViteConfig } from './viteConfigChoice.mjs';
 import { isProjectDir } from './projectRoots.mjs';
+import { acquireBuildClaim } from './buildClaimsStore.mjs';
+import { readGitProvenance, readHeadCommit, settleBuildStamp, writeBuildStamp, BUILD_STAMP_FILENAME } from './ota/buildStamp.mjs';
+import { subgameOutDir } from './subgameOutDir.mjs';
 
 const repoRoot = process.cwd();
 const engineDir = path.join(repoRoot, 'engine');
@@ -25,6 +28,27 @@ if (!proj) {
 
 const include = ['app'];
 const abs = path.resolve(repoRoot, proj);
+
+// Cross-process build claim (#650), taken before this script's first write (the scoped tsconfig
+// below). It writes `<project>/subgame-dist`, which since #837 the editor's Publish OTA Update…
+// uploads. This claim covers only the BUILD; `ota-publish.mjs` claims the same project again while
+// it hashes and uploads, so a second build of this sub-game cannot empty the folder under a live
+// upload. In the gap between the two, a racing build makes the publish REFUSE rather than tear.
+// Refuses rather than waits: a scripted build must not hang on an interactive editor.
+// `process.exit()` skips `finally`, so every exit path below releases explicitly, with the store's
+// own exit hook as the backstop.
+let buildClaim = null;
+try {
+  const claimed = acquireBuildClaim(abs, `sub-game build (CLI): ${path.basename(abs)}`, { kind: 'cli' });
+  if (!claimed.ok) {
+    console.error(`[build-subgame] ${claimed.message}`);
+    process.exit(1);
+  }
+  buildClaim = claimed;
+} catch (e) {
+  console.error(`[build-subgame] could not take the build claim: ${e instanceof Error ? e.message : String(e)}`);
+  process.exit(1);
+}
 if (isProjectDir(repoRoot, abs)) {
   include.push(path.relative(engineDir, abs).split(path.sep).join('/'));
 }
@@ -43,6 +67,9 @@ const run = (cmd) => execSync(cmd, { stdio: 'inherit', cwd: repoRoot, env: runEn
 
 const tscBin = path.join(repoRoot, 'node_modules', 'typescript', 'bin', 'tsc');
 const viteBin = path.join(repoRoot, 'node_modules', 'vite', 'bin', 'vite.js');
+// #906: a sub-game dist is only ever built to be OTA-published, so it records which tree built it.
+// Read at the START, same as build-web.mjs's native stamp — see ota/buildStamp.mjs for why.
+const stampStart = readGitProvenance(abs);
 try {
   if (existsSync(tscBin)) {
     writeFileSync(scopedPath, JSON.stringify({ extends: './tsconfig.app.json', include }, null, 2) + '\n');
@@ -60,6 +87,15 @@ try {
   // build is still run by hand, see docs/ota-subgame-modules.md), so the bug was latent — which
   // is exactly how it would have shipped the moment that gets wired to a button.
   run(`${q(node)} ${q(viteBin)} build --config ${chooseViteConfig(engineDir)}`);
-} catch {
+  const stamp = settleBuildStamp(stampStart, readHeadCommit(abs));
+  writeBuildStamp(subgameOutDir(abs), stamp);
+  console.log(`[build-subgame] ${BUILD_STAMP_FILENAME}: commit ${stamp.commit ?? 'unknown'}, dirty ${stamp.dirty ?? 'unknown'}.`);
+} catch (e) {
+  // A failing CHILD already printed its own diagnostics, but an in-process throw (the stamp write) has
+  // nobody else to report it — build-web.mjs's catch makes the same split, for the same reason.
+  const fromChild = e && (typeof e.status === 'number' || e.signal != null);
+  if (!fromChild) console.error(`[build-subgame] ${e instanceof Error ? e.message : String(e)}`);
+  buildClaim?.release();
   process.exit(1);
 }
+buildClaim?.release();

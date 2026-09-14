@@ -63,6 +63,19 @@ Each world carries **two** per-world indexes, both `WeakMap<World, Map<…>>` in
   process, with a stack, so one unregistered entity can't flood a CI log) so the missing
   registration gets fixed.
 
+  ⚠️ **Both indexes are typed koota `Entity`, and so are the lookups that read them**:
+  `findEntityById`/`findEntityByGuid` return `Entity | undefined`, and `findEntity` returns
+  `Entity | null`. The maps used to be `Map<…, any>`, which made all three lookups infer `any`. A
+  read of a field the handle does not have therefore compiled: six undo labels read
+  `findEntity(id)?.name`, which is always `undefined` because the name lives on `EntityAttributes`,
+  and they shipped with typecheck green (#1138). Typing the maps turned up 57 more errors (#1151).
+  Most were unguarded `get` reads; the rest came from two local interfaces (`GizmoBoundsEntity`,
+  `UndoEntity`) that declared `get` could never return `undefined`.
+  `engine/packages/modoki/tests/runtime/entityLookupTypes.test.ts` pins this with
+  `@ts-expect-error`, so a return type that goes back to `any` fails `verify`. A handle's
+  `get(trait)` is `T | undefined`, so read a trait by checking what `get` returns
+  (`const tf = e?.get(Transform); if (!tf) return;`), not with a `!`.
+
   **Always create and remove entities with `spawnEntity(world, ...traits)` and
   `destroyEntity(entity, world)`** — never a bare `world.spawn()` / `entity.destroy()`.
   koota owns `spawn()`, so index maintenance could never be automatic; it was a second call
@@ -477,14 +490,12 @@ interface GameDefinition {
   registerEditorBindings?: () => void | Promise<void>; // editor-only glue (UI bindings, creatable-asset registrations, …)
   registerAppServices?: () => Promise<void> | void;    // native analytics/ads/etc.
   resetPhase?: (world: World) => void;              // error-recovery reset
-  UIComponent?: React.ComponentType;                // optional custom React UI layer
 }
 ```
 
 `registerSystems()` is where a game adds its own systems (via `registerSystem`) and
 trait editor metadata; `unregisterSystems()` tears them down without touching engine
-systems. When `UIComponent` is set, it replaces the default ECS `UIRenderer` for that
-game (e.g. the chat-driven games).
+systems.
 
 Games are discovered through `virtual:modoki-games` at build time; the **editor** takes
 a runtime path (`app/projectGames.ts` → `loadProjectGames()`) that imports the *open*
@@ -494,7 +505,7 @@ project's `game.ts` from the backend, so switching projects needs no editor rebu
 traits; the game's own `runtime/setup.ts` registers its systems, projections, and trait
 metadata. Current projects: `3d-test` (Tropical Island — Three.js/NPR/model import,
 iOS+Android native), `alien-animal` (skeletal-animation showcase), `space-console`,
-`chess`, `llm-test`, and others; the template scaffold lives at `engine/templates/starter`.
+and others; the template scaffold lives at `engine/templates/starter`.
 
 ### The boot effect runs EXACTLY ONCE per `gameId` (#267)
 

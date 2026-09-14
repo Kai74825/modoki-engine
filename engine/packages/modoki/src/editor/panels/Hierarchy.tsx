@@ -3,7 +3,9 @@
 import React, { useState, useEffect, useCallback, useRef, useMemo } from 'react';
 import { onWorldSwap, getCurrentWorld } from '../../runtime/core/ecs/world';
 import { getAllTraits, getTraitByName, COMPONENT_CATEGORY_ORDER } from '../../runtime/core/ecs/traitRegistry';
-import { getAllEntities, buildEntityTree, deleteEntity, onStructureDirtyCoalesced, getStructureVersion, writeTraitField, readTraitData, subtreeIds, type EntityInfo } from '../../runtime/core/ecs/entityUtils';
+import { getAllEntities, buildEntityTree, deleteEntity, onStructureDirtyCoalesced, getStructureVersion, writeTraitField, readTraitData, subtreeIds, findEntity, type EntityInfo } from '../../runtime/core/ecs/entityUtils';
+import { pinEntityAt, livePinnedId, type EntityPin } from '../../runtime/core/ecs/entityPin';
+import { renameCommitTarget } from './renamePin';
 import { compareSiblings } from '../../runtime/core/ecs/entityOrder';
 import { flattenVisibleIds, rangeBetween } from './hierarchySelection';
 import { deleteEntitiesWithUndo, duplicateEntity, reparentEntity, createEntityWithUndo as createEntityAction, writeTraitFieldWithUndo, writeTraitFieldMultiWithUndo, writeTraitFieldPerEntityWithUndo, snapshotEntity, respawnFromSnapshot, regenerateSnapshotGuids, classifyPrefabDuplicate, stripPrefabInstanceFromSnapshot, reRootPrefabInstanceSubtree, moveEntityToScene, type EntitySnapshot } from '../undo/entityActions';
@@ -17,7 +19,7 @@ import { sceneManager } from '../../runtime/scene/SceneManager';
 import { aSceneSwapIsHappening } from '../scene/playMode';
 import { assetDisplayName } from './AssetRefField';
 import { useEditorStore } from '../store/editorStore';
-import { register } from '../input/keymap';
+import { register, registerBindings } from '../input/keymap';
 import { useHmrEpoch } from '../input/hmrEpoch';
 import { pushAction } from '../undo/undoManager';
 import { makePrefabInstantiateAction } from '../undo/prefabInstantiateUndo';
@@ -28,7 +30,7 @@ import { TreeSearchInput, TypeFilterMenu, treeRowPadLeft } from './treeChrome';
 import { useExpandedSet } from './useExpandedSet';
 import { loadCollapsedGuids, saveCollapsedGuids, computeRestoredCollapse, collapsedIdsToGuids, needsCollapseRestore, shouldPersistCollapse, type CollapseOwner } from './hierarchyCollapse';
 import { remapPrefix } from '../utils/assetPaths';
-import { filterEntityTree, collectEntityTypes, normalizeFolderPath, buildHierarchyFolders, countFolderRoots, folderSubtreePaths, folderSubtreeRootIds, revealTargetsFor, groupRootsBySourceScene, resolveDropFolderSync, type HierarchyFolder } from './hierarchyFolders';
+import { filterEntityTree, collectEntityTypes, normalizeFolderPath, buildHierarchyFolders, countFolderRoots, folderSubtreePaths, folderSubtreeRootIds, revealTargetsFor, isRevealRequest, type RevealKey, groupRootsBySourceScene, resolveDropFolderSync, type HierarchyFolder } from './hierarchyFolders';
 import { isSceneDirty } from '../scene/sceneDirty';
 import { startDragGhost, endDragGhost, armGrabCursor, getAssetDragInfo, setDragGhostRefusal } from '../utils/dragGhost';
 import { decideHierarchyAssetDrop } from './assetDropPolicy';
@@ -538,6 +540,7 @@ export default function Hierarchy() {
   const hmrEpoch = useHmrEpoch();
   const selectedId = useEditorStore((s) => s.selectedEntityId);
   const selectedEntityIds = useEditorStore((s) => s.selectedEntityIds);
+  const entityRevealRequest = useEditorStore((s) => s.entityRevealRequest);
   const selectEntity = useEditorStore((s) => s.selectEntity);
   const openFindReferences = useEditorStore((s) => s.openFindReferences);
   const setSelectedEntities = useEditorStore((s) => s.setSelectedEntities);
@@ -776,7 +779,7 @@ export default function Hierarchy() {
       // into the STAGING world BEFORE this swap (loadSceneFile's spawnEntity calls, which take the staging world) — SceneManager marks
       // nothing dirty after setCurrentWorld — so for an ordinary scene load no settled
       // refresh ever arrives. One frame from here getCurrentScenePath() is settled
-      // (loadScene writes it in its own tail, scene/serialize.ts:1080) and the restore runs.
+      // (loadScene writes it in its own tail, scene/serialize.ts's setCurrentScenePath call) and the restore runs.
       scheduleSettledRefresh(PATH_SETTLE_FRAMES);
     });
     return () => {
@@ -875,8 +878,20 @@ export default function Hierarchy() {
   // tucked inside a collapsed folder, or simply scrolled off. Expanding without scrolling
   // leaves the highlight below the fold, which reads exactly like nothing got selected.
   // So: un-collapse whatever hides the row, then scroll it into view.
+  //
+  // A lead change is a reveal request; so is an explicit `requestEntityReveal` (#1156) from a
+  // writer that means "select this" without moving the lead: an agent re-selecting the entity
+  // already selected, or a viewport/UI-preview click on the lead of a multi-selection. Undo/redo,
+  // a Cmd/Ctrl-click trim and a hand collapse never ask, so while the lead stays put they leave the
+  // tree as the user set it. The decision is `isRevealRequest` (hierarchyFolders.ts).
+  const revealKeyRef = useRef<RevealKey | null>(null);
+  /** Bumped only by a reveal request, so the scroll below follows a request, not every write. */
+  const [revealTick, setRevealTick] = useState(0);
   useEffect(() => {
-    if (selectedId === null) return;
+    const key: RevealKey = { lead: selectedId, epoch: collapseEpoch, request: entityRevealRequest };
+    const requested = isRevealRequest(revealKeyRef.current, key);
+    revealKeyRef.current = key;
+    if (selectedId === null || !requested) return;
     const { ancestorIds, folderPaths } = revealTargetsFor(getAllEntities(), selectedId);
     if (ancestorIds.length) {
       setCollapsed(prev => {
@@ -894,7 +909,8 @@ export default function Hierarchy() {
         return next;
       });
     }
-  }, [selectedId, collapseEpoch, setCollapsedFolders]);
+    setRevealTick((t) => t + 1);
+  }, [selectedId, entityRevealRequest, collapseEpoch, setCollapsedFolders]);
 
   // Scroll after the expansion above has committed — on the first pass the row may not be
   // mounted yet. `block: 'nearest'` is a no-op when the row is already visible, so clicking
@@ -903,12 +919,20 @@ export default function Hierarchy() {
     if (selectedId === null) return;
     const row = listRef.current?.querySelector(`[data-entity-row="${selectedId}"]`);
     row?.scrollIntoView({ block: 'nearest' });
-  }, [selectedId, collapsed, collapsedFolders, displayTree]);
+  }, [selectedId, revealTick, collapsed, collapsedFolders, displayTree]);
 
   // Context menu
   const [ctxMenu, setCtxMenu] = useState<{ x: number; y: number; entity: EntityInfo } | null>(null);
-  // Inline rename — id of the entity whose name field is currently editable
-  const [renamingId, setRenamingId] = useState<number | null>(null);
+  // Inline rename — the entity whose name field is currently editable. PINNED, not a bare id (#868):
+  // delete that entity and let another spawn take its index, and a bare id would open the newcomer's
+  // row in rename mode and commit the typed name onto it. Resolved every render; a gone pin is null.
+  const [renamingPin, setRenamingPin] = useState<EntityPin | null>(null);
+  const renamingId = livePinnedId(renamingPin, findEntity, getCurrentWorld());
+  const renamingPinRef = useRef(renamingPin);
+  renamingPinRef.current = renamingPin;
+  const setRenamingId = useCallback((id: number | null) => {
+    setRenamingPin(id === null ? null : pinEntityAt(id, findEntity, getCurrentWorld()));
+  }, []);
 
   const handleContextMenu = useCallback((e: React.MouseEvent, entity: EntityInfo) => {
     e.preventDefault();
@@ -952,9 +976,11 @@ export default function Hierarchy() {
   }, []);
 
   const commitRename = useCallback((id: number, name: string) => {
+    const target = renameCommitTarget(renamingPinRef.current, id, findEntity, getCurrentWorld());
     setRenamingId(null);
+    if (target === null) return; // the entity being renamed is gone — never write onto its index's next owner
     const eaMeta = getAllTraits().find((t) => t.name === 'EntityAttributes');
-    if (eaMeta) writeTraitFieldWithUndo(id, eaMeta, 'name', name);
+    if (eaMeta) writeTraitFieldWithUndo(target, eaMeta, 'name', name);
   }, []);
 
   const cancelRename = useCallback(() => setRenamingId(null), []);
@@ -1129,7 +1155,7 @@ export default function Hierarchy() {
     /** Register one selection command in every panel that shows the selection. */
     const each = (id: string, keys: string, when: () => boolean, run: () => void) =>
       SCOPES.map((scope) => register({ id: `${scope}.${id}`, keys, scope, when, run }));
-    const offs = [
+    const offBindings = registerBindings(() => [
       ...each('paste', 'mod+v',
         () => !!kbdRef.current.entityClipboard && noTextSelection(),
         () => kbdRef.current.handlePaste(kbdRef.current.selectedId ?? 0)),
@@ -1175,14 +1201,14 @@ export default function Hierarchy() {
           const ids = deletableIds();
           if (ids.length > 0) deleteEntitiesWithUndo(ids, kbdRef.current.setSelectionRaw);
         })),
-    ];
+    ]);
     function deletableIds(): number[] {
       const { selectedId, selectedEntityIds } = kbdRef.current;
       const resourceIds = new Set(getAllEntities().filter((en) => en.isResource).map((en) => en.id));
       return (selectedEntityIds.length > 0 ? selectedEntityIds : (selectedId != null ? [selectedId] : []))
         .filter((id) => id !== 0 && !resourceIds.has(id));
     }
-    return () => { for (const off of offs) off(); };
+    return offBindings;
     // `hmrEpoch` (0 in production) re-runs this on a hot update — Fast Refresh re-renders
     // the panel but never re-runs a []-deps effect, so without it an edited/added binding
     // silently never reaches the registry. See input/hmrEpoch.ts.

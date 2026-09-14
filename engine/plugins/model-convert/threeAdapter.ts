@@ -24,6 +24,7 @@
 
 import * as THREE from 'three';
 import { NodeIO, type Document, type Primitive, type Node as GLTFNode, type Material as GLTFMaterial } from '@gltf-transform/core';
+import { hasDocKey } from '../../packages/modoki/src/runtime/core/docKeys';
 
 export interface AdaptedMesh {
   threeMesh: THREE.Mesh;
@@ -77,8 +78,15 @@ function buildGeometry(prim: Primitive): THREE.BufferGeometry {
     const arr = acc.getArray();
     if (!arr) continue;
     const itemSize = acc.getElementSize();
+    // ⚠️ `hasDocKey`, NOT `if (!threeName)` (#993). `sem` is an attribute semantic read off the
+    // GLB's own primitive, and `SEMANTIC_TO_THREE` is a code-declared literal — so a semantic named
+    // `toString` would return the inherited FUNCTION and file the data under a stringified function.
+    // ⚠️ UNREACHABLE TODAY, measured (#1069): gltf-transform's own reader throws
+    // `prevRef.dispose is not a function` on any prototype-named semantic before this runs, so such
+    // a GLB fails loudly at `io.read`. Kept because it is correct the day that stops being true —
+    // `threeAdapter.test.ts` pins the premise and goes red on that day.
+    if (!hasDocKey(SEMANTIC_TO_THREE, sem)) continue;
     const threeName = SEMANTIC_TO_THREE[sem];
-    if (!threeName) continue;
     // Denormalize quantized integer accessors into a plain (non-normalized)
     // Float32 attribute so fixup math sees real [0,1]/[-1,1] values and the
     // write-back never produces a FLOAT-but-normalized accessor.
