@@ -168,7 +168,7 @@ const DECLS: Record<string, Decl> = {
     kind: 'mutate', method: 'POST', route: '/api/scene-mutate',
     mutating: true, undoable: true, persists: 'live', requires: ['editor', 'scene'], aim: 'entity',
     minimalArgs: { ops: [{ op: 'addEntity', name: 'ContractProbe', parentId: 0 }] },
-    notes: "Path defaults to the ACTIVE scene via activeScenePath (reads /api/editor-state first). ⚠️ The FILE-DIRECT path (a scene that is not the live one, or a setBaseScene op) refuses REQUIRES_SAVE while the editor holds ANY unsaved work, because the write hot-reloads the scene and that DISCARDS it — `holds` names each path and registry. There is no force/discardUnsaved hatch here on purpose: modoki_save_all is the only remedy. It also refuses NO_RENDERER (503) when a renderer may be attached and did not answer the probe — retry, it is usually mid-parse (#889 §8). With NO renderer at all it writes as before and says so in `warnings`.",
+    notes: "Path defaults to the ACTIVE scene via activeScenePath (reads /api/editor-state first) — or, in prefab-edit mode, to the prefab-edit world (`prefabEditWorld`, /__prefab-edit__/<guid>), which is LIVE-ONLY: no file-direct fallback, 409 unless that world is loaded with its edit session open (#1254). ⚠️ The FILE-DIRECT path (a scene that is not the live one, or a setBaseScene op) refuses REQUIRES_SAVE while the editor holds ANY unsaved work, because the write hot-reloads the scene and that DISCARDS it — `holds` names each path and registry. There is no force/discardUnsaved hatch here on purpose: modoki_save_all is the only remedy. It also refuses NO_RENDERER (503) when a renderer may be attached and did not answer the probe — retry, it is usually mid-parse (#889 §8). With NO renderer at all it writes as before and says so in `warnings`.",
   },
   modoki_set_transform: {
     kind: 'mutate', method: 'POST', route: '/api/scene-mutate',
@@ -341,7 +341,7 @@ const DECLS: Record<string, Decl> = {
   },
   modoki_eval_api: {
     kind: 'read', method: 'GET', route: '/api/eval-api', requires: ['editor', 'renderer'],
-    notes: 'Discovery for modoki_eval — lists every op as its generated modoki.<camelCase>(params) method, plus call/ops/api/composite.',
+    notes: 'Discovery for modoki_eval — lists every op as its generated modoki.<camelCase>(params) method, plus call/ops/api/composite/import. NOT Electron-only: the description said "Requires the Electron editor" until #1218, while `requires` here has always been [editor, renderer] and the route is a bare relay.',
   },
 
   // ── editor session + scene/entity ops ──
@@ -396,7 +396,7 @@ const DECLS: Record<string, Decl> = {
     kind: 'control', method: 'POST', route: '/api/editor-action', op: 'load-scene',
     mutating: true, persists: 'live', requires: ['editor', 'project'], aim: 'asset',
     minimalArgs: { path: '/assets/scenes/main.scene.json' },
-    notes: 'SWAPS THE WORLD: refuses while unsaved live changes exist (they would be destroyed). `discardUnsaved` to discard them deliberately — NOT `force`, which is the non-destructive escape hatch on the build family and was renamed here for exactly that reason (§2).',
+    notes: 'SWAPS THE WORLD: refuses while unsaved live changes exist (they would be destroyed, except in a scene loaded as a base that the target shares, which is carried live). `discardUnsaved` to discard them deliberately — NOT `force`, which is the non-destructive escape hatch on the build family and was renamed here for exactly that reason (§2).',
   },
   modoki_new_scene: {
     kind: 'control', method: 'POST', route: '/api/editor-action', op: 'new-scene',
@@ -459,11 +459,14 @@ const DECLS: Record<string, Decl> = {
       + "The edit-* actions drive PREFAB-EDIT MODE: 'edit-open' swaps the world for a synthetic "
       + 'prefab scene (world-destructive, so it takes `discardUnsaved` like load-scene, and it saves the '
       + "current scene on the way in), 'edit-save' re-serializes the .prefab.json, 'edit-exit' "
-      + 'reloads the return scene. None of the three is undoable — they are scene swaps and a '
+      + 'reloads the return scene (also world-destructive, so it refuses on unsaved prefab edits and takes '
+      + '`discardUnsaved` too, #1424). None of the three is undoable — they are scene swaps and a '
       + 'file write, matching load-scene and create respectively.',
   },
   modoki_set_gizmo: {
     kind: 'control', method: 'POST', route: '/api/editor-action', op: 'set-gizmo', mutating: true, persists: 'session',
+    // Not `{}`: an empty call is REFUSED as a no-op (#1213 B-9), so it is not a valid call at all.
+    minimalArgs: { mode: 'translate' },
   },
   modoki_set_scene_view_mode: {
     kind: 'control', method: 'POST', route: '/api/editor-action', op: 'set-scene-view-mode', mutating: true, persists: 'session',
@@ -712,13 +715,13 @@ const DECLS: Record<string, Decl> = {
     kind: 'asset', method: 'POST', route: '/api/asset-write',
     mutating: true, persists: 'file', requires: ['project'], aim: 'asset',
     minimalArgs: { path: '/assets/particles/probe.particle.json', type: 'particle', data: {} },
-    notes: 'F1: `path` and `type` — its two primary args — are undocumented. Can RE-MINT the asset id. ⚠️ REFUSES with REQUIRES_SAVE while the human has a PARKED edit to this same document, because this is a wholesale replace and the file-change event it raises makes the editor drop their copy (#889). The hatch is `discardUnsaved`, and the reply then names what was dropped in `discardedParked` — or carries `discardWarning` if the discard could not be confirmed, which means their older copy may still flush back over this write. The editor own save is exempt via selfWrite; an agent must not send that.',
+    notes: 'F1: `path` and `type` — its two primary args — are undocumented. Can RE-MINT the asset id. Refuses NOT_FOUND for a path that is not on disk rather than creating an id-less, unmanifested file (#1215); the editor\'s own flush (`selfWrite`) is exempt. ⚠️ REFUSES with REQUIRES_SAVE while the human has a PARKED edit to this same document, because this is a wholesale replace and the file-change event it raises makes the editor drop their copy (#889). The hatch is `discardUnsaved`, and the reply then names what was dropped in `discardedParked` — or carries `discardWarning` if the discard could not be confirmed, which means their older copy may still flush back over this write. The editor own save is exempt via selfWrite; an agent must not send that.',
   },
   modoki_delete_asset: {
     kind: 'mutate', method: 'POST', route: '/api/delete-asset',
     mutating: true, persists: 'file', requires: ['project'], aim: 'asset',
     minimalArgs: { paths: ['/assets/particles/probe.particle.json'] },
-    notes: 'A TOTAL OS refusal answers ok:false (200) and a PARTIAL one answers ok:true with `failed` naming the paths still on disk — the split exists because a single ok:true for both meant isFailureBody short-circuited and this tool reported a refused delete as a successful call (#884). NOT undoable and deliberately narrower than the Assets panel\'s Delete, which also sweeps a model\'s generated meshes/materials/sidecars and records a restore snapshot. Trashes exactly the paths named. The route rebuilds the asset manifest INLINE (`manifestRebuilt`) so modoki_list_assets verifies it immediately, rather than racing the watcher\'s 150ms debounce. NOT resolve_refs, which resolves ENTITY refs and never answers about an asset guid — measured, and it was named here in error at first.',
+    notes: 'A TOTAL OS refusal answers ok:false (200) and a PARTIAL one answers ok:true with `failed` naming the paths still on disk — the split exists because a single ok:true for both meant isFailureBody short-circuited and this tool reported a refused delete as a successful call (#884). NOT undoable and deliberately narrower than the Assets panel\'s Delete, which also sweeps a model\'s generated meshes/materials/sidecars and records a restore snapshot. Trashes exactly the paths named. The AGENT path refuses with REQUIRES_SAVE while a human holds an unsaved edit for a deleted path or anything under a deleted folder (#1215, hatch `discardUnsaved`); the editor\'s own deletes pass `rendererWrite` and are not gated. The route rebuilds the asset manifest INLINE (`manifestRebuilt`) so modoki_list_assets verifies it immediately, rather than racing the watcher\'s 150ms debounce. NOT resolve_refs, which resolves ENTITY refs and never answers about an asset guid — measured, and it was named here in error at first.',
   },
   modoki_list_creatable_assets: {
     kind: 'read', method: 'GET', route: '/api/creatable-assets',
@@ -728,7 +731,7 @@ const DECLS: Record<string, Decl> = {
     kind: 'mutate', method: 'POST', route: '/api/editor-action', op: 'create-registered-asset',
     mutating: true, persists: 'file', requires: ['editor', 'project'], aim: 'asset',
     minimalArgs: { kind: 'material', path: '/assets/materials/probe.mat.json' },
-    notes: "Routes around the panel's native save dialog (a BLOCKING osascript panel on darwin) by taking an explicit path, which is what made the whole 'New X' surface agent-unreachable (#288 gap 5). Separate from modoki_create_asset, whose `type` is a fixed enum while this registry is dynamic and game-extensible. REFUSES create-override kinds: `scene`'s override discards the live world, and the dialog it normally goes through IS the guard an explicit path removes — modoki_new_scene has the REQUIRES_SAVE check instead.",
+    notes: "Routes around the panel's native save dialog (a modal panel only a human can answer) by taking an explicit path, which is what made the whole 'New X' surface agent-unreachable (#288 gap 5). Separate from modoki_create_asset, whose `type` is a fixed enum while this registry is dynamic and game-extensible. REFUSES create-override kinds: `scene`'s override discards the live world, and the dialog it normally goes through IS the guard an explicit path removes — modoki_new_scene has the REQUIRES_SAVE check instead. REFUSES an existing path (409 from `/api/write-file` `ifNoneMatch`) rather than replacing that asset under a new guid (#1215); only the Assets panel replaces, and it keeps the replaced guid.",
   },
   modoki_open_animation_editor: {
     kind: 'control', method: 'POST', route: '/api/editor-action', op: 'open-animation-editor',
@@ -745,7 +748,7 @@ const DECLS: Record<string, Decl> = {
   modoki_exit_pose_envelope: {
     kind: 'control', method: 'POST', route: '/api/editor-action', op: 'exit-pose-envelope',
     mutating: true, persists: 'live', requires: ['editor', 'scene'],
-    notes: "The way OUT of the envelope modoki_pose_clip opens — not optional scope, since the envelope pins the run-mode at 'scrub' and that is exactly what blocks the human's Cmd+S. Refuses when the TIMELINE panel owns the envelope: ending its session would revert its world mid-run.",
+    notes: "The way OUT of the envelope modoki_pose_clip opens — not optional scope, since the envelope pins the run-mode at 'scrub' and that is exactly what blocks the human's Cmd+S. Refuses (REFUSED_BY_OP + modeOwner) when the TIMELINE panel owns the envelope: ending its session would revert its world mid-run, and modoki_play_control stop is the destructive exit there. With nothing open it is NOT_FOUND; while Playing it refuses with runMode.",
   },
   modoki_read_asset_def: {
     kind: 'read', method: 'GET', route: '/api/asset-def', requires: ['editor'], aim: 'asset',
@@ -809,13 +812,13 @@ const DECLS: Record<string, Decl> = {
     kind: 'asset', method: 'POST', route: '/api/write-meta',
     mutating: true, persists: 'file', requires: ['project'], aim: 'asset',
     minimalArgs: { path: '/assets/textures/probe.png', meta: {} },
-    notes: "The write half of modoki_get_asset_meta, which is its verification read (§8). REPLACES the sidecar rather than merging, so a partial post drops every omitted setting. Writing settings does not re-convert — modoki_reimport_asset does. REFUSES with REQUIRES_SAVE while a human's Inspector import-settings edit is parked for that path, because a wholesale replace DESTROYS it (#872); the hatch is `discardUnsaved`, the DESTROYED half of §8. requires:['project'] and NOT ['editor'] on purpose — the park is renderer-only state, so a definitively-absent renderer means no park can exist and the write proceeds, labelled editorConnected:false. A renderer that is attached and does NOT answer is refused (NO_RENDERER), never treated as 'nothing is parked' (§5).",
+    notes: "The write half of modoki_get_asset_meta, which is its verification read (§8). REPLACES the sidecar rather than merging, so a partial post drops every omitted setting. An omitted `id` is kept from the sidecar on disk, and a path with no asset on disk is refused NOT_FOUND rather than writing an orphan (#1215). Writing settings does not re-convert — modoki_reimport_asset does. REFUSES with REQUIRES_SAVE while a human's Inspector import-settings edit is parked for that path, because a wholesale replace DESTROYS it (#872); the hatch is `discardUnsaved`, the DESTROYED half of §8. requires:['project'] and NOT ['editor'] on purpose — the park is renderer-only state, so a definitively-absent renderer means no park can exist and the write proceeds, labelled editorConnected:false. A renderer that is attached and does NOT answer is refused (NO_RENDERER), never treated as 'nothing is parked' (§5).",
   },
   modoki_duplicate_asset: {
     kind: 'asset', method: 'POST', route: '/api/duplicate-asset',
     mutating: true, persists: 'file', requires: ['project'], aim: 'asset',
     minimalArgs: { from: '/assets/particles/probe.particle.json', to: '/assets/particles/probe-copy.particle.json' },
-    notes: "Not a file copy: it MINTS a fresh guid for the duplicate, because two assets sharing one guid breaks every ref that resolves through the manifest. Refuses an existing destination (409) rather than clobbering. Also refuses with REQUIRES_SAVE while the SOURCE has a parked Inspector import-settings edit (#882) — the copy's sidecar is seeded from the source's FILE, so it would be born with the pre-edit settings. Hatch is `force`: nothing is destroyed, the copy is merely built from disk.",
+    notes: "Not a file copy: it MINTS a fresh guid for the duplicate, because two assets sharing one guid breaks every ref that resolves through the manifest. A scene copy also remints every entity guid the file defines, carrying its in-file refs along (#1293). Refuses an existing destination (409) rather than clobbering. Also refuses with REQUIRES_SAVE while the SOURCE has a parked Inspector import-settings edit (#882) — the copy's sidecar is seeded from the source's FILE, so it would be born with the pre-edit settings. Hatch is `force`: nothing is destroyed, the copy is merely built from disk.",
   },
   modoki_move_asset: {
     kind: 'asset', method: 'POST', route: '/api/move-file',
@@ -827,7 +830,7 @@ const DECLS: Record<string, Decl> = {
     kind: 'asset', method: 'POST', route: '/api/create-folder',
     mutating: true, persists: 'file', requires: ['project'], aim: 'asset',
     minimalArgs: { path: '/assets/probe-folder' },
-    notes: 'The prerequisite for modoki_import_file `destFolder` and modoki_create_asset `path`, neither of which creates its destination. Not recursive; refuses an existing folder (409).',
+    notes: 'Only needed for an EMPTY folder: modoki_import_file `destFolder` and modoki_create_asset `path` both mkdir -p their destination (create-asset since QA-CTX-0008), which this note denied until #1415, and a live smoke that trusted it left an empty `particles/` folder behind. RECURSIVE (mkdir -p): missing parents are created. Refuses an existing folder (409) — the existence check is on the TARGET only, never its parents. It said "not recursive" until #1218; the code never was.',
   },
 
   modoki_capture_gesture: {

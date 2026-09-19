@@ -10,7 +10,8 @@
  *  or the `EntityAttributes.guid`. New entities get the next free numeric id and
  *  a fresh guid. */
 
-import { newGuid } from '../core/assetRefRules';
+import { newGuid, durableGuid, findRuntimeGuids } from '../core/assetRefRules';
+import { traitRemoveRefusal, traitWriteRefusal } from '../core/ecs/traitEditPolicy';
 import { parentWorldTrs, localToWorldTrs, worldToLocalTrs, mergeTrs, persistedTrsKeys, collapsedParentAxes, type TRS } from './transformSpace';
 
 /** Minimal on-disk entity shape (matches editor SerializedEntity / runtime
@@ -61,10 +62,6 @@ export type MutateOp =
   | { op: 'removeEntity'; entity: EntityRef }
   | { op: 'setBaseScene'; baseScene: string | null };
 
-/** Core traits every entity needs — refused by removeTrait (a human can't remove
- *  these in the Inspector either; dropping them corrupts the entity). */
-const CORE_TRAITS = new Set(['Transform', 'EntityAttributes']);
-
 export interface ApplyResult {
   scene: MutableScene;
   /** Number of ops that produced a change. */
@@ -85,6 +82,18 @@ export interface ApplyResult {
    *  reason; both mutate paths now do too. Omitted (absent, not `[]`) when nothing was created, so
    *  a caller can't mistake "no adds in this batch" for "the add produced nothing". */
   created?: Array<{ op: number; id: number; guid: string; name: string }>;
+  /** A trait an entity did NOT have, added because a `setTrait` set fields on it (#1216 C-12, #1223 D6):
+   *  `{op, id, guid, trait}` in op order — the same row as the live path's. `changed:1` alone could not tell a field write from a new component,
+   *  and a typo'd trait name that happens to be registered lands as a whole new trait. A no-fields
+   *  `setTrait` (a tag) is not listed — adding is what it asked for. Absent when nothing was added.
+   *  ⚠️ Only for an entity whose own `traits` are written: a prefab-instance root writes an override,
+   *  and whether the PREFAB carries the trait is not visible from this file. */
+  addedTraits?: Array<{ op: number; id: number; guid: string | undefined; trait: string }>;
+  /** The descendants every `removeEntity` op took with the entity it named, for the whole call — see
+   *  {@link AlsoDeletedFields}. Absent when no remove cascaded. */
+  alsoDeleted?: string[];
+  alsoDeletedNoGuidIds?: number[];
+  alsoDeletedTotal?: number;
   /** Hard errors (entity not found, malformed op). Non-empty means some ops
    *  were skipped — the caller decides whether to still write. */
   errors: string[];
@@ -98,6 +107,45 @@ export interface ApplyResult {
   code?: EntityResolveCode;
 }
 
+/** How many cascaded descendants a delete reply names before it only counts them. */
+export const ALSO_DELETED_CAP = 100;
+
+/** What a delete took WITH the entities it was asked for (#1216 C-6, #1262), as reply fields: `alsoDeleted`
+ *  (guids) + `alsoDeletedNoGuidIds`, and `alsoDeletedTotal` when more than the cap were taken. All absent
+ *  when nothing cascaded. Every delete surface removes a whole subtree and used to answer only with what
+ *  it was named, so a parent's delete removed its children without a word. Capped because the list is
+ *  unbounded (a scene root's subtree is the scene) and an over-budget reply is elided whole. */
+export interface AlsoDeletedFields { alsoDeleted?: string[]; alsoDeletedNoGuidIds?: number[]; alsoDeletedTotal?: number }
+
+/** Builds {@link AlsoDeletedFields} across one or more deletes — the ONE shape every delete reply uses
+ *  (`delete_entities` on both surfaces, both `removeEntity` backends). `room()` is how many more ids
+ *  would still be listed, so a caller that must mint a guid before naming an entity mints only those. */
+export function alsoDeletedTally() {
+  const guids: string[] = [];
+  const noGuidIds: number[] = [];
+  let total = 0;
+  const room = () => Math.max(0, ALSO_DELETED_CAP - guids.length - noGuidIds.length);
+  return {
+    room,
+    /** Read the guids BEFORE the delete: afterwards a live descendant has none to read. */
+    add(descendants: readonly number[], guidOf: (id: number) => string | null | undefined) {
+      for (const id of descendants.slice(0, room())) {
+        const g = guidOf(id);
+        if (g) guids.push(g); else noGuidIds.push(id);
+      }
+      total += descendants.length;
+    },
+    fields(): AlsoDeletedFields {
+      if (!total) return {};
+      return {
+        alsoDeleted: [...guids],
+        ...(noGuidIds.length ? { alsoDeletedNoGuidIds: [...noGuidIds] } : {}),
+        ...(total > guids.length + noGuidIds.length ? { alsoDeletedTotal: total } : {}),
+      };
+    },
+  };
+}
+
 /** Apply a list of mutation ops to a scene object. Mutates `scene` in place and
  *  also returns it. `mint` is injectable so tests get deterministic ids. */
 export function applyOps(scene: MutableScene, ops: MutateOp[], mint: () => string = newGuid): ApplyResult {
@@ -105,6 +153,8 @@ export function applyOps(scene: MutableScene, ops: MutateOp[], mint: () => strin
   const warnings: string[] = [];
   const unresolved: EntityRef[] = [];
   const created: Array<{ op: number; id: number; guid: string; name: string }> = [];
+  const addedTraits: NonNullable<ApplyResult['addedTraits']> = [];
+  let alsoDeleted = alsoDeletedTally();
   let changed = 0;
   // FIRST resolveEntity failure's code, if any op hit one — see `ApplyResult.code`.
   const codeOut: { code?: EntityResolveCode } = {};
@@ -121,6 +171,8 @@ export function applyOps(scene: MutableScene, ops: MutateOp[], mint: () => strin
         const entity = resolveEntity(scene, op.entity, errors, where, unresolved, codeOut);
         if (!entity) continue;
         if (!op.trait) { errors.push(`${where}: missing 'trait'`); continue; }
+        const writeRefused = traitWriteRefusal(op.trait);
+        if (writeRefused) { errors.push(`${where}: ${writeRefused}`); continue; }
         const fields = op.fields ?? {};
         // Check `space` BEFORE the empty-fields (tag) branch. It used to sit in the `else if`
         // after it, so `{op:'setTrait', trait:'<non-Transform>', space:'world'}` with no fields was
@@ -150,6 +202,7 @@ export function applyOps(scene: MutableScene, ops: MutateOp[], mint: () => strin
             if ('error' in converted) { errors.push(`${where}: ${converted.error}`); continue; }
             write = converted.fields;
           }
+          if (existing === undefined && container === entity.traits) addedTraits.push({ op: i, id: entity.id, guid: entityGuid(entity), trait: op.trait });
           container[op.trait] = { ...base, ...write };
           changed++;
         }
@@ -157,7 +210,8 @@ export function applyOps(scene: MutableScene, ops: MutateOp[], mint: () => strin
         const entity = resolveEntity(scene, op.entity, errors, where, unresolved, codeOut);
         if (!entity) continue;
         if (!op.trait) { errors.push(`${where}: missing 'trait'`); continue; }
-        if (CORE_TRAITS.has(op.trait)) { errors.push(`${where}: cannot remove core trait '${op.trait}'`); continue; }
+        const removeRefused = traitRemoveRefusal(op.trait);
+        if (removeRefused) { errors.push(`${where}: ${removeRefused}`); continue; }
         // Removing a trait the entity doesn't have is a genuine no-op (not an
         // error) — mirrors removeTraitFromEntitiesWithUndo's skip-if-absent.
         // Prefab-instance roots remove the override (same container as setTrait).
@@ -167,6 +221,9 @@ export function applyOps(scene: MutableScene, ops: MutateOp[], mint: () => strin
           changed++;
         }
       } else if (op.op === 'addEntity') {
+        // A new entity cannot carry a hand-made prefab link either (#1454) — refused whole.
+        const linkRefused = Object.keys(op.traits ?? {}).map(traitWriteRefusal).find((r) => r);
+        if (linkRefused) { errors.push(`${where}: ${linkRefused}`); continue; }
         // Warn if the requested parent doesn't exist yet (ops apply in order, so a
         // parent added by an earlier op IS present here). An orphan won't render
         // under the expected parent and the agent gets no other signal. (F5)
@@ -187,9 +244,12 @@ export function applyOps(scene: MutableScene, ops: MutateOp[], mint: () => strin
           : {};
         traits.EntityAttributes = {
           name: op.name ?? existingAttrs.name ?? `Entity ${id}`,
-          guid: existingAttrs.guid ?? mint(),
           parentId: op.parentId ?? existingAttrs.parentId ?? 0,
           ...existingAttrs,
+          // After the spread, so a caller's guid cannot override it: an EMPTY one would leave the
+          // entity unaddressable, and a RUNTIME one (#1210) — copied from a live-world read — is
+          // valid only until reload and must never reach a file.
+          guid: durableGuid(existingAttrs.guid as string) || mint(),
           // re-apply the canonical name/parentId in case existingAttrs lacked them
           ...(op.name ? { name: op.name } : {}),
           ...(op.parentId != null ? { parentId: op.parentId } : {}),
@@ -213,11 +273,16 @@ export function applyOps(scene: MutableScene, ops: MutateOp[], mint: () => strin
         // Collect the removed guids BEFORE filtering so we can flag any surviving
         // entity that still references the deleted subtree (a now-dangling ref). (F5)
         const removedGuids = new Set<string>();
+        const byId = new Map<number, MutableEntity>();
         for (const e of scene.entities) {
           if (!toRemove.has(e.id)) continue;
+          byId.set(e.id, e);
           const g = entityGuid(e);
           if (g) removedGuids.add(g);
         }
+        // The subtree, not just the named entity, leaves the file — name the rest (#1262). The Set is in
+        // walk order, root first, so a parent is listed before its children.
+        alsoDeleted.add([...toRemove].filter((id) => id !== entity.id), (id) => entityGuid(byId.get(id)!));
         scene.entities = scene.entities.filter((e) => !toRemove.has(e.id));
         if (removedGuids.size) flagDanglingRefs(scene, removedGuids, warnings, where);
         changed++;
@@ -239,7 +304,26 @@ export function applyOps(scene: MutableScene, ops: MutateOp[], mint: () => strin
     }
   }
 
-  return { scene, changed, errors, warnings, unresolved, ...(created.length ? { created } : {}), ...(codeOut.code ? { code: codeOut.code } : {}) };
+  // Tripwire (#1210): a runtime guid is a LIVE-world address, valid only until reload, and this
+  // edits the FILE. One arrives when an agent copies a guid from a live read (scene-state, a
+  // journal event) into a ref field, a parentId or an authored string. Refuse the whole write —
+  // `changed = 0` is what the route reads as "leave the file untouched" — rather than persist an
+  // address that names a different entity next session. Checked after every op, so it cannot
+  // matter which op introduced it.
+  const runtimeHits = findRuntimeGuids(scene.entities);
+  if (runtimeHits.length > 0) {
+    for (const h of runtimeHits.slice(0, 5)) {
+      errors.push(`entities.${h.path}: '${h.guid}' is a RUNTIME guid — a live-world address valid only `
+        + `until reload, so it cannot be written to a scene file. Save the live world first (modoki_save_all) `
+        + `so the entity gets a durable guid, then use that.`);
+    }
+    changed = 0;
+    created.length = 0; // nothing is written, so nothing was created
+    addedTraits.length = 0; // …and no trait was added to anything
+    alsoDeleted = alsoDeletedTally(); // …or removed from the file
+  }
+
+  return { scene, changed, errors, warnings, unresolved, ...(created.length ? { created } : {}), ...(addedTraits.length ? { addedTraits } : {}), ...alsoDeleted.fields(), ...(codeOut.code ? { code: codeOut.code } : {}) };
 }
 
 /** Scan surviving entities for entity-ref fields that still point at a removed guid.
@@ -266,8 +350,19 @@ function flagDanglingRefs(scene: MutableScene, removedGuids: Set<string>, warnin
  *  an out-param rather than a return value so every existing `if (!entity) continue;` call site
  *  stays unchanged. */
 function resolveEntity(scene: MutableScene, ref: EntityRef, errors: string[], where: string, unresolved?: EntityRef[], codeOut?: { code?: EntityResolveCode }): MutableEntity | null {
-  if (!ref || (ref.id == null && !ref.name && !ref.guid)) {
+  // The live resolver's rules (`app/debug/entityRef.ts`, #1223), applied to the FILE: an empty string is
+  // absent, and more than one address is refused rather than resolved by precedence. This path used to
+  // let `id` win over a `guid` given beside it, the opposite of the live path, so the same ref named
+  // different entities depending on the persistence mode. (`id` here is the FILE's authored id, not a
+  // runtime one, so the live path's id-only-for-a-guid-less-entity rule does not apply.)
+  const given = ref ? ([ref.id != null ? 'id' : '', ref.guid ? 'guid' : '', ref.name ? 'name' : ''].filter(Boolean)) : [];
+  if (given.length === 0) {
     errors.push(`${where}: entity ref needs an id, name, or guid`);
+    return null;
+  }
+  if (given.length > 1) {
+    errors.push(`${where}: ${given.map((k) => `{${k}}`).join(' | ')} given together — pass exactly one. Two addresses can name two different entities.`);
+    if (codeOut && codeOut.code === undefined) codeOut.code = 'AMBIGUOUS';
     return null;
   }
   let matches: MutableEntity[];

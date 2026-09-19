@@ -10,6 +10,7 @@ import { createElement } from 'react';
 import type React from 'react';
 import {
   createEditor, setExtraMenus, useEditorStore, backendFetch, backendEventSource, fetchDeviceList,
+  installEditorPrefabCacheWarm,
   type ExtraMenuItem, type DeviceListReply,
 } from '@modoki/engine/editor';
 import { GameView } from '@modoki/engine/editor/rendering';
@@ -69,8 +70,8 @@ async function runGameHook(gameId: string, phase: string, hook?: () => unknown):
 /** Trigger a build + deploy via the dev server's SSE endpoint */
 async function runBuild(platform: 'ios' | 'android' | 'web' | 'playable', variant: 'debug' | 'release' = 'debug') {
   // Refuse a SECOND concurrent build (see `buildRefusal` for what two at once actually do to the
-  // project dir). The DOM progress modal does not gate this: under Electron the build items live
-  // in the native application menu, which a modal cannot cover.
+  // project dir). Since #1270 the progress dialog is a modal and greys the whole menu, so the menu
+  // refuses first; this stays as the guard for any caller that is not the menu.
   const refusal = buildRefusal(useEditorStore.getState().buildStatus);
   if (refusal) { useEditorStore.getState().showToast(refusal, 'warn'); return; }
   // Tool gate: if a native build's required tools aren't installed, OPEN Build Support
@@ -145,7 +146,9 @@ async function refreshDeviceTargets(): Promise<void> {
 async function pickDeviceTarget(patch: DeviceTargetPatch, andBuild?: 'ios' | 'android'): Promise<void> {
   const { showToast } = useEditorStore.getState();
   // Refuse while Project Settings is open — see `pickRefusal`: that dialog would write back the
-  // device it snapshotted when it opened, silently undoing this pick on its next Save.
+  // device it snapshotted when it opened, silently undoing this pick on its next Save. Since #1270
+  // that dialog is a modal and the menu is greyed under it, so the menu refuses first; this stays
+  // as the guard for any caller that is not the menu.
   const refusal = pickRefusal(useEditorStore.getState().projectSettingsOpen);
   if (refusal) { showToast(refusal, 'warn'); return; }
   try {
@@ -245,6 +248,12 @@ export async function createGameEditor(): Promise<{ default: React.ComponentType
   // 0. Load the open project's games at runtime (C4c) — dev editor pulls them
   //    from the project registry over the backend; packaged/web use the baked
   //    virtual module. Replaces the static `virtual:modoki-games` import.
+  // Warm the EDITOR prefab cache on every scene swap, before the swap completes (#1295).
+  // Installed here because this module is the editor-only entry point — App.tsx lazy-imports
+  // it and never loads it in a game build, so the hook cannot reach a shipped runtime.
+  // Not torn down: `createGameEditor` runs once per editor boot, and the hook is idempotent.
+  installEditorPrefabCacheWarm();
+
   const { ALL_GAMES } = await loadProjectGames();
 
   // 1. Load the game's config — running the config module registers its scene
@@ -442,6 +451,7 @@ export async function createGameEditor(): Promise<{ default: React.ComponentType
                 { key: 'app.appName', label: 'App name', type: 'text' },
                 { key: 'app.iconSource', label: 'App icon (source PNG)', type: 'path', pathMode: 'file', committedPath: true, placeholder: 'empty = bundled Modoki icon', help: 'square, ≥1024px; all sizes generated on build' },
                 { key: 'app.iconMonochromeSource', label: 'Icon — monochrome (Android)', type: 'path', pathMode: 'file', committedPath: true, placeholder: 'empty = derived from the app icon', help: 'the silhouette a themed-icon launcher tints (Android 13+). The derived version is a fallback: flattening a full-colour PAINTING to one tone usually gives a low-contrast blob, so author this one whenever the icon is artwork rather than a flat mark.' },
+                { key: 'app.notificationIconSource', label: 'Notification icon (Android)', type: 'path', pathMode: 'file', committedPath: true, placeholder: 'empty = none (Android shows its generic "i")', help: 'the 24dp status-bar glyph for local notifications. A WHITE SILHOUETTE on transparency: Android draws the alpha only, so a full-colour image becomes a solid square. The monochrome icon above is usually the right file. Also set capacitor.config.json plugins.LocalNotifications.smallIcon to "ic_stat_notification".' },
                 { key: 'app.iconDarkSource', label: 'Icon — dark (iOS 18+)', type: 'path', pathMode: 'file', committedPath: true, placeholder: 'empty = derived from the app icon', help: 'the dark-mode home-screen icon. Derived by flattening onto the dark ground and easing the luminance down.' },
                 { key: 'app.iconTintedSource', label: 'Icon — tinted (iOS 18+)', type: 'path', pathMode: 'file', committedPath: true, placeholder: 'empty = derived from the app icon', help: 'GREYSCALE — iOS applies the user\'s tint to its luminance. Derived by greyscaling and normalising; without an entry iOS derives its own, poorly.' },
                 { key: 'app.splashSource', label: 'Splash (source PNG)', type: 'path', pathMode: 'file', committedPath: true, placeholder: 'empty = generated from the app icon', help: 'the NATIVE launch screen, shown before the web view boots — not an in-game title card. Ideally a large square (2732²). ⚠️ Both platforms COVER-FILL it, so the edges are always cropped: on a 19.5:9 phone only the central ~45% of the WIDTH survives. Compose the subject inside that column.' },
@@ -452,7 +462,7 @@ export async function createGameEditor(): Promise<{ default: React.ComponentType
                 { key: 'app.splashBadge', label: 'Splash: "Made by Modoki Engine"', type: 'checkbox', help: 'composites the small Modoki mark at the bottom of the splash\'s crop-safe region. Off by default — nothing already shipped grows a mark it did not have. The badge picks cream or navy per image by measuring the brightness underneath it.' },
                 { key: 'app.version', label: 'Version', type: 'text', placeholder: '1.0', help: 'marketing version, what players see in the store listing — synced into Android versionName + iOS MARKETING_VERSION on open and before every build' },
                 { key: 'app.buildNumber', label: 'Build number', type: 'number', placeholder: '1', disabledIf: { key: 'app.buildNumberAuto', is: 'true' }, help: 'BUMP BEFORE EVERY STORE UPLOAD (read-only while Auto is on — uncheck Auto to edit). Both stores refuse a build number they have already seen and do it SILENTLY — Play just reports "this release is empty". Synced into Android versionCode + iOS CURRENT_PROJECT_VERSION on open and before every build (not on save); never lowered — a lower value is reported in the log and ignored.' },
-                { key: 'app.buildNumberAuto', label: 'Auto build number', type: 'checkbox', help: 'ON = the build number above is IGNORED; versionCode / CFBundleVersion derive from this repo\'s total git commit count on every open/build — no more hand-bumping per upload. The stored number still acts as a floor; if a store ever demands a jump past it, uncheck Auto, type the higher number, and re-check.' },
+                { key: 'app.buildNumberAuto', label: 'Auto build number', type: 'checkbox', help: 'ON = the build number above is IGNORED; versionCode / CFBundleVersion derive from this repo\'s total git commit count on every native build — no more hand-bumping per upload. The number is passed to the build, not written into the native project files, so a build leaves git status clean; archiving directly in Xcode or Android Studio uses the number last committed there. The stored number still acts as a floor; if a store ever demands a jump past it, uncheck Auto, type the higher number, and re-check.' },
               ],
             },
             {
@@ -526,8 +536,10 @@ export async function createGameEditor(): Promise<{ default: React.ComponentType
                 { key: 'build.webCdnUrlMap', label: 'Web CDN url-map', type: 'text', placeholder: 'empty = no CDN', help: 'gcloud compute url-maps invalidate-cdn-cache <name>', showIf: { key: 'build.webDeployMode', in: ['gcs'] } },
                 { key: 'build.webCdnBackendBucket', label: 'Web CDN backend-bucket', type: 'text', placeholder: 'empty = no ?v= cache-bust', help: 'whitelists ?v in the CDN cache key + marks glb/ktx2/webp immutable', showIf: { key: 'build.webDeployMode', in: ['gcs'] } },
                 // Per-machine (project.user.json — not committed): where the gcloud CLI lives. A
-                // Finder-launched packaged editor has a minimal PATH without the Cloud SDK.
-                { key: 'user.sdk.gcloudPath', label: 'gcloud path override', type: 'path', pathMode: 'file', placeholder: 'empty = auto-detect (Homebrew / Cloud SDK / login shell)', help: 'the gcloud binary (or its bin dir); set this if the deploy reports "gcloud not found"', showIf: { key: 'build.webDeployMode', in: ['gcs'] } },
+                // Finder-launched packaged editor has a minimal PATH without the Cloud SDK. Shown in
+                // EVERY deploy mode: OTA publish/status read it too, and on Windows it is their only
+                // way to find gcloud (no auto-detect there) while GCS web deploy is posix-only (#1444).
+                { key: 'user.sdk.gcloudPath', label: 'gcloud path override', type: 'path', pathMode: 'file', placeholder: 'empty = auto-detect on macOS/Linux; required on Windows', help: 'the gcloud binary (gcloud.cmd on Windows) or its bin dir — used by the GCS web deploy and OTA publish/status; set this if either reports "gcloud not found"' },
                 // Custom-only field
                 { key: 'build.webDeployCommand', label: 'Custom deploy command', type: 'text', placeholder: 'e.g. rsync -a {dist}/ host:/var/www', help: 'runs after build; {dist} {base}', showIf: { key: 'build.webDeployMode', in: ['custom'] } },
               ],
@@ -735,7 +747,12 @@ export async function createGameEditor(): Promise<{ default: React.ComponentType
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ mode, prompt: mode === 'file' ? 'Choose a file' : 'Choose a folder' }),
           });
-          if (!r.ok) return null;
+          if (!r.ok) {
+            // A chooser that FAILED is not a Cancel (#1440) — say so, or Browse… just does nothing.
+            const msg = await r.json().then((j: { error?: string }) => j?.error).catch(() => undefined);
+            alert(msg || `Could not open the file chooser (${r.status}).`);
+            return null;
+          }
           const j = (await r.json()) as { path?: string };
           return j.path ?? null;
         } catch {

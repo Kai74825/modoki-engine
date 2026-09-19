@@ -20,10 +20,11 @@ import { EntityAttributes } from '../core/traits/EntityAttributes';
 import { worldTransforms } from '../core/ecs/transformPropagationSystem';
 import { getWorldTransform3D, type WorldTransform3D } from '../core/ecs/worldTransform';
 import { packedOf, type PackedEntity } from '../core/ecs/entityTable';
-import type { ZoneEventBus, ZonePhase } from './zoneEventBus';
+import type { ZoneEventBus, ZonePhase, ZoneRefs } from './zoneEventBus';
 
-/** Fire the declarative `OnZone` action on the ZONE for one enter/exit. */
-export type FireOnZone = (zone: Entity, other: Entity, phase: ZonePhase) => void;
+/** Fire the declarative `OnZone` action on the ZONE for one enter/exit. `refs` are both entities'
+ *  journal refs as last seen ALIVE — the only identity a despawn-synthesized exit still has (#1227). */
+export type FireOnZone = (zone: Entity, other: Entity, phase: ZonePhase, refs: ZoneRefs) => void;
 
 /** A zone resolved for this frame: its entity + a containment predicate over an occupant's
  *  WORLD position, with the zone's own world pose (centre/rotation/scale) already baked in. */
@@ -34,49 +35,63 @@ export interface OccupantSample { entity: Entity; x: number; y: number; z: numbe
 
 /** Build the declarative `OnZone` dispatcher for a given trait (`OnZone2D`/`OnZone3D`). The
  *  action lives on the ZONE ("when something enters THIS zone, do X"): dispatched with the
- *  OTHER (occupant) as `ctx.target` and `{ self: zone, other, phase }` in `ctx.params`.
+ *  OTHER (occupant) as `ctx.target` and `{ self: zone, other, phase, selfRef, otherRef }` in
+ *  `ctx.params`. On an exit `other` may be DEAD, and its index already reclaimed: `otherRef` is the
+ *  ref it had while alive, and `entityRef(other)` answers `null` rather than name the newcomer (#1227).
  *  Pipeline-safe: `dispatchGameAction` never throws on an unwired name; a despawned zone (a
  *  synthesized exit) is guarded by `isAlive()`. */
 export function makeFireOnZone(OnZoneTrait: Parameters<Entity['has']>[0]): FireOnZone {
-  return (zone, other, phase) => {
+  return (zone, other, phase, refs) => {
     if (!zone.isAlive() || !zone.has(OnZoneTrait)) return;
     const r = zone.get(OnZoneTrait) as { onEnter: string; onExit: string };
     const name = phase === 'enter' ? r.onEnter : r.onExit;
     if (!name) return;
-    dispatchGameAction(name, { target: other, params: { self: zone, other, phase } });
+    dispatchGameAction(name, { target: other, params: { self: zone, other, phase, selfRef: refs.zone, otherRef: refs.other } });
   };
 }
 
-/** One member of `ZoneState` — the live handle PLUS its numeric id, cached at the moment this
- *  entry was recorded (when the entity was known alive, sampled fresh from this frame's query).
- *  The cache is what `refOf` falls back to once the handle may have gone dead AND had its index
- *  reclaimed by an unrelated entity — see `refOf`'s own comment. */
-interface ZoneMember { entity: Entity; id: number }
+/** One member of `ZoneState` — the live handle PLUS its journal ref, cached at the moment this
+ *  entry was first recorded (when the entity was known alive, sampled fresh from this frame's
+ *  query) and refreshed by every live `refOf`. The cache is what `refOf` returns once the handle
+ *  may have gone dead AND had its index reclaimed by an unrelated entity — see `refOf`. */
+interface ZoneMember { entity: Entity; ref: string | number }
 
 /** Stable Percept/journal reference for a zone-state member: its GUID when the handle is STILL
- *  alive (`entityRef` does its own live-handle probe — `has()`/`get()`), else the id CACHED when
- *  this entry was recorded. Mirrors `physicsContactEvents.refOf` exactly, and for the same reason
+ *  alive (`entityRef` does its own live-handle probe — `has()`/`get()`), else the ref CACHED on
+ *  the member. Mirrors `physicsContactEvents.refOf` exactly, and for the same reason
  *  (QA-ZONE-0003, review follow-up): koota's `has()`/`get()` do not check generation, only
  *  `isAlive()` does — so calling `entityRef(deadHandle)` on a handle whose index has been
  *  RECLAIMED by a new entity silently resolves to the NEW entity's guid/name, misattributing the
  *  exit. Reproduced live: a same-tick despawn+respawn produced a `@zone` journal entry with the
  *  zone/other roles inverted, both naming entities that were still alive — the exit belonged to
- *  the DEAD pair, not to them. The cached `id` avoids re-deriving anything from the handle. */
+ *  the DEAD pair, not to them. The cached ref avoids re-deriving anything from the handle.
+ *
+ *  The cache used to be the numeric id, which split enter (guid) from despawn-exit (number) — for
+ *  every code-spawned occupant once #1210 gave each one a runtime guid (#1225). */
 function refOf(m: ZoneMember): string | number {
-  return m.entity.isAlive() ? entityRef(m.entity) : m.id;
+  if (m.entity.isAlive()) m.ref = entityRef(m.entity) ?? m.ref;
+  return m.ref;
 }
 
-/** Route ONE zone/occupant transition to all three sinks. The journal payload uses `refOf`
- *  (despawn-safe — see its own comment); `bus`/`fire` still receive the raw `Entity` handles,
- *  matching `physicsContactEvents.routePair`'s same accepted trade-off for a synthesized exit
- *  (`makeFireOnZone` already guards `zone.isAlive()` before dispatching). */
+/** The member for `entity` in the next diff: last frame's member when the same (packed) entity
+ *  was already tracked, so its cached ref carries over; otherwise a new one, its ref taken now
+ *  while the entity is known alive. Only a first appearance pays for an `entityRef`. */
+function memberFor(entity: Entity, prior: ZoneMember | undefined): ZoneMember {
+  return prior ?? { entity, ref: entityRef(entity) ?? entity.id() }; // sampled this tick, so alive
+}
+
+/** Route ONE zone/occupant transition to all three sinks. Every sink gets the SAME refs, taken
+ *  once through `refOf` (despawn-safe — see its own comment): the journal payload, and the `refs`
+ *  handed to `bus`/`fire` beside the raw `Entity` handles. The handles may be dead on a synthesized
+ *  exit (`makeFireOnZone` guards `zone.isAlive()` before dispatching); the refs never are (#1227). */
 function routeZone(
   world: World, zone: ZoneMember, other: ZoneMember,
   phase: ZonePhase, bus: ZoneEventBus, fire: FireOnZone, journalType: string,
 ): void {
-  emit(journalType, { zone: refOf(zone), other: refOf(other), phase }, world);
-  bus.__emitZone(world, zone.entity, other.entity, phase);
-  fire(zone.entity, other.entity, phase);
+  const refs: ZoneRefs = { zone: refOf(zone), other: refOf(other) };
+  emit(journalType, { zone: refs.zone, other: refs.other, phase }, world);
+  bus.__emitZone(world, zone.entity, other.entity, phase, refs);
+  fire(zone.entity, other.entity, phase, refs);
 }
 
 /** Per-world occupancy: which occupants were inside each zone last frame, keeping the zone +
@@ -127,15 +142,16 @@ export function runZoneTriggers(
   const next: ZoneState = new Map();
   for (const z of zones) {
     const zid = packedOf(z.entity); // generation-carrying — see ZoneState's doc comment
+    const before = prev.get(zid);
     const occ = new Map<PackedEntity, ZoneMember>();
     for (const o of occupants) {
       const oid = packedOf(o.entity);
       if (oid === zid) continue;
-      // `.id()` cached HERE, while `o.entity` is known alive (freshly sampled this tick) — see
-      // `refOf`'s comment for why this must never be re-derived from the handle later.
-      if (z.contains(o.x, o.y, o.z)) occ.set(oid, { entity: o.entity, id: o.entity.id() });
+      // The ref is cached HERE, while `o.entity` is known alive (freshly sampled this tick) — see
+      // `refOf`'s comment for why it must never be re-derived from the handle later.
+      if (z.contains(o.x, o.y, o.z)) occ.set(oid, memberFor(o.entity, before?.occ.get(oid)));
     }
-    next.set(zid, { member: { entity: z.entity, id: z.entity.id() }, occ });
+    next.set(zid, { member: memberFor(z.entity, before?.member), occ });
   }
 
   // Enters — in `next` but not `prev`.

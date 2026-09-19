@@ -2,8 +2,9 @@
  *  scene shape. Deterministic GUID minting injected. Pure, no world. */
 
 import { describe, it, expect } from 'vitest';
-import { applyOps, assignSyntheticEntityIds, stripBackfilledEntityIds, type MutableScene, type MutateOp } from '../../src/runtime/scene/sceneMutate';
+import { applyOps, assignSyntheticEntityIds, stripBackfilledEntityIds, ALSO_DELETED_CAP, type MutableScene, type MutateOp } from '../../src/runtime/scene/sceneMutate';
 import { validateSceneData, type SceneSchema } from '../../src/runtime/loaders/sceneValidation';
+import { formatRuntimeGuid } from '../../src/runtime/core/assetRefRules';
 
 let guidN = 0;
 const mint = () => `guid-${++guidN}`;
@@ -32,6 +33,19 @@ describe('applyOps — setTrait', () => {
     const scene = freshScene();
     applyOps(scene, [{ op: 'setTrait', entity: { id: 1 }, trait: 'Rotate3D', fields: { speed: 2 } }], mint);
     expect(scene.entities[0].traits.Rotate3D).toEqual({ speed: 2 });
+  });
+
+  // #1216 C-12 / #1223 D6: the add was silent — `changed:1`, the same answer as a field edit.
+  // Mutation: drop the `addedTraits.push` in applyOps' setTrait branch.
+  it('says which trait it added, and lists neither an edit nor a tag', () => {
+    const scene = freshScene();
+    const res = applyOps(scene, [
+      { op: 'setTrait', entity: { id: 1 }, trait: 'Rotate3D', fields: { speed: 2 } },
+      { op: 'setTrait', entity: { id: 2 }, trait: 'Transform', fields: { x: 1 } },
+      { op: 'setTrait', entity: { id: 2 }, trait: 'Persistent' },
+    ], mint);
+    expect(res.addedTraits).toEqual([{ op: 0, id: 1, guid: 'g-root', trait: 'Rotate3D' }]);
+    expect(applyOps(freshScene(), [{ op: 'setTrait', entity: { id: 2 }, trait: 'Transform', fields: { x: 1 } }], mint).addedTraits).toBeUndefined();
   });
 
   it('sets a tag when no fields given', () => {
@@ -69,6 +83,22 @@ describe('applyOps — setTrait', () => {
     scene.entities.push({ id: 3, name: 'Child', traits: {} });
     const res = applyOps(scene, [{ op: 'setTrait', entity: { name: 'Child' }, trait: 'Transform', fields: { x: 1 } }], mint);
     expect(res.errors.join('\n')).toMatch(/match.*disambiguate/);
+  });
+
+  // #1223 D1: the FILE path let `id` win over a guid given beside it, the opposite of the live path, so
+  // one ref named two different entities depending on the persistence mode. Mutation: delete the
+  // `given.length > 1` refusal in resolveEntity.
+  it('refuses a ref carrying two addresses (AMBIGUOUS), and treats an empty string as absent', () => {
+    const scene = freshScene();
+    const res = applyOps(scene, [{ op: 'setTrait', entity: { id: 1, guid: 'g-child' }, trait: 'Transform', fields: { x: 7 } }], mint);
+    expect(res.changed).toBe(0);
+    expect(res.code).toBe('AMBIGUOUS');
+    expect(res.errors.join('\n')).toMatch(/given together/);
+    expect(scene.entities[0].traits.Transform).toBeUndefined(); // the id's entity was not written either
+    // Accept side: an empty guid beside an id is ONE address.
+    const ok = applyOps(scene, [{ op: 'setTrait', entity: { id: 2, guid: '' }, trait: 'Transform', fields: { x: 7 } }], mint);
+    expect(ok.errors).toEqual([]);
+    expect((scene.entities[1].traits.Transform as { x: number }).x).toBe(7);
   });
 });
 
@@ -177,6 +207,32 @@ describe('applyOps — removeTrait', () => {
     expect(scene.entities[1].traits.Transform).toBeDefined();
   });
 
+  // #1454: the prefab link is not a component — neither removed nor written by a generic edit. Mutation: drop the
+  // removeTrait / setTrait refusal in applyOps.
+  it('refuses to remove or write the PrefabInstance link', () => {
+    const scene = freshScene();
+    (scene.entities[0].traits as Record<string, unknown>).PrefabInstance = { source: 'g', localId: 1 };
+    const res = applyOps(scene, [
+      { op: 'removeTrait', entity: { id: 1 }, trait: 'PrefabInstance' },
+      { op: 'setTrait', entity: { id: 2 }, trait: 'PrefabInstance', fields: { localId: 3 } },
+    ], mint);
+    expect(res.changed).toBe(0);
+    expect(res.errors).toHaveLength(2);
+    expect(res.errors.join('\n')).toMatch(/Detach Prefab/);
+    expect((scene.entities[0].traits as Record<string, unknown>).PrefabInstance).toEqual({ source: 'g', localId: 1 });
+    expect((scene.entities[1].traits as Record<string, unknown>).PrefabInstance).toBeUndefined();
+  });
+
+  // Close-out review: addEntity copied op.traits verbatim. Mutation: drop the addEntity refusal in applyOps.
+  it('refuses an addEntity carrying the PrefabInstance link, creating nothing', () => {
+    const scene = freshScene();
+    const before = scene.entities.length;
+    const res = applyOps(scene, [{ op: 'addEntity', name: 'Fake', traits: { PrefabInstance: { source: 'g', localId: 1 } } }], mint);
+    expect(res.changed).toBe(0);
+    expect(res.errors.join('\n')).toMatch(/Detach Prefab/);
+    expect(scene.entities).toHaveLength(before);
+  });
+
   it('errors when the entity is not found', () => {
     const scene = freshScene();
     const res = applyOps(scene, [{ op: 'removeTrait', entity: { name: 'Ghost' }, trait: 'Light' }], mint);
@@ -265,8 +321,38 @@ describe('applyOps — removeEntity', () => {
 
   it('removes only the leaf when it has no children', () => {
     const scene = freshScene();
-    applyOps(scene, [{ op: 'removeEntity', entity: { name: 'Child' } }], mint);
+    const res = applyOps(scene, [{ op: 'removeEntity', entity: { name: 'Child' } }], mint);
     expect(scene.entities.map((e) => e.id)).toEqual([1]);
+    expect(res).not.toHaveProperty('alsoDeleted'); // nothing cascaded, so no field at all
+  });
+
+  // #1262: `changed:1` was the whole answer, so a parent's remove took its subtree without a word.
+  // Mutation: drop the `alsoDeleted.add(...)` call, or the `...alsoDeleted.fields()` spread.
+  it('names the descendants the remove took, parents first, and not the entity it named', () => {
+    const scene = freshScene();
+    scene.entities.push({ id: 3, name: 'GC', traits: { EntityAttributes: { name: 'GC', guid: 'g-gc', parentId: 2 } } });
+    const res = applyOps(scene, [{ op: 'removeEntity', entity: { name: 'Root' } }], mint);
+    expect(res.alsoDeleted).toEqual(['g-child', 'g-gc']);
+    expect(res).not.toHaveProperty('alsoDeletedTotal');
+    expect(res).not.toHaveProperty('alsoDeletedNoGuidIds');
+  });
+
+  it('lists across every remove in the call, a guid-less descendant by id, and counts past the cap', () => {
+    const scene: MutableScene = { version: 8, entities: [
+      { id: 1, name: 'A', traits: { EntityAttributes: { name: 'A', guid: 'g-a', parentId: 0 } } },
+      { id: 2, name: 'A1', traits: { EntityAttributes: { name: 'A1', parentId: 1 } } },
+      { id: 3, name: 'B', traits: { EntityAttributes: { name: 'B', guid: 'g-b', parentId: 0 } } },
+    ] };
+    const n = ALSO_DELETED_CAP + 2;
+    for (let i = 0; i < n; i++) scene.entities.push({ id: 10 + i, name: `k${i}`, traits: { EntityAttributes: { name: `k${i}`, guid: `g-k${i}`, parentId: 3 } } });
+    const res = applyOps(scene, [
+      { op: 'removeEntity', entity: { name: 'A' } },
+      { op: 'removeEntity', entity: { name: 'B' } },
+    ], mint);
+    expect(res.alsoDeletedNoGuidIds).toEqual([2]);
+    expect(res.alsoDeleted).toHaveLength(ALSO_DELETED_CAP - 1); // the cap counts both lists
+    expect(res.alsoDeleted!.every((g) => g.startsWith('g-k'))).toBe(true);
+    expect(res.alsoDeletedTotal).toBe(n + 1);
   });
 
   // F5 — dangling entity-ref warning.
@@ -635,5 +721,66 @@ describe("setTrait {space:'world'} — authoring in world coordinates (file path
     const r = applyOps(scene, [{ op: 'setTrait', entity: { id: 2 }, trait: 'EntityAttributes', space: 'world', fields: { name: 'x' } }]);
     expect(r.errors.join(' ')).toMatch(/'space' applies only to trait 'Transform'/);
     expect(r.changed).toBe(0);
+  });
+});
+
+/** #1210: this edits the scene FILE, and a runtime guid is a LIVE-world address valid only until
+ *  reload. An agent copying one from a live read must not get it written to disk. */
+describe('applyOps — runtime guids never reach the file (#1210)', () => {
+  const rg = formatRuntimeGuid(1, 77);
+
+  it('addEntity mints over a caller-supplied runtime guid, and over an empty one', () => {
+    const scene = freshScene();
+    const res = applyOps(scene, [
+      { op: 'addEntity', name: 'FromLive', traits: { EntityAttributes: { guid: rg } } },
+      { op: 'addEntity', name: 'Blank', traits: { EntityAttributes: { guid: '' } } },
+    ], mint);
+    expect(res.errors).toEqual([]);
+    const guidOf = (name: string) => (scene.entities.find((e) => e.name === name)!.traits.EntityAttributes as { guid: string }).guid;
+    expect(guidOf('FromLive')).toBe('guid-1');
+    expect(guidOf('Blank')).toBe('guid-2');
+    expect(res.created?.map((c) => c.guid)).toEqual(['guid-1', 'guid-2']); // the reply names what was written
+  });
+
+  it('refuses the whole write when any field would carry a runtime guid', () => {
+    const scene = freshScene();
+    const res = applyOps(scene, [
+      { op: 'setTrait', entity: { name: 'Child' }, trait: 'Transform', fields: { x: 5 } },
+      { op: 'setTrait', entity: { name: 'Root' }, trait: 'UIAction', fields: { bindings: [{ target: rg }] } },
+    ], mint);
+    expect(res.changed).toBe(0); // the route writes only when changed > 0
+    expect(res.errors.join('\n')).toMatch(/RUNTIME guid/);
+  });
+
+  // #1223 P4 review: the tripwire cleared `changed` and `created` but not `addedTraits`, so a refused write
+  // still reported a trait added. Mutation: drop `addedTraits.length = 0` from the tripwire.
+  it('a refused write reports no trait added either', () => {
+    const res = applyOps(freshScene(), [
+      { op: 'setTrait', entity: { id: 1 }, trait: 'Rotate3D', fields: { speed: 2 } },
+      { op: 'setTrait', entity: { name: 'Root' }, trait: 'UIAction', fields: { bindings: [{ target: rg }] } },
+    ], mint);
+    expect(res.changed).toBe(0);
+    expect(res.addedTraits).toBeUndefined();
+  });
+
+  // #1262: nor a cascade, since nothing left the file. Mutation: drop the tally reset from the tripwire.
+  it('a refused write reports nothing also deleted', () => {
+    const scene = freshScene();
+    scene.entities.push({ id: 3, name: 'Other', traits: { EntityAttributes: { name: 'Other', guid: 'g-other', parentId: 0 } } });
+    const res = applyOps(scene, [
+      { op: 'removeEntity', entity: { name: 'Root' } },
+      { op: 'setTrait', entity: { name: 'Other' }, trait: 'UIAction', fields: { bindings: [{ target: rg }] } },
+    ], mint);
+    expect(res.changed).toBe(0);
+    expect(res).not.toHaveProperty('alsoDeleted');
+  });
+
+  it('a refused write reports no created entity — none was written', () => {
+    const scene = freshScene();
+    const res = applyOps(scene, [
+      { op: 'addEntity', name: 'Holder', traits: { UIAction: { bindings: [{ target: rg }] } } },
+    ], mint);
+    expect(res.changed).toBe(0);
+    expect(res.created ?? []).toEqual([]);
   });
 });

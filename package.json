@@ -1,7 +1,7 @@
 {
   "name": "modoki-engine",
   "private": true,
-  "version": "0.7.1",
+  "version": "0.7.2",
   "type": "module",
   "description": "Modoki — a Claude-friendly game engine + visual editor",
   "author": "Modoki",
@@ -16,7 +16,7 @@
   "scripts": {
     "upload:dsyms": "node engine/scripts/upload-dsyms.mjs",
     "dev": "vite --config engine/vite.config.ts",
-    "build:plugins": "npm run build --workspace engine/packages/capacitor-game-debug --workspace engine/packages/capacitor-modoki-ota --workspace engine/packages/capacitor-modoki-iap --workspace engine/packages/capacitor-appsflyer --workspace engine/packages/capacitor-applovin-max",
+    "build:plugins": "npm run build --workspace engine/packages/capacitor-game-debug --workspace engine/packages/capacitor-modoki-ota --workspace engine/packages/capacitor-modoki-iap --workspace engine/packages/capacitor-appsflyer --workspace engine/packages/capacitor-applovin-max --workspace engine/packages/capacitor-modoki-system",
     "postinstall": "npm run build:plugins && node engine/scripts/stamp-plugin-builds.mjs && node engine/scripts/bootstrap-mcp-deps.mjs && node engine/scripts/bootstrap-game-deps.mjs",
     "electron:build": "node engine/scripts/build-electron.mjs",
     "dev:electron": "npm run electron:build && electron engine/electron/dist/main.cjs",
@@ -30,6 +30,7 @@
     "dist:dir": "npm run build:electron && electron-builder --dir",
     "dev:stop": "bash engine/scripts/stop-dev.sh",
     "editor:stop": "bash engine/scripts/stop-editor.sh",
+    "toolchain:install": "node engine/scripts/toolchain-install.mjs",
     "clean:texture-cache": "node engine/scripts/clean-texture-cache.mjs",
     "clean:packaged-cache": "node engine/scripts/clean-packaged-cache.mjs",
     "migrate:private-config": "node engine/scripts/migrate-private-config.mjs",
@@ -91,7 +92,7 @@
     "@modoki/engine": "file:engine/packages/modoki",
     "@monogrid/gainmap-js": "^3.4.0",
     "@pixi/react": "^8.0.5",
-    "@types/three": "^0.183.1",
+    "@types/three": "^0.185.4",
     "@vitejs/plugin-react": "^6.0.1",
     "@zappar/msdf-generator": "^1.2.4",
     "capacitor-game-debug": "file:engine/packages/capacitor-game-debug",
@@ -108,7 +109,7 @@
     "react-dom": "^19.2.4",
     "sharp": "^0.35.0",
     "tar": "^7.5.22",
-    "three": "0.184.0",
+    "three": "0.185.1",
     "vite": "^8.0.5",
     "yauzl": "^2.10.0",
     "zustand": "^5.0.12"

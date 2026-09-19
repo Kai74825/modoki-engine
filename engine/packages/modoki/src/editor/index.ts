@@ -17,7 +17,9 @@ export {
   writeTraitFieldWithUndo, deleteEntityWithUndo, deleteEntitiesWithUndo, duplicateEntity,
   reparentEntity, setActionCallback, createEntityWithUndo,
   addTraitToEntitiesWithUndo, removeTraitFromEntitiesWithUndo, type TraitSpec,
+  planReparent, applyReparent, type ReparentPlan,
 } from './undo/entityActions';
+export { preflightSceneMove, formatSceneMoveConfirm } from './scene/sceneMoveScan';
 export {
   emptySpecs, primitiveSpecs, shape2DSpecs, canvas2DSpecs, uiSpecs, cameraSpecs, lightSpecs, environmentSpecs, particleSpecs,
   buildEntityCreateSpecs, type CreateEntitySpec, type CreateSpecs, type LightKind,
@@ -38,9 +40,11 @@ export {
 } from './scene/devicePresets';
 export {
   editorEmit, readEditorJournal, clearEditorJournal, setEditorJournalEnabled,
-  withEditorActor, openActorLease, closeActorLease, ACTOR_LEASE_TTL_MS, ACTOR_LEASE_GRACE_MS,
+  withEditorActor, AGENT_SCOPE_MAX_MS, openActorLease, closeActorLease, ACTOR_LEASE_TTL_MS, ACTOR_LEASE_GRACE_MS,
   waitForEditorJournal, type EditorEvent, type WaitForEditResult,
+  editorJournalEpoch, editorJournalEpochChanged, resolveEditorJournalCursor, type ResolvedEditorJournalCursor,
   EDITOR_JOURNAL_SOURCES, isEditorJournalSource, type EditorJournalSource,
+  EDITOR_JOURNAL_TYPES, isEditorJournalType, type EditorJournalType,
 } from './editorJournal';
 export {
   getEditorViewportCamera, setEditorViewportCamera, focusEntityInSceneView,
@@ -56,14 +60,18 @@ export {
   fetchDeviceList, androidRowLabel, androidRowNote,
   type DeviceListReply, type AndroidDeviceRow, type IosDeviceRow, type DeviceClaim,
 } from './panels/deviceConnectModel';
+export { installEditorPrefabCacheWarm, warmEditorPrefabCacheFor } from './scene/prefabCacheWarm';
 export {
   PREFAB_FORMAT_VERSION,
   serializePrefab, instantiatePrefab, instantiatePrefabAsync, setPrefabSource,
+  instantiatePrefabInstance,
+  primeEditorPrefabCache, isEditorPrefabCached,
   getPrefabSource, setPrefabCache, refreshPrefabSourceForPath, getOverrides, getOverrideValues,
+  preloadNestedPrefabs, preloadNestedPrefabsForSubtree,
   captureInstanceOverrides, applyOverridesByRootInstance,
   applyToPrefab, applyToPrefabSelective,
   revertOverridesSelective, rebuildInstance,
-  writePrefabFile, resolveExistingPrefabId,
+  writePrefabFile, warnInertPrefabSizes, resolveExistingPrefabId,
   tagEntityTreeAsInstance, untagEntityTreeAsInstance,
   detachPrefabInstance, reattachPrefabInstance,
   captureInstanceStructure, resolveInstanceContext,
@@ -85,8 +93,9 @@ export { applyToPrefabWithUndo } from './undo/applyPrefabUndo';
 export {
   saveScene, saveAll, serializeScene, loadScene, newScene, NewSceneRefusedError,
   getCurrentScenePath, setCurrentScenePath, isTraitDefault, type SceneFile,
-  getLastSceneLoadFailureMessage, type SceneLoadOutcome,
+  getLastSceneLoadFailureMessage, getLastSceneLoadStartupErrors, type SceneLoadOutcome,
 } from './scene/serialize';
+export { SCENE_EXT, correctedScenePath, isAcceptableScenePath } from './scene/sceneFileName';
 export {
   markAssetDirty, hasDirtyAssets, getDirtyAssetPaths, peekDirtyAsset, clearDirtyAssets,
   discardDirtyAssets, assetWrittenToDisk, flushDirtyAssets, type FlushResult,
@@ -107,7 +116,9 @@ export {
   readMetaPreferringPark, metaWrittenToDisk, metaReadFallback, type PreferredMetaRead,
 } from './scene/pendingMeta';
 export { importModel } from './scene/modelImport';
-export { useEditorStore } from './store/editorStore';
+export { useEditorStore, GIZMO_MODES, GIZMO_SPACES, SCENE_VIEW_MODES, ASSET_EDITOR_KINDS, dirtyAssetEditorHolds } from './store/editorStore';
+export type { AssetEditorKind, AssetEditorMount } from './store/editorStore';
+export { colliderEditBlocker, isColliderEditable } from './scene/colliderEditable';
 export type { SelectedAsset } from './store/editorStore';
 export { upsertKey, findTrack, encodeValue, relativeEntityPath } from './animation/recording';
 // The pose path, extracted out of AnimationEditor.tsx so the `pose-clip` agent op drives the SAME
@@ -140,7 +151,7 @@ export { makePrefabInstantiateAction } from './undo/prefabInstantiateUndo';
 
 // C7: agent ops must refuse to DESTROY unsaved live work (load_scene/new_scene swap the world).
 export {
-  hasUnsavedChanges, unsavedChangeCauses, markSceneSaved, causeSpecs, flushParked,
+  hasUnsavedChanges, unsavedChangeCauses, markSceneSaved, causeSpecs, flushParked, adoptWorldReloadedFromDisk,
   type SaveResult, type UnsavedCauses, type PathKeyedCause, type SceneWrittenCause,
   type FlushPhase, type ParkedFlushResults,
 } from './scene/serialize';
@@ -161,13 +172,14 @@ export { readUnusedStaleness, type UnusedStaleness } from './panels/assetOps';
 // otherwise an explicit `path` writes the SYNTHETIC prefab-edit world over a real scene.
 // #125: prefab-edit is also the only round-trip that re-serializes a .prefab.json, so the
 // bulk re-save sweep (engine/scripts/resave-prefabs.sh) drives these three as agent ops.
-export { isEditingPrefab, openPrefabForEditing, savePrefabEdit, exitPrefabEditing } from './scene/prefabEdit';
+export { isEditingPrefab, openPrefabForEditing, savePrefabEdit, savePrefabEditReport, type PrefabEditSaveReport, exitPrefabEditing } from './scene/prefabEdit';
 // The PURE predicate, and the ground truth `isEditingPrefab`'s store flag only approximates.
 // Exported because a PROBE must not use the self-healing one — see its docblock (#889 close-out).
-export { isPrefabEditWorld, PREFAB_EDIT_SCENE_PREFIX } from './scene/prefabEditWorld';
+export { isPrefabEditWorld, prefabEditWorldPath, prefabSessionWorldPath, PREFAB_EDIT_SCENE_PREFIX } from './scene/prefabEditWorld';
 
 // QA-PHYS-0003: `/api/input/key` needs to know whether a key it is about to press will reach
 // ANYTHING — the editor keymap, or the running game past the input gate. Both answers live
 // inside this package (the keymap registry, the installed gate), so the probe does too and
 // the route asks for one measured verdict rather than re-deriving the policy in main.
 export { probeKeyReach, chordFromElectronKey, DOM_KEY_ALIAS, type KeyReach } from './input/keyReach';
+export { collectTransientSubtreeIds, filterAuthoringVisible, runtimeExcludedMessage } from './scene/authoringScope';

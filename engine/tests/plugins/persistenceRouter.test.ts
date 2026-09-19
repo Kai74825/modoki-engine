@@ -195,6 +195,8 @@ describe('Phase 1: file-direct routes report `saved` (additive, no behaviour cha
 
   it('asset-write: saved:true on a successful write', async () => {
     const assetPath = path.join(TMP, `asset-${seq++}.particle.json`);
+    // An agent write edits an EXISTING asset; a missing path is NOT_FOUND since #1215.
+    fs.writeFileSync(assetPath, '{}');
     const r = (await post('/api/asset-write', {
       path: assetPath, type: 'particle', data: { emitter: { shape: 'point' }, particle: { lifetime: 1 } },
     }, makeCtx())) as { body: { ok: boolean; saved?: boolean } };
@@ -397,6 +399,89 @@ describe('Phase 2b: scene-mutate goes LIVE when a renderer is connected on the m
     expect(String(fileBody.created![0].guid).length).toBeGreaterThan(0);
   });
 
+  // #1216 C-12 / D6: `addedTraits` has the same two backends, and the same three literals to be dropped at
+  // (the op wrapper, `decodeSceneOpsReply`, this route's two json() calls). Mutation: drop either
+  // route spread, or the decoder's.
+  it('BOTH branches forward `addedTraits` for a setTrait that added a trait', async () => {
+    const addTrait = (scenePath: string) => ({ path: scenePath, ops: [{ op: 'setTrait', entity: { guid: 'g-box' }, trait: 'Renderable3DPrimitive', fields: { size: 2 } }] });
+    const liveScene = tempScene();
+    const added = [{ op: 0, id: 1, guid: 'g-box', trait: 'Renderable3DPrimitive' }];
+    const liveBrowser = vi.fn(async (op: string) => {
+      if (op === 'editor-state') return { playState: 'stopped', scenePath: liveScene, unsavedChanges: false };
+      if (op === 'apply-scene-ops') return { ok: true, changed: 1, errors: [], warnings: [], unresolved: [], addedTraits: added };
+      throw new Error(`unexpected op ${op}`);
+    });
+    const liveBody = ((await post('/api/scene-mutate', addTrait(liveScene), makeCtx({ requestBrowser: liveBrowser }))) as { body: { addedTraits?: unknown } }).body;
+    expect(liveBody.addedTraits, 'the live branch dropped addedTraits').toEqual(added);
+
+    const fileScene = tempScene();
+    const fileBrowser = vi.fn(async (op: string, params?: unknown) => {
+      if (op === 'editor-state') return { playState: 'stopped', scenePath: '/some/other/scene.json', unsavedChanges: false };
+      if (op === 'resolve-unsaved') return { ok: true, holds: [], discarded: [], covers: (params as { registries?: string[] })?.registries ?? [] };
+      throw new Error(`unexpected op ${op} — should have stayed file-direct`);
+    });
+    const fileBody = ((await post('/api/scene-mutate', addTrait(fileScene), makeCtx({ requestBrowser: fileBrowser }))) as { body: { addedTraits?: unknown } }).body;
+    expect(fileBody.addedTraits, 'the file branch dropped addedTraits').toEqual([{ op: 0, id: 1, guid: 'g-box', trait: 'Renderable3DPrimitive' }]);
+  });
+
+  // #1262: `alsoDeleted` rides the same four places. Mutation: drop any one of the three spreads from
+  // either route json(), or from decodeSceneOpsReply.
+  it('BOTH branches forward `alsoDeleted` for a removeEntity that took descendants', async () => {
+    const withChild = () => {
+      const p = tempScene();
+      fs.writeFileSync(p, JSON.stringify({ entities: [
+        { id: 1, name: 'Box', traits: { Transform: { x: 0 }, EntityAttributes: { name: 'Box', guid: 'g-box' } } },
+        { id: 2, name: 'Kid', traits: { Transform: { x: 0 }, EntityAttributes: { name: 'Kid', guid: 'g-kid', parentId: 'g-box' } } },
+        // Enough grandchildren to pass the cap, so the file branch has an `alsoDeletedTotal` to drop.
+        ...Array.from({ length: 100 }, (_, i) => ({ id: 10 + i, name: `k${i}`, traits: { EntityAttributes: { name: `k${i}`, guid: `g-k${i}`, parentId: 'g-kid' } } })),
+        { id: 3, name: 'Bare', traits: { Transform: { x: 0 }, EntityAttributes: { name: 'Bare', parentId: 'g-kid' } } },
+      ] }));
+      return p;
+    };
+    const removeBox = (scenePath: string) => ({ path: scenePath, ops: [{ op: 'removeEntity', entity: { guid: 'g-box' } }] });
+    const also = { alsoDeleted: ['g-kid'], alsoDeletedNoGuidIds: [3], alsoDeletedTotal: 101 };
+    const liveScene = withChild();
+    const liveBrowser = vi.fn(async (op: string) => {
+      if (op === 'editor-state') return { playState: 'stopped', scenePath: liveScene, unsavedChanges: false };
+      if (op === 'apply-scene-ops') return { ok: true, changed: 1, errors: [], warnings: [], unresolved: [], ...also };
+      throw new Error(`unexpected op ${op}`);
+    });
+    const liveBody = ((await post('/api/scene-mutate', removeBox(liveScene), makeCtx({ requestBrowser: liveBrowser }))) as { body: object }).body;
+    expect(liveBody, 'the live branch dropped a cascade field').toMatchObject(also);
+
+    const fileScene = withChild();
+    const fileBrowser = vi.fn(async (op: string, params?: unknown) => {
+      if (op === 'editor-state') return { playState: 'stopped', scenePath: '/some/other/scene.json', unsavedChanges: false };
+      if (op === 'resolve-unsaved') return { ok: true, holds: [], discarded: [], covers: (params as { registries?: string[] })?.registries ?? [] };
+      throw new Error(`unexpected op ${op} — should have stayed file-direct`);
+    });
+    const fileBody = ((await post('/api/scene-mutate', removeBox(fileScene), makeCtx({ requestBrowser: fileBrowser }))) as {
+      body: { alsoDeleted?: string[]; alsoDeletedNoGuidIds?: number[]; alsoDeletedTotal?: number };
+    }).body;
+    expect(fileBody.alsoDeleted?.[0], 'the file branch dropped alsoDeleted').toBe('g-kid');
+    expect(fileBody.alsoDeletedNoGuidIds, 'the file branch dropped alsoDeletedNoGuidIds').toHaveLength(1);
+    expect(fileBody.alsoDeletedTotal, 'the file branch dropped alsoDeletedTotal').toBe(102);
+  });
+
+  // #1223 D4, found by the live stale probe: the op answered `stale` and `options` beside its code, and
+  // this route's reply literal (and the decoder before it) dropped both. Mutation: delete the `stale`
+  // spread from the route's live-branch json(), or from decodeSceneOpsReply.
+  it('the LIVE branch carries a refusal\'s `stale` and `options` beside its code', async () => {
+    const liveScene = tempScene();
+    const liveBrowser = vi.fn(async (op: string) => {
+      if (op === 'editor-state') return { playState: 'stopped', scenePath: liveScene, unsavedChanges: false };
+      if (op === 'apply-scene-ops') {
+        return { ok: false, changed: 0, errors: ['op[0] (setTrait): entity: no LIVE entity with guid "g"'], warnings: [], unresolved: [{ guid: 'g' }],
+          code: 'NOT_FOUND', stale: 'world-swapped', options: ['g-other'] };
+      }
+      throw new Error(`unexpected op ${op}`);
+    });
+    const body = ((await post('/api/scene-mutate', addBox(liveScene), makeCtx({ requestBrowser: liveBrowser }))) as {
+      body: { code?: string; stale?: string; options?: string[] };
+    }).body;
+    expect(body).toMatchObject({ code: 'NOT_FOUND', stale: 'world-swapped', options: ['g-other'] });
+  });
+
   it('does NOT go live when the requested scene is not the one currently loaded — stays file-direct', async () => {
     const scenePath = tempScene();
     const before = fs.readFileSync(scenePath, 'utf-8');
@@ -558,4 +643,122 @@ describe('Phase 2b: scene-mutate goes LIVE when a renderer is connected on the m
     expect(r.body.ok).toBe(true);
     expect(r.body.changed).toBe(1);
   });
+});
+
+describe('/api/scene-mutate — the prefab-edit world is addressed by its handle, LIVE-ONLY (#1254)', () => {
+  // `modoki_prefab edit-open` loads a synthetic world with no scene FILE, and tells the agent to edit it with the
+  // scene tools. The route used to 403 that handle (`resolveAssetPath` knows only asset roots) — and could never have
+  // gone live anyway, because `canGoLive` compared against the renderer's `scenePath`, which prefab-edit sets to null.
+  const WORLD = '/__prefab-edit__/b134802e-0000-4000-8000-000000000001';
+  const setX = (p: string, op: Record<string, unknown> = { op: 'setTrait', entity: { name: 'Face' }, trait: 'Transform', fields: { x: 5 } }) =>
+    ({ path: p, ops: [op] });
+  type Body = { ok?: boolean; changed?: number; code?: string; error?: string; hint?: string; saved?: boolean; options?: string[] };
+
+  /** A renderer holding `prefabEditWorld` (or none), recording every op; `markEditorWrite` spied so a disk write is visible. */
+  function rig(prefabEditWorld: string | undefined, over: { playState?: string; editorState?: () => unknown } = {}) {
+    const requestBrowser = vi.fn(async (op: string) => {
+      if (op === 'editor-state') {
+        if (over.editorState) return over.editorState();
+        return { playState: over.playState ?? 'stopped', runMode: 'stopped', scenePath: null, unsavedChanges: false, ...(prefabEditWorld ? { prefabEditWorld } : {}) };
+      }
+      if (op === 'apply-scene-ops') return { ok: true, changed: 1, errors: [], warnings: [], unresolved: [] };
+      throw new Error(`unexpected op ${op} — a prefab-edit mutate goes live or refuses, nothing else`);
+    });
+    // Like the real scanner: the synthetic handle resolves to NO file, which is what produced the old 403.
+    const resolveAssetPath = vi.fn((p: string) => (p.startsWith("/__prefab-edit__/") ? null : p));
+    const markEditorWrite = vi.fn();
+    return { requestBrowser, resolveAssetPath, markEditorWrite, ctx: makeCtx({ requestBrowser, resolveAssetPath, markEditorWrite }) };
+  }
+
+  it('goes live when the renderer has THAT world loaded — no file gate, no write, and the hint names edit-save', async () => {
+    const r = rig(WORLD);
+    const res = (await post('/api/scene-mutate', setX(WORLD), r.ctx)) as { status?: number; body: Body };
+    expect(res.status ?? 200).toBe(200);
+    expect(res.body).toMatchObject({ ok: true, changed: 1, saved: false });
+    expect(r.requestBrowser).toHaveBeenCalledWith('apply-scene-ops', expect.anything(), expect.any(Number));
+    expect(r.markEditorWrite).not.toHaveBeenCalled();
+    // modoki_save_all REFUSES in prefab-edit mode, so pointing at it would be a dead end.
+    expect(res.body.hint).toContain('edit-save');
+    expect(res.body.hint).not.toContain('modoki_save_all');
+  });
+
+  it('refuses a handle whose world is NOT loaded — a different prefab, or none — and applies nothing', async () => {
+    for (const loaded of ['/__prefab-edit__/some-other-prefab', undefined]) {
+      const r = rig(loaded);
+      const res = (await post('/api/scene-mutate', setX(WORLD), r.ctx)) as { status?: number; body: Body };
+      expect(res.status, `loaded=${loaded}`).toBe(409);
+      expect(res.body).toMatchObject({ ok: false, changed: 0, code: 'NOT_FOUND' });
+      expect(res.body.error).toContain(loaded ? 'DIFFERENT prefab' : 'no prefab-edit session');
+      expect(r.requestBrowser).not.toHaveBeenCalledWith('apply-scene-ops', expect.anything(), expect.anything());
+      expect(r.markEditorWrite).not.toHaveBeenCalled();
+    }
+  });
+
+  it('refuses with no renderer at all — there is no file-direct fallback for a world that is not a file', async () => {
+    const r = rig(undefined, { editorState: () => { throw new Error('no editor renderer connected'); } });
+    const res = (await post('/api/scene-mutate', setX(WORLD), r.ctx)) as { status?: number; body: Body };
+    expect(res.status).toBe(409);
+    expect(res.body.error).toContain('no editor renderer');
+    expect(r.markEditorWrite).not.toHaveBeenCalled();
+  });
+
+  it('refuses setBaseScene (400) even with the world loaded — it has no meaning inside a template', async () => {
+    const r = rig(WORLD);
+    const res = (await post('/api/scene-mutate', setX(WORLD, { op: 'setBaseScene', baseScene: null }), r.ctx)) as { status?: number; body: Body };
+    expect(res.status).toBe(400);
+    expect(res.body.code).toBe('REFUSED_BY_OP');
+    expect(r.requestBrowser).not.toHaveBeenCalledWith('apply-scene-ops', expect.anything(), expect.anything());
+  });
+
+  it('a renderer that does not answer is a 503 that neither blames a file write nor offers save_all', async () => {
+    // Neither applies to the prefab-edit handle: there is no file, and save_all refuses in that world (#1254 review).
+    const r = rig(undefined, { editorState: () => { throw new Error('timed out waiting for the renderer'); } });
+    const res = (await post('/api/scene-mutate', setX(WORLD), r.ctx)) as { status?: number; body: Body };
+    expect(res.status).toBe(503);
+    expect(res.body.code).toBe('NO_RENDERER');
+    expect(res.body.error).not.toContain('scene FILE');
+    expect(res.body.options?.join(' ')).not.toContain('modoki_save_all');
+    expect(res.body.options?.join(' ')).toContain('retry');
+    expect(r.requestBrowser).not.toHaveBeenCalledWith('apply-scene-ops', expect.anything(), expect.anything());
+  });
+
+  it('keeps the Play refusal ahead of the live apply', async () => {
+    const r = rig(WORLD, { playState: 'playing' });
+    const res = (await post('/api/scene-mutate', setX(WORLD), r.ctx)) as { status?: number; body: Body };
+    expect(res.status).toBe(409);
+    expect(res.body.error).toContain('game is playing');
+    expect(r.requestBrowser).not.toHaveBeenCalledWith('apply-scene-ops', expect.anything(), expect.anything());
+  });
+
+  it("a path outside the asset roots is refused with ITS OWN options, so the MCP does not blame a different editor", async () => {
+    const ctx = makeCtx({ resolveAssetPath: () => null });
+    const res = (await post('/api/scene-mutate', setX('/@fs/Users/x/scene.json'), ctx)) as { status?: number; body: Body };
+    expect(res.status).toBe(403);
+    expect(res.body.options?.join(' ')).toContain('asset-root URL');
+    expect(res.body.options?.join(' ')).not.toContain('C6');
+  });
+});
+
+describe('an asset-root path refusal carries its own options on every MCP-reachable route (#1212 A-5, #1254)', () => {
+  // A 403 with no route-authored options fell through to the MCP's bare-403 option — "the backend belongs to a
+  // DIFFERENT editor/project (C6)" — which is the Electron token gate's meaning and never a rejected path. write-meta's
+  // body was not even JSON with an error in it: an empty `{}`.
+  const cases: Array<[route: string, body: Record<string, unknown>]> = [
+    ['/api/scene-mutate', { path: '/@fs/x.scene.json', ops: [] }],
+    ['/api/delete-asset', { path: '/@fs/x.png' }],
+    ['/api/duplicate-asset', { from: '/@fs/x.png', to: '/@fs/y.png' }],
+    ['/api/move-file', { from: '/@fs/x.png', to: '/@fs/y.png' }],
+    ['/api/create-folder', { path: '/@fs/dir' }],
+    ['/api/write-meta', { path: '/@fs/x.png', meta: { version: 2 } }],
+  ];
+  for (const [route, body] of cases) {
+    it(`${route} → 403 with an error and asset-root options`, async () => {
+      const ctx = makeCtx({ resolveAssetPath: () => null });
+      const res = (await post(route, body, ctx)) as { kind: string; status?: number; body: { error?: string; options?: string[] } };
+      expect(res.status).toBe(403);
+      expect(res.kind).toBe('json');
+      expect(res.body.error).toMatch(/outside allowed directories/i);
+      expect(res.body.options?.join(' ')).toContain('asset-root URL');
+    });
+  }
 });

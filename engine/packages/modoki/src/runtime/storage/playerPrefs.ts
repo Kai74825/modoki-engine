@@ -30,7 +30,7 @@
  *  Platform backend selection (localStorage / @capacitor/preferences) is layered on
  *  in Phase 2; app-shell init/flush wiring in Phase 3. */
 
-import { InMemoryBackend, type PrefsBackend } from './backends';
+import { InMemoryBackend, PREFS_KEY_ROOT, type PrefsBackend } from './backends';
 import { createSupersessionToken } from '../core/liveness';
 
 /** A plain JSON-serializable value. No functions, class instances, Map/Set, or cycles. */
@@ -108,6 +108,18 @@ const dirty = new Set<string>();
  *  (see the comment on `has()`) — the protection is against silent clobbering, not against the
  *  player's stated intent, so `del()`/`clear()` can still remove a protected key. */
 const unreadable = new Map<string, number>();
+
+/** Logical keys whose stored entry is CORRUPT — bad JSON, or no recognizable envelope (#1317).
+ *  Populated during hydration beside `unreadable`, and for the opposite reason that map exists:
+ *  nothing here is protected (`set()` overwrites a corrupt entry freely, see `readEnvelope`), and
+ *  every reader treats the key as absent. It exists ONLY so a DELETE can still reach the name —
+ *  the entry is still on disk, and before this set hydrate forgot it, so `clear()` and
+ *  `keysIncludingProtected()` left it there while the wipe reported the namespace empty.
+ *
+ *  Dropped by `del()`, `clear()` and a namespace swap. `set()` deliberately leaves the name: the key
+ *  is then in `cache` too, the listing de-duplicates, and `cache` only loses a key through those
+ *  same three paths — so a removal in `set()` could never change an answer. */
+const corrupt = new Set<string>();
 
 /**
  * Keys a drain has taken OUT of `dirty` but whose backend call has not settled yet (#559).
@@ -231,7 +243,7 @@ function sanitizeNamespace(ns: string): string {
  *  `drain()`'s doc comment, #438) rather than reading the live global — a full key is never
  *  built off whatever `namespace` happens to be at the moment a write settles. */
 function prefixFor(ns: string): string {
-  return `mk:${ns}:`;
+  return `${PREFS_KEY_ROOT}${ns}:`;
 }
 
 // ── Envelope ──────────────────────────────────────────────────────
@@ -755,6 +767,7 @@ async function doInitBody(opts: PlayerPrefsInitOptions): Promise<PlayerPrefsInit
       inFlight.clear();
       unreadable.clear(); // #630 — same reasoning as `cache.clear()` above: a stale entry from the
                           // outgoing namespace must not leak into the incoming (unhydrated) one.
+      corrupt.clear();    // #1317 — same reasoning.
       hydrated = false;
       // Close the landing-tracking window and reclassify (#454 B) — same shape as the
       // successful-install path below; see the comment there for the reasoning.
@@ -798,6 +811,7 @@ async function doInitBody(opts: PlayerPrefsInitOptions): Promise<PlayerPrefsInit
                         // is defensive and uncovered.
     unreadable.clear(); // #630 — same reasoning as `cache.clear()` above: a stale entry from the
                         // previous namespace must not leak into the incoming one.
+    corrupt.clear();    // #1317 — same reasoning.
     // Populate from a freshly-cleared cache (not layered on top of whatever was already
     // there) — clearing immediately before repopulating from `raw` means a key that survived
     // in the old cache but is absent from the incoming namespace's `getAll` result cannot
@@ -812,8 +826,11 @@ async function doInitBody(opts: PlayerPrefsInitOptions): Promise<PlayerPrefsInit
         // written by a NEWER build). Leave it OUT of `cache` (so it reads as absent) and record
         // it so `set()` refuses to clobber it.
         unreadable.set(logicalKey, read.version);
+      } else {
+        // Corrupt — readers still see nothing, but the NAME is kept so a delete can reach the
+        // entry still on disk (#1317).
+        corrupt.add(logicalKey);
       }
-      // else: corrupt — skip, exactly as before.
     }
     hydrated = true;
     // Close the landing-tracking window and reclassify (#454 B). Set membership alone (whether a
@@ -943,6 +960,7 @@ function del(key: string): void {
   cache.delete(key);
   unreadable.delete(key); // #630 — explicit deletion is allowed even for a protected key; a
                           // later set() on this key must then behave normally again.
+  corrupt.delete(key);    // #1317 — the delete reaches the corrupt entry; nothing left to list
   dirty.add(key); // dirty with no cache entry ⇒ backend.remove
   scheduleFlush();
 }
@@ -953,6 +971,27 @@ function keys(): string[] {
   return [...cache.keys()];
 }
 
+/** Every logical key present in this namespace, INCLUDING one protected by an unreadable save
+ *  (#1276) and one whose stored entry is corrupt (#1317) — i.e. every name a delete can still
+ *  reach on disk, readable or not. (The name predates the corrupt case; a corrupt key is NOT
+ *  protected — `isProtected()` stays false for it and `set()` overwrites it.) The counterpart to `keys()`, for the one thing `keys()` cannot serve: a caller
+ *  DELETING a set of keys rather than reading them.
+ *
+ *  ⚠️ **A prefix sweep must use this, not `keys()`.** `keys()` answers "what can I read", which is
+ *  the right answer for every reader and the wrong one for a wipe: a key this build cannot decode
+ *  is still on disk, still occupies its logical name, and `del()` removes it perfectly well. Court
+ *  wipes `court.session.*` on account deletion by enumerating a prefix, and with `keys()` a session
+ *  written by a NEWER build (then read back after a downgrade) was invisible both to the delete
+ *  loop and to the read-back that CONFIRMS the wipe — so the wipe reported success over a save that
+ *  was still there. `clear()` already compensates for exactly this in its own loop; a targeted
+ *  sweep had no way to.
+ *
+ *  Deliberately NOT folded into `keys()`: every other caller is a reader, and a reader handed a key
+ *  whose `get()` returns `undefined` is the asymmetry `has()`'s comment exists to prevent. */
+function keysIncludingProtected(): string[] {
+  return [...new Set([...cache.keys(), ...unreadable.keys(), ...corrupt])];
+}
+
 /** Remove every key in this namespace. */
 function clear(): void {
   for (const k of cache.keys()) dirty.add(k);
@@ -961,8 +1000,13 @@ function clear(): void {
   // including one this build can't read — explicit deletion is allowed even for a protected key
   // (see `del()`), so mark it dirty too and drop the protection.
   for (const k of unreadable.keys()) dirty.add(k);
+  // #1317 — a corrupt entry is in neither `cache` nor `unreadable`, and is still on disk. Same
+  // rule: every key means every key, garbage included (owner, 2026-09-17 — a truncated session
+  // write can still hold readable player data, so an account wipe must reach it).
+  for (const k of corrupt) dirty.add(k);
   cache.clear();
   unreadable.clear();
+  corrupt.clear();
   scheduleFlush();
 }
 
@@ -1104,6 +1148,7 @@ export const PlayerPrefs = {
   has,
   delete: del,
   keys,
+  keysIncludingProtected,
   clear,
   flush,
   isHydrated,
@@ -1151,6 +1196,7 @@ export function resetPlayerPrefsForTest(): void {
   dirty.clear();
   inFlight.clear();
   unreadable.clear(); // #630 — else a protected key leaks between tests
+  corrupt.clear();    // #1317 — same
   writeChain = Promise.resolve();
   initChain = Promise.resolve();
 }

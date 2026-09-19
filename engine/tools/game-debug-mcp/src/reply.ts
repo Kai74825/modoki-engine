@@ -14,13 +14,17 @@ export function parseReply<T>(raw: unknown): T {
  *  transport resolves as a normal `result`. Detect that convention so `device_eval`/`device_tap`/
  *  `device_drag` flag `isError` instead of reporting success (F9/F15). */
 export function isDeviceError(v: unknown): v is string {
-  return typeof v === 'string' && (v.startsWith('Error:') || v.startsWith('Unknown method:'));
+  // Not a bare `startsWith`: the backend fronts a synthetic-fallback reply with a banner line, a
+  // refusal included, and the prefix test read every such refusal as a success (#1223 P3).
+  return isDeviceFailureText(v);
 }
 
 // ── device_console_logs reply shape (#644) ─────────────────────────────────
 export type ConsoleLogEntry = { level: string; args: string[]; timestamp: number };
 export type ConsoleLogsReply =
-  | { ok: true; logs: ConsoleLogEntry[]; dropped: number }
+  /** `ringTotal`/`byLevel` (#1214) describe the whole ring, level filter ignored — absent from an app
+   *  built before them, so they stay optional rather than defaulting to a false 0. */
+  | { ok: true; logs: ConsoleLogEntry[]; dropped: number; ringTotal?: number; byLevel?: Record<string, number> }
   | { ok: false; got: string };
 
 /** Shape-tolerant parse of `handleConsoleLogs`'s (`engine/app/debug/bridge.ts`) reply.
@@ -41,8 +45,12 @@ export function parseConsoleLogsReply(raw: unknown): ConsoleLogsReply {
   if (v == null) return { ok: true, logs: [], dropped: 0 }; // an empty ring is an ANSWER, not a failure
   if (Array.isArray(v)) return { ok: true, logs: v as ConsoleLogEntry[], dropped: 0 }; // pre-6f5e81b48 bridge
   if (typeof v === 'object' && 'logs' in v && Array.isArray((v as { logs: unknown }).logs)) {
-    const obj = v as { logs: ConsoleLogEntry[]; dropped?: unknown };
-    return { ok: true, logs: obj.logs, dropped: typeof obj.dropped === 'number' ? obj.dropped : 0 };
+    const obj = v as { logs: ConsoleLogEntry[]; dropped?: unknown; ringTotal?: unknown; byLevel?: unknown };
+    return {
+      ok: true, logs: obj.logs, dropped: typeof obj.dropped === 'number' ? obj.dropped : 0,
+      ...(typeof obj.ringTotal === 'number' ? { ringTotal: obj.ringTotal } : {}),
+      ...(obj.byLevel && typeof obj.byLevel === 'object' && !Array.isArray(obj.byLevel) ? { byLevel: obj.byLevel as Record<string, number> } : {}),
+    };
   }
   return { ok: false, got: describeShape(v) };
 }
@@ -80,6 +88,142 @@ export function parseNativeLogsReply(raw: unknown): NativeLogsReply {
 // not cost this file the "no MCP-SDK dependency" property its header promises.
 export { describeShape } from '../../shared/mcpResult.js';
 import { describeShape } from '../../shared/mcpResult.js';
+import { isDeviceFailureText } from '../../shared/deviceRefusal.js';
+import type { BackendIdentity } from '../../shared/identity.js';
+
+// ── device_list reply shape (#1211 C-21) ───────────────────────────────────
+/** `clone` is typed as the route sends it, but the decoder does not require it: the claims file is
+ *  hand-editable, and `describeClaim` renders a record without one as unreadable. */
+export type DeviceListClaim = { deviceId: string; clone: string; branch: string; pid: number; guid?: string; at: number; label?: string; purpose?: string; owner?: string };
+
+export type DeviceListReply = {
+  /** `name` is what the PHONE calls itself ("Galaxy A23 5G"); `model` is only ever the model CODE
+   *  ("SC_56C"), which is the string a human cannot match to a handset on the desk. Prefer `name`
+   *  wherever one is shown, and fall back to `model` — a device that would not answer has neither. */
+  android: Array<{ serial: string; state: string; model?: string; name?: string; transportId?: string; usable: boolean; claim: DeviceListClaim | null }>;
+  /** `devicectl` is set when `xcrun devicectl` itself listed the device (iOS 17+/CoreDevice) —
+   *  absent for one only the legacy `xctrace` listing can see (#143). It is what the editor's
+   *  Build-menu target picker reads to decide a hands-free install vs an Xcode handoff (#170). */
+  ios: Array<{ udid: string; name: string; connected: boolean; productType?: string; osVersion?: string; devicectl?: boolean; claim: DeviceListClaim | null }>;
+  /** Claims keyed by WiFi address (`ip:<host>`) — no hardware row exists for these, so they would be
+   *  invisible in either list above without being surfaced separately. */
+  otherClaims: DeviceListClaim[];
+  adb: { present: boolean; path?: string };
+  /** Present only when adb is absent — "no adb" and "no Android devices" are different problems
+   *  with different fixes, so this is a field, not folded into an empty `android` array. */
+  note?: string;
+  /** The iOS counterpart (#1096): present only when `ios` is EMPTY *and* a listing source broke, so
+   *  an empty list is never reported as "no iPhone attached" when nobody actually managed to look. */
+  iosNote?: string;
+  /** WHO ASKED — the editor process answering the route. Absent from a backend older than the field;
+   *  without it a claim cannot be told apart from a sibling's, so it is rendered as one. */
+  self?: { clone: string; pid: number };
+};
+
+/** Decode `/api/device/list` (§9-bis, #1211 C-21). Only the keys the renderer dereferences without a
+ *  guard are required — a missing one used to throw into `caughtFailure` ("relaunch the app") or,
+ *  worse, read as an empty listing. `self` and the notes are optional because older backends omit them. */
+export function decodeDeviceListReply(raw: unknown): { ok: true; reply: DeviceListReply } | { ok: false; got: string } {
+  const v = parseReply<unknown>(raw);
+  const isObj = (x: unknown): x is Record<string, unknown> => typeof x === 'object' && x !== null && !Array.isArray(x);
+  // A claim only has to be an OBJECT: the claims file is hand-editable and `readClaims` checks only
+  // `deviceId`, so one corrupt record must not turn the whole listing into "restart the editor".
+  // `describeClaim` renders a record with no `clone` as unreadable instead.
+  const claimOk = (c: unknown) => c === null || isObj(c);
+  if (
+    isObj(v)
+    && Array.isArray(v.android) && v.android.every((d) => isObj(d) && typeof d.serial === 'string' && claimOk(d.claim ?? null))
+    && Array.isArray(v.ios) && v.ios.every((d) => isObj(d) && typeof d.udid === 'string' && claimOk(d.claim ?? null))
+    && Array.isArray(v.otherClaims) && v.otherClaims.every((c) => isObj(c) && typeof c.deviceId === 'string' && claimOk(c))
+    && isObj(v.adb) && typeof v.adb.present === 'boolean'
+  ) {
+    const self = isObj(v.self) && typeof v.self.clone === 'string' && typeof v.self.pid === 'number'
+      ? { clone: v.self.clone, pid: v.self.pid } : undefined;
+    return { ok: true, reply: { ...(v as unknown as DeviceListReply), self } };
+  }
+  return { ok: false, got: describeShape(v) };
+}
+
+// ── Every editor-backend reply is DECODED (#1313, §9-bis) ────────────────────
+/** What a backend decoder returns. `got` describes the shape it could not read, for the refusal. */
+export type Decoded<T> = { ok: true; value: T } | { ok: false; got: string };
+export type Decoder<T> = (raw: unknown) => Decoded<T>;
+
+const isObject = (x: unknown): x is Record<string, unknown> => typeof x === 'object' && x !== null && !Array.isArray(x);
+
+/** `device_list`'s decoder in the shape the backend helpers take. */
+export const deviceListDecoder: Decoder<DeviceListReply> = (raw) => {
+  const d = decodeDeviceListReply(raw);
+  return d.ok ? { ok: true, value: d.reply } : d;
+};
+
+/** Decode `/api/device/status` — and `/api/device/connect` / `/api/device/disconnect`, which answer
+ *  the same `DeviceConnectStatus`. The fields required are the ones a MISREAD turns into a wrong
+ *  answer rather than a crash: an absent `useAdb` read as "not adb" sent an adb lease down the native
+ *  screenshot path, and an absent `target` on a connected lease read as "no lease". A disconnected
+ *  status may omit `target`: that is the same answer as `null`. */
+export function decodeLeaseStatus(raw: unknown): Decoded<LeaseStatus> {
+  const v = parseReply<unknown>(raw);
+  if (!isObject(v) || typeof v.state !== 'string') return { ok: false, got: describeShape(v) };
+  const t = v.target;
+  const targetOk = t === null || t === undefined
+    ? v.state !== 'connected'
+    : isObject(t) && typeof t.port === 'number' && typeof t.useAdb === 'boolean'
+      && (t.serial === undefined || typeof t.serial === 'string')
+      && (t.udid === undefined || typeof t.udid === 'string');
+  const last = v.lastTarget;
+  if (!targetOk || !(last === null || last === undefined || isObject(last))) {
+    return { ok: false, got: `${describeShape(v)}; target: ${describeShape(t)}` };
+  }
+  return { ok: true, value: { ...(v as unknown as LeaseStatus), target: (t ?? null) as LeaseStatus['target'], lastTarget: (last ?? null) as LeaseStatus['lastTarget'] } };
+}
+
+/** The `/api/device/request` envelope: the device's own reply under `result`, with any sibling
+ *  fields the route adds about the read itself (truncation, `unverified`). Every 2xx the route sends
+ *  carries a `result` KEY — without one, `deviceRequest` handed `undefined` to all the relay tools,
+ *  which read it as a successful empty answer. */
+export type DeviceRequestReply = Record<string, unknown> & { result: unknown };
+export function decodeDeviceRequestReply(raw: unknown): Decoded<DeviceRequestReply> {
+  return isObject(raw) && 'result' in raw
+    ? { ok: true, value: raw as DeviceRequestReply }
+    : { ok: false, got: describeShape(raw) };
+}
+
+/** Decode `/api/identity`. Only `repoRoot` is load-bearing: the wrong-clone check compares it. */
+export function decodeIdentity(raw: unknown): Decoded<BackendIdentity> {
+  return isObject(raw) && typeof raw.repoRoot === 'string'
+    ? { ok: true, value: raw as unknown as BackendIdentity }
+    : { ok: false, got: describeShape(raw) };
+}
+
+/** Decode `/api/toolchain` down to the one part this MCP reads. A missing `adb.present` used to read
+ *  as "adb is not installed". */
+export function decodeToolchain(raw: unknown): Decoded<{ adb: { present: boolean; path?: string } }> {
+  if (isObject(raw) && isObject(raw.adb) && typeof raw.adb.present === 'boolean'
+    && (raw.adb.path === undefined || raw.adb.path === null || typeof raw.adb.path === 'string')) {
+    return { ok: true, value: { adb: { present: raw.adb.present, ...(typeof raw.adb.path === 'string' ? { path: raw.adb.path } : {}) } } };
+  }
+  return { ok: false, got: isObject(raw) ? `${describeShape(raw)}; adb: ${describeShape(raw.adb)}` : describeShape(raw) };
+}
+
+/** The claim half of a `device_list` row. The route's `self` is what tells YOUR clone's claim from a
+ *  sibling's — ignoring it rendered the lease this session holds as "CLAIMED by <some path>", which
+ *  reads as a collision and sends the agent off to find another phone. Same `clone ===` rule as the
+ *  editor's Build-menu `claimNote`. */
+export function describeClaim(c: DeviceListClaim | null, self: DeviceListReply['self']): string {
+  if (!c) return '';
+  if (typeof c.clone !== 'string') return ' — CLAIMED by an unreadable claim record (no clone; check ~/.modoki/device-claims.json)';
+  const why = c.purpose ? `, ${c.purpose}` : '';
+  const trim = (p: string) => p.replace(/[\\/]+$/, '');
+  if (self && trim(c.clone) === trim(self.clone)) {
+    // A CLI claim (#285) carries `pid: 0` and an `owner` token — "pid 0" would name no process.
+    if (c.owner) return ` — held by this clone's CLI (owner ${c.owner}${why})`;
+    return c.pid === self.pid
+      ? ` — held by THIS editor (your lease${why})`
+      : ` — held by this clone, another process (pid ${c.pid}${why})`;
+  }
+  return ` — CLAIMED by ${c.clone} (${c.branch})${why}`;
+}
 
 // ── Input fidelity (#32) ──────────────────────────────────────────────────
 // The literals a device_* reply / device_status line can report. Kept as named constants (rather
@@ -101,7 +245,12 @@ export const TRUSTED_WDA_MECHANISM = 'trusted-wda' as const;
 export interface LeaseStatus {
   state: string;
   /** `useUsb`/`udid`: an iOS lease tunnelled over USB by go-ios (#1065). */
-  target: { host: string; port: number; useAdb: boolean; useUsb?: boolean; udid?: string } | null;
+  guid?: string;
+  /** `serial` (#149): the adb serial the LEASE resolved at connect time — present only for an adb
+   *  target, so a screenshot can be aimed at the SAME phone the lease drives rather than a guessed
+   *  one. `DEVICE_STATUS_TARGET_FIELDS` (mcp-tools.ts) is type-checked equal to these keys, and
+   *  `deviceStatusShape.test.ts` compares that list against `DeviceConnectStatus`. */
+  target: { host: string; port: number; useAdb: boolean; serial?: string; useUsb?: boolean; udid?: string } | null;
   lastTarget: { ip: string; useAdb: boolean; useUsb?: boolean } | null;
   detail?: string;
   /** LIVE probe result (#32) — present only when `state === 'connected'` (a disconnected lease has

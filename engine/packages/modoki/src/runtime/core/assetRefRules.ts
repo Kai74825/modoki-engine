@@ -58,6 +58,86 @@ export function isGuid(ref: string | undefined | null): boolean {
   return GUID_RE.test(ref);
 }
 
+/** A RUNTIME guid (#1210): the address `spawnEntity` mints for an entity spawned with an empty
+ *  `EntityAttributes.guid`. Shape `00000000-GGGG-GGGG-0000-NNNNNNNNNNNN` — a 32-bit world
+ *  generation, then a 48-bit per-generation spawn counter. Deterministic (same spawn order →
+ *  same guids) and valid only until its world is swapped out.
+ *
+ *  It is an ADDRESS, never a persistent identity. Everything that treats a non-empty guid as
+ *  "this entity is saved/anchored" must read it through {@link durableGuid}, and nothing may
+ *  write one to a file or to storage that outlives the process — the counter restarts, so a
+ *  persisted runtime guid names a DIFFERENT entity next session.
+ *
+ *  Cannot collide with a v4 (`newGuid`): a v4's fourth group starts with the variant nibble
+ *  8-b, never `0`. The all-zero guid is excluded (generation 0 is never minted) because it is
+ *  already a placeholder elsewhere. */
+const RUNTIME_GUID_RE = /^00000000-([0-9a-f]{4})-([0-9a-f]{4})-0000-[0-9a-f]{12}$/i;
+
+export function isRuntimeGuid(ref: string | undefined | null): boolean {
+  if (!ref) return false;
+  const m = RUNTIME_GUID_RE.exec(ref);
+  return !!m && (m[1] !== '0000' || m[2] !== '0000');
+}
+
+/** Format a runtime guid. `generation` must be ≥ 1; both parts are masked to their widths. */
+export function formatRuntimeGuid(generation: number, ordinal: number): string {
+  // Generation 0 formats as the all-zero placeholder shape, which `isRuntimeGuid` REJECTS — so a
+  // 0 (or a wrapped 2^32) would pass every durableGuid guard and tripwire as if it were durable.
+  if (!Number.isInteger(generation) || generation < 1 || generation > 0xffffffff) {
+    throw new RangeError(`formatRuntimeGuid: generation must be 1..0xffffffff (got ${generation})`);
+  }
+  const g = generation.toString(16).padStart(8, '0');
+  // 48 bits exceed the 32-bit ops, so split into a high 16 and low 32.
+  const hi = Math.floor(ordinal / 0x100000000) & 0xffff;
+  const lo = ordinal >>> 0;
+  const n = hi.toString(16).padStart(4, '0') + lo.toString(16).padStart(8, '0');
+  return `00000000-${g.slice(0, 4)}-${g.slice(4)}-0000-${n}`;
+}
+
+/** Parse a runtime guid back into its parts, or null when `ref` is not one. */
+export function parseRuntimeGuid(ref: string | undefined | null): { generation: number; ordinal: number } | null {
+  if (!isRuntimeGuid(ref)) return null;
+  const s = ref as string;
+  const generation = parseInt(s.slice(9, 13) + s.slice(14, 18), 16);
+  const ordinal = parseInt(s.slice(24), 16);
+  return { generation, ordinal };
+}
+
+/** The entity guid if it is DURABLE — safe to persist, to anchor a derivation on, or to treat as
+ *  "this entity already has an identity" — else `''`. A runtime guid reads as `''` here, so every
+ *  fill-if-empty site that routes through this mints a real guid over it instead of keeping it. */
+export function durableGuid(guid: string | undefined | null): string {
+  return guid && !isRuntimeGuid(guid) ? guid : '';
+}
+
+/** Every runtime guid anywhere inside `value` — strings, array items, object values AND object
+ *  keys (`+added.<guid>`-style keys) — with the path it was found at. The tripwire for files and
+ *  storage: a runtime guid must never be persisted (see {@link isRuntimeGuid}). */
+export function findRuntimeGuids(value: unknown, path = ''): { path: string; guid: string }[] {
+  const out: { path: string; guid: string }[] = [];
+  const walk = (v: unknown, p: string, depth: number) => {
+    if (depth > 64) return;
+    if (typeof v === 'string') {
+      // Cheap prefix test first: a scene file holds thousands of strings.
+      if (v.length >= 36 && v.includes('00000000-')) {
+        for (const m of v.matchAll(/00000000-[0-9a-f]{4}-[0-9a-f]{4}-0000-[0-9a-f]{12}/gi)) {
+          if (isRuntimeGuid(m[0])) out.push({ path: p, guid: m[0] });
+        }
+      }
+      return;
+    }
+    if (!v || typeof v !== 'object') return;
+    if (Array.isArray(v)) { v.forEach((item, i) => walk(item, `${p}[${i}]`, depth + 1)); return; }
+    for (const [k, child] of Object.entries(v as Record<string, unknown>)) {
+      const cp = p ? `${p}.${k}` : k;
+      walk(k, `${cp} (key)`, depth + 1);
+      walk(child, cp, depth + 1);
+    }
+  };
+  walk(value, path, 0);
+  return out;
+}
+
 /** Genuinely external resources that are NOT manifest assets and pass through
  *  reference resolution unchanged (remote CDN files, inline data/blob URIs). */
 export function isExternalUrl(ref: string | undefined | null): boolean {
@@ -127,4 +207,66 @@ export function deriveGuid(seed: string): string {
   const part = (n: number) => fnv(n + ':' + seed).toString(16).padStart(8, '0');
   const hex = part(0) + part(1) + part(2) + part(3); // 32 hex chars
   return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20, 32)}`;
+}
+
+/** The guid a prefab-instance MEMBER derives on load: `anchor` is the durable guid of its nearest
+ *  guid-carrying ancestor, `path` the step ids from just below that ancestor down to the member
+ *  ({@link memberStepId}; a keyed added node steps as `'+' + key` — `addedKeyStep`, #1387, which
+ *  cannot collide with a numeric step, so every numeric path hashes exactly as it always did). The ONE spelling of the rule — `deriveInstanceMemberGuids` applies it on
+ *  load, and both duplicate paths (`remintSceneEntityGuids` for a scene file, `regenerateSnapshotGuids`
+ *  for an editor subtree) predict it with it, so a copy's refs land where a reload puts the members. */
+export function deriveMemberGuid(anchor: string, path: readonly (number | string)[]): string {
+  return deriveGuid(`${anchor}|${path.join('.')}`);
+}
+
+/** A template-keyed added node's step in {@link deriveMemberGuid}'s path (#1387; see
+ *  `templateIdentity.ts`). The `+` keeps it disjoint from every numeric localId step, which is what
+ *  leaves every existing derived guid unchanged. */
+export function addedKeyStep(key: string): string {
+  return `+${key}`;
+}
+
+/** A member's step in {@link deriveMemberGuid}'s path: its `PrefabInstance.localId` — EXCEPT a
+ *  nested-instance root, whose localId is the (shared) inner root id; its distinguishing position is
+ *  `parentLocalId` (which OUTER row produced it). An entity with no `PrefabInstance` steps by 0. */
+export function memberStepId(pi: { localId?: number; parentLocalId?: number } | null | undefined): number {
+  return pi ? (pi.parentLocalId || pi.localId || 0) : 0;
+}
+
+/** `value` with every string VALUE that is a key of `remap` replaced by its mapped value — the
+ *  reference half of a duplicate, wherever the reference sits (`parentId`, any registry `entityRef`
+ *  field including a game's own, `UIAction.bindings[].target`). A walk rather than a field list, so a
+ *  newly registered ref field needs nothing kept in sync. Object KEYS are not rewritten. Arrays and
+ *  PLAIN objects are copied only where something inside them changed; anything else (a class
+ *  instance, a typed array) is returned as-is, because the editor hands the result to live trait
+ *  stores. Callers must not put `''` in `remap`, or every empty string would be rewritten. */
+export function remapGuidValues(value: unknown, remap: ReadonlyMap<string, string>): unknown {
+  return mapStringValues(value, (s) => remap.get(s) ?? s);
+}
+
+/** `value` with every string VALUE replaced by `fn(value)` — the walk under `remapGuidValues`, and
+ *  under the template member-token rebase (`templateRefs.ts`, #1352). Same copy-on-write rules:
+ *  object KEYS are not rewritten; arrays and PLAIN objects are copied only where something inside
+ *  them changed; anything else is returned as-is. */
+export function mapStringValues(value: unknown, fn: (s: string) => string): unknown {
+  if (typeof value === 'string') return fn(value);
+  if (Array.isArray(value)) {
+    const out = value.map((v) => mapStringValues(v, fn));
+    return out.some((v, i) => v !== value[i]) ? out : value;
+  }
+  if (value && typeof value === 'object') {
+    const proto = Object.getPrototypeOf(value);
+    if (proto !== Object.prototype && proto !== null) return value;
+    const entries = Object.entries(value);
+    const mapped = entries.map(([, v]) => mapStringValues(v, fn));
+    if (mapped.every((v, i) => v === entries[i]![1])) return value;
+    // Every key is DEFINED, not assigned: a parsed document can carry an own `__proto__` key, which
+    // `out[k] = v` would turn into a prototype assignment instead of a copied field.
+    const out: Record<string, unknown> = {};
+    entries.forEach(([k], i) => {
+      Object.defineProperty(out, k, { value: mapped[i], enumerable: true, writable: true, configurable: true });
+    });
+    return out;
+  }
+  return value;
 }

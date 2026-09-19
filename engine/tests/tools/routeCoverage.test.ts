@@ -53,6 +53,8 @@ const EXTRA_ROUTES: Record<string, string[]> = {
 const NO_TOOL_BY_DESIGN: Record<string, string> = {
   // ── consumed by the tool layer itself, so they need no tool of their own ──
   '/api/read-meta': "the EDITOR's own disk read of a .meta.json — `readMetaPreferringPark` (renderer) and the /api/asset-meta fallback both call it. The agent's read is `modoki_get_asset_meta` -> /api/asset-meta, which PREFERS a parked Inspector edit; pointing a tool at this one would hand an agent the pre-edit file and call it the answer (#872)",
+  '/api/prefab-member-paths': "the RENDERER's half of an applied prefab move (#1437): Apply re-parents a row, and this route repairs the member refs every other scene and prefab stores. It needs the prefab document as it was BEFORE the write, which only the renderer holds, so the agent's way in is modoki_prefab { prefabAction: 'apply' }, whose response reports it as fileRepair",
+  '/api/scene-save-as': "the RENDERER's half of modoki_save_all { path } to another file (#1414): the editor serializes the live world and this route writes it as a copy under a fresh scene id. It takes the serialized scene as input, which only the renderer holds, so the agent's way in is modoki_save_all",
   '/api/identity': "the once-per-process identity probe in context.ts; `modoki_identity` answers FROM it, which is why that contract declares route:null",
   '/api/dev-server-identity': 'the dev server\'s own identity, for the wrong-clone banner',
   '/api/module-url': "consumed by modoki_eval's second-module-instance warning and by `modoki.import()` inside an eval (#1155); a standalone tool would only restate what the warning already says at the moment it matters",
@@ -67,7 +69,7 @@ const NO_TOOL_BY_DESIGN: Record<string, string> = {
   '/api/device/request': 'the device lease data plane — every device_* tool proxies through it, asserted in deviceToolCoverage.test.ts',
 
   // ── native OS dialogs: a BLOCKING panel an agent must never open ──
-  '/api/pick-path': 'opens a native file picker — modal, and only a human can dismiss one. #288 gap 5 routed the agent AROUND this (modoki_create_registered_asset takes an explicit path) precisely because a blocking osascript panel made the New-X surface agent-unreachable',
+  '/api/pick-path': 'opens a native file picker — modal, and only a human can dismiss one. #288 gap 5 routed the agent AROUND this (modoki_create_registered_asset takes an explicit path) precisely because a modal native panel made the New-X surface agent-unreachable (and until #1440 it was an osascript child that also blocked the backend)',
   '/api/save-dialog': 'native save panel — same blocking-modal reason',
   '/api/reveal-in-finder': 'opens Finder/Explorer on the human\'s desktop; nothing to read back',
   '/api/open-file': 'hands a file to the OS default application — a human affordance with no agent-observable result',

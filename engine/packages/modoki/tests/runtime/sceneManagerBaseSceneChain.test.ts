@@ -12,7 +12,7 @@
  *  sceneManagerLifecycle.test.ts's rationale — this needs its own careful world
  *  budget given how many loadScene calls a chain scenario drives. */
 
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { trait } from 'koota';
 import { completeResponse } from '../stubs/assetResponse';
 
@@ -141,21 +141,6 @@ function defineBase() {
   };
 }
 
-/** Same as defineBase(), but the base ALSO contains a prefab-instance entity —
- *  used to test the "editor bookkeeping may not survive a carry" warning. */
-function defineBaseWithPrefabInstance() {
-  fetchResponses['/base.json'] = {
-    id: BASE_GUID,
-    version: 10,
-    resources: [{ type: 'material', path: M('/materials/base.mat.json') }],
-    entities: [
-      { id: 1, traits: { Transform: { x: 0 }, EntityAttributes: { name: 'Camera', parentId: 0, guid: BASE_CAMERA_GUID }, Renderable3D: { mesh: '', material: M('/materials/base.mat.json') } } },
-      { id: 2, traits: { Time: { delta: 0, elapsed: 0, frame: 0, timeScale: 1 }, EntityAttributes: { name: 'Time', parentId: 0 } } },
-      { id: 3, traits: { Transform: { x: 0 }, EntityAttributes: { name: 'FishInstance', parentId: 0 }, PrefabInstance: true } },
-    ],
-  };
-}
-
 function defineLevel1() {
   fetchResponses['/level1.json'] = {
     id: '20000000-0000-4000-8000-000000000001',
@@ -205,9 +190,20 @@ beforeEach(async () => {
   manifest.registerAsset(BASE_GUID, '/base.json', 'scene');
 });
 
+// koota caps live worlds at 16 per process, and this file drives many loads: release each test's
+// last world, as sceneManagerLifecycle.test.ts does (its header says why a budget cannot be rationed
+// per `it`). Captured per test because `vi.resetModules()` gives each one its own world module.
+let releaseWorld: (() => void) | null = null;
+afterEach(() => {
+  try { releaseWorld?.(); } catch { /* a test destroyed it itself */ }
+  releaseWorld = null;
+});
+
 async function getSceneManager() {
   const mod = await import('../../src/runtime/scene/SceneManager');
   mod.sceneManager.resetForTesting();
+  const world = await import('../../src/runtime/core/ecs/world');
+  releaseWorld = () => { (world.getCurrentWorld() as { destroy?: () => void } | null)?.destroy?.(); };
   return mod;
 }
 async function getWorld() { return import('../../src/runtime/core/ecs/world'); }
@@ -222,7 +218,7 @@ describe('SceneManager base-scene chain — additive load + carry-across-swap', 
 
     const world = getCurrentWorld();
     const names: string[] = [];
-    world.query(EntityAttributes).updateEach(([attr]: any[]) => names.push((attr as any).name));
+    world.query(EntityAttributes).updateEach(([attr]: any[]) => { const n = (attr as { name: string }).name; if (n) names.push(n); }); // unnamed = a materialized Time/Input (#1248)
     expect(names.sort()).toEqual(['Camera', 'Level1Thing', 'Time']);
 
     // Base-origin entities are stamped with the base's guid; the level's own
@@ -247,8 +243,10 @@ describe('SceneManager base-scene chain — additive load + carry-across-swap', 
     // The swap to a level sharing the base carries the base (no reload) and
     // respawns the snapshot — still exactly one clear for the new world.
     markCounters.clearAllCalls = 0;
-    await sceneManager.loadScene('/level2.json');
+    const swap = await sceneManager.loadScene('/level2.json');
     expect(markCounters.clearAllCalls).toBe(1);
+    // #1417: the level→level swap reports the carried base, the case the editor's dirty flag needs.
+    expect([...swap.keptBaseGuids]).toEqual([BASE_GUID]);
   });
 
   it('opening a level standalone still works — the base loads with it', async () => {
@@ -256,7 +254,7 @@ describe('SceneManager base-scene chain — additive load + carry-across-swap', 
     const { getCurrentWorld } = await getWorld();
     await sceneManager.loadScene('/level2.json');
     const names: string[] = [];
-    getCurrentWorld().query(EntityAttributes).updateEach(([attr]: any[]) => names.push((attr as any).name));
+    getCurrentWorld().query(EntityAttributes).updateEach(([attr]: any[]) => { const n = (attr as { name: string }).name; if (n) names.push(n); }); // unnamed = a materialized Time/Input (#1248)
     expect(names.sort()).toEqual(['Camera', 'Level2Thing', 'Time']);
   });
 
@@ -292,7 +290,7 @@ describe('SceneManager base-scene chain — additive load + carry-across-swap', 
 
     // Level1's own entity is gone; level2's is present.
     const names: string[] = [];
-    world2.query(EntityAttributes).updateEach(([attr]: any[]) => names.push((attr as any).name));
+    world2.query(EntityAttributes).updateEach(([attr]: any[]) => { const n = (attr as { name: string }).name; if (n) names.push(n); }); // unnamed = a materialized Time/Input (#1248)
     expect(names).not.toContain('Level1Thing');
     expect(names).toContain('Level2Thing');
   });
@@ -374,36 +372,36 @@ describe('SceneManager base-scene chain — additive load + carry-across-swap', 
     expect(base?.guid).toBe(BASE_GUID);
   });
 
-  // ── Phase 5 "editor bookkeeping" warning — fires on the CARRY, not on every fresh load ──
-
-  it('a base with a prefab instance does NOT warn on its own fresh load', async () => {
-    defineBaseWithPrefabInstance();
-    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+  /** #1427 — the carry snapshot is built from the trait registry, so the UNREGISTERED markers were
+   *  silently dropped: `Transient` (what keeps a runtime subtree out of a save) and `TemplateAddedKey`
+   *  (how a template-added node is named). Asserted per entity, like the marks above, so a marker
+   *  landing on the wrong carried entity fails too. Mutation: drop the `restoreMarkers` call in the
+   *  carry respawn's `onEntitySpawned`. */
+  it('carries the unregistered markers across a swap, attributed to the right entity (#1427)', async () => {
     const { sceneManager } = await getSceneManager();
+    const { getCurrentWorld } = await getWorld();
+    const { Transient } = await import('../../src/runtime/core/traits/Transient');
+    const { TemplateAddedKey } = await import('../../src/runtime/core/templateIdentity');
+    const KEY = 'dddddddd-0000-4000-8000-00000000142a';
+    const byName = (world: any) => {
+      const out = new Map<string, any>();
+      world.query(EntityAttributes).updateEach(([attr]: any[], e: any) => out.set((attr as any).name, e));
+      return out;
+    };
 
     await sceneManager.loadScene('/level1.json');
+    const before = byName(getCurrentWorld());
+    before.get('Camera')!.add(Transient);
+    before.get('Time')!.add(TemplateAddedKey({ key: KEY }));
 
-    expect(warn.mock.calls.some(([msg]) => typeof msg === 'string' && msg.includes('editor'))).toBe(false);
-    warn.mockRestore();
-  });
+    await sceneManager.loadScene('/level2.json'); // carries the base
 
-  it('warns exactly when a base containing a prefab instance is CARRIED across a swap, not before', async () => {
-    defineBaseWithPrefabInstance();
-    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
-    const { sceneManager } = await getSceneManager();
-
-    // Fresh load of level1 — base loads fresh too. No carry has happened yet.
-    await sceneManager.loadScene('/level1.json');
-    expect(warn.mock.calls.some(([msg]) => typeof msg === 'string' && msg.includes('does not survive this carry'))).toBe(false);
-
-    // Swap to level2, which shares the SAME base guid — the base is now CARRIED
-    // (kept, not freshly reloaded). This is the moment bookkeeping actually gets lost.
-    await sceneManager.loadScene('/level2.json');
-    expect(warn.mock.calls.some(([msg]) =>
-      typeof msg === 'string' && msg.includes('/base.json') && msg.includes('does not survive this carry'),
-    )).toBe(true);
-
-    warn.mockRestore();
+    const after = byName(getCurrentWorld());
+    expect(after.get('Camera')).toBeDefined();
+    expect(after.get('Camera')!.has(Transient)).toBe(true);
+    expect(after.get('Camera')!.has(TemplateAddedKey)).toBe(false);
+    expect(after.get('Time')!.has(Transient)).toBe(false);
+    expect((after.get('Time')!.get(TemplateAddedKey) as { key: string } | undefined)?.key).toBe(KEY);
   });
 
   it('a resolved base hop re-registers its guid→path mapping, so a LATER chain walk referencing it by guid alone still resolves (338b1446 torn-read-race fix)', async () => {
@@ -453,7 +451,7 @@ describe('SceneManager base-scene chain — additive load + carry-across-swap', 
     await sceneManager.loadScene('/level-guid-base.json');
 
     const names: string[] = [];
-    getCurrentWorld().query(EntityAttributes).updateEach(([attr]: any[]) => names.push((attr as any).name));
+    getCurrentWorld().query(EntityAttributes).updateEach(([attr]: any[]) => { const n = (attr as { name: string }).name; if (n) names.push(n); }); // unnamed = a materialized Time/Input (#1248)
     // The base's Camera entity must be present — without the fix, chain resolution
     // for '/level-guid-base.json' degrades to primary-only (the guid can't be
     // resolved), silently dropping the base from the world.
@@ -478,7 +476,7 @@ describe('SceneManager base-scene chain — additive load + carry-across-swap', 
     await sceneManager.loadScene('/level3.json');
 
     const names: string[] = [];
-    getCurrentWorld().query(EntityAttributes).updateEach(([attr]: any[]) => names.push((attr as any).name));
+    getCurrentWorld().query(EntityAttributes).updateEach(([attr]: any[]) => { const n = (attr as { name: string }).name; if (n) names.push(n); }); // unnamed = a materialized Time/Input (#1248)
     expect(names).toEqual(['Level3Thing']);
     expect(sceneManager.getLoadedScenes().size).toBe(1);
     expect(getResourceStats().materials['/materials/base.mat.json']).toBeUndefined();
@@ -540,7 +538,8 @@ describe('SceneManager base-scene chain — additive load + carry-across-swap', 
 
   it('A7: a normal reload of the SAME primary keeps (carries) an unchanged-guid base — the fresh file content never reaches the world', async () => {
     const { sceneManager } = await getSceneManager();
-    await sceneManager.loadScene('/level1.json');
+    const first = await sceneManager.loadScene('/level1.json');
+    expect(first.keptBaseGuids.size, 'a first load has nothing to keep').toBe(0);
 
     // Edit the base's file on disk (guid unchanged) and reload the SAME primary.
     // Chain resolution still re-fetches the base's raw bytes (it needs to read the
@@ -555,11 +554,13 @@ describe('SceneManager base-scene chain — additive load + carry-across-swap', 
         { id: 2, traits: { Time: { delta: 0, elapsed: 0, frame: 0, timeScale: 1 }, EntityAttributes: { name: 'Time', parentId: 0 } } },
       ],
     };
-    await sceneManager.loadScene('/level1.json');
+    const second = await sceneManager.loadScene('/level1.json');
+    // #1417: the load REPORTS the keep, because the editor must keep this base's dirty flag.
+    expect([...second.keptBaseGuids]).toEqual([BASE_GUID]);
 
     const { getCurrentWorld } = await getWorld();
     const names: string[] = [];
-    getCurrentWorld().query(EntityAttributes).updateEach(([attr]: any[]) => names.push((attr as any).name));
+    getCurrentWorld().query(EntityAttributes).updateEach(([attr]: any[]) => { const n = (attr as { name: string }).name; if (n) names.push(n); }); // unnamed = a materialized Time/Input (#1248)
     expect(names).not.toContain('CameraEdited'); // stale copy still live
     expect(names).toContain('Camera'); // the ORIGINAL base entity, carried unchanged
   });
@@ -576,17 +577,132 @@ describe('SceneManager base-scene chain — additive load + carry-across-swap', 
         { id: 2, traits: { Time: { delta: 0, elapsed: 0, frame: 0, timeScale: 1 }, EntityAttributes: { name: 'Time', parentId: 0 } } },
       ],
     };
-    await sceneManager.loadScene('/level1.json', { forceReloadBases: [BASE_GUID] });
+    const forced = await sceneManager.loadScene('/level1.json', { forceReloadBases: [BASE_GUID] });
+    expect(forced.keptBaseGuids.has(BASE_GUID), 'a forced base is reloaded, not kept (#1417)').toBe(false);
 
     expect(fetchCalls['/base.json'] ?? 0).toBeGreaterThan(fetchesAfterFirstLoad); // re-fetched
     const { getCurrentWorld } = await getWorld();
     const names: string[] = [];
-    getCurrentWorld().query(EntityAttributes).updateEach(([attr]: any[]) => names.push((attr as any).name));
+    getCurrentWorld().query(EntityAttributes).updateEach(([attr]: any[]) => { const n = (attr as { name: string }).name; if (n) names.push(n); }); // unnamed = a materialized Time/Input (#1248)
     expect(names).toContain('CameraEdited');
     expect(names).not.toContain('Camera'); // the stale entity is gone, not duplicated
     // Still exactly one base entry in the chain, still correctly ROLE'd — forcing a
     // reload doesn't turn the base into a second primary or drop its role.
     const base = [...sceneManager.getLoadedScenes().values()].find((e) => e.role === 'base');
     expect(base?.guid).toBe(BASE_GUID);
+  });
+});
+
+// #1422: a base hot reload (`forceReloadBases`) overtaken by a newer load in its POST-swap tail.
+// The editor adopts each load's outcome after it resolves (serialize.ts `adoptReplacedWorld`, and
+// agentBridge's hot reload through `adoptWorldReloadedFromDisk`), and adopting the hot reload
+// LAST would rebind the undo stack and rebaseline over the newer load's world. That cannot
+// happen, and this pins why: the post-swap tail's only yielding await is the scene managers'
+// `init()`, and the overtaking load's own post-swap `disposeActiveSceneManagers` waits for those
+// same inits. So the hot reload always RESOLVES (a newer load is not a teardown, so no
+// AbortError), and resolves FIRST.
+describe('a base hot reload overtaken in its post-swap tail (#1422)', () => {
+  it('resolves, and resolves BEFORE the load that overtook it, even though that load kept the fresh base', async () => {
+    const { sceneManager } = await getSceneManager();
+    const managers = await import('../../src/runtime/managers/managerRegistry');
+    managers.__resetManagersForTesting();
+    let release = () => {};
+    const hang = new Promise<void>((r) => { release = r; });
+    let inits = 0;
+    // Resolves for the first load; the hot reload's re-init (the 2nd) is held open.
+    managers.registerManager({ name: 'slowLevel1', scenes: ['level1'], init: () => (++inits === 2 ? hang : undefined) });
+    try {
+      await sceneManager.loadScene('/level1.json');
+      const order: string[] = [];
+      const hot = sceneManager.loadScene('/level1.json', { forceReloadBases: [BASE_GUID] })
+        .then((r) => { order.push('hot'); return r; }, (e: unknown) => { order.push('hot-rejected'); throw e; });
+      await vi.waitFor(() => { if (inits < 2) throw new Error('hot reload not yet in its post-swap tail'); });
+      const next = sceneManager.loadScene('/level2.json').then((r) => { order.push('next'); return r; });
+      // Let the overtaking load run as far as it can on its own before the held init settles.
+      for (let i = 0; i < 50; i++) await new Promise((r) => setTimeout(r, 0));
+      expect(order, 'the overtaking load must not finish while the hot reload is still in its tail').toEqual([]);
+      release();
+      const [hotResult, nextResult] = await Promise.all([hot, next]);
+      expect(order).toEqual(['hot', 'next']);
+      expect(hotResult.keptBaseGuids.has(BASE_GUID), 'the forced base was reloaded').toBe(false);
+      expect(nextResult.keptBaseGuids.has(BASE_GUID), 'the overtaking load kept the FRESH base').toBe(true);
+    } finally {
+      release();
+      managers.__resetManagersForTesting();
+    }
+  });
+
+  // The PRE-swap half (#1422 close-out review, reproduced): the hot reload is overtaken while still
+  // fetching, so it rejects with an AbortError and never reloads the changed base. The overtaking
+  // load (an editor scene open, with no `forceReloadBases` of its own) used to find the base in both
+  // chains and KEEP the stale live copy, and nothing re-queued the change, so the external write was
+  // lost and a later save wrote the stale base over it. The overtaking load now inherits the forced
+  // base (SceneManager step 1).
+  it('a load that overtakes it BEFORE its swap inherits the forced base, so the disk change is not lost', async () => {
+    const { sceneManager } = await getSceneManager();
+    await sceneManager.loadScene('/level1.json');
+    const base = fetchResponses['/base.json'] as { entities: Array<{ traits: { Transform: { x: number } } }> };
+    base.entities[0].traits.Transform.x = 99; // the external write to the base's file
+    const hot = sceneManager.loadScene('/level1.json', { forceReloadBases: [BASE_GUID] });
+    const hotSettled = hot.then(() => 'resolved', (e: unknown) => (e as { name?: string }).name);
+    const next = await sceneManager.loadScene('/level2.json');
+    expect(await hotSettled, 'fixture: the hot reload was overtaken before its swap').toBe('AbortError');
+    expect(next.keptBaseGuids.has(BASE_GUID), 'the base is reloaded from disk, not carried').toBe(false);
+    const { getCurrentWorld } = await getWorld();
+    let cameraX: number | undefined;
+    getCurrentWorld().query(EntityAttributes, Transform).updateEach(([attr, t]: any[]) => {
+      if ((attr as { name: string }).name === 'Camera') cameraX = (t as { x: number }).x;
+    });
+    expect(cameraX, 'the live base shows the external write').toBe(99);
+  });
+
+  const cameraXNow = async (): Promise<number | undefined> => {
+    const { getCurrentWorld } = await getWorld();
+    let x: number | undefined;
+    getCurrentWorld().query(EntityAttributes, Transform).updateEach(([attr, t]: any[]) => {
+      if ((attr as { name: string }).name === 'Camera') x = (t as { x: number }).x;
+    });
+    return x;
+  };
+  const writeBaseCameraX = (x: number) => {
+    (fetchResponses['/base.json'] as { entities: Array<{ traits: { Transform: { x: number } } }> }).entities[0].traits.Transform.x = x;
+  };
+  const settle = (p: Promise<unknown>) => p.then(() => 'resolved', (e: unknown) => (e as { name?: string }).name ?? 'rejected');
+
+  // Close-out §2d review: a base reload followed by two prefab reloads is a CHAIN — each supersedes
+  // the last before its swap, and only the forced one carries `forceReloadBases`.
+  it('the forced base survives a CHAIN of pre-swap supersedes (A forced → B → C)', async () => {
+    const { sceneManager } = await getSceneManager();
+    await sceneManager.loadScene('/level1.json');
+    writeBaseCameraX(99);
+    const a = settle(sceneManager.loadScene('/level1.json', { forceReloadBases: [BASE_GUID] }));
+    const b = settle(sceneManager.loadScene('/level1.json'));
+    const c = await sceneManager.loadScene('/level2.json');
+    expect([await a, await b], 'fixture: A and B were both overtaken before their swaps').toEqual(['AbortError', 'AbortError']);
+    expect(c.keptBaseGuids.has(BASE_GUID)).toBe(false);
+    expect(await cameraXNow()).toBe(99);
+  });
+
+  // Close-out §2d review: the load that inherited the forced base can itself FAIL (a bad path, a
+  // scene format that is too new). The file is still changed, so the next load must reload it.
+  it('the forced base survives an inheriting load that FAILS, and applies to the next load', async () => {
+    const { sceneManager } = await getSceneManager();
+    await sceneManager.loadScene('/level1.json');
+    writeBaseCameraX(99);
+    const hot = settle(sceneManager.loadScene('/level1.json', { forceReloadBases: [BASE_GUID] }));
+    await expect(sceneManager.loadScene('/nope.json'), 'fixture: the inheriting load fails').rejects.toBeTruthy();
+    expect(await hot).toBe('AbortError');
+    expect(await cameraXNow(), 'fixture: nothing reloaded the base yet').toBe(0);
+    const next = await sceneManager.loadScene('/level2.json');
+    expect(next.keptBaseGuids.has(BASE_GUID)).toBe(false);
+    expect(await cameraXNow()).toBe(99);
+  });
+
+  it('a load that overtakes nothing still KEEPS a shared base — the inheritance is only from a superseded load', async () => {
+    const { sceneManager } = await getSceneManager();
+    await sceneManager.loadScene('/level1.json');
+    await sceneManager.loadScene('/level1.json', { forceReloadBases: [BASE_GUID] }); // completes: nothing left to inherit
+    const next = await sceneManager.loadScene('/level2.json');
+    expect(next.keptBaseGuids.has(BASE_GUID)).toBe(true);
   });
 });

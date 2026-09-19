@@ -344,7 +344,8 @@ unsaved-work refusal, unlike `/api/scene-mutate` above). Two things worth knowin
 
   ⚠️ **There are FOUR doors onto `/api/write-meta`, and the path-keyed flag watched one.** It was consulted on
   the park, so it could not see `writeMetaWholesale` — and `EnvironmentAssetView.apply()`'s UltraHDR
-  branch builds `{...(meta ?? {}), environment, environmentCache}` and writes it without parking,
+  branch built `{...(meta ?? {}), environment, environmentCache}` and wrote it without parking
+  (that door closed in #1314 — Apply now converts through `/api/reimport`),
   with its `loadMeta` dropping the read's `ok` and its Apply button disabled only while `importing`,
   never on a failed load. A 500 on the GET, a switch to UltraHDR, one click, and an id-less document
   reached the route. `makeTexture2D` is the precedent that returns early on `!res.ok`, and
@@ -426,7 +427,13 @@ unsaved-work refusal, unlike `/api/scene-mutate` above). Two things worth knowin
   edit there refused with only a console line. Together: the key stops the display, the stamp stops
   anything reaching disk. The key is also what reaches the `.mat.json`-registry views (#897), whose
   `if (!data) return <Loading…/>` gate is honest again once `data` resets — the stamp cannot see
-  that registry at all.
+  that registry at all. It also remounts the modals an asset view owns: the Sprite Editor and the
+  9-slice editor never outlive a texture swap, even when `open-sprite-editor` /
+  `open-nine-slice-editor` re-point an open one. #1328 assumed they did and was closed after a
+  live run. `engine/tests/e2e/editor-texture-modal-swap.spec.ts` goes red without the key, so a
+  modal needs no per-path reset of its own. The flip side, read from source and not driven: moving
+  or renaming the open texture changes `selectedAsset.path` too, which closes an open modal
+  without a prompt and drops its unsaved edits (#1362).
 
   ⚠️ **Two producers outside the read helper re-stamp explicitly rather than being holes in the
   guard.** `VideoAssetView` (the declared raw-read exemption — an exemption from the READ HELPER is
@@ -452,7 +459,9 @@ unsaved-work refusal, unlike `/api/scene-mutate` above). Two things worth knowin
   requires `doc !== null` and so answered *false* for the one state where the panel holds no
   document at all — a thrown read. Apply then encoded the gainmap, committed `~ultrahdr.jpg` and
   replaced the sidecar with an id-less document: #890's destruction, through the door the park-seam
-  guard does not watch. It asks `metaReadPathOf(meta) !== path` now. The other three writers were
+  guard does not watch. It asked `metaReadPathOf(meta) !== path` afterwards, and since #1314 it
+  writes no sidecar at all (both formats convert through `/api/reimport`), so it left the table. The
+  other three writers were
   safe only because each had independently reached for *"did a read land"* rather than *"is this
   the tagged fallback"* — three files right by coincidence, which is what the table converts into
   one thing that is checked.
@@ -467,10 +476,10 @@ unsaved-work refusal, unlike `/api/scene-mutate` above). Two things worth knowin
     indistinguishable from a broken control — the field snaps back, nothing is parked, nothing on
     screen says why, which is exactly what #890's drive saw. The store holds ONE toast slot on a
     3.5s timer, so a per-keystroke field re-shows the same message rather than queueing N.
-    ⚠️ **Four of the eight `.meta.json` refusal sites reach the human, four do not** — counted
+    ⚠️ **Three of the seven `.meta.json` refusal sites reach the human, four do not** — counted
     from the `WRITERS` table in `tests/architecture/wholesaleMetaWriteProvenance.test.ts`, which is
     the only enumeration of this population that cannot go stale, plus `parkMetaEdit`'s two
-    branches. Reaching the human: those two branches, `EnvironmentAssetView.apply()`, and
+    branches. Reaching the human: those two branches and
     `scene/modelImport.ts`, whose `ImportWriteAborted` surfaces as an import-failed toast carrying
     the reason. Console-only: `makeTexture2D`, the Sprite and 9-slice editors' Save, and
     `writeMetaConditional` at the endpoint (`grep -c showToast` is 0 in all four files).
@@ -484,10 +493,11 @@ unsaved-work refusal, unlike `/api/scene-mutate` above). Two things worth knowin
   - **A control that cannot work is DISABLED in one place and left live in the other.**
     `EnvironmentAssetView`'s Apply is `disabled={importing || meta === null}`; the Inspector's
     postprocessor `<select>` stays enabled after a failed read (its `metaLoaded` is set true in the
-    catch) and relies on the refusal plus the toast. The asymmetry is chosen, not overlooked: Apply
-    spends real work before it can fail (a gainmap encode, a multi-MB file write), so offering it
-    is worse than greying it; a dropdown costs nothing to try, and a greyed control with no
-    explanation is its own dead end. Do not "fix" either one into the other without asking.
+    catch) and relies on the refusal plus the toast. The asymmetry is chosen, not overlooked: until
+    the read lands, Apply's panel shows the DEFAULT format rather than the asset's, so offering a
+    conversion it cannot describe is worse than greying it (it no longer writes the sidecar itself
+    since #1314 — the server converts from disk); a dropdown costs nothing to try, and a greyed
+    control with no explanation is its own dead end. Do not "fix" either one into the other without asking.
 
   ⚠️ **What it does NOT fix: #886/#896** — a failed `.mat.json`/`.rig2d.json`/`.anim.json` read
   represented as a loadable DOCUMENT. That is the emptiness face on the dirty-asset registry, and
@@ -799,6 +809,123 @@ CREATE/REGENERATE writes — a new file has to exist on disk for `registerAsset`
 see it. Of those, `SkinEditor`'s auto-rig is the one that matters: it derives `<sprite>.rig2d.json`,
 so re-rigging the same sprite regenerates over a rig that may already have unsaved edits parked.
 
+### A create asks before it replaces, and a Replace keeps the replaced guid (#1264)
+
+Every human create that writes a file goes through ONE primitive, `writeNewAssetDocument`
+(`editor/scene/createAssetDocument.ts`). It writes create-only (`/api/write-file`'s `ifNoneMatch:'*'`),
+asks `confirmReplace` on a 409, and on a yes writes again **under the replaced document's id**. It
+also calls `assetWrittenToDisk`, so the rule above comes with it. The callers are the four editor
+"New" buttons (Animation, Particle, 2D Rig, Sprite Animation), Auto-rig, Create Prefab (Hierarchy
+menu and Assets entity drop), Save Scene As, and — via `createRegisteredAsset` — the Assets panel's
+New X (#1215).
+
+**Why a Replace keeps the id** (owner, 2026-09-15): "Replace" is about the file's content, not about
+breaking what uses it. Before #1264 each of these minted a fresh guid over the existing file, so
+every scene/prefab ref to the old asset dangled.
+
+**Why the check is at the write, not in the save dialog.** The dialog never was a guard. The
+Windows/Linux fallback is a text box with no existence check. The macOS panel checks the name IT
+returned, before `ensureExt`, so typing `Walk` for a `.anim.json` checks `Walk.json`. Three callers
+also derive their path with no dialog at all. And a dialog-time check can go stale before the write,
+while a 409 cannot. `chooseNewAssetPath` returns the `confirmReplace` to use: when the panel already
+checked the exact destination (`scene.json`), it does not ask a second time.
+
+**Two shapes that differ, on purpose:**
+- **Assets → Create Scene asks BEFORE its override** (`mayCreateOver`), because the override
+  discards the live world first and writes last. A 409 would arrive after the damage. This is the
+  one check-then-act.
+- **Create Prefab's undo after a Replace RESTORES the replaced bytes.** It used to trash the path,
+  which deleted the original prefab too. Its undo also puts back the `PrefabInstance` links the tree
+  had BEFORE tagging (snapshotted with `detachPrefabInstance`, keyed by guid): Create Prefab on an
+  instance of the prefab it replaces used to come back from undo unlinked.
+
+  ⚠️ **That snapshot cannot be relied on across a Play→Stop, and the fix was to stop relying on it**
+  (#1272). Once the tree is a prefab, a held nested instance is *owned*-nested, so `serialize.ts`
+  writes no scene entry for it (`parentIsMember && parentLocalId`), its guid never reaches disk, and
+  `deriveInstanceMemberGuids` mints a fresh one from the new root on load. The snapshot's ref then
+  misses and reattach skipped it **silently** — the instance was left plain and the next save dropped
+  its link for good. Chasing the guid was the obvious fix and the wrong one: after a reload the
+  prefab's own rows carry `source === this prefab` while the held instance carries its child
+  prefab's guid, so **`untagEntityTreeAsInstance` takes the source and removes only its own rows**.
+  Undo never destroys the nested link, so nothing needs resolving across the reload. A nested root
+  this prefab owned also loses its `parentLocalId`, since the row that owned it is going away.
+  `reattachPrefabInstance` **returns** how many links it could not put back, and the human path
+  reports them — undo no longer depends on it, but "restored nothing" and "restored everything" must
+  not look alike, which is precisely what kept this invisible. ⚠️ It counts by **outcome, not by
+  ref**: the snapshot is taken with `strip: false`, so it also holds the entities the scoped untag
+  KEEPS, whose guids the reload re-mints. Counting unresolved refs announced a failure over a
+  completely correct undo — the first version of this shipped that way.
+
+  ⚠️ **Two shapes where undo does NOT restore the pre-create world**, both residues rather than
+  regressions (before the scoping they were left fully unlinked, which is worse), both from a nested
+  root whose `parentLocalId` this tagging overwrote and whose re-derived guid then defeats reattach:
+  a nested instance held *inside another held instance* keeps the stamp this Create Prefab wrote, so
+  `serializeScene`'s owned-nested branch (`parentIsMember && parentLocalId`) files its edits as a
+  `nestedOverrides` delta keyed to a row that is not it; and one owned by an OUTER prefab is zeroed
+  rather than returned to the outer row's id, so the user-added branch beside it captures it as an
+  `added` reference node while the outer prefab still expands its own — a duplicated subtree on the
+  next load. The correct rule is "did THIS tagging write my
+  `parentLocalId`?", which is `plan.nestedRefs`; the untag asks "was my nearest linked ancestor
+  stripped?" instead. Not fixed — tracked on #1272.
+
+**The one exception: an agent Save As gets a FRESH id, and overwrites under it (#1414, owner
+2026-09-18).** `modoki_save_all { path }` naming another file than the open scene's writes a copy
+through `/api/scene-save-as`, which stamps a new scene id and re-mints the entity guids exactly as
+Duplicate does (`remintSceneEntityGuids`, with #1293's accepted `Persistent` cost). If a scene is
+already at that path, it is overwritten, and its old id stops resolving. That is deliberate: what
+referenced a scene replaced by Save As no longer resolves. It is not drift from the rule above.
+- **Why not keep an id.** The copy used to take the OPEN scene's id, so two files claimed one guid.
+  The dev scanner heals that by keeping the lexicographically-first path's id and rewriting the
+  other file's (`buildManifest(…, heal=true)`), so it re-minted the COMMITTED original whenever the
+  copy sorted first. Measured on the MCP smoke: `mcp-smoke-save` rewrote `tropical-island`'s id. The
+  smoke case now does exactly that save-as and asserts the original stays byte-identical.
+- **The editor reopens the copy.** The live world still holds the original's scene and entity guids.
+  Left pointing at the copy, the next save would write them straight back into it, so the copy is
+  loaded from disk. Any undo stack kept for the target path is dropped first (`forgetHistory`), since
+  it names guids the copy does not have, and the #124 authored-writes warning is printed before the
+  reopen, because a load clears its records. Before that, every OTHER dirty loaded scene (a base) is
+  written to its own file, because the reopen reloads the chain. If one of those writes fails,
+  nothing is copied. If an edit lands during the write, or the reopen fails, the editor stays on the
+  original, which is still unsaved, and the op answers `PARTIAL`. A failed copy after the bases
+  landed is `PARTIAL` too, naming them.
+- **Not a Save As:** the open scene's own path is a plain save that keeps its id and its on-disk
+  spelling. The client compares strings (case-insensitively, or by the manifest naming the open
+  scene's guid there), which cannot see every spelling of one file: `%20`, `./` and a `/@fs/` form
+  all resolve to it. So the route also compares the two files the DISK resolves (`realpath`) and
+  answers `409 sameFile`, and the client falls back to the plain save, to the path it captured
+  before its awaits (a scene load landing meanwhile is refused as `superseded`, not overwritten).
+  Every other loaded scene is compared the same way and answers `409 targetLoaded`. Without these
+  backstops a second spelling re-minted the ORIGINAL's ids, or a base's (both found in the #1414
+  close-out reviews). A
+  scene with no path yet (`new_scene`) already has a fresh id. A base loaded under the open scene is
+  refused as a target. The human Save As is unaffected: it is offered only for an untitled scene.
+
+**A Replace never crosses KINDS.** The scene flows write plain `.json`, so their destination can be
+`Enemy.prefab.json`. Kept, that guid would be re-registered as a scene, and every `PrefabInstance.source`
+would resolve to a scene document. A destination the manifest types as another kind is refused
+before any question (`otherAssetKindAt`). Only the scene flows pass `kind`: every other create
+enforces a compound extension. A file the manifest has not indexed yet cannot be classified and is
+not refused.
+
+**A case-variant name resolves to the file that is really there** (#1273). On APFS/NTFS the create-only
+check folds case, so `enemy.prefab.json` 409s over `Enemy.prefab.json` — while the manifest keys the
+prefab by its on-disk name, so asking it about the TYPED spelling found no asset and no kind to refuse.
+The 409 (and `/api/exists`) now answer with the existing file's on-disk path (`existingPath` / `path`),
+and `writeNewAssetDocument` / `mayCreateOver` switch to it for every step after the conflict: the kind
+check, the Replace question, the kept guid, the replacing write, the parked-edit drop, and the path the
+caller registers. That last one is why each create caller reads `result.path` rather than the path it
+asked for — registering the typed spelling would give the manifest a second key for one file. The
+spelling comes from `absToAssetUrl`; see "Asset urls take the disk's spelling" below.
+
+**Not verified: stale live display.** A Replace keeps the guid, and `/api/write-file` skips the
+watcher for the editor's own writes. So an entity already showing a replaced particle, clip or rig
+may keep showing the old definition from a guid-keyed runtime cache until the scene reloads. Prefabs
+are not affected: `setPrefabCache` replaces the runtime prefab cache entry with the written bytes (#1308). This came from reading the code
+in the #1264 close-out review, not from an observation.
+
+Guarded by `tests/editor/createWritesAskFirst.test.ts`: no editor function may mint a guid and write
+it with a plain `writeAssetFile`/`postWriteFile`, which is the shape all eight members had.
+
 The collision this rule was written for was measured on the old panel autosave: `particle_set`
 parked v1, a panel-shaped `/api/write-file` put v2 on disk, `dirtyAssetPaths` still listed the path,
 and `save_all` rewrote the file back to **v1** with no warning. That whole class is gone now that
@@ -998,13 +1125,70 @@ they carry deliberately different shapes and collapsing them is a wire change. S
 cause can no longer be **forgotten** — it reaches disk — but it can be left **unnamed in the report**,
 i.e. the work is saved and the toast does not mention it. Stated rather than pretended away.
 
-#### Why `/api/move-file` and `/api/delete-asset` are EXEMPT rather than gated
+#### Why `/api/move-file` is EXEMPT, and `/api/delete-asset` gates only the AGENT
 
-Gating them would refuse a rename *because* the file being renamed has unsaved edits — precisely the
-case the repair exists to carry across. A file must stay renameable while it is being edited. They
-instead repair every path-keyed registry, **by derivation**, and the exemption in
+Gating a move would refuse a rename *because* the file being renamed has unsaved edits — precisely
+the case the repair exists to carry across. A file must stay renameable while it is being edited.
+The route instead repairs every path-keyed registry, **by derivation**, and the exemption in
 `tests/architecture/unsavedGateCoverage.test.ts` is void if that stops being true. "It repairs them"
 was true of the hand-written version too, right up until it was two of three and nothing said so.
+
+`/api/delete-asset` used to share that exemption, and the reasoning did not transfer (#1215 A-7,
+owner 2026-09-15). **A move carries the work across; a delete destroys it.** The repair drops the
+parked writes for the dead path and reports the drop in `repaired` — but that reply goes to whoever
+called, and when the caller is an agent the human whose edit it was is told nothing. That is §8's
+`destroys` consequence, so the agent path now refuses with `REQUIRES_SAVE` (hatch `discardUnsaved`,
+which skips the probe and lets the repair drop the work as before). Three details carry the weight:
+
+- **`rendererWrite:true` exempts the editor's own deletes** — the Assets panel, undo/redo, the Cleanup
+  dialog, the model-import prune. That is the human deleting on purpose, and "deletable while being
+  edited" is still the right rule for them. Same flag and meaning as on `/api/write-meta`.
+- **The probe is global and filtered at the route**, exact path or `folder + '/'`, because a folder
+  delete takes every hold beneath it and the renderer's per-path matchers answer about one path.
+  The match is **case-insensitive** (on APFS/NTFS `/FX/a.json` trashes the file a hold calls
+  `/fx/a.json`), and a path with **no canonical url** — the asset root — counts as containing every
+  hold rather than skipping the probe. Both were found by the close-out review and reproduced. The
+  fold stays even though the candidates now carry the disk's spelling (#1261, below): a path reached
+  through a symlinked folder is still spelled lexically, and a refusal gate that misses is the unsafe
+  direction.
+
+**Asset urls take the disk's spelling (#1261, #1273).** `resolveAssetPath` is lexical, and an fs op on
+its result acts on whichever file matches in any case, while `scanDir` keys the manifest and every
+renderer registry by the on-disk name. So a route answering about a request asks
+`absToAssetUrl(abs, { onDisk: true })`, which spells an EXISTING path the way the disk does
+(`canonicalPath`, i.e. `realpathSync.native`) — and until it did, a case-mismatched move or delete
+repaired no binding (`applyMove` compares exactly) and the next Cmd+S resurrected the file, reporting
+`ok:true` throughout. The callers are the delete and move repair lists, the create-only 409, a
+successful `/api/write-file`'s `path` (a NEW file created in a folder typed in another case lands in the
+folder that exists, so `writeNewAssetDocument` reports and its caller registers that spelling),
+`/api/exists`, `/api/import-file`'s manifest lookup of its own copy (lexically it 422'd a good import
+into a folder named in another case), and `/api/save-dialog`'s `existingPath`. That last route answers
+TWO spellings on purpose: `path` is what the human typed, which `ensureExt` builds the new file's name
+from, and `existingPath` is the file the panel's own Replace question was about, which
+`chooseNewAssetPath` compares against the create's 409 to skip asking twice (`saveDialogReply`, testable
+without a panel). ⚠️ That skip rests on an
+unobserved premise — that the macOS panel's "already exists" check folds case as APFS does. Four
+limits, each deliberate:
+- **The watcher never passes it** (observed by the close-out review). A chokidar path already IS the
+  disk's spelling at its event, so canonicalising can only change it after a rename — and after an
+  out-of-editor `Level.scene.json` → `level.scene.json` it reported the OLD file's `unlink` under the
+  new name. `handleSceneChanged` matches exactly, so a world loaded from `Level` was never told, and
+  its next save wrote the stale world back. An event names what changed; a route names what is there.
+- **Only a case-only difference is taken.** `canonicalPath` resolves symlinks, so a linked folder
+  INSIDE a root canonicalises to its target's name, which `scanDir` never keyed; there the lexical
+  spelling stays. A root reached through a link (`/var` → `/private/var`) is compared against its own
+  canonical form, so it still gets the disk's spelling under its own `urlPrefix`.
+- **A missing path keeps the caller's spelling** — there is no on-disk name to prefer. That is why
+  `/api/move-file` takes the SOURCE url before `moveAssetFile`: afterwards the source is gone.
+- **Not fixed: the write guard key.** `/api/write-file` still fingerprints the request's spelling
+  (`markEditorWrite`), and so does `/api/move-file` for its source and landings. The create flows now
+  write to the on-disk spelling, so they are unaffected; an agent write, or a move INTO a folder named
+  in another case, may reach the watcher as a foreign change and drop a parked edit — unverified.
+
+Cover: `engine/tests/plugins/assetUrlDiskCasing.test.ts`, against the real resolver on a scratch dir,
+skipped on a case-sensitive filesystem where the defect cannot occur.
+- **`liveScene` is not asked.** Trashing the file a live world was loaded from destroys nothing in
+  the world; the next save writes it back. The ledger row narrowed to that registry alone.
 
 #### Incident: Cmd+S under a timeline preview flushed 2 of 3 (#972 P12)
 
@@ -1147,21 +1331,21 @@ path-scoped ask from `/api/validate-prefab` match) and a marker for a genuinely 
 
 ### What is still NOT fixed
 
-- ⚠️ **`/api/move-file` and `/api/delete-asset` repair the park for `dirtyAsset` and `pendingMeta`
-  and NOT `pendingBaseScene`** — `assetEditorBindings.ts` does not reference that registry at all.
-  A moved or deleted `.scene.json` strands its parked baseScene edit on a dead path and it never
-  flushes: edit a baseScene ref, rename the scene, and the edit is silently gone at the next
-  `save_all`. Tracked as **#972**, not #889, because the mechanism is #972's — a consumer
-  hand-enumerating the registries instead of deriving them. ⚠️ **Gating these routes would be the
-  WRONG fix**: it would refuse a rename *because* the file being renamed has unsaved edits, which
-  is the case the repair exists to carry across. The fix is to finish the repair.
+- ~~`/api/move-file` and `/api/delete-asset` repair the park for `dirtyAsset` and `pendingMeta`
+  and NOT `pendingBaseScene`~~ — **fixed by #972**: `PARKED_MOVE_REPAIRS` (`assetEditorBindings.ts`)
+  now covers every path-keyed cause by derivation, `pendingBaseScenes` included. Gating was the
+  wrong fix for a MOVE, which the repair carries across; a DELETE destroys the work instead, and
+  since #1215 its agent path is gated (see "Why `/api/move-file` is EXEMPT" above).
 - These three used to be **prose here and invisible to the guard** — they matched none of
   `CONTENT_CALLS`' trigger symbols, so `unsavedGateCoverage` classified them as nothing and this
   list read as a ledger the guard keeps when for them it was not. Closed in phase 3 by adding
   `moveToTrash`, `moveAssetFile` and `writeFileSync` as triggers. `/api/write-file` came out
-  **exempt**: it has no `contracts.ts` entry, so no agent tool reaches it, and it fingerprints every
-  write through `markEditorWrite` — the same assertion `selfWrite` makes. ⚠️ Void the day it gains
-  an MCP contract.
+  **exempt**: it has no `contracts.ts` entry, so no agent tool calls it directly, and it
+  fingerprints every write through `markEditorWrite` — the same assertion `selfWrite` makes.
+  ⚠️ This said "no agent tool reaches it", which was false: `create_registered_asset`, `prefab
+  create` and `save_all` all reach it THROUGH the renderer (#1215). The exemption survives because
+  each of those writes is issued by the renderer, which holds the registries. ⚠️ Void the day it
+  gains an MCP contract.
 
 ## 6. Prior fix this generalizes
 

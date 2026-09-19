@@ -5,7 +5,26 @@
 
 import fs from 'fs';
 import path from 'path';
-import { execSync } from 'child_process';
+import { execFileSync, type ExecFileSyncOptions } from 'child_process';
+import { withPathEntry, spawnable, whichSync } from '../../toolchain';
+import { loginShellCommandPath } from './loginShellProbe';
+
+const GCLOUD_NAMES = ['gcloud', 'gcloud.cmd'];
+
+/** `env` with the resolved gcloud dir first on PATH — platform delimiter, and a win32 `Path` key
+ *  read rather than shadowed (#1444; see `withPathEntry`). */
+export function withGcloudOnPath<E extends NodeJS.ProcessEnv>(env: E, gcloudDir: string): E {
+  return withPathEntry(env, gcloudDir);
+}
+
+/** `execFileSync('gcloud', args)` that also runs on Windows, where the CLI is `gcloud.cmd`: a bare
+ *  name gets no PATHEXT lookup without a shell, and a `.cmd` needs `shell:true` (docs/windows.md
+ *  § PATHEXT). Resolved against `opts.env.PATH`, so the gcloud dir must already be on it. */
+export function execGcloudSync(args: string[], opts: ExecFileSyncOptions & { env: NodeJS.ProcessEnv }): string | Buffer {
+  const resolved = whichSync('gcloud', { pathEnv: opts.env.PATH ?? '' }) ?? 'gcloud';
+  const s = spawnable(resolved, args);
+  return execFileSync(s.command, s.args, { ...opts, shell: s.shell });
+}
 
 /** Resolve the directory containing the `gcloud` CLI, or null if not installed. A
  *  Finder-launched packaged editor gets a minimal PATH without the Google Cloud SDK, so
@@ -14,10 +33,11 @@ import { execSync } from 'child_process';
  *  editor can't provision (it carries the user's cloud auth) — distinct from the build tools
  *  the toolchain provisions. Exported for unit testing. */
 export function resolveGcloudDir(override?: string): string | null {
-  // An explicit Project Settings override wins (sdk.gcloudPath — the binary OR its dir).
+  // An explicit Project Settings override wins (sdk.gcloudPath — the binary OR its dir). On Windows
+  // the binary is `gcloud.cmd` — what Browse… picks — beside an extensionless bash shim (#1444).
   if (override) {
-    if (fs.existsSync(path.join(override, 'gcloud'))) return override;                 // a bin dir
-    if (fs.existsSync(override) && path.basename(override) === 'gcloud') return path.dirname(override); // the binary
+    if (GCLOUD_NAMES.some((n) => fs.existsSync(path.join(override, n)))) return override; // a bin dir
+    if (fs.existsSync(override) && GCLOUD_NAMES.includes(path.basename(override).toLowerCase())) return path.dirname(override); // the binary
   }
   if (process.platform === 'win32') return null; // web deploy steps are posix-only
   const home = process.env.HOME ?? '';
@@ -30,12 +50,9 @@ export function resolveGcloudDir(override?: string): string | null {
   for (const d of dirs) {
     if (d && fs.existsSync(path.join(d, 'gcloud'))) return d;
   }
-  try {
-    const shell = process.env.SHELL || '/bin/zsh';
-    const out = execSync(`${shell} -ilc 'command -v gcloud'`, { timeout: 4000, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).trim();
-    if (out && fs.existsSync(out)) return path.dirname(out);
-  } catch { /* not found via the login shell */ }
-  return null;
+  // The login shell runs the user's profile, which can ignore SIGTERM and hold a pipe (#1449).
+  const out = loginShellCommandPath('gcloud', process.env, 4000).path;
+  return out && fs.existsSync(out) ? path.dirname(out) : null;
 }
 
 /** OTA Phase 5a — `ota.baseUrl` (e.g. "https://storage.googleapis.com/bucket/prefix") is

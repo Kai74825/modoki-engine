@@ -73,7 +73,7 @@ entity in a new world can too. So a packed-keyed map that nothing sweeps before 
 clears on spawn (`loaders/overrideMarks.ts`, which a prefab rebuild loop drives past 256), and a
 world-swap reset stays load-bearing under a packed key (`games/space-console/runtime/setup.ts`).
 
-**UI state held across user time** — a dialog's subject, the row being renamed, a debug-tree selection —
+**UI state about ONE instance, held across user time** — a dialog's subject, the row being renamed —
 pins its entity with `core/ecs/entityPin.ts`, which records the World object as well as the packed
 value, and drops the pin on a world swap where nothing else re-checks it. A React list keyed by
 entity keys by `uiNodeKey` (`id:generation`, `runtime/ui/uiNodeKey.ts`), or a respawn keeps the dead
@@ -83,9 +83,35 @@ entity's DOM and hook state.
 picker, which run between the pass that fills the cache and the pass that sweeps it — checks a packed owner
 stamped on each entry at every visit, and refuses a dead one: [enact.md](enact.md), the scene-entity row of the aim table (#1197).
 
-**A generation-free `Map<number, …>` / `Set<number>` in `runtime/**` needs a ledger row saying why** —
-`engine/tests/architecture/entityKeyedMaps.test.ts` flags every one at module scope, as a class field
-or as an interface field, with a tagged reason (`not-entity:`, `scratch:`, `revalidated:`, …).
+**A generation-free `Map<number, …>` / `Set<number>` anywhere entity state lives — `runtime/**`, the
+editor, `src/three`, `engine/app`, the starter template, `games/`, `demos/` — needs a ledger row saying why** —
+`engine/tests/architecture/entityKeyedMaps.test.ts` flags every one at module scope, as a class field or
+as an interface field, with a tagged reason (`not-entity:`, `scratch:`, `revalidated:`, …). **A game fixes
+one the engine's way**: `EntityTable`, `packedOf` and `PackedEntity` are exported from
+`@modoki/engine/runtime` (#1198), so the hand-rolled `entity.valueOf()` key is no longer the game-side
+shape. Component state holding an id (`useState<Set<number>>`) is outside the guard by ruling and stays a
+by-hand review.
+
+#### What to hold, decided by what the holder MEANS (#1222, owner decision 2026-09-15)
+
+⚠️ **A GUID is an address, not a lifetime key.** Every place that remembers an entity beyond one loop
+or one frame picks its key from this table:
+
+| The code holds… | Key | Why |
+|---|---|---|
+| **Per-entity state** — lives and dies with ONE entity: a cache, a GPU object, a timer, a warn-once flag | `packedOf` / `EntityTable` / despawn eviction (above) | `spawnPrefabInstance`'s `guidSeed` re-mints the SAME guid on every respawn by design (Timeline scrub, Entries rows), so a guid-keyed cache hands the dead instance's state to its replacement — #868 spelled as a string. An entity without `EntityAttributes` has no guid at all. |
+| **A reference that should follow "the same thing"** — a selection, a collapsed tree node, a cross-entity field, anything that must survive a reload | the **guid**, resolved through `findEntityByGuid` (inside a structure callback, `peekEntityByGuid`) | A seeded respawn IS the same thing to the person looking at it, and a board rebuild's fresh runtime guids are not. An entity with no guid (since #1248, only a registered one whose EntityAttributes was removed) is dropped when it goes. The editor's worked example is `editor/store/heldEntity.ts` ([editor.md](editor.md) § "Inside one world"). |
+| **A reference to THIS instance only** — a dialog's subject, the row being renamed; or a game module's handle that never outlives its world | `entityPin` (below) / a live `Entity` checked with `isPackedAlive` before every use | It must never act on a replacement, seeded or not. Court's roots and board handles are the game-side worked example (`games/court/rendering-notes.md` § "The eighth member dies MID-world", #1224). |
+| **Crosses a boundary** — the journal, an agent reply, undo, a game-facing callback | the **guid, taken while the entity was alive** | A dead handle has nothing left to derive it from: `entityRef(deadHandle)` returns `null` (#1227), and an exit callback reads `otherRef`/`refs` instead ([zones.md](zones.md), [physics-2d.md](physics-2d.md)). |
+| Used inside one loop or one frame, never stored | the id | Owner ruling on #1222. |
+
+The same test flags the held-reference rows too (`HELD_LEDGER`): a declaration typed with koota's `Entity`,
+a module `…Id(s)` number (a variable or an object-literal property) and a `…EntityId(s)` field each need
+`alive-checked:`, `revalidated:`, `brief:` or another tagged reason. Sling's handles are pruned at the top of
+its GAME and LATE_UPDATE ticks (`pruneDeadHandles`, #1222) and Court's
+are checked before use (#1224); Wordweave's `Built` handles are the open `pending: #1243` rows. It cannot see
+a string key, an untyped handle (`let puck = null`) or id array (`movedIds: []`), an id field with another name (`parentId`) or a trait
+default inside `trait({…})`; those stay by hand.
 
 Sites that predate the type and carry the second shape by hand, ledgered as `gen-in-value:` and
 deliberately not converted (each is tested, and converting risks iteration order or purge semantics):
@@ -178,6 +204,86 @@ pass that rebuilt it (`entityIndex.ts`). One rebuilt at one priority and read at
 
 **In serialized data and event payloads, use the GUID, never the id** — runtime ids are reassigned
 on every scene hot-reload.
+
+#### Entity identity: durable guid vs runtime guid (#1210)
+
+`EntityAttributes.guid` is the entity's **address** — what every guid-addressed tool, journal ref
+and entity-ref field takes. It comes in two kinds, and the difference is lifetime:
+
+- **Durable** — a v4 (or `deriveGuid`) guid written to the scene file. Survives reload, scene swaps
+  and saves. Loaded entities have one; the save pre-pass mints one for everything it writes.
+- **Runtime** — `00000000-GGGG-GGGG-0000-NNNNNNNNNNNN` (`isRuntimeGuid`). `spawnEntity` mints one
+  for any entity spawned with an empty guid, or with a runtime guid it was COPIED with. An entity
+  spawned WITHOUT EntityAttributes is given the trait at spawn (#1248), so that includes the Time
+  and Input singletons and a bare FX spawn: **every entity has a guid**. So a shot, a board cell or an imported model part is addressable by guid from the
+  frame it spawns. **Valid only until its world is swapped out.**
+  - **N** counts the MINTS in the world (a spawn that already carries a durable guid takes no
+    number), so the same sequence of spawns — the same order AND the same mix of authored and empty
+    guids — yields the same guids, and replays and journals stay comparable. **G** is a generation this engine owns, assigned once
+    per World. ⚠️ It is never koota's world id or entity generation: koota reuses both across a swap,
+    so either would let an old guid name an entity in the new world instead of missing.
+  - `findEntityByGuid` resolves one through a per-world address table
+    (`core/ecs/world.ts`). A stale one misses in O(1). One whose entity a save has since given a
+    durable guid still resolves to that entity, so an agent's handle survives `save_all` — in every
+    lookup that goes THROUGH `findEntityByGuid`. ⚠️ A lookup that scans `EntityAttributes.guid` for
+    an equal string does not follow it, so a live entity lookup by guid uses `findEntityByGuid`.
+  - `createTestWorld` saves the generation on create and restores it on dispose, so identical harness
+    runs mint identical guids.
+  - **Unique per page load, not just per world (#1223 D5).** The generation counter is module state,
+    so every page load restarted it at 1 and re-issued the previous page's guids. Observed live in the
+    editor on 2026-09-15: before a reload the current world was generation 2, and after it the new page
+    minted generation 1 again, a generation the previous page had already used. A guid an agent held
+    across the reload could then resolve to a different entity instead of missing. The app entry
+    (`app/main.tsx`) calls `saltRuntimeGuidGeneration()` once, which starts the page's generations at
+    a random base. The harness never runs that file, so harness runs stay deterministic.
+  - **A miss says why when it can (#1223 D4).** `classifyRuntimeGuidMiss(guid)` answers `'despawned'`
+    (minted in this world, entity gone) or `'world-swapped'` (minted in an earlier world of this page).
+    It answers `null` for a guid this page never issued, whether from an earlier page load or invented.
+    The agent tools report it as `stale` beside `NOT_FOUND`
+    ([mcp-tool-conventions.md](mcp-tool-conventions.md) §3). A DURABLE miss cannot be classified:
+    nothing records which durable guids once existed.
+- **What a lookup costs** (measured #1222, vitest, n = live entities): a durable hit ~140 ns at 1k and
+  ~195 ns at 10k, a runtime hit ~210–270 ns, a runtime stale miss ~160 ns — against 37–190 ns for
+  `findEntityById`. A **durable stale miss** rescans the world to self-heal a mint site that forgot
+  `indexEntityGuid` (0.13 ms at 1k, 1.6 ms at 10k). ⚠️ It rescans only when koota reported an
+  `EntityAttributes` add or write since the last rescan (or a destroy of one of two live entities
+  sharing a durable guid, or a `world.reset()` — the mechanism is documented at `GuidEpoch` in
+  `core/ecs/world.ts`), so a guid polled every frame after its entity
+  is gone costs one scan, not one per frame — measured: 0 rescans over 20 stepped polls with a system
+  reading `EntityAttributes` each frame, 20 with one that `set`s it each frame. A game that writes
+  `EntityAttributes` every frame therefore reopens the rescan every frame.
+
+Three rules follow:
+- **A runtime guid is never persisted.** Anything that treats a non-empty guid as "this entity
+  already has an identity" reads it through `durableGuid(g)` (`''` for empty or runtime), and mints a
+  durable guid over it: the save pre-pass, `ensureGuid`, `markPersistent`, `spawnPrefabInstance`
+  (a `guidSeed` still wins), `deriveInstanceMemberGuids` (never an anchor), and the stores that
+  outlive the process (Hierarchy collapse, camera-gizmo toggle, last animation clip). The save also
+  rewrites a guid-STRING ref pointing at a live entity's runtime guid to that entity's durable guid.
+  The tripwires are `assertNoRuntimeGuids` (console.error in the editor, a throw under vitest),
+  `applyOps` refusing a file write that carries one, and `tests/assets/noRuntimeGuidsOnDisk.test.ts`
+  over the committed corpus.
+- **A guid is an address, not a lifetime key** — the rule is stated once, above (#1198). Runtime guids
+  add a second reason to it: a COPY is re-minted, so a guid-keyed cache loses an entity that was only
+  carried or respawned.
+- **No guid at all** is no longer reachable through any spawn (#1248). Only an entity whose
+  EntityAttributes was REMOVED after spawn lacks one. Replies still report `guid: null` for it
+  ([mcp-tool-conventions.md](mcp-tool-conventions.md) §3).
+- **A resource entity is not a node in the tree** (#1248). A resource is an entity carrying a
+  `resource`-category trait: Time, Input, Physics2D, or a game config. It stays at the root and holds
+  no children. Every entity now has a Hierarchy row, the Transient Time and Input singletons included,
+  and a child under one of those is dropped from every save and Play snapshot with it. A resource moved
+  under an entity is deleted with that entity's subtree.
+  - **The rule lives in `runtime/core/ecs/hierarchy.ts`.** `reparentRefusal` judges moves: the editor
+    reparent, the agent `reparent-entity` op, device `set-traits`, and `apply-scene-ops`' `parentId`
+    write. `parentRefusal` / `parentOrRootFor` judge the paths that CREATE a link.
+  - **Agent create and instantiate are refused:** `create-entity` (editor and device) and prefab
+    instantiate.
+  - **Editor gestures re-root instead:** paste, a prefab dropped on a row, `apply-scene-ops`
+    `addEntity`, and a cross-scene move.
+  - **Only a NEW link is judged.** A reorder under the current parent, or a move to the root, stays legal.
+
+The Inspector's entity header shows which kind an entity has (`editor/panels/entityGuidLabel.ts`).
 
 ### Component (Trait)
 A **component** is a bag of typed data attached to an entity. In koota's

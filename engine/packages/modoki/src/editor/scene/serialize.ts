@@ -2,32 +2,37 @@
  *  Uses the trait registry — no hardcoded trait knowledge. */
 
 import { getAllEntities, readTraitData, findEntity, subtreeIds } from '../../runtime/core/ecs/entityUtils';
-import { hasDocKey } from '../../runtime/core/docKeys';
+import { collectTransientSubtreeIds } from './authoringScope';
 import { orderEntitiesForSave } from '../../runtime/core/ecs/entityOrder';
 import { getAuthoredWritesWhileStopped, clearAuthoredWritesWhileStopped } from '../../runtime/core/ecs/authoredWrites';
 import { Transient } from '../../runtime/core/traits/Transient';
-import { spawnEntity } from '../../runtime/core/ecs/world';
+import { spawnEntity, findEntityByGuid } from '../../runtime/core/ecs/world';
 import { Camera } from '../../runtime/traits/Camera';
 import { Transform } from '../../runtime/core/traits/Transform';
 import { EntityAttributes } from '../../runtime/core/traits/EntityAttributes';
 import { Environment } from '../../three/traits/Environment';
 import { Light } from '../../three/traits/Light';
-import { writeAssetFile, jsonFileBody } from '../backend/editorBackend';
-import { saveAssetDialog } from '../utils/saveDialog';
+import { writeAssetFile, writeSceneCopy, jsonFileBody } from '../backend/editorBackend';
+import { chooseNewAssetPath } from '../utils/saveDialog';
+import { SCENE_EXT, classifyExplicitSceneSave } from './sceneFileName';
+import { writeNewAssetDocument } from './createAssetDocument';
 import { getAllTraits, getTraitByName } from '../../runtime/core/ecs/traitRegistry';
 import { sceneManager } from '../../runtime/scene/SceneManager';
 import { isPrefabEditWorld } from './prefabEditWorld';
 import { useEditorStore } from '../store/editorStore';
 import { setPlayState, getRunMode } from '../../runtime/core/playState';
 import { beginWorldReplacement } from './authoringSettle';
-import { swapHistory, getEditVersion } from '../undo/undoManager';
+import { swapHistory, forgetHistory, getEditVersion } from '../undo/undoManager';
 import { editorEmit } from '../editorJournal';
-import { captureInstanceOverrides, captureInstanceStructure, getPrefabSource, getCachedPrefabSync } from './prefab';
-import type { AddedEntity, NestedOverridePaths } from '../../runtime/loaders/loadSceneFile';
-import { mergeOverrideMaps, descendNestedOverrides, mergeNestedOverridePaths, collectResourceRefsFromEntities, SceneFormatRefusedError } from '../../runtime/loaders/loadSceneFile';
+import { captureInstanceOverrides, captureInstanceStructure, captureNestedChannels, getPrefabSource, preloadNestedPrefabs } from './prefab';
+// Moved to prefab.ts with the walk that uses it (#1369); re-exported for existing importers.
+export { captureNestedSceneDelta } from './prefab';
+import type { AddedEntity, NestedOverridePaths, NestedStructurePaths } from '../../runtime/loaders/loadSceneFile';
+import { collectResourceRefsFromEntities, SceneFormatRefusedError } from '../../runtime/loaders/loadSceneFile';
 import { newGuid, isInternalAssetPath, getGuidForPath, registerAsset } from '../../runtime/loaders/assetManifest';
-import { isGuid } from '../../runtime/core/assetRefRules';
-import { clearAllSceneDirty, clearSceneDirty, dirtySceneGuidsSnapshot, hasDirtyScenes, isSceneDirty } from './sceneDirty';
+import { isGuid, durableGuid, isRuntimeGuid } from '../../runtime/core/assetRefRules';
+import { assertNoRuntimeGuids } from './runtimeGuidTripwire';
+import { clearAllSceneDirty, clearSceneDirty, clearSceneDirtyExcept, dirtySceneGuidsSnapshot, hasDirtyScenes, hasDirtySceneOutside, isSceneDirty } from './sceneDirty';
 import { WHITE_HDR_GUID } from '../../runtime/assets/builtinAssets';
 import { REF_FIELDS_BY_TRAIT } from '../../runtime/loaders/sceneValidation';
 import { SCENE_FORMAT_VERSION } from '../../runtime/core/version';
@@ -69,10 +74,15 @@ export interface SerializedEntity {
   removed?: number[];
   /** Per-localId component (trait) names the instance deleted from prefab members. */
   removedTraits?: Record<number, string[]>;
+  /** Members moved to another parent inside the instance (#1437): row localId → live parent guid. */
+  moved?: Record<number, string>;
   /** Scene-level overrides on this instance's NESTED prefab instances (a prefab's
    *  own internal nested instances, e.g. a ship's engine flames). Path-keyed so the
    *  scene can reach a member nested at ANY depth (see NestedOverridePaths). */
   nestedOverrides?: NestedOverridePaths;
+  /** Scene-level STRUCTURAL edits inside this instance's nested instances, path-keyed exactly like
+   *  `nestedOverrides` (#1358). */
+  nestedStructure?: NestedStructurePaths;
 }
 
 /** A single resource the scene needs at load time. SceneManager acquires these
@@ -106,64 +116,6 @@ export interface SceneFile {
 
 // ── Serialize Scene (generic) ───────────────────────────
 
-/** Capture a nested instance's SCENE-specific override delta: its full per-localId
- *  override (vs the child prefab base) minus the fields the parent prefab's own
- *  nested row already overrides. So the scene stores only what it uniquely changed
- *  on this nested instance — the row's own overrides (e.g. the flames' mirrored
- *  positions) stay owned by the parent prefab and aren't redundantly baked in. */
-export function captureNestedSceneDelta(
-  nestedRootId: number,
-  childPrefab: Parameters<typeof captureInstanceOverrides>[1],
-  rowOverrides: Record<number, Record<string, Record<string, unknown>>> | undefined,
-): Record<number, Record<string, Record<string, unknown>>> {
-  const all = captureInstanceOverrides(nestedRootId, childPrefab);
-  for (const [lidStr, traits] of Object.entries(all)) {
-    const lid = Number(lidStr);
-    // A nested instance's member guids are regenerated from the prefab chain each
-    // load — never scene-authored — so drop them; otherwise the serialize guid
-    // pre-pass makes every nested member look "overridden".
-    if (traits.EntityAttributes) delete (traits.EntityAttributes as Record<string, unknown>).guid;
-    const rowTraits = rowOverrides?.[lid];
-    for (const [traitName, fields] of Object.entries(traits)) {
-      const rowFields = rowTraits?.[traitName];
-      // `hasDocKey` (#986): `f` and `rowFields` both derive from scene/prefab JSON, so a
-      // prototype-named field tested TRUE against any rowFields object and was wrongly
-      // deleted from the serialized output.
-      if (rowFields) for (const f of Object.keys(fields)) if (hasDocKey(rowFields, f)) delete fields[f];
-      if (Object.keys(fields).length === 0) delete traits[traitName];
-    }
-    if (Object.keys(traits).length === 0) delete all[lid];
-  }
-  return all;
-}
-
-/** The override map the PREFAB FILES alone would apply to a nested instance reached
- *  by `path` (a chain of nested-row localIds) from a fresh instantiation of
- *  `topSource` — i.e. every ancestor prefab row's own overrides + deep overrides
- *  targeting it, resolved outside-in exactly like the runtime. Subtracted from the
- *  live capture so the scene stores only the delta IT uniquely changed (and an
- *  intermediate prefab change still propagates). All path prefabs must be cached. */
-function resolveEffectivePrefabOverride(
-  topSource: string,
-  path: number[],
-): Record<number, Record<string, Record<string, unknown>>> {
-  let prefab = getCachedPrefabSync(topSource);
-  let pending: NestedOverridePaths | undefined;
-  let result: Record<number, Record<string, Record<string, unknown>>> = {};
-  for (let i = 0; i < path.length; i++) {
-    if (!prefab) return result;
-    const r = path[i];
-    const row = prefab.entities.find((e) => e.localId === r && e.prefab);
-    if (!row) return result;
-    const { direct, forward } = descendNestedOverrides(pending, r);
-    const stepDirect = direct ? mergeOverrideMaps(row.overrides, direct) : (row.overrides ?? {});
-    pending = mergeNestedOverridePaths(row.nestedOverrides, forward);
-    if (i === path.length - 1) result = stepDirect;
-    prefab = getCachedPrefabSync(row.prefab!);
-  }
-  return result;
-}
-
 /** Serialize the live ECS world to a SceneFile.
  *
  *  GUID assignment is a SIDE-EFFECT and is opt-in via `assignGuids`. Every
@@ -185,8 +137,28 @@ function resolveEffectivePrefabOverride(
 // `isTraitDefault` moved to its own LEAF module so `prefab.ts` can share the rule without
 // importing this file's dependency graph. Re-exported here — this was its home, and
 // `@modoki/engine/editor` still surfaces it from this module.
-import { isTraitDefault } from './traitDefault';
+import { isTraitDefault, writtenTraitKeys } from './traitDefault';
 export { isTraitDefault };
+
+/** Whether a PRIMARY-scene save skips this entity: it or an ancestor is `Transient`, or it or an
+ *  ancestor came from a base scene (`sourceScene` non-empty). The same two exclusions
+ *  `serializeScene` applies below (a Transient root and its subtree; a foreign entity and its
+ *  subtree) — asked of one entity, for a caller that must not promise a save does something to it
+ *  (the Inspector's guid label, #1210). Walks `parentId`; cycle-guarded. */
+export function isSkippedByPrimarySave(entityId: number): boolean {
+  const seen = new Set<number>();
+  let id = entityId;
+  while (id && !seen.has(id)) {
+    seen.add(id);
+    const e = findEntity(id);
+    if (!e) return false;
+    if (e.has(Transient)) return true;
+    const ea = e.has(EntityAttributes) ? (e.get(EntityAttributes) as { parentId?: number; sourceScene?: string }) : undefined;
+    if (ea?.sourceScene) return true;
+    id = ea?.parentId ?? 0;
+  }
+  return false;
+}
 
 export async function serializeScene(opts?: {
   assignGuids?: boolean;
@@ -199,10 +171,7 @@ export async function serializeScene(opts?: {
   // below (guid pre-pass, prefab-child collection, the main loop) simply never see them, which
   // avoids orphaning a transient prefab-instance's members. See runtime/core/traits/Transient.ts.
   const allInfos = getAllEntities();
-  const transientIds = new Set<number>();
-  for (const e of allInfos) {
-    if (findEntity(e.id)?.has(Transient)) for (const id of subtreeIds(allInfos, e.id)) transientIds.add(id);
-  }
+  const transientIds = collectTransientSubtreeIds(allInfos);
   // Base-scene persistence (Phase 6, generalized in Phase 12): never bake an entity
   // that doesn't belong to the scene being saved into that scene's file.
   // EntityAttributes.sourceScene is stamped non-empty ONLY on entities a BASE scene
@@ -262,7 +231,9 @@ export async function serializeScene(opts?: {
       const entity = findEntity(info.id);
       if (!entity || !entity.has(eaMeta.trait)) continue;
       const data = entity.get(eaMeta.trait) as Record<string, unknown>;
-      if (!data.guid || data.guid === '') {
+      // A RUNTIME guid (#1210) is an address valid only until reload, so it counts as no guid:
+      // saving one would hand a later session's spawn counter a collision.
+      if (!durableGuid(data.guid as string)) {
         const guid = newGuid();
         mintedGuids.set(info.id, guid);
         if (opts?.assignGuids) entity.set(eaMeta.trait, { ...data, guid });
@@ -278,7 +249,8 @@ export async function serializeScene(opts?: {
   const guidForId = (id: number): string => {
     if (!id || !eaMeta) return '';
     const live = findEntity(id)?.get(eaMeta.trait) as { guid?: string } | undefined;
-    if (live?.guid) return live.guid;
+    const durable = durableGuid(live?.guid);
+    if (durable) return durable;
     return mintedGuids.get(id) || '';
   };
 
@@ -288,10 +260,6 @@ export async function serializeScene(opts?: {
   const prefabChildIds = new Set<number>();
   const prefabSources = new Set<string>();
   const prefabRootInfo = new Map<number, { source: string; localId: number }>();
-  // Owned nested instances (a prefab's internal nested instances, e.g. a ship's
-  // flames): their scene-level overrides are captured onto the OWNING top-level
-  // instance entry rather than written as standalone entities.
-  const nestedInstances: { rootId: number; source: string; parentLocalId: number; ownerId: number }[] = [];
   const byId = new Map(entityInfos.map((e) => [e.id, e] as const));
   if (piMeta) {
     for (const info of entityInfos) {
@@ -315,12 +283,9 @@ export async function serializeScene(opts?: {
         const parentIsMember = parentInfo?.traits.includes('PrefabInstance');
         if (parentIsMember && parentLocalId) {
           // Owned nested instance (expanded from the parent prefab, so it carries a
-          // parentLocalId): its scene-level edits ride on the owner's
-          // nestedOverrides — it is NOT written as its own scene entry.
+          // parentLocalId): its scene-level edits ride on the owner's nested channels
+          // (`captureNestedChannels`) — it is NOT written as its own scene entry.
           prefabChildIds.add(info.id);
-          const parentPi = readTraitData(info.parentId, piMeta);
-          const ownerId = (parentPi?.['rootInstanceId'] as number) || info.parentId;
-          nestedInstances.push({ rootId: info.id, source, parentLocalId, ownerId });
           prefabSources.add(source); // preload child prefab for delta capture
         } else if (parentIsMember) {
           // User-added nested instance dragged under a prefab member (parentLocalId
@@ -349,39 +314,26 @@ export async function serializeScene(opts?: {
   // entities + removed traits, and fold the added entities' live ECS ids into the
   // skip set so they aren't ALSO written as standalone scene entities (which is
   // how they used to leak out and orphan on reload).
-  const rootStructure = new Map<number, { added: AddedEntity[]; removed: number[]; removedTraits: Record<number, string[]> }>();
+  const rootStructure = new Map<number, { added: AddedEntity[]; removed: number[]; removedTraits: Record<number, string[]>; moved: Record<number, string> }>();
+  // The nested channels, per top-level root — one top-down walk each (#1369; see captureNestedChannels).
+  const nestedOverridesByTop = new Map<number, NestedOverridePaths>();
+  const nestedStructureByTop = new Map<number, NestedStructurePaths>();
   for (const [rootId, { source }] of prefabRootInfo) {
     const prefab = await getPrefabSource(source);
     if (!prefab) continue;
+    // A nested row whose instance is gone is recorded as removed only when its prefab is cached
+    // (#1355), and a deleted instance's source is not among the live ones preloaded above.
+    await preloadNestedPrefabs(prefab);
     const s = captureInstanceStructure(rootId, prefab);
     for (const ecsId of s.consumedEcsIds) prefabChildIds.add(ecsId);
-    if (s.added.length || s.removed.length || Object.keys(s.removedTraits).length) {
-      rootStructure.set(rootId, { added: s.added, removed: s.removed, removedTraits: s.removedTraits });
+    const channels = captureNestedChannels(source, s.ownedNested);
+    for (const ecsId of channels.consumedEcsIds) prefabChildIds.add(ecsId);
+    if (channels.nestedOverrides) nestedOverridesByTop.set(rootId, channels.nestedOverrides);
+    if (channels.nestedStructure) nestedStructureByTop.set(rootId, channels.nestedStructure);
+    if (s.added.length || s.removed.length || Object.keys(s.removedTraits).length || Object.keys(s.moved).length) {
+      rootStructure.set(rootId, { added: s.added, removed: s.removed, removedTraits: s.removedTraits, moved: s.moved });
     }
   }
-
-  // Nested-instance override pre-pass: for EACH nested instance (at any depth),
-  // resolve the path of nested-row localIds up to the owning TOP-level instance,
-  // capture the SCENE-specific override delta (its full override minus what the
-  // prefab chain already applies to it — so the scene stores only what it uniquely
-  // changed and an intermediate prefab change still propagates), and file it under
-  // the top instance's nestedOverrides[path]. The path-keyed form (e.g. "2.5")
-  // lets the scene override a member nested arbitrarily deep; a one-level path is
-  // the legacy single-segment key, so existing scenes round-trip unchanged.
-  const nestedById = new Map(nestedInstances.map((ni) => [ni.rootId, ni] as const));
-  /** Walk up the owner chain to the top-level instance; returns its id + the path
-   *  of nested-row localIds from it down to `rootId`, or null if no top-level owner. */
-  const resolvePath = (rootId: number): { topId: number; path: number[] } | null => {
-    const path: number[] = [];
-    let cur = rootId, guard = 0;
-    while (guard++ < 64) {
-      const ni = nestedById.get(cur);
-      if (!ni) break; // reached a non-nested instance (a top-level root)
-      path.unshift(ni.parentLocalId);
-      cur = ni.ownerId;
-    }
-    return prefabRootInfo.has(cur) ? { topId: cur, path } : null;
-  };
 
   /** The order entities are WRITTEN in — the Hierarchy's display order, made fully
    *  stable (QA-HIER-0002). The rule itself lives in `runtime/core/ecs/entityOrder.ts`,
@@ -408,23 +360,6 @@ export async function serializeScene(opts?: {
     name: info.name,
     guid: guidForId(info.id),
   }));
-
-  const nestedOverridesByTop = new Map<number, NestedOverridePaths>();
-  for (const ni of nestedInstances) {
-    const resolved = resolvePath(ni.rootId);
-    if (!resolved || resolved.path.length === 0) continue;
-    const topSource = prefabRootInfo.get(resolved.topId)!.source;
-    const childPrefab = await getPrefabSource(ni.source);
-    if (!childPrefab) continue;
-    // Subtract what the whole prefab chain applies to this instance (not just the
-    // immediate row) so a deep scene edit stores only its own delta.
-    const effective = resolveEffectivePrefabOverride(topSource, resolved.path);
-    const delta = captureNestedSceneDelta(ni.rootId, childPrefab, effective);
-    if (Object.keys(delta).length === 0) continue;
-    const map = nestedOverridesByTop.get(resolved.topId) ?? {};
-    map[resolved.path.join('.')] = delta;
-    nestedOverridesByTop.set(resolved.topId, map);
-  }
 
   for (const info of orderedInfos) {
     // Skip prefab children + structural additions — re-instantiated from the prefab
@@ -454,9 +389,12 @@ export async function serializeScene(opts?: {
           if (struct.added.length) entry.added = struct.added;
           if (struct.removed.length) entry.removed = struct.removed;
           if (Object.keys(struct.removedTraits).length) entry.removedTraits = struct.removedTraits;
+          if (Object.keys(struct.moved).length) entry.moved = struct.moved;
         }
         const nested = nestedOverridesByTop.get(info.id);
         if (nested && Object.keys(nested).length) entry.nestedOverrides = nested;
+        const nestedStruct = nestedStructureByTop.get(info.id);
+        if (nestedStruct && Object.keys(nestedStruct).length) entry.nestedStructure = nestedStruct;
         // Persist the root's stable guid on the node. The trait loop below writes
         // ONLY PrefabInstance for a captured root (EntityAttributes never gets
         // written, and guid is never an override), so this is the only place the
@@ -464,7 +402,7 @@ export async function serializeScene(opts?: {
         // it's live on the entity; on the snapshot path it's in mintedGuids.
         if (eaMeta) {
           const live = findEntity(info.id)?.get(eaMeta.trait) as { guid?: string } | undefined;
-          const rootGuid = (live?.guid && live.guid !== '' ? live.guid : undefined) ?? mintedGuids.get(info.id);
+          const rootGuid = durableGuid(live?.guid) || mintedGuids.get(info.id);
           if (rootGuid) entry.guid = rootGuid;
         }
         // Persist the PLACEMENT parent for a REPARENTED instance (parent isn't the
@@ -519,12 +457,13 @@ export async function serializeScene(opts?: {
         // fall back to the live data's own keys for those.
         const schema = (meta.trait as { schema?: Record<string, unknown> }).schema;
         const soa = !!schema && typeof schema === 'object';
-        const keys = soa ? Object.keys(schema!) : Object.keys(data);
-        for (const key of keys) {
+        // WHICH keys are written, and in WHAT ORDER, is `writtenTraitKeys` (traitDefault.ts) —
+        // shared with prefab.ts's added-child writer and with the committed-scene guard
+        // (sceneFormatCanonical.test.ts, #1412), so none of the three can drift. Its two rules:
+        for (const key of writtenTraitKeys(soa ? schema! : null, data, meta.fields)) {
           // Skip pure runtime fields (e.g. Time.elapsed/frame): recomputed each
           // frame, so persisting them bakes a stale snapshot and churns the file
           // on every save. The loader re-derives them from the schema default.
-          if (meta.fields[key]?.runtimeOnly) continue;
           // Omit a field that still holds its trait default: the loader
           // reconstructs it from the same schema (`meta.trait(partialData)` — koota
           // fills every absent key), so this is lossless, and it keeps DEFAULTS LIVE.
@@ -537,7 +476,6 @@ export async function serializeScene(opts?: {
           // skipping one here would only move it to the END of the object — pure diff
           // noise across a bulk migration. Assigning in schema order now and
           // overwriting in place later keeps key order stable.
-          if (soa && !meta.fields[key]?.entityId && isTraitDefault(data[key], schema![key])) continue;
           traitData[key] = data[key];
         }
         // Snapshot path: the world wasn't mutated, so a freshly-minted guid for a
@@ -546,9 +484,10 @@ export async function serializeScene(opts?: {
         // survive a Stop-revert) without having written to the authored world.
         // (Prefab roots route their guid through overrides, not here, and already
         // carry one minted at instantiation — so they never need this.)
-        if (meta.name === 'EntityAttributes' && !traitData.guid) {
+        if (meta.name === 'EntityAttributes' && !durableGuid(traitData.guid as string)) {
           const minted = mintedGuids.get(info.id);
           if (minted) traitData.guid = minted;
+          else delete traitData.guid; // never write a runtime guid (#1210)
         }
         // Write parentId as the parent's stable GUID ('' for root) rather than the
         // live koota id, so the hierarchy survives a world rebuild without the
@@ -585,6 +524,26 @@ export async function serializeScene(opts?: {
   // internal asset path before it's written to disk, instead of silently
   // healing it (which is how path refs used to slip through unnoticed).
   for (const entry of entities) assertNoPathRefs(entry);
+  // A guid-STRING ref (Joint2D.entityB, BoneAttachment.target, a UIAction target) holding a live
+  // entity's RUNTIME guid (#1210) — an agent read it from scene-state and wrote it through the live
+  // path, where it resolves. Numeric entityId fields already go through `guidForId`; this is the
+  // same "write the target's stable identity" rule for the string form. Resolved through
+  // `findEntityByGuid`, which still finds an entity whose guid was re-minted by the pre-pass above,
+  // so the ref follows its target to the durable guid being written for it. A runtime guid that
+  // names nothing live (a despawned target, another world) is left alone for the tripwire.
+  const durableForRuntime = (g: string): string | undefined => {
+    const target = findEntityByGuid(g);
+    if (!target || !eaMeta) return undefined;
+    // Snapshot path only: a prefab member or captured added child is written WITHOUT its minted guid
+    // (the structure capture reads the live, still-runtime one and records it unguided), so a ref
+    // rewritten to that mint would name nothing after Stop. Leave it for the tripwire instead. The
+    // save path wrote the mint onto the live entity before capture, so there it is the real guid.
+    if (!opts?.assignGuids && prefabChildIds.has(target.id())) return undefined;
+    const live = durableGuid((target.get(eaMeta.trait) as { guid?: string } | undefined)?.guid);
+    return live || mintedGuids.get(target.id()) || undefined;
+  };
+  for (const entry of entities) rewriteRuntimeGuidStrings(entry, durableForRuntime);
+  assertNoRuntimeGuids(entities, 'a serialized scene');
 
   const resources = collectResourceRefs(entities);
 
@@ -640,6 +599,24 @@ export async function serializeScene(opts?: {
   return file;
 }
 
+/** Replace every runtime guid inside string VALUES of `node` (in place) with `resolve(guid)`, when that
+ *  returns one. Keys are left alone — none is built from an entity ref on this path. */
+function rewriteRuntimeGuidStrings(node: unknown, resolve: (g: string) => string | undefined): void {
+  if (!node || typeof node !== 'object') return;
+  const visit = (v: unknown): unknown => {
+    if (typeof v === 'string') {
+      if (!v.includes('00000000-')) return v;
+      return v.replace(/00000000-[0-9a-f]{4}-[0-9a-f]{4}-0000-[0-9a-f]{12}/gi, (m) => (isRuntimeGuid(m) ? resolve(m) ?? m : m));
+    }
+    if (v && typeof v === 'object') rewriteRuntimeGuidStrings(v, resolve);
+    return v;
+  };
+  if (Array.isArray(node)) { for (let i = 0; i < node.length; i++) node[i] = visit(node[i]); return; }
+  for (const k of Object.keys(node as Record<string, unknown>)) {
+    (node as Record<string, unknown>)[k] = visit((node as Record<string, unknown>)[k]);
+  }
+}
+
 /** Dev guard: console.error if any REF field anywhere in a serialized entity holds an
  *  internal asset PATH instead of a GUID — walks traits, the prefab field, per-localId
  *  `overrides`, recursive `added` subtrees, and path-keyed `nestedOverrides` (F8).
@@ -677,11 +654,22 @@ export function assertNoPathRefs(entry: SerializedEntity): void {
   // An added subtree node (recursive): plain node (traits/children) OR a nested-instance
   // reference node (prefab + overrides/added/nestedOverrides). F8: prefab edits inject
   // refs here, exactly where the old guard was blind.
+  // nestedStructure: Record<path, { added, removed, removedTraits }>. ⚠️ MUST be walked: an
+  // `added[]` node inside it carries `prefab` and trait asset refs exactly like a top-level one, and
+  // a ref this scan misses is a ref the BUILD cannot see — the asset is dropped from the production
+  // bundle and it fails only once shipped (#53's class). `removed`/`removedTraits` hold no refs.
+  const flagNestedStructure = (nested: NestedStructurePaths | undefined, ctx: string) => {
+    if (!nested) return;
+    for (const [path, delta] of Object.entries(nested)) {
+      for (let i = 0; i < (delta.added?.length ?? 0); i++) flagAdded(delta.added![i], `${ctx}{${path}}.added[${i}]`);
+    }
+  };
   const flagAdded = (node: AddedEntity, ctx: string) => {
     flagTraits(node.traits ?? {}, `${ctx}.`);
     flag(`${ctx}.prefab`, node.prefab);
     flagOverrideMap(node.overrides, `${ctx}.overrides`);
     flagNested(node.nestedOverrides, `${ctx}.nestedOverrides`);
+    flagNestedStructure(node.nestedStructure, `${ctx}.nestedStructure`); // a reference node's own slot (#1369)
     for (let i = 0; i < (node.children?.length ?? 0); i++) flagAdded(node.children[i], `${ctx}.child[${i}]`);
     for (let i = 0; i < (node.added?.length ?? 0); i++) flagAdded(node.added![i], `${ctx}.added[${i}]`);
   };
@@ -690,6 +678,7 @@ export function assertNoPathRefs(entry: SerializedEntity): void {
   flag('prefab', entry.prefab);
   flagOverrideMap(entry.overrides, 'overrides');
   flagNested(entry.nestedOverrides, 'nestedOverrides');
+  flagNestedStructure(entry.nestedStructure, 'nestedStructure');
   for (let i = 0; i < (entry.added?.length ?? 0); i++) flagAdded(entry.added![i], `added[${i}]`);
 }
 
@@ -806,6 +795,60 @@ export function hasUnsavedChanges(): boolean {
   return false;
 }
 
+/** Does the LIVE WORLD hold edits that a world swap would throw away? The two world-shaped causes
+ *  only — the primary scene and the other loaded scenes. A parked asset doc, base-scene ref or
+ *  import setting survives the swap (it is not in the world), so it does not make the outgoing
+ *  undo stack stale. It is what `swapHistory`'s `discardOutgoing` is decided from (#1409) — read
+ *  on both sides of the swap's await, since the outgoing world stays editable while it runs. */
+export function worldHasUnsavedEdits(): boolean {
+  return CAUSE_SPECS.sceneDirty.has() || CAUSE_SPECS.dirtyScenes.has();
+}
+
+/** The world-shaped unsaved work, read BEFORE a world replacement's await (#1409): the outgoing
+ *  world stays live and editable while the new one loads, so the adopt step reads it again after
+ *  and takes the union. */
+export interface WorldDirt {
+  readonly edited: boolean;
+  readonly scenes: ReadonlySet<string>;
+}
+
+export function readWorldDirt(): WorldDirt {
+  return { edited: CAUSE_SPECS.sceneDirty.has(), scenes: dirtySceneGuidsSnapshot() };
+}
+
+/** Adopt a world that `SceneManager.loadScene` just built: the ONE rule for `loadScene`'s tail and
+ *  a hot reload, so the two cannot drift (#1409, #1417).
+ *
+ *  - **The undo stack drops iff work was DISCARDED.** That is a world edit since the last save, or
+ *    a dirty base the swap did not keep. A kept base's edits survive the swap live, so they are not
+ *    discarded work. ⚠️ The edit version is ONE global counter, and a base edit bumps it too, so
+ *    it cannot tell a primary edit from a base edit. In the common case a kept base edit still
+ *    drops the stack: the edit stays on screen and flagged dirty (saveable), but not undoable,
+ *    which is the lesser loss next to a stack replaying discarded primary work (#1409). The stack
+ *    survives only when the counter is clean, e.g. after a Save All that wrote the primary and
+ *    failed on the base.
+ *  - **Only a kept base keeps its dirty flag** (#1417). Clearing it made `saveAll` skip the base
+ *    and the unsaved-work guard stop asking, which lost the surviving edit silently.
+ *  - The reloaded world is the new clean baseline (`markSceneSaved`). */
+function adoptReplacedWorld(scenePath: string, keptBaseGuids: ReadonlySet<string>, before?: WorldDirt): void {
+  const discarded = CAUSE_SPECS.sceneDirty.has() || hasDirtySceneOutside(keptBaseGuids)
+    || (before !== undefined && (before.edited || [...before.scenes].some((g) => !keptBaseGuids.has(g))));
+  swapHistory(scenePath, { discardOutgoing: discarded });
+  markSceneSaved();
+  clearSceneDirtyExcept(keptBaseGuids);
+}
+
+/** The editor's half of a scene HOT-RELOAD: an external write to the open scene or a prefab it
+ *  uses, where disk wins over unsaved edits (owner, 2026-09-13, #1164). The runtime replaced the
+ *  world from disk without going through `loadScene`, so it owes `loadScene`'s rules, which
+ *  `adoptReplacedWorld` holds. Before #1409, `unsavedChanges` stayed true after the reload over a
+ *  world that matched disk, and the stack still offered to undo a reparent the file never had.
+ *  A changed BASE reloads through `forceReloadBases`, so it is not in `keptBaseGuids` and its
+ *  edits are discarded with its flag. Installed via `setWorldReloadedFromDiskHook`. */
+export function adoptWorldReloadedFromDisk(scenePath: string, keptBaseGuids: ReadonlySet<string>): void {
+  adoptReplacedWorld(scenePath, keptBaseGuids);
+}
+
 /** WHICH kinds of unsaved work exist, told apart. The causes themselves — what each one is, what
  *  it is keyed by, and which half of a save writes it — are documented on `CAUSE_SPECS` below,
  *  which this derives from; they are not re-listed here.
@@ -907,8 +950,9 @@ const CAUSE_SPECS = {
     writtenBy: { flush: 'before-scene', run: flushDirtyAssets },
     label: { noun: 'unsaved asset edit' },
   },
-  // Non-primary loaded scenes whose edits are still only in memory — typically a base whose write
-  // failed in a partial `saveAll` (which keeps its dirty flag by design, so a later save retries).
+  // Loaded BASE scenes whose edits are still only in memory: usually an edit to a base, which a
+  // load that keeps the base carries across (#1417), and also a base whose write failed in a
+  // partial `saveAll` (which keeps its flag by design, so a later save retries). #1420.
   // Keyed by GUID, so a file rename cannot strand it.
   dirtyScenes: {
     has: hasDirtyScenes,
@@ -1010,7 +1054,12 @@ export function causeSpecs(): Readonly<Record<keyof UnsavedCauses, CauseSpec>> {
 export interface SaveResult {
   saved: boolean;
   path: string | null;
-  reason: 'ok' | 'cancelled' | 'write-failed' | 'needs-path' | 'playing' | 'prefab-edit';
+  reason: 'ok' | 'cancelled' | 'write-failed' | 'needs-path' | 'playing' | 'prefab-edit' | 'target-loaded' | 'superseded';
+  /** Set when an explicit `path` wrote the open scene to ANOTHER file (#1414): the copy got a fresh
+   *  scene id and reminted entity guids, and the editor then reopened it from disk so the live world
+   *  carries the identities the file does. `reopened:false` means the copy IS on disk but the editor
+   *  is still on `from`, with its edits unsaved there — `note` says why. */
+  savedAs?: { from: string; reopened: boolean; note?: string };
   /** Other loaded scenes (Phase 12, M3 — a dirty BASE, edited in place) written in
    *  the SAME `saveAll` call, alongside the primary. Absent/empty when nothing else
    *  was dirty. A base is only ever written once the primary's own save succeeded —
@@ -1047,6 +1096,94 @@ export interface SaveResult {
    *  `ASSET_SCHEMA_TYPES` document, so it does not go through `/api/asset-write`. Present on a
    *  FAILED result too — this flush is unconditional, same as the asset flush above. */
   importSettings?: MetaFlushResult;
+}
+
+/** `saveScene`'s agent Save As (#1414): write the open scene to `target` as a COPY with its own
+ *  identity, then reopen the copy.
+ *
+ *  The copy cannot carry the open scene's ids. Two files claiming one scene guid is what the dev
+ *  scanner heals by re-minting one of them, and it picks by path order, so it re-minted the COMMITTED
+ *  original whenever the copy sorted first; the entity guids would be shared too. So the backend
+ *  stamps a fresh scene id and re-mints the entity guids, exactly as Duplicate does, and overwrites
+ *  whatever scene is at `target` (owner, 2026-09-18) — anything that referenced that scene's old id
+ *  no longer resolves. That is the one deliberate exception to #1264's "a Replace keeps the replaced
+ *  guid": see docs/mcp-persistence.md.
+ *
+ *  **Why it reopens.** The live world still holds the ORIGINAL's scene id and entity guids. Left
+ *  pointing at the copy, the next save would write them straight back into it — the collision this
+ *  exists to prevent. Loading the copy is the one way the world takes the file's identities. It swaps
+ *  to the copy's (empty) undo history, since the old entries name the old guids.
+ *
+ *  **Why the other loaded scenes save FIRST.** The reopen reloads the whole chain from disk, so a
+ *  dirty base still only in memory would be discarded. They are written now (the same writes Save All
+ *  makes after the primary anyway); if any fails, nothing is copied and nothing is reopened.
+ *
+ *  The original file is never written. */
+async function saveSceneAs(target: string, content: string, sceneId: string, entityCount: number, savedAtEditVersion: number): Promise<SaveResult> {
+  const from = _currentScenePath!;
+  const others = await saveOtherLoadedScenes();
+  const othersReport = {
+    ...(others.extraSaved.length ? { extraSaved: others.extraSaved } : {}),
+    ...(others.failed.length ? { failed: others.failed } : {}),
+  };
+  if (others.failed.length) return { saved: false, path: target, reason: 'write-failed', ...othersReport };
+  const written = await writeSceneCopy(target, content, from, [...sceneManager.getLoadedScenes().values()].map((e) => e.path));
+  if (written === 'same-file') {
+    // `target` is the open scene's own file under another spelling (`%20`, `./`, a `/@fs/` form) —
+    // the classifier compares strings, the disk does not. A plain save, to `from` as captured: a
+    // scene load landing during the awaits above would otherwise take this write over ITS file.
+    if (_currentScenePath !== from) return { saved: false, path: from, reason: 'superseded', ...othersReport };
+    return { ...(await writePrimaryScene(from, content, sceneId, entityCount, savedAtEditVersion)), ...othersReport };
+  }
+  if (written === 'target-loaded') return { saved: false, path: target, reason: 'target-loaded', ...othersReport };
+  if (!written) {
+    console.error(`[Editor] Failed to save scene as ${target}`);
+    return { saved: false, path: target, reason: 'write-failed', ...othersReport };
+  }
+  // Also drops an overwritten scene's old id — `registerAsset` evicts the guid that owned the path —
+  // so what referenced it no longer resolves (the accepted cost), rather than resolving to the copy.
+  registerAsset(written.guid, written.path, 'scene');
+  // The overwritten file's kept undo stack names guids the copy does not have — on every exit below.
+  forgetHistory(written.path);
+  editorEmit('!save', { path: written.path, entities: entityCount }); // Editor Percept (V2)
+  console.log(`[Editor] Saved scene as a copy (fresh id ${written.guid}): ${entityCount} entities → ${written.path}`);
+  const stay = (note: string): SaveResult => ({ saved: true, path: written.path, reason: 'ok', savedAs: { from, reopened: false, note }, ...othersReport });
+  // An edit that landed during the writes is in the live world but not in the copy — reopening
+  // would discard it. Stay on the original, still dirty, and say so (#573's window, one level up).
+  if (getEditVersion() !== savedAtEditVersion) {
+    return stay(`an edit landed while the copy was being written, so it is NOT in the copy; the editor stays on ${from} with that edit unsaved`);
+  }
+  // The reopen swaps the world, and `SceneManager` clears the #124 records on a load — so warn now,
+  // or the copy is the one save that bakes a system-rewritten field in silently.
+  warnAuthoredWritesWhileStopped();
+  const outcome = await loadScene(written.path);
+  if (outcome === 'superseded') {
+    return stay(`another scene load started meanwhile and won, so the editor is on whatever that load opened; ${from} was not written`);
+  }
+  if (outcome !== 'loaded') {
+    return stay(`the copy could not be reopened (${outcome}${_lastLoadFailureMessage ? `: ${_lastLoadFailureMessage}` : ''}); the editor stays on ${from} with its edits unsaved`);
+  }
+  return { saved: true, path: written.path, reason: 'ok', savedAs: { from, reopened: true }, ...othersReport };
+}
+
+/** Write the serialized primary scene to `path` under its own id, and make `path` the open scene's. */
+async function writePrimaryScene(path: string, content: string, sceneId: string, entityCount: number, savedAtEditVersion: number): Promise<SaveResult> {
+  const openBefore = _currentScenePath;
+  const ok = await writeAssetFile(path, content);
+  if (!ok) {
+    console.error(`[Editor] Failed to save scene to ${path}`);
+    return { saved: false, path, reason: 'write-failed' };
+  }
+  registerAsset(sceneId, path, 'scene');
+  editorEmit('!save', { path, entities: entityCount }); // Editor Percept (V2)
+  console.log(`[Editor] Saved scene: ${entityCount} entities → ${path}`);
+  // A scene load that landed during the write owns the editor now. Pointing it back at `path`, or
+  // stamping its world as saved, would make the next save write THAT world over this file (#1414
+  // close-out review). The bytes above are the old scene's, written to its own file — still true.
+  if (_currentScenePath !== openBefore) return { saved: true, path, reason: 'ok' };
+  if (path !== _currentScenePath) setCurrentScenePath(path);
+  markSceneSaved(savedAtEditVersion);
+  return { saved: true, path, reason: 'ok' };
 }
 
 export async function saveScene(opts: {
@@ -1108,22 +1245,20 @@ export async function saveScene(opts: {
   // re-reading the version on the other side of an await; see markSceneSaved's doc comment.
   const savedAtEditVersion = getEditVersion();
 
-  const knownPath = explicitPath || _currentScenePath;
-  if (knownPath) {
-    // Save to known path via dev server
-    const ok = await writeAssetFile(knownPath, content);
-    if (ok) {
-      // scene.id is always populated by serializeScene (required field).
-      registerAsset(scene.id, knownPath, 'scene');
-      if (knownPath !== _currentScenePath) setCurrentScenePath(knownPath);
-      editorEmit('!save', { path: knownPath, entities: scene.entities.length }); // Editor Percept (V2)
-      console.log(`[Editor] Saved scene: ${scene.entities.length} entities → ${knownPath}`);
-      markSceneSaved(savedAtEditVersion);
-      return { saved: true, path: knownPath, reason: 'ok' };
-    }
-    console.error(`[Editor] Failed to save scene to ${knownPath}`);
-    return { saved: false, path: knownPath, reason: 'write-failed' };
-  }
+  const kind = explicitPath ? classifyExplicitSceneSave(explicitPath, {
+    currentPath: _currentScenePath,
+    openSceneId: scene.id,
+    targetGuid: getGuidForPath(explicitPath),
+    loadedPaths: [...sceneManager.getLoadedScenes().values()].map((e) => e.path),
+  }) : null;
+  if (kind === 'target-loaded') return { saved: false, path: explicitPath!, reason: 'target-loaded' };
+  if (kind === 'save-as') return saveSceneAs(explicitPath!, content, scene.id, scene.entities.length, savedAtEditVersion);
+
+  // The open scene's own file is written under the spelling it was opened with (#1273) — a
+  // case-variant `path` names the same file, and adopting it would give the manifest a second key.
+  const knownPath = kind === 'same' ? _currentScenePath! : explicitPath || _currentScenePath;
+  // scene.id is always populated by serializeScene (required field).
+  if (knownPath) return writePrimaryScene(knownPath, content, scene.id, scene.entities.length, savedAtEditVersion);
 
   // No path, and no dialog allowed (an agent) — say so instead of opening a modal panel
   // only a human can close.
@@ -1133,23 +1268,40 @@ export async function saveScene(opts: {
   // the project's scenes folder via the backend, so it persists to the project on
   // disk (dev/Electron). We deliberately do NOT use `showSaveFilePicker`: the File
   // System Access API writes to the user's LOCAL disk, not the project.
-  // `saveAssetDialog` uses the native macOS panel where available and an in-app
+  // `chooseNewAssetPath` uses the native macOS panel where available and an in-app
   // name prompt everywhere else.
-  const target = await saveAssetDialog({
-    defaultName: 'scene.json',
-    ext: '.json',
+  const pick = await chooseNewAssetPath({
+    defaultName: 'New Scene' + SCENE_EXT,
+    ext: SCENE_EXT, // was '.json', which wrote `<name>.json` — a scene only by the legacy /scenes/ rule (#1413)
     defaultFolder: '/assets/scenes',
     prompt: 'Save Scene As',
   });
-  if (!target) return { saved: false, path: null, reason: 'cancelled' }; // user cancelled
-  const ok = await writeAssetFile(target, content);
-  if (ok) {
-    registerAsset(scene.id, target, 'scene');
-    setCurrentScenePath(target); // persists, so the next Save All goes straight to it
-    editorEmit('!save', { path: target, entities: scene.entities.length }); // Editor Percept (V2)
-    console.log(`[Editor] Saved scene: ${scene.entities.length} entities → ${target}`);
+  if (!pick) return { saved: false, path: null, reason: 'cancelled' }; // user cancelled
+  const target = pick.path;
+  // Create-only, asking before replacing an existing scene (#1264) — the fallback prompt never
+  // checked. A Replace gives THIS scene the replaced one's guid (owner 2026-09-15), so what points
+  // at that scene keeps pointing at it; registering it below is what the next save reads back.
+  const written = await writeNewAssetDocument(target, (guid) => (guid === scene.id ? content : jsonFileBody({ ...scene, id: guid })), {
+    guid: scene.id, confirmReplace: pick.confirmReplace, kind: 'scene',
+  });
+  if (written.outcome === 'declined') return { saved: false, path: null, reason: 'cancelled' };
+  if (written.outcome === 'wrongKind') {
+    // Replacing a file of another kind would hand its guid to a scene. Since #1413 the dialog always
+    // yields a `.scene.json` name, which the classifier can only type `scene`, so this fires only
+    // for a manifest entry that disagrees with its own suffix — kept because the write reports it.
+    useEditorStore.getState().showToast(`${written.path} is not a scene (it is typed '${written.existingType}') — choose another name.`, 'warn');
+    return { saved: false, path: null, reason: 'cancelled' };
+  }
+  if (written.outcome === 'created' || written.outcome === 'replaced') {
+    // `written.path`, not `target`: a Replace lands on the existing file's on-disk spelling (#1273),
+    // and the current scene path persists — a second spelling would be what every later save writes.
+    const saved = written.path;
+    registerAsset(written.guid, saved, 'scene');
+    setCurrentScenePath(saved); // persists, so the next Save All goes straight to it
+    editorEmit('!save', { path: saved, entities: scene.entities.length }); // Editor Percept (V2)
+    console.log(`[Editor] Saved scene: ${scene.entities.length} entities → ${saved}`);
     markSceneSaved(savedAtEditVersion);
-    return { saved: true, path: target, reason: 'ok' };
+    return { saved: true, path: saved, reason: 'ok' };
   }
   console.error(`[Editor] Failed to save scene to ${target}`);
   return { saved: false, path: target, reason: 'write-failed' };
@@ -1217,6 +1369,13 @@ export type SceneLoadOutcome = 'loaded' | 'superseded' | 'failed' | 'refused';
 let _lastLoadFailureMessage: string | null = null;
 export function getLastSceneLoadFailureMessage(): string | null { return _lastLoadFailureMessage; }
 
+/** The managers that failed to start during the last scene load this module ADOPTED, one line
+ *  each (`<manager>: <message>`). Empty for a clean load. The scene is still loaded: a failed
+ *  manager does not un-load it (#1425, `SceneLoadResult.startupErrors`). Read by the agent
+ *  `load-scene` op, so an agent learns it without scraping the console. */
+let _lastLoadStartupErrors: readonly string[] = [];
+export function getLastSceneLoadStartupErrors(): readonly string[] { return _lastLoadStartupErrors; }
+
 /** Load a scene from a JSON file. Delegates to SceneManager which handles the
  *  full async preload + atomic swap + refcount lifecycle. The editor wrapper
  *  layers on the editor-only concerns: tracking the current scene path and
@@ -1259,7 +1418,11 @@ export async function loadScene(
   try {
     setPlayState('stopped'); // a scene load always returns the editor to edit mode
     setSceneLoadStatus({ active: true, loaded: 0, total: 0 });
-    await sceneManager.loadScene(scenePath, {
+    // Read on BOTH sides of the await (#1409): the outgoing world stays live and editable while the
+    // new one loads, so an edit made mid-load is discarded too. Nothing resets the dirty state until
+    // `adoptReplacedWorld` below; the swap itself does not.
+    const dirtBeforeLoad = readWorldDirt();
+    const { keptBaseGuids, startupErrors = [] } = await sceneManager.loadScene(scenePath, {
       ...(gameId !== undefined ? { gameId } : {}),
       // Resources acquire in parallel; each completion (on a cold cache, a finished
       // bake) advances the bar. The SceneLoadModal only shows past a ~400ms delay.
@@ -1286,15 +1449,25 @@ export async function loadScene(
     // stack. Per-scene keying also keeps another scene's actions (stale ids) from
     // ever applying here. (Play→Stop does NOT come through here — it reloads via
     // sceneManager directly — so its same-scene history is preserved.)
-    swapHistory(scenePath);
-    const entityCount = getAllEntities().length;
-    markSceneSaved(); // the freshly loaded world matches disk — a new baseline (C7)
-    // A stale dirty guid from the PREVIOUS chain (e.g. a base no longer loaded) must
-    // not linger — the freshly loaded chain has no unsaved live-world work yet either.
-    clearAllSceneDirty();
+    //
+    // ⚠️ Unless the outgoing world held work this load DISCARDED (#1409): then its stack
+    // describes that work, and parking it (or, on a same-path discard-reload, keeping it live) let
+    // one undo replay it onto the fresh world. A kept base's dirty flag survives (#1417). Both
+    // rules: `adoptReplacedWorld`.
+    adoptReplacedWorld(scenePath, keptBaseGuids, dirtBeforeLoad);
+    _lastLoadStartupErrors = startupErrors.map(({ manager, error }) => `${manager}: ${(error as Error)?.message ?? String(error)}`);
+    if (_lastLoadStartupErrors.length) {
+      // The scene IS loaded, so this is not a failure toast; SceneManager already console.error'd each.
+      useEditorStore.getState().showToast(
+        `Scene loaded, but ${startupErrors.length} manager(s) failed to start: ${startupErrors.map((f) => f.manager).join(', ')} (see the console)`,
+        'warn',
+      );
+    }
+    const worldEntityTotal = getAllEntities().length;
     // Editor Percept (V2): the human opened a scene — correlate later game/edit events to it.
-    editorEmit('!scene-load', { path: scenePath, entityCount });
-    console.log(`[Editor] Loaded scene: ${entityCount} entities from ${scenePath}`);
+    // `worldEntityTotal`, the editor state's name for the same count (§2, #1223 D3).
+    editorEmit('!scene-load', { path: scenePath, worldEntityTotal });
+    console.log(`[Editor] Loaded scene: ${worldEntityTotal} entities from ${scenePath}`);
     return 'loaded';
   } catch (e) {
     // An AbortError means a newer load superseded this one — CANCELLED early, by design (see
@@ -1421,6 +1594,8 @@ export async function newScene(path: string | null = null): Promise<void> {
     // from a path that is still the OUTGOING scene's. Setting it first removes the ordering
     // dependency instead of racing it. ⚠️ This is also what makes the refusal above a LOCK
     // rather than a supersession token — see there.
+    // Read on both sides of the await, for the same reason as in `loadScene` (#1409).
+    const dirtyBeforeSwap = worldHasUnsavedEdits();
     setCurrentScenePath(path);
     setCurrentBaseScene(undefined);
     // Replace the world CONTENT through SceneManager rather than deleting and respawning in
@@ -1452,9 +1627,11 @@ export async function newScene(path: string | null = null): Promise<void> {
       );
     });
     // Keyed by the new scene's own path when it has one, so its undo stack is its own and the
-    // outgoing scene's is preserved under ITS key rather than dropped. '' is the untitled
+    // outgoing scene's is preserved under ITS key when clean rather than dropped. '' is the untitled
     // bootstrap context, which is what the agent `new-scene` op (no path) still gets.
-    swapHistory(path ?? '');
+    // `freshIncoming`: a starter world matches no stack ever recorded under this key — '' above all,
+    // which every untitled scene shares (#1409).
+    swapHistory(path ?? '', { discardOutgoing: dirtyBeforeSwap || worldHasUnsavedEdits(), freshIncoming: true });
     markSceneSaved(); // a fresh untitled scene has no unsaved WORK yet — new baseline (C7)
     clearAllSceneDirty();
     console.log('[Editor] New scene created');
@@ -1486,6 +1663,46 @@ export function warnAuthoredWritesWhileStopped(): void {
   clearAuthoredWritesWhileStopped();
 }
 
+/** Write every OTHER loaded scene with unsaved edits (a dirty base, edited in place) to its own
+ *  path. Save All's second half; also run by `saveSceneAs` BEFORE its reopen. */
+async function saveOtherLoadedScenes(): Promise<{ extraSaved: { path: string; guid: string }[]; failed: { path: string; guid: string; reason: string }[] }> {
+  const extraSaved: { path: string; guid: string }[] = [];
+  const failed: { path: string; guid: string; reason: string }[] = [];
+  // Snapshot the chain BEFORE iterating — each iteration below `await`s (serialize +
+  // write), and a scene swap landing mid-loop would otherwise mutate the live Map
+  // out from under a bare `for...of`, skipping or misattributing entries.
+  const loadedScenes = [...sceneManager.getLoadedScenes().values()];
+  for (const entry of loadedScenes) {
+    if (entry.role === 'primary' || !isSceneDirty(entry.guid)) continue;
+    // Catch per-scene so one scene that fails to serialize can't block every OTHER
+    // dirty scene in the same Save All, and so its dirty flag stays SET (not
+    // silently cleared) until it can actually be written. This used to be load-
+    // bearing for Phase 12's A8/A9 guard, which threw for a base containing a
+    // prefab instance; that guard is gone (both bugs fixed), but the per-scene
+    // isolation is worth keeping on its own merits for any future throw.
+    let sceneFile;
+    try {
+      sceneFile = await serializeScene({ scene: { path: entry.path, guid: entry.guid } });
+    } catch (e) {
+      console.error(`[Editor] Refused to save "${entry.path}": ${(e as Error).message}`);
+      failed.push({ path: entry.path, guid: entry.guid, reason: `serialize failed: ${(e as Error).message}` });
+      continue;
+    }
+    const ok = await writeAssetFile(entry.path, jsonFileBody(sceneFile));
+    if (!ok) {
+      console.error(`[Editor] Failed to save scene to ${entry.path}`);
+      failed.push({ path: entry.path, guid: entry.guid, reason: 'the write to disk was rejected' });
+      continue;
+    }
+    registerAsset(entry.guid, entry.path, 'scene');
+    clearSceneDirty(entry.guid);
+    editorEmit('!save', { path: entry.path, entities: sceneFile.entities.length }); // Editor Percept (V2)
+    console.log(`[Editor] Saved scene: ${sceneFile.entities.length} entities → ${entry.path}`);
+    extraSaved.push({ path: entry.path, guid: entry.guid });
+  }
+  return { extraSaved, failed };
+}
+
 /** Save all editor-managed assets: every parked ASSET doc (the dirty-asset registry), the
  *  primary scene file (via `saveScene`), THEN every OTHER dirty scene in the loaded chain — a
  *  base edited in place (Phase 12, M3, scene-loading.md) — to ITS OWN file. Per-material edits
@@ -1502,7 +1719,8 @@ export function warnAuthoredWritesWhileStopped(): void {
  *  run-mode refusal (no writing while playing/previewing) sits above this loop, so it
  *  covers bases too; a cancelled Save-As or a failed primary write means nothing else
  *  gets written either, and the caller sees the primary's own failure reason
- *  unchanged. Silent by design (the owner's call, 2026-07-26) — the dirty-dot on the
+ *  unchanged. ⚠️ Except an agent Save As (#1414), which writes the bases FIRST because its
+ *  reopen reloads them — so a failed copy can come back `saved:false` WITH `extraSaved`. Silent by design (the owner's call, 2026-07-26) — the dirty-dot on the
  *  Hierarchy scene-group row (Phase 13) is the visibility half that makes a silent
  *  multi-file save legible instead of a surprise. */
 export async function saveAll(opts: { path?: string; allowDialog?: boolean } = {}): Promise<SaveResult> {
@@ -1545,40 +1763,12 @@ export async function saveAll(opts: { path?: string; allowDialog?: boolean } = {
   // (playing/previewing) doesn't warn about a file nothing wrote.
   warnAuthoredWritesWhileStopped();
 
-  const extraSaved: { path: string; guid: string }[] = [];
-  const failed: { path: string; guid: string; reason: string }[] = [];
-  // Snapshot the chain BEFORE iterating — each iteration below `await`s (serialize +
-  // write), and a scene swap landing mid-loop would otherwise mutate the live Map
-  // out from under a bare `for...of`, skipping or misattributing entries.
-  const loadedScenes = [...sceneManager.getLoadedScenes().values()];
-  for (const entry of loadedScenes) {
-    if (entry.role === 'primary' || !isSceneDirty(entry.guid)) continue;
-    // Catch per-scene so one scene that fails to serialize can't block every OTHER
-    // dirty scene in the same Save All, and so its dirty flag stays SET (not
-    // silently cleared) until it can actually be written. This used to be load-
-    // bearing for Phase 12's A8/A9 guard, which threw for a base containing a
-    // prefab instance; that guard is gone (both bugs fixed), but the per-scene
-    // isolation is worth keeping on its own merits for any future throw.
-    let sceneFile;
-    try {
-      sceneFile = await serializeScene({ scene: { path: entry.path, guid: entry.guid } });
-    } catch (e) {
-      console.error(`[Editor] Refused to save "${entry.path}": ${(e as Error).message}`);
-      failed.push({ path: entry.path, guid: entry.guid, reason: `serialize failed: ${(e as Error).message}` });
-      continue;
-    }
-    const ok = await writeAssetFile(entry.path, jsonFileBody(sceneFile));
-    if (!ok) {
-      console.error(`[Editor] Failed to save scene to ${entry.path}`);
-      failed.push({ path: entry.path, guid: entry.guid, reason: 'the write to disk was rejected' });
-      continue;
-    }
-    registerAsset(entry.guid, entry.path, 'scene');
-    clearSceneDirty(entry.guid);
-    editorEmit('!save', { path: entry.path, entities: sceneFile.entities.length }); // Editor Percept (V2)
-    console.log(`[Editor] Saved scene: ${sceneFile.entities.length} entities → ${entry.path}`);
-    extraSaved.push({ path: entry.path, guid: entry.guid });
-  }
+  const others = await saveOtherLoadedScenes();
+  // A Save As already saved the others before its reopen (`saveSceneAs`), and reports them itself.
+  // By path: a base written inside `saveSceneAs` and dirtied again during its copy write is
+  // written twice, and reported once.
+  const extraSaved = [...new Map([...(primaryResult.extraSaved ?? []), ...others.extraSaved].map((e) => [e.path, e])).values()];
+  const failed = [...(primaryResult.failed ?? []), ...others.failed];
   return withAssets({
     ...primaryResult,
     ...(extraSaved.length ? { extraSaved } : {}),

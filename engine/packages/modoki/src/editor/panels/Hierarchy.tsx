@@ -2,16 +2,18 @@
 
 import React, { useState, useEffect, useCallback, useRef, useMemo } from 'react';
 import { onWorldSwap, getCurrentWorld } from '../../runtime/core/ecs/world';
+import { durableGuid } from '../../runtime/core/assetRefRules';
 import { getAllTraits, getTraitByName, COMPONENT_CATEGORY_ORDER } from '../../runtime/core/ecs/traitRegistry';
+import { parentOrRootFor } from '../../runtime/core/ecs/hierarchy';
 import { getAllEntities, buildEntityTree, deleteEntity, onStructureDirtyCoalesced, getStructureVersion, writeTraitField, readTraitData, subtreeIds, findEntity, type EntityInfo } from '../../runtime/core/ecs/entityUtils';
 import { pinEntityAt, livePinnedId, type EntityPin } from '../../runtime/core/ecs/entityPin';
 import { renameCommitTarget } from './renamePin';
 import { compareSiblings } from '../../runtime/core/ecs/entityOrder';
 import { flattenVisibleIds, rangeBetween } from './hierarchySelection';
-import { deleteEntitiesWithUndo, duplicateEntity, reparentEntity, createEntityWithUndo as createEntityAction, writeTraitFieldWithUndo, writeTraitFieldMultiWithUndo, writeTraitFieldPerEntityWithUndo, snapshotEntity, respawnFromSnapshot, regenerateSnapshotGuids, classifyPrefabDuplicate, stripPrefabInstanceFromSnapshot, reRootPrefabInstanceSubtree, moveEntityToScene, type EntitySnapshot } from '../undo/entityActions';
+import { deleteEntitiesWithUndo, duplicateEntity, reparentEntity, createEntityWithUndo as createEntityAction, writeTraitFieldWithUndo, writeTraitFieldMultiWithUndo, writeTraitFieldPerEntityWithUndo, snapshotEntity, respawnFromSnapshot, regenerateSnapshotGuids, classifyPrefabDuplicate, stripPrefabInstanceFromSnapshot, clearOwnedNestedStampFromSnapshot, moveEntityToScene, planReparent, applyReparent, type EntitySnapshot } from '../undo/entityActions';
 import { preflightSceneMove, formatSceneMoveConfirm } from '../scene/sceneMoveScan';
 import { entityRef } from '../undo/entityRef';
-import { instantiatePrefabAsync, setPrefabSource, detachPrefabInstance, reattachPrefabInstance, type PrefabFile } from '../scene/prefab';
+import { instantiatePrefabInstance, detachPrefabInstance, reattachPrefabInstance, type PrefabFile } from '../scene/prefab';
 import { parseAssetJson, isMissingAsset } from '../../runtime/loaders/assetFetch';
 import { focusEntityInSceneView, canFrameSelected } from '../scene/sceneViewBus';
 import { getCurrentScenePath } from '../scene/serialize';
@@ -28,10 +30,10 @@ import ContextMenu, { type ContextMenuItem } from '../components/ContextMenu';
 import RenameInput from '../components/RenameInput';
 import { TreeSearchInput, TypeFilterMenu, treeRowPadLeft } from './treeChrome';
 import { useExpandedSet } from './useExpandedSet';
-import { loadCollapsedGuids, saveCollapsedGuids, computeRestoredCollapse, collapsedIdsToGuids, needsCollapseRestore, shouldPersistCollapse, type CollapseOwner } from './hierarchyCollapse';
+import { loadCollapsedGuids, saveCollapsedGuids, computeRestoredCollapse, needsCollapseRestore, shouldPersistCollapse, holdCollapsed, reconcileCollapsed, persistableCollapsedGuids, NO_COLLAPSE_HOLDS, type CollapseHolds, type CollapseOwner } from './hierarchyCollapse';
 import { remapPrefix } from '../utils/assetPaths';
 import { filterEntityTree, collectEntityTypes, normalizeFolderPath, buildHierarchyFolders, countFolderRoots, folderSubtreePaths, folderSubtreeRootIds, revealTargetsFor, isRevealRequest, type RevealKey, groupRootsBySourceScene, resolveDropFolderSync, type HierarchyFolder } from './hierarchyFolders';
-import { isSceneDirty } from '../scene/sceneDirty';
+import { isSceneDirty, adoptParentScene, resolveAffectedScenes } from '../scene/sceneDirty';
 import { startDragGhost, endDragGhost, armGrabCursor, getAssetDragInfo, setDragGhostRefusal } from '../utils/dragGhost';
 import { decideHierarchyAssetDrop } from './assetDropPolicy';
 import { PRIMITIVE_NAMES } from '../../runtime/loaders/primitives';
@@ -46,6 +48,8 @@ import {
 // matching live in assetOps/assetRoots so the flat-project "/assets" prefix
 // can't be forgotten in one copy again (#29).
 import { firstWritableAssetRoot, createPrefabFromEntity } from './assetOps';
+import { runtimeExcludedMessage } from '../scene/authoringScope';
+import { confirmReplaceAsset, confirmInEditor } from '../utils/saveDialog';
 
 type DropZone = 'before' | 'child' | 'after' | null;
 
@@ -231,12 +235,6 @@ interface EntityNodeProps {
   onSelect: (id: number, e: React.MouseEvent) => void;
   onContextMenu: (e: React.MouseEvent, entity: EntityInfo) => void;
   onReparent: (entityId: number, newParentId: number, sortOrder?: number) => void;
-  /** Cross-scene-group drop (scene-loading.md Phase 14): the
-   *  dragged entity's sourceScene differs from this row's — promote/demote it,
-   *  reparenting directly under this row (owner decision: a row-drop takes only
-   *  the dragged subtree, landing under the target row; the old parent is left
-   *  behind untouched). */
-  onMoveToScene: (entityId: number, targetScene: string, newParentId?: number) => void;
   onPrefabDrop: (e: React.DragEvent, parentId: number) => void;
   collapsed: Set<number>;
   onToggle: (id: number, recursive?: boolean) => void;
@@ -249,7 +247,7 @@ interface EntityNodeProps {
   onCancelRename: () => void;
 }
 
-const EntityNode = React.memo(function EntityNode({ entity, depth, selectedId, selectedIds, onSelect, onContextMenu, onReparent, onMoveToScene, onPrefabDrop, collapsed, onToggle, prevSiblingSort, nextSiblingSort, parentLayer, parentHasCanvas2D, renamingId, onCommitRename, onCancelRename }: EntityNodeProps) {
+const EntityNode = React.memo(function EntityNode({ entity, depth, selectedId, selectedIds, onSelect, onContextMenu, onReparent, onPrefabDrop, collapsed, onToggle, prevSiblingSort, nextSiblingSort, parentLayer, parentHasCanvas2D, renamingId, onCommitRename, onCancelRename }: EntityNodeProps) {
   const isRenaming = renamingId === entity.id;
   const hasChildren = entity.children && entity.children.length > 0;
   const isCollapsed = collapsed.has(entity.id);
@@ -298,7 +296,8 @@ const EntityNode = React.memo(function EntityNode({ entity, depth, selectedId, s
         onContextMenu={(e) => onContextMenu(e, entity)}
         onMouseDown={(e) => { if (isSelected) armGrabCursor(e); }}
         onMouseUp={() => document.body.classList.remove('editor-mousedown')}
-        draggable={!isRenaming}
+        // A resource row (Time, Input, a config singleton) is not a tree node: it is never dragged (#1248).
+        draggable={!isRenaming && !entity.isResource}
         onDragStart={(e) => {
           e.dataTransfer.setData('application/editor-entity', JSON.stringify({
             id: entity.id, name: entity.name, parentId: entity.parentId, sortOrder: entity.sortOrder,
@@ -350,7 +349,9 @@ const EntityNode = React.memo(function EntityNode({ entity, depth, selectedId, s
           const draggedScene = getAllEntities().find((x) => x.id === id)?.sourceScene || '';
           const targetScene = entity.sourceScene || '';
           if (draggedScene !== targetScene) {
-            onMoveToScene(id, targetScene, entity.id);
+            // Under this row, whatever the zone: a sibling slot would sit between rows of another scene.
+            // The reparent asks first, because it moves the entity into this row's scene (#1429).
+            onReparent(id, entity.id);
             return;
           }
 
@@ -481,7 +482,6 @@ const EntityNode = React.memo(function EntityNode({ entity, depth, selectedId, s
           onSelect={onSelect}
           onContextMenu={onContextMenu}
           onReparent={onReparent}
-          onMoveToScene={onMoveToScene}
           onPrefabDrop={onPrefabDrop}
           collapsed={collapsed}
           onToggle={onToggle}
@@ -692,6 +692,9 @@ export default function Hierarchy() {
   // "restore needed" boolean (which nothing was guaranteed to clear) and not the scene path
   // (which File → Save As changes with no swap). See hierarchyCollapse.ts for both scars.
   const collapseOwnerRef = useRef<CollapseOwner>(null);
+  // #1221: what each collapsed id MEANT when it was collapsed, so a destroy-and-replace on the same
+  // index inside this world does not hand the collapse to the newcomer (hierarchyCollapse.ts).
+  const collapsedHeldRef = useRef<CollapseHolds>(NO_COLLAPSE_HOLDS);
   // Set by the effect below so the persistence effect can ask for a settled refresh too.
   const requestSettledRefreshRef = useRef<() => void>(() => {});
   useEffect(() => {
@@ -713,6 +716,14 @@ export default function Hierarchy() {
       const v = getStructureVersion();
       if (v !== prevVersionRef.current) {
         prevVersionRef.current = v;
+        // Re-resolve the collapsed ids BEFORE the tree rebuild, in the world they were restored for
+        // only — across a swap the restore below owns the set (#1221).
+        const world = getCurrentWorld();
+        if (collapseOwnerRef.current?.world === world) {
+          // A PURE updater: React runs it twice in development. The holds for the new set are re-taken
+          // by the [collapsed] effect below, never written from in here (hierarchyCollapse.ts says why).
+          setCollapsed((prev) => reconcileCollapsed(prev, collapsedHeldRef.current, world) ?? prev);
+        }
         const flat = getAllEntities();
         setEntityCount(flat.length);
         setTree(buildEntityTree(flat));
@@ -797,6 +808,15 @@ export default function Hierarchy() {
     // Same reasoning as the keymap effect below. See input/hmrEpoch.ts.
   }, [hmrEpoch]);
 
+  // Hold each collapsed id while it still names the entity the user collapsed (#1221). Only for a set
+  // restored for the live world — a pre-restore set holds a dead world's ids.
+  useEffect(() => {
+    const world = getCurrentWorld();
+    collapsedHeldRef.current = collapseOwnerRef.current?.world === world
+      ? holdCollapsed(collapsed, collapsedHeldRef.current, world)
+      : NO_COLLAPSE_HOLDS;
+  }, [collapsed]);
+
   // Persist collapse per scene (by guid). Gated on the OWNER so a transient pre-restore set
   // (stale ids from before a swap) can't overwrite the save.
   useEffect(() => {
@@ -809,7 +829,8 @@ export default function Hierarchy() {
       if (path) requestSettledRefreshRef.current();
       return;
     }
-    saveCollapsedGuids(path, collapsedIdsToGuids(getAllEntities(), collapsed));
+    // Parked guids too: a collapsed entity a game system destroyed during Play is still collapsed.
+    saveCollapsedGuids(path, persistableCollapsedGuids(getAllEntities(), collapsed, collapsedHeldRef.current));
   }, [collapsed]);
 
   const handleToggle = useCallback((id: number, recursive = false) => {
@@ -1002,14 +1023,60 @@ export default function Hierarchy() {
     if (snapshot) setEntityClipboard({ snapshot, op: 'cut', sourceId: entity.id });
   }, []);
 
-  const handlePaste = useCallback((parentId: number) => {
+  /** Every Hierarchy reparent goes through here (#1429): the row drop and cut → paste. A parent from
+   *  another scene makes it a SCENE MOVE into that scene, so it asks first, in the editor's own modal.
+   *  A same-scene reparent applies at once, as before. */
+  const requestReparent = useCallback(async (entityId: number, newParentId: number, sortOrder?: number): Promise<boolean> => {
+    const plan = planReparent(entityId, newParentId);
+    if (plan.kind === 'refused') {
+      // Only the scene-move refusals toast. Self, cycle and resource refusals are refused silently,
+      // as a same-scene drop always was.
+      if (plan.reason === 'instance-member') {
+        useEditorStore.getState().showToast('This would split a prefab instance across two scene files: part of it belongs to an instance that stays behind. Move the whole instance, or unpack it first.', 'warn');
+      }
+      return false;
+    }
+    if (plan.kind === 'scene-move') {
+      // Held by guid across the await: a hot reload while the modal is open reassigns runtime ids, and
+      // a raw id could then name an entity the person never dragged.
+      const movedRef = entityRef(entityId);
+      const parentRef = entityRef(newParentId);
+      const pre = await preflightSceneMove(entityId, plan.to);
+      const parentName = getAllEntities().find((e) => e.id === newParentId)?.name || `Entity ${newParentId}`;
+      const sceneName = sceneOrder.labels.get(plan.to) ?? (plan.to || 'primary');
+      const text = formatSceneMoveConfirm(pre, plan.to, { parentName, sceneName });
+      if (!(await confirmInEditor('Move into another scene?', text, 'Move'))) return false;
+      // The world can change while the modal is open (an agent edit, a hot reload). Apply only the move
+      // the person was shown: the same two entities, still a move into the same scene.
+      const liveId = movedRef.resolve();
+      const liveParent = parentRef.resolve();
+      const now = liveId != null && liveParent != null ? planReparent(liveId, liveParent) : null;
+      if (!now || now.kind !== 'scene-move' || now.to !== plan.to) {
+        useEditorStore.getState().showToast('Not moved: the scene changed while the prompt was open. Drag it again.', 'warn');
+        return false;
+      }
+      entityId = liveId!;
+      newParentId = liveParent!;
+    }
+    const res = applyReparent(entityId, newParentId, sortOrder);
+    if (res.ok && res.plan.kind === 'scene-move') {
+      const to = res.plan.to;
+      if (to) setExpandedSceneGroups((prev) => { const next = new Set(prev); next.add(to); return next; });
+      selectEntity(entityId);
+    }
+    return res.ok;
+  }, [sceneOrder, selectEntity, setExpandedSceneGroups]);
+
+  const handlePaste = useCallback((pasteParentId: number) => {
     if (!entityClipboard) return;
+    // ⌘V with a resource row selected pastes at the root: nothing is parented under a resource (#1248).
+    const parentId = parentOrRootFor(pasteParentId);
     const { snapshot, op, sourceId } = entityClipboard;
     if (op === 'cut') {
-      // Move the original under the new parent. reparentEntity carries its own
-      // undo and rejects illegal targets (self / descendant) by returning false.
-      reparentEntity(sourceId, parentId);
-      setEntityClipboard(null);
+      // Move the original under the new parent. requestReparent carries its own undo, asks before a
+      // move into another scene, and rejects illegal targets (self / descendant) by returning false.
+      // The cut is spent only when the move happens: a Cancel at the scene-move prompt keeps it.
+      void requestReparent(sourceId, parentId).then((moved) => { if (moved) setEntityClipboard(null); });
       return;
     }
     // copy → spawn a fresh deep copy under the target parent, with a unique
@@ -1017,7 +1084,7 @@ export default function Hierarchy() {
     // distinct, mirroring duplicateEntity).
     const eaMeta = getAllTraits().find(t => t.name === 'EntityAttributes');
     // Prefab-instance handling, identical to duplicateEntity (prefab F1): pasting an
-    // instance ROOT → new linked instance (re-root); pasting a non-root MEMBER →
+    // instance ROOT → new linked instance; pasting a non-root MEMBER →
     // plain ADDED child (strip PrefabInstance).
     const prefabKind = classifyPrefabDuplicate(snapshot);
     // Mint fresh guids for the pasted copy ONCE (stable across undo/redo, and not
@@ -1025,15 +1092,18 @@ export default function Hierarchy() {
     // paste a guid-based handle that survives a world rebuild (Play→Stop).
     let pasteSnapshot = regenerateSnapshotGuids(snapshot);
     if (prefabKind === 'member') pasteSnapshot = stripPrefabInstanceFromSnapshot(pasteSnapshot);
+    // A pasted owned nested instance root becomes an INDEPENDENT instance (#1354, owner ruling).
+    else if (prefabKind === 'root') pasteSnapshot = clearOwnedNestedStampFromSnapshot(pasteSnapshot);
     const parentRef = parentId ? entityRef(parentId) : null;
     const spawn = (p: number) => {
       const id = respawnFromSnapshot(pasteSnapshot, p);
+      // The copy belongs to its new parent's scene, not the source's (#1429).
+      adoptParentScene(id);
       if (eaMeta) {
         const siblings = getAllEntities().filter(e => e.parentId === p && e.id !== id);
         const nextSort = siblings.length ? Math.max(...siblings.map(s => s.sortOrder)) + 1 : 0;
         writeTraitField(id, eaMeta, 'sortOrder', nextSort);
       }
-      if (prefabKind === 'root') reRootPrefabInstanceSubtree(id);
       return id;
     };
     let currentId = spawn(parentId);
@@ -1041,10 +1111,11 @@ export default function Hierarchy() {
     selectEntity(currentId);
     pushAction({
       label: 'Paste Entity',
+      affectedScenes: resolveAffectedScenes([currentId]),
       undo: () => { const id = ref.resolve(); if (id != null) deleteEntity(id); selectEntity(null); },
       redo: () => { currentId = spawn(parentRef?.resolve() ?? parentId); ref = entityRef(currentId); selectEntity(currentId); },
     });
-  }, [entityClipboard, selectEntity]);
+  }, [entityClipboard, selectEntity, requestReparent]);
 
   // ── Focus (frame in SceneView orbit camera — see SceneView F-key) ──
   const handleFocus = useCallback((entity: EntityInfo) => {
@@ -1071,9 +1142,13 @@ export default function Hierarchy() {
     if (!root) { console.error('[Hierarchy] No writable asset root for prefab'); return; }
     const safeName = (entity.name || 'Entity').replace(/[^a-zA-Z0-9_-]/g, '_');
     const savePath = `${root}/prefabs/${safeName}.prefab.json`;
-    const result = await createPrefabFromEntity(entity.id, savePath, `Save prefab "${entity.name}"`);
+    // The path is derived from the entity's NAME, so it can land on an existing prefab — asked,
+    // and a Replace keeps that prefab's guid (#1264).
+    const result = await createPrefabFromEntity(entity.id, savePath, `Save prefab "${entity.name}"`, confirmReplaceAsset);
+    if (result === 'declined') return;
     if (!result) { console.error(`[Hierarchy] Failed to create prefab ${savePath}`); return; }
     console.log(`[Hierarchy] Created prefab: ${savePath}`);
+    if (result.runtimeExcluded > 0) useEditorStore.getState().showToast(runtimeExcludedMessage(result.runtimeExcluded), 'warn');
     pushAction(result.action);
   }, []);
 
@@ -1088,14 +1163,20 @@ export default function Hierarchy() {
     const pi = readTraitData(entity.id, piMeta);
     const rootId = (pi?.rootInstanceId as number) || entity.id;
     const snapshot = detachPrefabInstance(rootId);
-    if (!snapshot.length) return;
+    if (!snapshot.links.length) return;
     const name = getAllEntities().find(e => e.id === rootId)?.name ?? entity.name;
     // Resolve the instance root by guid so redo detaches the right entity after a
     // world rebuild (Play→Stop); undo rebuilds from the snapshot.
     const ref = entityRef(rootId);
     pushAction({
       label: `Detach prefab "${name}"`,
-      undo: () => reattachPrefabInstance(snapshot),
+      // Detach leaves PLAIN entities, whose guids ARE serialized, so these refs survive a
+      // Play→Stop where Create Prefab's do not (#1272). Report a miss anyway rather than
+      // discard the count — that silence is what hid #1272 for as long as it did.
+      undo: () => {
+        const unresolved = reattachPrefabInstance(snapshot);
+        if (unresolved > 0) console.warn(`[Hierarchy] Detach undo: ${unresolved} prefab link(s) could not be put back — no longer addressable.`);
+      },
       redo: () => { const id = ref.resolve(); if (id != null) detachPrefabInstance(id); },
     });
   }, []);
@@ -1454,7 +1535,7 @@ export default function Hierarchy() {
   const ctxMenuItems = useCallback((entity: EntityInfo): ContextMenuItem[] => {
     const parentId = entity.id;
     const pasteItem: ContextMenuItem = {
-      label: 'Paste', shortcut: '⌘V', disabled: !entityClipboard,
+      label: 'Paste', shortcut: '⌘V', disabled: !entityClipboard || !!entity.isResource,
       onClick: () => handlePaste(parentId),
     };
 
@@ -1477,7 +1558,8 @@ export default function Hierarchy() {
     // Find References needs a stable guid to send the backend (runtime ids are
     // reassigned every scene reload) — disable rather than send a target that
     // cannot resolve (a 404 the user can't act on is worse than a greyed-out item).
-    const guid = attr ? (attr.guid as string) || '' : '';
+    // Durable only (#1210): a runtime guid is in no file on disk, so it would search for nothing.
+    const guid = attr ? durableGuid(attr.guid as string) : '';
     return [
       { label: 'Rename', shortcut: 'F2', onClick: () => handleRename(entity), disabled: dis },
       { label: 'Duplicate', shortcut: '⌘D', onClick: () => handleDuplicate(entity), disabled: dis },
@@ -1495,7 +1577,7 @@ export default function Hierarchy() {
       { label: 'New Folder', onClick: () => createFolder(''), disabled: dis },
       ...(entity.parentId === 0 && entity.editorFolder ? [{ label: 'Remove from Folder', onClick: () => moveEntityToFolder(entity.id, '') }] : []),
       { label: '', separator: true },
-      { label: 'Create', children: createItems(parentId) },
+      { label: 'Create', children: createItems(parentId), disabled: dis },
       { label: '', separator: true },
       { label: 'Delete', shortcut: '⌫', onClick: () => handleDelete(entity), danger: true, disabled: dis },
     ];
@@ -1503,8 +1585,8 @@ export default function Hierarchy() {
 
   // Reparent handler: entity dragged onto another entity or root
   const handleReparent = useCallback((entityId: number, newParentId: number, sortOrder?: number) => {
-    reparentEntity(entityId, newParentId, sortOrder);
-  }, []);
+    void requestReparent(entityId, newParentId, sortOrder);
+  }, [requestReparent]);
 
   /** Cross-scene-group drop (scene-loading.md Phase 14):
    *  change which scene FILE authors this subtree — "promote" (level → base,
@@ -1513,15 +1595,15 @@ export default function Hierarchy() {
    *  owner decision: never offers an auto-rekey), then applies the move. On
    *  success, auto-expands the target scene group and keeps the entity selected
    *  (owner decision — a promoted entity ghosts + its group may be collapsed by
-   *  default, so it can otherwise look like it vanished). `newParentId` is the
-   *  row-drop gesture (reparent directly under that row); omitted for a
-   *  group-header/folder drop (lands at the target scene's root). `folderPath`
+   *  default, so it can otherwise look like it vanished). It lands at the target
+   *  scene's root: a drop ON a row is a reparent, and goes through
+   *  `requestReparent` instead (#1429). `folderPath`
    *  additionally tags the moved root into that folder once landed (used when
    *  the drop target was one of the target scene's OWN folder rows). */
-  const handleMoveToScene = useCallback(async (entityId: number, targetScene: string, newParentId?: number, folderPath?: string) => {
+  const handleMoveToScene = useCallback(async (entityId: number, targetScene: string, folderPath?: string) => {
     const pre = await preflightSceneMove(entityId, targetScene);
-    if (!window.confirm(formatSceneMoveConfirm(pre, targetScene))) return;
-    const res = moveEntityToScene(entityId, targetScene, newParentId ? { newParentId } : undefined);
+    if (!(await confirmInEditor('Move to another scene?', formatSceneMoveConfirm(pre, targetScene), 'Move'))) return;
+    const res = moveEntityToScene(entityId, targetScene);
     if (!res.ok) return;
     if (folderPath !== undefined) {
       const eaMeta = eaMetaFind();
@@ -1534,8 +1616,10 @@ export default function Hierarchy() {
   // Drop handler: prefab dragged from Assets → instantiate in scene
   const [dropActive, setDropActive] = useState(false);
 
-  const handlePrefabDrop = useCallback(async (e: React.DragEvent, parentId: number = 0) => {
+  const handlePrefabDrop = useCallback(async (e: React.DragEvent, dropParentId: number = 0) => {
     e.preventDefault();
+    // A prefab dropped on a resource row lands at the root: nothing is parented under a resource (#1248).
+    const parentId = parentOrRootFor(dropParentId);
     setDropActive(false);
     const raw = e.dataTransfer.getData('application/editor-asset');
     if (!raw) return;
@@ -1558,8 +1642,7 @@ export default function Hierarchy() {
       }
       // Preload nested children before the sync expand — otherwise a nested (v2)
       // prefab's children are silently dropped.
-      const currentId = await instantiatePrefabAsync(prefab, parentId);
-      setPrefabSource(currentId, path);
+      const currentId = await instantiatePrefabInstance(prefab, path, parentId);
       selectEntity(currentId);
       console.log(`[Hierarchy] Instantiated prefab "${prefab.name}" under parent ${parentId}`);
 
@@ -1575,8 +1658,7 @@ export default function Hierarchy() {
             if (isMissingAsset(e)) return null;
             throw e;
           }
-          const id = await instantiatePrefabAsync(p, parentId);
-          setPrefabSource(id, path);
+          const id = await instantiatePrefabInstance(p, path, parentId);
           selectEntity(id);
           return id;
         },
@@ -1602,7 +1684,6 @@ export default function Hierarchy() {
       onSelect={handleSelectClick}
       onContextMenu={handleContextMenu}
       onReparent={handleReparent}
-      onMoveToScene={handleMoveToScene}
       onPrefabDrop={handlePrefabDrop}
       collapsed={effectiveCollapsed}
       onToggle={handleToggle}
@@ -1637,7 +1718,7 @@ export default function Hierarchy() {
           onDropEntity={(id) => {
             const draggedScene = getAllEntities().find((x) => x.id === id)?.sourceScene || '';
             if (draggedScene === targetScene) { moveEntityToFolder(id, node.path); return; }
-            handleMoveToScene(id, targetScene, undefined, node.path);
+            handleMoveToScene(id, targetScene, node.path);
           }}
           onDropAsset={(e) => handlePrefabDrop(e, 0)}
           onDropFolder={(src) => moveFolder(src, node.path)}

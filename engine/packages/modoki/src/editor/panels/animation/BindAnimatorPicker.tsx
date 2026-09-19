@@ -9,7 +9,11 @@
  *  just appends to its clip bank) is the obvious choice when it exists. */
 
 import { useMemo, useState } from 'react';
-import { getAllEntities, type EntityInfo } from '../../../runtime/core/ecs/entityUtils';
+import { getAllEntities, findEntity, type EntityInfo } from '../../../runtime/core/ecs/entityUtils';
+import { getCurrentWorld } from '../../../runtime/core/ecs/world';
+import { pinEntityAt, livePinnedId } from '../../../runtime/core/ecs/entityPin';
+import { useEditorStore } from '../../store/editorStore';
+import { ModalShell } from '../../components/ModalShell';
 
 export interface BindEntityRow {
   id: number;
@@ -81,6 +85,23 @@ export default function BindAnimatorPicker({ clipName, onBind, onClose }: {
   // Start fully expanded: the entity you want may be nested, and a picker that
   // opens collapsed makes the fix look unavailable.
   const [expanded, setExpanded] = useState<Set<number>>(() => new Set(entities.map((e) => e.id)));
+  // The snapshot's ids are koota's recycled index: an entity destroyed while the picker is open (a
+  // Play rebuild) hands its id to the next spawn, and Bind would bind THAT. So each row is pinned to
+  // the entity it listed, and a pick whose entity is gone is refused (#1221; the ApplyPrefabDialog
+  // shape from #868).
+  const pins = useMemo(() => {
+    const world = getCurrentWorld();
+    return new Map(entities.map((e) => [e.id, pinEntityAt(e.id, findEntity, world)]));
+  }, [entities]);
+  const bind = (id: number) => {
+    const live = livePinnedId(pins.get(id) ?? null, findEntity, getCurrentWorld());
+    if (live === null) {
+      onClose();
+      useEditorStore.getState().showToast('That entity no longer exists — open the picker again to choose from the current scene.', 'warn');
+      return;
+    }
+    onBind(live);
+  };
 
   const rows = useMemo(() => buildEntityRows(entities, filter, expanded), [entities, filter, expanded]);
   const selected = rows.find((r) => r.id === selectedId) ?? null;
@@ -92,7 +113,7 @@ export default function BindAnimatorPicker({ clipName, onBind, onClose }: {
   });
 
   return (
-    <div style={overlay} onClick={onClose}>
+    <ModalShell kind="bind-animator-picker" onDismiss={onClose} scrim="rgba(0,0,0,0.4)">
       <div style={popover} onClick={(e) => e.stopPropagation()}>
         <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginBottom: 4 }}>
           <span style={{ color: '#7aa2f7', fontWeight: 'bold', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>Bind “{clipName}”</span>
@@ -117,7 +138,7 @@ export default function BindAnimatorPicker({ clipName, onBind, onClose }: {
                 key={r.id}
                 data-bind-entity-id={r.id}
                 onClick={() => setSelectedId(r.id)}
-                onDoubleClick={() => onBind(r.id)}
+                onDoubleClick={() => bind(r.id)}
                 title={r.hasAnimator ? 'Has an Animator — the clip is added to its clip list' : 'No Animator — one is added when you bind'}
                 style={{ display: 'flex', alignItems: 'center', gap: 2, padding: '2px 6px', paddingLeft: 6 + r.depth * 12, cursor: 'pointer', background: isSel ? '#2a2a40' : 'transparent', color: isSel ? '#cdd' : '#aab', fontSize: 11, userSelect: 'none', whiteSpace: 'nowrap' }}
                 onMouseEnter={(e) => { if (!isSel) e.currentTarget.style.background = '#1d1d2c'; }}
@@ -142,15 +163,14 @@ export default function BindAnimatorPicker({ clipName, onBind, onClose }: {
             data-ui-id="animation.bindAnimator.confirm" data-ui-kind="button" data-ui-label="bind"
             style={{ ...btn, opacity: selected ? 1 : 0.4, cursor: selected ? 'pointer' : 'default' }}
             disabled={!selected}
-            onClick={() => { if (selected) onBind(selected.id); }}
+            onClick={() => { if (selected) bind(selected.id); }}
           >Bind</button>
         </div>
       </div>
-    </div>
+    </ModalShell>
   );
 }
 
-const overlay: React.CSSProperties = { position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.4)', zIndex: 9999, display: 'flex', alignItems: 'center', justifyContent: 'center' };
 const popover: React.CSSProperties = { width: 420, height: '60vh', display: 'flex', flexDirection: 'column', background: '#15151f', border: '1px solid #3a3a5a', borderRadius: 5, padding: 10, fontFamily: 'monospace', fontSize: 12, color: '#ccc', boxShadow: '0 6px 24px rgba(0,0,0,0.6)' };
 const input: React.CSSProperties = { background: '#0e0e16', color: '#ddd', border: '1px solid #333', borderRadius: 3, padding: '3px 6px', fontFamily: 'monospace', fontSize: 12 };
 const btn: React.CSSProperties = { background: '#2a2a40', color: '#ccc', border: '1px solid #444', borderRadius: 3, padding: '2px 10px', cursor: 'pointer' };

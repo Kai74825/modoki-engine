@@ -6,8 +6,9 @@ import { fileToBase64 } from './fileBytes';
 import { getGameConfig } from '../../runtime/core/config';
 import { loadAllFonts } from '../../runtime/loaders/fontLoader';
 import {
-  instantiatePrefabAsync, setPrefabSource, type PrefabFile, serializePrefab,
+  instantiatePrefabInstance, type PrefabFile, serializePrefab,
 } from '../scene/prefab';
+import { runtimeExcludedMessage } from '../scene/authoringScope';
 import { importModel } from '../scene/modelImport';
 import { needsGLBConversion, convertSourceToGLB } from '../scene/convertToGLB';
 import { readMetaPreferringPark } from '../scene/pendingMeta';
@@ -23,7 +24,7 @@ import {
   describeRefusedDeletes, planDeleteOutcome,
   duplicateAssetFile as duplicateAsset, createFolderApi, moveFileTo, createPrefabFromEntity,
   reimportTargets, planImports, refreshHandlerTypes, HANDLER_TYPES,
-  deletionPathsFor, planRename,
+  deletionPathsFor, planRename, assetEditorHoldMessage,
 } from './assetOps';
 import { resolveClickSelection, dragPathsFor } from './assetSelection';
 import { createStoreSelectionTracker, revealKeysFor } from './assetReveal';
@@ -38,8 +39,10 @@ import { newGuid } from '../../runtime/loaders/assetManifest';
 import { getCreatableAssets, type CreatableAssetDef } from './creatableAssets';
 import { reimportPaths } from './assetViews/reimport';
 import { openAssetInEditor } from './openAssetInEditor';
-import { saveAssetDialog } from '../utils/saveDialog';
-import { createRegisteredAsset } from './createRegisteredAsset';
+import { chooseNewAssetPath, confirmReplaceAsset } from '../utils/saveDialog';
+import { confirmDiscardUnsaved } from '../scene/unsavedGate';
+import { mayCreateOver } from '../scene/createAssetDocument';
+import { createRegisteredAssetAskingToReplace } from './createRegisteredAsset';
 
 /** Display name from an asset path: last segment minus a known double/single extension. */
 function assetDisplayName(p: string, ext: string): string {
@@ -56,7 +59,7 @@ import {
 } from '../utils/assetPaths';
 import { ASSET_TYPE_COLORS, AssetTypeGlyph, compareAssetTypes } from './assetTypeIcons';
 import {
-  spritesByTexture as spritesByTextureOf, filterAssets, flatAssetTotal, groupByType, visibleOrder,
+  spritesByTexture as spritesByTextureOf, filterAssets, flatAssetTotal, fileActionTargets, fileActionPaths, groupByType, visibleOrder,
   ASSETS_SECTION, type ViewMode,
 } from './assetListing';
 import { resolveAssetKey } from './assetKeyCommands';
@@ -68,6 +71,7 @@ import {
   setExpanded, setPendingFolders, setTypeFilter, setViewMode,
   getCurrentFolder, setCurrentFolder,
 } from './assetFolderState';
+import { ModalShell } from '../components/ModalShell';
 
 
 async function instantiatePrefabFromPath(prefabPath: string, _name: string) {
@@ -75,8 +79,7 @@ async function instantiatePrefabFromPath(prefabPath: string, _name: string) {
     const res = await fetch(prefabPath);
     if (!res.ok) { console.error(`[Assets] Failed to fetch ${prefabPath}`); return; }
     const prefab: PrefabFile = await res.json();
-    const rootId = await instantiatePrefabAsync(prefab);
-    setPrefabSource(rootId, prefabPath);
+    const rootId = await instantiatePrefabInstance(prefab, prefabPath);
     console.log(`[Assets] Instantiated prefab "${prefab.name}"`);
 
     const { deleteEntity } = await import('../../runtime/core/ecs/entityUtils');
@@ -87,8 +90,7 @@ async function instantiatePrefabFromPath(prefabPath: string, _name: string) {
         const r = await fetch(prefabPath);
         if (!r.ok) return null;
         const p: PrefabFile = await r.json();
-        const id = await instantiatePrefabAsync(p);
-        setPrefabSource(id, prefabPath);
+        const id = await instantiatePrefabInstance(p, prefabPath);
         return id;
       },
       remove: (id) => { deleteEntity(id); },
@@ -754,7 +756,7 @@ export default function Assets() {
     }
     if (plan.expand) {
       setExpanded((prev) => {
-        const keys = revealKeysFor(selectedAsset);
+        const keys = revealKeysFor(selectedAsset, { spriteRow: filtered.some((a) => a.path === selectedAsset.path) });
         if (keys.every((k) => prev.has(k))) return prev;
         const next = new Set(prev);
         for (const k of keys) next.add(k);
@@ -927,24 +929,40 @@ export default function Assets() {
    *  right editor / selects the new asset. `folder` (a right-clicked folder path) wins
    *  over the def's own `defaultFolder`. */
   const runCreate = useCallback(async (def: CreatableAssetDef, folder?: string) => {
-    const path = await saveAssetDialog({
+    // A `create` override (Scene) replaces the live world — ask before the path picker, so a Cancel
+    // here costs nothing and the picker is not answered for a create that then does not happen (#1419).
+    if (def.create && !(await confirmDiscardUnsaved(`create ${def.label.replace(/^Create /, 'a new ').toLowerCase()}`, 'world-swap'))) return;
+    const pick = await chooseNewAssetPath({
       defaultName: def.defaultName + def.ext, ext: def.ext,
       defaultFolder: folder ?? def.defaultFolder, prompt: def.prompt ?? def.label,
     });
-    if (!path) return;
+    if (!pick) return;
+    const { path } = pick;
     // The `create`-OVERRIDE kinds (Scene) stay HERE and are not routed through
     // `createRegisteredAsset`, which refuses them. That is not an inconsistency: the override
     // discards the live world, and the dialog above is what makes a cancel safe — which is exactly
     // the guard an explicit-path call would remove. See createRegisteredAsset.ts's header.
     if (def.create) {
-      await def.create(path);
+      // ⚠️ Asked BEFORE the override, not at its write (#1264): Scene's override throws the live
+      // world away first and writes last, so a create-only 409 would arrive after the damage.
+      const may = await mayCreateOver(path, pick.confirmReplace, def.assetType);
+      if (may === 'declined') return;
+      if ('existingType' in may) {
+        useEditorStore.getState().showToast(`${path} is not a ${def.assetType} (it is typed '${may.existingType}') — choose another name.`, 'warn');
+        return;
+      }
+      // `may.create`, not `path`: over an existing file it is that file's on-disk spelling (#1273).
+      await def.create(may.create);
       refresh();
-      def.onCreated?.({ path, name: assetDisplayName(path, def.ext), guid: newGuid() });
+      def.onCreated?.({ path: may.create, name: assetDisplayName(may.create, def.ext), guid: newGuid() });
       return;
     }
     // Everything else shares ONE create path with the agent op (#288 gap 5), so a kind that works
     // for the human cannot silently differ for a tool.
-    const r = await createRegisteredAsset(def.id, path);
+    // Create-only, then an in-app "Replace?" if the file exists — the save dialog above cannot be
+    // trusted to have asked for the real destination (#1215). A Replace keeps the replaced guid.
+    const r = await createRegisteredAssetAskingToReplace(def.id, path, pick.confirmReplace);
+    if (!r) return;
     if (!r.ok) { console.error(`[Assets] ${r.error}`); return; }
     refresh();
     def.onCreated?.({ path: r.path, name: r.name, guid: r.guid });
@@ -1131,6 +1149,11 @@ export default function Assets() {
       return;
     }
     const { toPath, base: safe } = plan;
+    // #1362: the backend refuses this move while a texture editor holds unsaved edits on it, and
+    // `moveFileTo` keeps only ok/false — so say WHY here rather than letting the rename look like a
+    // no-op. The refusal itself stays server-side; this is the message, not the guard.
+    const held = assetEditorHoldMessage([asset.path]);
+    if (held) { useEditorStore.getState().showToast(held, 'warn'); return; }
     const ok = await moveFileTo(asset.path, toPath);
     if (!ok) { console.error(`[Assets] Failed to rename ${asset.path}`); return; }
     console.log(`[Assets] Renamed ${asset.path} → ${toPath}`);
@@ -1234,11 +1257,12 @@ export default function Assets() {
   }, [assets, collectDeletion, pushDeleteUndo, clearSelection, refresh]);
 
   // The AssetEntry objects currently selected (falls back to the active item).
+  // Sprites are dropped — they have no file to act on (fileActionTargets, assetListing.ts).
   const selectedAssets = useCallback((): AssetEntry[] => {
     const inSel = assets.filter((a) => selection.has(a.path));
-    if (inSel.length) return inSel;
+    if (inSel.length) return fileActionTargets(inSel);
     const a = assets.find((x) => x.path === selected);
-    return a ? [a] : [];
+    return a ? fileActionTargets([a]) : [];
   }, [assets, selection, selected]);
 
   const deleteSelection = useCallback(async () => {
@@ -1269,6 +1293,12 @@ export default function Assets() {
     // into the current location), else the root.
     const targetFolder = targetOverride ?? defaultTargetFolder();
     const taken = new Set(assets.map((a) => a.path));
+    // #1362: a CUT is a move, so the same refusal applies. A COPY is not — it leaves the held asset
+    // where it is, so an open editor is no reason to block it.
+    if (clipboard.op === 'cut') {
+      const cutHeld = assetEditorHoldMessage(clipboard.paths);
+      if (cutHeld) { useEditorStore.getState().showToast(cutHeld, 'warn'); return; }
+    }
     const done: { from: string; to: string }[] = [];
     for (const from of clipboard.paths) {
       const to = pastePathIn(targetFolder, from, taken);
@@ -1330,6 +1360,10 @@ export default function Assets() {
     if (isFolderPath(newPath, { pendingFolders, diskFolders, assets })) {
       console.warn(`[Assets] Folder already exists: ${newPath}`); return;
     }
+    // #1362: the fourth move seam, and the one that needs the reason MOST — the held texture is not
+    // the thing the user named, so a silent no-op is baffling here.
+    const heldFolder = assetEditorHoldMessage([node.path]);
+    if (heldFolder) { useEditorStore.getState().showToast(heldFolder, 'warn'); return; }
     const ok = await moveFileTo(node.path, newPath);
     if (!ok) { console.error(`[Assets] Failed to rename folder ${node.path}`); return; }
     const oldPath = node.path;
@@ -1421,8 +1455,10 @@ export default function Assets() {
   const ctxMenuItems = useCallback((asset: AssetEntry): ContextMenuItem[] => {
     const items: ContextMenuItem[] = [];
     // Number of items the action will apply to (the menu was opened on a row
-    // inside the current multi-selection ⇒ act on the whole selection).
-    const count = selection.has(asset.path) ? Math.max(1, selection.size) : 1;
+    // inside the current multi-selection ⇒ act on the whole selection). Counted over FILE rows
+    // only (#1257): selected sprite rows are not acted on, and counting them made one texture
+    // plus a few sprites read as `many` and hid this file's single-item actions.
+    const count = selection.has(asset.path) ? Math.max(1, fileActionPaths(selection, assets).length) : 1;
     const many = count > 1;
     const suffix = many ? ` (${count})` : '';
     if (!many && asset.type === 'prefab') {
@@ -1453,7 +1489,7 @@ export default function Assets() {
     if (!many) items.push({ label: 'Find References', onClick: () => openFindReferences(asset.guid || asset.path, asset.name) });
     items.push({ label: `Move to Trash${suffix}`, onClick: () => (many ? deleteSelection() : handleDelete(asset)), danger: true });
     return items;
-  }, [handleDelete, handleDuplicate, refresh, reimport, selection, clipboard, duplicateSelection, deleteSelection, copySelection, pasteClipboard, openFindReferences]);
+  }, [handleDelete, handleDuplicate, refresh, reimport, selection, assets, clipboard, duplicateSelection, deleteSelection, copySelection, pasteClipboard, openFindReferences]);
 
   // Drop handler: entity dragged from Hierarchy → create prefab
   const [dropHighlight, setDropHighlight] = useState<string | null>(null); // folder path being hovered
@@ -1528,9 +1564,12 @@ export default function Assets() {
       ? `${targetFolder}/${safeName}.prefab.json`
       : `/prefabs/${safeName}.prefab.json`;
 
-    const result = await createPrefabFromEntity(id, savePath, `Save prefab "${name}"`);
+    // Asked when a prefab of that name is already in the folder; a Replace keeps its guid (#1264).
+    const result = await createPrefabFromEntity(id, savePath, `Save prefab "${name}"`, confirmReplaceAsset);
+    if (result === 'declined') return;
     if (!result) { console.error(`[Assets] Failed to create prefab ${savePath}`); return; }
     console.log(`[Assets] Created prefab: ${savePath}`);
+    if (result.runtimeExcluded > 0) useEditorStore.getState().showToast(runtimeExcludedMessage(result.runtimeExcluded), 'warn');
     refresh();
 
     const { action } = result;
@@ -1551,7 +1590,14 @@ export default function Assets() {
     // dragged folder gets `prefix: true` — without it the repair below matched the folder itself
     // and returned `undefined` for every file under it (#867 member 2).
     const known = { pendingFolders, diskFolders, assets };
-    const planned = planFilesDropMoves(filePaths, targetFolder, (p) => isFolderPath(p, known));
+    // #1257 — a multi-drag carries the whole selection, sprite rows included (the asset-paths payload
+    // needs them), but a sprite has no file to move: each one 404'd and logged "Could not move".
+    const planned = planFilesDropMoves(fileActionPaths(filePaths, assets), targetFolder, (p) => isFolderPath(p, known));
+    // #1362: refuse the WHOLE drop when a texture editor holds unsaved edits on anything in it,
+    // rather than moving the other items and leaving that one behind — a half-applied drag is worse
+    // to undo than one that did not start. The backend refuses the move itself; this is the reason.
+    const dropHeld = assetEditorHoldMessage(planned.map((m) => m.from));
+    if (dropHeld) { useEditorStore.getState().showToast(dropHeld, 'warn'); return; }
     const moves: DropMove[] = [];
     for (const m of planned) {
       // `moveFileTo(from, TO)`, not `moveFile(from, FOLDER)`: the planner has already derived the
@@ -1615,13 +1661,13 @@ export default function Assets() {
     });
   }, []);
 
-  // Sliced sprites are nested UNDER their source texture (Unity-style sub-assets),
-  // not shown as standalone rows — index them by parent texture GUID.
+  // Sliced sprites are nested UNDER their source texture (Unity-style sub-assets) —
+  // index them by parent texture GUID — unless the `sprite` chip makes them rows (#1249).
   // The list-shaping decisions live in assetListing.ts (#105 Phase 3) — pure, and
   // unit-tested there rather than only through e2e.
-  const spritesByTexture = useMemo(() => spritesByTextureOf(assets), [assets]);
+  const spritesByTexture = useMemo(() => spritesByTextureOf(assets, typeFilter), [assets, typeFilter]);
   const filtered = useMemo(() => filterAssets(assets, filter, typeFilter), [assets, filter, typeFilter]);
-  const flatTotal = useMemo(() => flatAssetTotal(assets), [assets]);
+  const flatTotal = useMemo(() => flatAssetTotal(assets, filter, typeFilter), [assets, filter, typeFilter]);
   const grouped = useMemo(() => groupByType(filtered), [filtered]);
 
   // Folder view: build tree (seeded with empty pending folders)
@@ -1946,13 +1992,7 @@ export default function Assets() {
 
       {/* Re-import all confirmation — guards a potentially slow full reconvert. */}
       {confirmReimportAll && (
-        <div
-          style={{
-            position: 'fixed', inset: 0, zIndex: 9999,
-            background: 'rgba(0,0,0,0.5)', display: 'flex', alignItems: 'center', justifyContent: 'center',
-          }}
-          onClick={() => setConfirmReimportAll(false)}
-        >
+        <ModalShell kind="reimport-all-confirm" onDismiss={() => setConfirmReimportAll(false)}>
           <div
             onClick={(e) => e.stopPropagation()}
             style={{
@@ -1985,7 +2025,7 @@ export default function Assets() {
               >Re-import all</button>
             </div>
           </div>
-        </div>
+        </ModalShell>
       )}
     </div>
   );

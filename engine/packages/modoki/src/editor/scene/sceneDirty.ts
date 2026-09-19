@@ -15,7 +15,7 @@
  *  every unit test that touches a trait edit. Scenes are tracked by guid, matching
  *  `EntityAttributes.sourceScene`'s own values directly. */
 
-import { findEntity } from '../../runtime/core/ecs/entityUtils';
+import { findEntity, readTraitData, writeTraitField, getAllEntities, subtreeIds } from '../../runtime/core/ecs/entityUtils';
 import { getTraitByName } from '../../runtime/core/ecs/traitRegistry';
 
 const dirtySceneGuids = new Set<string>();
@@ -30,11 +30,31 @@ export function markSceneDirty(guid: string): void {
 /** A live entity's raw `EntityAttributes.sourceScene` — '' (falsy) for a primary-owned
  *  entity or one with no EntityAttributes at all. Deliberately NOT resolved to the
  *  primary's own real guid (see the module doc comment for why). */
-function rawSourceScene(entityId: number): string {
+export function rawSourceScene(entityId: number): string {
   const meta = getTraitByName('EntityAttributes');
   const entity = meta ? findEntity(entityId) : null;
   const data = entity?.has(meta!.trait) ? (entity.get(meta!.trait) as { sourceScene?: string }) : undefined;
   return data?.sourceScene || '';
+}
+
+/** Put a NEWLY CREATED subtree in its parent's scene (#1429, owner option A). Create, paste-copy and
+ *  instantiate stamp nothing, so without this a child created under a base entity is primary-owned
+ *  under a base parent, the state `planReparent` exists to prevent. Nothing moves, so nothing is
+ *  prompted: the subtree is born where it was put. A root keeps its own stamp. Raw writes with no undo:
+ *  call it BEFORE the caller snapshots or resolves `affectedScenes`, so redo respawns the stamped copy
+ *  and the right scene is marked dirty. Returns the scene the subtree now belongs to. */
+export function adoptParentScene(rootId: number): string {
+  const attrMeta = getTraitByName('EntityAttributes');
+  const attrs = attrMeta ? readTraitData(rootId, attrMeta) : null;
+  if (!attrMeta || !attrs) return '';
+  const own = (attrs.sourceScene as string) || '';
+  const parentId = (attrs.parentId as number) || 0;
+  if (!parentId) return own;
+  const parentScene = rawSourceScene(parentId);
+  if (parentScene !== own) {
+    for (const id of subtreeIds(getAllEntities(), rootId)) writeTraitField(id, attrMeta, 'sourceScene', parentScene);
+  }
+  return parentScene;
 }
 
 /** Resolve the set of BASE scene guids a batch of LIVE entity ids belongs to, deduped
@@ -90,4 +110,20 @@ export function isSceneDirty(guid: string): boolean {
  *  must not linger and cause a later saveAll to try writing a scene that isn't loaded. */
 export function clearAllSceneDirty(): void {
   dirtySceneGuids.clear();
+}
+
+/** The world-replacement form of `clearAllSceneDirty`: clear every flag EXCEPT a kept base's
+ *  (#1417). `SceneManager.loadScene` carries a kept base's entities over from the live world, so
+ *  its unsaved edits survive the swap. Clearing its flag then made `saveAll` skip the base and
+ *  the unsaved-work guard stop asking, which lost the edit silently while it was still on screen.
+ *  Every other flag goes, including a base that dropped out of the chain. */
+export function clearSceneDirtyExcept(keptGuids: ReadonlySet<string>): void {
+  for (const g of dirtySceneGuids) if (!keptGuids.has(g)) dirtySceneGuids.delete(g);
+}
+
+/** Is any scene dirty that is NOT in `keptGuids`? That is base-scene work a world replacement
+ *  throws away, as opposed to work it carries (#1417). */
+export function hasDirtySceneOutside(keptGuids: ReadonlySet<string>): boolean {
+  for (const g of dirtySceneGuids) if (!keptGuids.has(g)) return true;
+  return false;
 }

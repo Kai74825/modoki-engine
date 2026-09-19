@@ -355,13 +355,17 @@ physics2DEvents.onSensorExit(...); physics2DEvents.onCollisionEnter(...); physic
 ```
 Subscribers are **world-scoped** (WeakMap<World>, like the journal) so dual editor viewports /
 parallel test worlds stay isolated; the manager's `dispose` clears the old world's subscribers on
-scene swap. Callbacks receive live koota `Entity` handles. Use this when a reaction needs arbitrary
-game state, filtering, or cross-entity logic.
+scene swap. Callbacks receive koota `Entity` handles, and sensor/collision callbacks also get `refs`
+(`{ sensor, other }` / `{ a, b }`), both entities' journal refs cached while alive. Use this when a
+reaction needs arbitrary game state, filtering, or cross-entity logic.
 
 **B — `OnCollision2D` trait (declarative, no-code).** Put it on the same entity as a `Collider2D`
 (e.g. a Sensor Zone). Fields `onEnter`/`onExit` name a UIAction (Inspector dropdown of registered
 actions). On overlap begin/end the physics system dispatches that action, passing the **other**
-entity as `ctx.target` and `{ self, other, phase }` in `ctx.params`. Dispatch goes through the new
+entity as `ctx.target` and `{ self, other, phase, selfRef, otherRef }` in `ctx.params`. ⚠️ A body
+despawned while overlapping gets a synthesized exit whose `other` is a DEAD handle, possibly already
+reclaimed by a new spawn: name it through `otherRef` (or the bus's `refs`), never `entityRef(other)`,
+which returns `null` for a dead handle (#1227; the zone twin is in [zones.md](zones.md)). Dispatch goes through the new
 **pipeline-safe `dispatchGameAction`** (never throws on a missing handler, unlike the
 event-handler-only `dispatchUIAction`, whose dev-throw would abort the frame — F10). This is the
 declarative sugar on top of C. Demonstrated in `demos/2d-physics-demo` (the Sensor Zone tints
@@ -422,8 +426,8 @@ crates costs nothing).
   body than its enter did (decrementing by that would leak) — force-clearing by body identity is
   exact.
 - **Folded into `get_scene_state`.** `getContactState(world, id)` returns sorted `contacts`/
-  `overlaps` id arrays; `agentBridge.ts` resolves each to a GUID (`id:<n>` for a partner with no
-  guid, #1199 — see [mcp-tool-conventions.md](./mcp-tool-conventions.md) §3) and attaches them under the
+  `overlaps` id arrays; `agentBridge.ts` resolves each to a GUID (a runtime guid for a code-spawned partner, #1210;
+  `id:<n>` only for one with no guid — since #1248 only an entity whose EntityAttributes was removed after spawn — #1199 — see [mcp-tool-conventions.md](./mcp-tool-conventions.md) §3) and attaches them under the
   `contacts` enricher (`?contacts=1`). Cleared on scene swap + Play→Stop (same lifecycle as the
   physics world). See [debug-tools-mcp.md](./debug-tools-mcp.md) "Percept".
 
@@ -568,8 +572,18 @@ through an agent tool it's "could not look" reported as "nothing is there". The 
 first two BEFORE casting, so `ok:true` with `hit:null` genuinely means the query ran and found
 nothing. That required a new exported predicate per dimension, `hasPhysics2D`/`hasPhysics3D`
 (`physics2DSystem.ts`/`physics3DSystem.ts`) — nothing exported could previously answer "does a
-Rapier world exist at all." A world exists only once the physics system has ticked, i.e. while the
-sim is Playing; a stopped editor has none, and a scene with no colliders never builds one.
+Rapier world exist at all." A world exists only once the physics system has ticked over at least
+one `RigidBody2D`/`RigidBody3D`, and it is freed on Stop. The refusal's `reason` says which absence
+it is, because each needs a different fix (#1260; the rule is `classifyWorldAbsence` in
+`engine/app/debug/sceneQueryAbsence.ts`). Three can never be fixed by waiting: `no-bodies` (the
+scene has no bodies of that dimension), `no-physics-module` (the build strips it), and
+`physics-failed` (Rapier gave up loading, so it names the error). `stopped` means start the sim.
+Two are retryable: `physics-loading` (the op waits up to 1.5 s, on THAT dimension's module only via
+`ensurePhysicsModuleReady`, to tell this apart from a failure; a stopped sim does not wait)
+and `not-built-yet` (in play mode, but the system has not ticked since the bodies appeared). #1175's `ensurePhysicsReady` guarantees
+Rapier is *loaded* when Play returns, but not that a *tick* has run, and the first frame after Play
+can be late on a cold or loaded editor. A caller that queries right after Play should retry on the two
+retryable reasons rather than sleep a fixed time; smoke UC12 does exactly that.
 
 Hits report `guid`/`name` beside the raw `entityId` (runtime ids are reassigned on every scene
 reload). `pointQuery` results are not padded with a zeroed distance/normal — same field, same

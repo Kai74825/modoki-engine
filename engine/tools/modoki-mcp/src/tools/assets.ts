@@ -8,7 +8,7 @@
 import { z } from 'zod';
 import type { ToolDef } from '../toolDef.js';
 import type { ToolContext } from '../context.js';
-import { DISCARD_UNSAVED_BASE, unsavedForceParam } from '../shapes.js';
+import { DISCARD_UNSAVED_BASE, displayNameParam, unsavedForceParam } from '../shapes.js';
 
 /** Every type the backend's `getAssetSchema` actually serves. ONE list, because three tools take
  *  it and they had drifted NARROWER than the backend: the enum was material|particle|animation
@@ -82,7 +82,7 @@ export function registerAssetTools(tool: ToolDef, ctx: ToolContext): void {
   tool(
     'modoki_create_asset',
     `Scaffold a new asset (${ASSET_TYPES_PROSE}) with sensible defaults + a fresh GUID at ` +
-      'the given path. Then edit it with modoki_write_asset or (for live preview) the particle/anim ops. ' +
+      'the given path. For a GAME-registered kind, or the Assets panel\'s own "New X" document plus the editor it opens, use modoki_create_registered_asset. Then edit it with modoki_write_asset or (for live preview) the particle/anim ops. ' +
       'Always writes the file directly, regardless of persistence mode (modoki_persistence) — this is ' +
       'an explicit "write this file" tool, not a live-state edit.',
     {
@@ -105,15 +105,18 @@ export function registerAssetTools(tool: ToolDef, ctx: ToolContext): void {
       'an explicit "write this file" tool, not a live-state edit. For a LIVE particle/animation preview ' +
       'while tuning, prefer modoki_particle_set / modoki_anim_set_clip.',
     {
-      path: z.string().describe('Asset-root URL of the file to WRITE, e.g. /assets/particles/spark.particle.json. Must already exist — use modoki_create_asset for a new one.'),
+      path: z.string().describe('Asset-root URL of the file to WRITE, e.g. /assets/particles/spark.particle.json. Must already exist — a path that is not on disk is refused NOT_FOUND; use modoki_create_asset for a new one.'),
       type: z.enum(ASSET_TYPES)
         .describe('The asset type `data` conforms to; picks the validator applied before the write.'),
       data: z.record(z.any()).describe('The asset document IN FULL (see modoki_asset_schema for the shape). Fields you omit are DELETED — this is a replace, not a merge.'),
       replace: z.boolean().optional().describe('Acknowledge that this write DELETES top-level fields the existing file has. Without it, such a write is refused (409) and lists them.'),
       discardUnsaved: z.boolean().optional().describe(
         `${DISCARD_UNSAVED_BASE}. Here that work is a PARKED edit to this same asset document — a `
-        + 'panel edit the human has not saved. It is dropped before the write, so their older copy '
-        + 'cannot flush back over you at the next save_all.',
+        + 'panel edit the human has not saved. It is dropped AFTER the write succeeds, deliberately: '
+        + 'riding along with the probe meant a write that then threw destroyed their park with '
+        + 'nothing written in its place. So a FAILED write costs them nothing — and a succeeded one '
+        + 'can still report `discardWarning`, meaning the park was NOT dropped and their older copy '
+        + 'may yet flush over you at the next save_all. Read it; do not assume the drop happened.',
       ),
     },
     async ({ path, type, data, replace, discardUnsaved }) => postJson(
@@ -137,25 +140,34 @@ export function registerAssetTools(tool: ToolDef, ctx: ToolContext): void {
       'an asset already loaded into the open scene stays live until the next scene swap, even ' +
       'though its file is gone. The panel\'s delete has the same limit — this is not a difference ' +
       'between them.\n\n' +
+      'REFUSES (REQUIRES_SAVE) while the editor holds a human\'s UNSAVED edit for a path you are ' +
+      'deleting, or for anything inside a folder you are deleting: the delete would destroy it. ' +
+      'modoki_save_all first, or discardUnsaved:true. An unsaved live-world scene edit does not ' +
+      'refuse — trashing the file destroys nothing in the world.\n\n' +
       'A path that is not on disk is REPORTED in `missing`, not an error — so a list carrying ' +
       'maybe-absent sidecars is safe, and `trashed` counts only files that really existed. ' +
       'A path the OS REFUSES to trash (locked, denied ACL, >260 chars) is named in `failed` and ' +
       'is STILL ON DISK: `ok:true` + `failed` means the REST went, `ok:false` means none did. ' +
-      '⚠️ `failed` is populated on Windows only — elsewhere a refusal arrives as ok:false with ' +
-      '`failed` empty, so an empty `failed` is not evidence every path went. `ok` is.\n\n' +
+      'On macOS the paths still on disk after Finder refuses are what `failed` names, and ' +
+      '`failedReason` carries what Finder said. `ok` is still the verdict to read first.\n\n' +
       '⚠️ `repairFailed` is NOT `failed`: the files are trashed, but an attached editor still ' +
       'holds bindings and parked writes for the dead path, so the next human Cmd+S can recreate ' +
       'what you deleted. The panel repairs itself; you, from another process, have no backstop. ' +
       'Verify with modoki_list_assets — NOT modoki_resolve_refs, which resolves ENTITY refs and ' +
       'never answers about an asset GUID at all. The asset manifest is rebuilt ' +
       'BEFORE the reply (`manifestRebuilt:true`), so a check issued straight after — including in ' +
-      'the same modoki_batch — sees the deletion. `manifestRebuilt:false` means the rebuild did ' +
-      'not run and the manifest is still catching up via the file watcher.',
+      'the same modoki_batch — sees the deletion. `manifestRebuilt:false` with `trashed>0` means the rebuild did ' +
+      'not run and the manifest is still catching up via the file watcher; with `trashed:0` nothing was deleted ' +
+      '(every path is in `missing`), so there was nothing to rebuild.',
     {
       paths: z.array(z.string()).min(1)
         .describe('Asset-root URLs to trash, e.g. ["/games/x/assets/fx/probe.particle.json"]. Trashed in ONE OS call (one trash sound). Include the .meta.json sidecars yourself — nothing expands the list for you.'),
+      discardUnsaved: z.boolean().optional().describe(
+        `${DISCARD_UNSAVED_BASE}. Here that work is an unsaved asset document, import-settings or `
+        + 'base-scene edit for a path being deleted: the editor drops it along with the file.',
+      ),
     },
-    async ({ paths }) => postJson('/api/delete-asset', { paths },
+    async ({ paths, discardUnsaved }) => postJson('/api/delete-asset', { paths, ...(discardUnsaved ? { discardUnsaved: true } : {}) },
       undefined, `move ${paths.length} asset file(s) to the OS trash`),
   );
 
@@ -167,8 +179,9 @@ export function registerAssetTools(tool: ToolDef, ctx: ToolContext): void {
       'IT DOES NOT POSE THE RIG. This moves the editor\'s playhead VALUE; the human scrub path ' +
       'additionally opens a preview session and poses the skeleton, and this op does not. A ' +
       'render_sequence / capture_viewport taken afterwards shows the UNCHANGED pose — the reply ' +
-      'says so (`posed:false`) and names the bound clip, or tells you none is bound. The value is ' +
-      'clamped to the clip duration, like the panel does.\n\n' +
+      'says so (`posed:false`) and names the bound clip. With NO clip or timeline open it is refused ' +
+      '(NOT_FOUND) — the value would drive nothing. The value is clamped to the clip duration, like the panel ' +
+      'does, and the reply says so (`clampedFrom`).\n\n' +
       'modoki_pose_clip is the tool that DOES pose the rig — it moves the playhead too, so reach ' +
       'for it whenever you want the world to change. Use this one only to set the keyframe ' +
       'INSERTION POINT without disturbing the live world.',
@@ -192,20 +205,29 @@ export function registerAssetTools(tool: ToolDef, ctx: ToolContext): void {
   tool(
     'modoki_create_registered_asset',
     'Create one of the Assets panel\'s "New X" assets at a path you supply. The agent-reachable ' +
-      'half of that surface: the panel\'s own flow opens the native save dialog FIRST, and on ' +
-      'macOS that is a BLOCKING osascript panel, so the whole "New X" surface was unreachable ' +
-      'from here. Passing the path routes around it; the human\'s dialog is untouched.\n\n' +
-      'DIFFERENT FROM modoki_create_asset, which takes a fixed enum of six engine asset types. ' +
+      'half of that surface: the panel\'s own flow opens the native save dialog FIRST — a modal ' +
+      'panel only a human can answer — so the whole "New X" surface was unreachable from here. ' +
+      'Passing the path routes around it; the human\'s dialog is untouched.\n\n' +
+      'DIFFERENT FROM modoki_create_asset, which takes a fixed enum of engine asset types. ' +
       'This drives the live, game-extensible registry — read modoki_list_creatable_assets for what ' +
       'is available in the OPEN project.\n\n' +
       'A create-OVERRIDE kind is REFUSED, `scene` above all: its override discards the live world, ' +
       'and the save dialog is what made cancelling safe — supplying a path is exactly what removes ' +
       'that guard. Use modoki_new_scene, which refuses with REQUIRES_SAVE when there is unsaved ' +
       'work.\n\n' +
+      'REFUSES a path that already exists rather than replacing it — a replacement would be a ' +
+      'blank default under a NEW guid, dangling every ref to the old asset. Edit that asset with ' +
+      'modoki_write_asset instead.\n\n' +
       'Writes the file directly and registers its GUID. Verify with modoki_list_assets (a `name` ' +
       'filter finds it in one call); edit the new document with modoki_write_asset; remove it with ' +
       'modoki_delete_asset. NOT modoki_resolve_refs — that resolves ENTITY refs from journal ' +
-      'payloads and never answers about an asset GUID.',
+      'payloads and never answers about an asset GUID.\n\n' +
+      '⚠️ SIDE EFFECT: the kind\'s own post-create hook runs, exactly as the panel runs it, and for ' +
+      'SEVERAL kinds (spriteanim, rig2d, particle) that OPENS the matching editor panel — so `openPanels` (and for a rig, ' +
+      '`editingSkinAsset`) change in modoki_get_editor_state without this tool saying so. A hook ' +
+      'that THROWS is swallowed to a console.debug and this still answers ok:true, so a missing ' +
+      'panel is not an error you can see here: check modoki_get_editor_state, or ' +
+      'modoki_get_console_logs for the hook failure.',
     {
       kind: z.string().describe('A `kind` id from modoki_list_creatable_assets (e.g. "material", "animation", "sling.level"). An unknown kind is refused with the live list.'),
       path: z.string().describe("Asset-root URL for the new file, e.g. /assets/materials/rock.mat.json. The kind's extension is appended if you leave it off, so the manifest cannot classify the file as something other than the kind you asked for."),
@@ -228,9 +250,9 @@ export function registerAssetTools(tool: ToolDef, ctx: ToolContext): void {
       'modoki_get_editor_state.openPanels if it refuses.',
     {
       path: z.string().describe('Asset-root URL of the clip, e.g. /assets/animations/walk.anim.json. Must be an animation asset — another type is refused.'),
-      name: z.string().optional().describe('Display name for the editor tab. Defaults to the filename without its .anim.json suffix.'),
+      displayName: displayNameParam('Here the stem drops .anim.json. \u26a0\ufe0f This is DATA, not a label: the editor uses it as the CLIP NAME when it scaffolds a clip for an empty file, and as the clip-name fallback the panel displays.'),
     },
-    async ({ path, name }) => editorAction('open-animation-editor', { path, ...(name !== undefined ? { name } : {}) }),
+    async ({ path, displayName }) => editorAction('open-animation-editor', { path, ...(displayName !== undefined ? { displayName } : {}) }),
   );
   tool(
     'modoki_pose_clip',
@@ -265,9 +287,10 @@ export function registerAssetTools(tool: ToolDef, ctx: ToolContext): void {
       'CALL IT WHEN YOU ARE DONE POSING. While the envelope is open the run-mode is `scrub`, and ' +
       'that is precisely what BLOCKS a scene save — so a posed editor left behind is one the human ' +
       'cannot Cmd+S until they press ⏹ themselves.\n\n' +
-      'It refuses when the TIMELINE panel owns the envelope rather than the Animation side. That is ' +
-      'deliberate: ending the Timeline\'s session would revert its world mid-run, which is worse ' +
-      'than refusing.\n\n' +
+      'It REFUSES (REFUSED_BY_OP, `modeOwner` names the holder) when another panel — the ' +
+      'Timeline — owns the envelope. That is deliberate: ending the Timeline\'s session would ' +
+      'revert its world mid-run, which is worse than refusing. With NO envelope open it answers ' +
+      'NOT_FOUND: there was nothing to exit, and the authored world is already showing.\n\n' +
       'IT ALWAYS RESTORES — there is no way to keep the posed values. Every path in the editor\'s ' +
       'own UI restores too, and the only thing a keep-the-pose option would do is bake a preview ' +
       'frame into the authored world, which is exactly what the envelope exists to prevent. If you ' +
@@ -386,14 +409,18 @@ export function registerAssetTools(tool: ToolDef, ctx: ToolContext): void {
   // ── validate_prefab (#261 audit F6) ── the prefab twin of modoki_validate_scene ──
   tool(
     'modoki_validate_prefab',
-    'Validate a .prefab.json file — the PREFAB twin of modoki_validate_scene, and the read that '
-    + 'confirms a prefab you edited by hand or through modoki_prefab is well-formed. Reports '
-    + '`warnings`, notably INERT sizes: a width/height authored on a prefab child that the runtime '
-    + 'ignores, which renders at the wrong size with nothing erroring. Like validate_scene, '
-    + '`ok:false` is an ANSWER (this prefab has problems), not a failed call. Unlike it, this pass '
-    + 'consults no trait schema, so it reports no schemaAvailable — the checks it runs are '
-    + 'structural and need no renderer. Also covers a prefab INSTANCE\'s overridden fields, which '
-    + 'live in the entity\'s sibling `overrides` object rather than in `traits`.',
+    'Validate a .prefab.json file — the PREFAB twin of modoki_validate_scene. It checks the layout '
+    + 'rules only, NOT the whole schema: INERT sizes (a width/height authored on a prefab child that '
+    + 'the runtime ignores, so it renders at the wrong size with nothing erroring), multiplier-shaped '
+    + 'lineHeight, and collapsed newlines — plus a document that is not a prefab at all (no `entities` '
+    + 'array, or an entry that is not an object). `ok` is `warnings.length === 0`; like validate_scene, '
+    + '`ok:false` is an ANSWER (this prefab has problems), not a failed call. It consults no trait '
+    + 'schema, so it reports no schemaAvailable and needs no renderer. A prefab INSTANCE\'s `overrides` '
+    + 'live in the SCENE, so modoki_validate_scene checks those.\n\n'
+    + '⚠️ Reads the FILE on disk, so an unsaved edit parked in the editor is not validated here — '
+    + 'modoki_save_all first. `staleInputs` / `staleInputsUnknown` / `staleInputsNote` name what the '
+    + 'pass could not see, and are ABSENT when the editor is clean, so their absence is the '
+    + 'all-clear rather than a silence.',
     { path: z.string().describe('Asset-root URL of the .prefab.json, e.g. /assets/prefabs/crate.prefab.json.') },
     async ({ path }) => getJson(`/api/validate-prefab?path=${encodeURIComponent(path)}`),
   );
@@ -410,7 +437,14 @@ export function registerAssetTools(tool: ToolDef, ctx: ToolContext): void {
     + 'constant). Returns `orphans` (largest first, each with `bytes`), `totalBytes`, `sceneCount` '
     + 'and `warnings`. Scoped to the PROJECT\'s own assets — the engine\'s shared /modoki/assets '
     + 'root is excluded, because those are engine-owned and shared with every other project. '
-    + 'The INVERSE question ("what points AT this?") is modoki_find_references.',
+    + 'The INVERSE question ("what points AT this?") is modoki_find_references.\n\n'
+    + '⚠️ Reads FILES ON DISK, not the live editor — a ref you just added in an UNSAVED scene is '
+    + 'invisible here, so its target lists as an orphan. That matters more than on the other reads '
+    + 'because this answer feeds a DELETE. modoki_save_all first. When the editor held something '
+    + 'this pass could not see, it says so rather than guessing: `staleInputs` names what was '
+    + 'unread, `staleInputsUnknown` says the renderer could not be asked at all, and '
+    + '`staleInputsNote` carries both in prose. All three are ABSENT when the editor is clean — '
+    + 'never an empty array — so their absence IS the all-clear.',
     {},
     async () => getJson('/api/unused-assets'),
   );
@@ -424,7 +458,8 @@ export function registerAssetTools(tool: ToolDef, ctx: ToolContext): void {
     + 'opposed to what references it.\n\n'
     + 'REPLACES the sidecar — it does not merge — so modoki_get_asset_meta FIRST, change the fields '
     + 'you mean, and post the whole object back. A partial post silently drops every setting you '
-    + 'omitted.\n\n'
+    + 'omitted, except the asset\'s `id`, which is kept. A path with no asset on disk, a folder, or the .meta.json itself is refused '
+    + '(NOT_FOUND) rather than writing an orphan sidecar.\n\n'
     + 'Writing settings does NOT re-convert the asset: run modoki_reimport_asset afterwards, or the '
     + 'files on disk still reflect the OLD settings while the sidecar claims the new ones. '
     + '⚠️ Texture settings are load-bearing on real hardware — block-compressed KTX2 needs '
@@ -445,7 +480,9 @@ export function registerAssetTools(tool: ToolDef, ctx: ToolContext): void {
       meta: z.record(z.any()).describe('The COMPLETE sidecar object to write — read it back with modoki_get_asset_meta first and edit that, since this replaces rather than merges.'),
       discardUnsaved: z.boolean().optional().describe(
         `${DISCARD_UNSAVED_BASE}. Here that work is a parked Inspector import-settings edit for this `
-        + 'asset: it is dropped before the write, so nothing stale survives to flush back over you.',
+        + 'asset. It is dropped AFTER the write succeeds (#872), so a failed write costs the human '
+        + 'nothing — and `discardUnconfirmed` in the reply says the drop could not be confirmed, '
+        + 'which is the case where something stale CAN still flush back over you.',
       ),
     },
     async ({ path, meta, discardUnsaved }) => postJson(
@@ -462,8 +499,8 @@ export function registerAssetTools(tool: ToolDef, ctx: ToolContext): void {
     'Copy an asset to a new path, MINTING A FRESH GUID for the copy (returned as `guid`) — which '
     + 'is why this is not a file copy: a byte-for-byte duplicate would carry the original\'s guid '
     + 'and two assets claiming one guid breaks every ref that resolves through the manifest. Use it '
-    + 'to fork a material/prefab/particle as a starting point. REFUSES rather than clobbering: a '
-    + 'destination that already exists is a 409. Verify with modoki_list_assets.\n\n'
+    + 'to fork a material/prefab/particle as a starting point. A SCENE copy also gets fresh ENTITY guids, with its own internal refs following (refs into other scenes are kept). REFUSES rather than clobbering: a '
+    + 'destination that already exists is a 409. Verify with modoki_list_assets — the manifest is rebuilt before the reply (`manifestRebuilt`).\n\n'
     + '⚠️ The copy\'s .meta.json import settings are seeded from the SOURCE\'S FILE, so this refuses '
     + '(REQUIRES_SAVE) while the source has a parked Inspector import-settings edit — the copy '
     + 'would otherwise be born with the pre-edit settings. modoki_save_all first, or force:true.',
@@ -487,7 +524,7 @@ export function registerAssetTools(tool: ToolDef, ctx: ToolContext): void {
     + '`mv` is not, because the manifest is rebuilt from the new location. REFUSES rather than '
     + 'clobbering: a destination that already exists is a 409, and a missing source is a 404. A '
     + 'case-only rename (Sprites -> sprites) IS allowed, since on macOS/Windows the two paths are '
-    + 'the same entry rather than a collision. Verify with modoki_list_assets.\n\n'
+    + 'the same entry rather than a collision. Verify with modoki_list_assets — the manifest is rebuilt before the reply (`manifestRebuilt`).\n\n'
     + '⚠️ `repairFailed` = the file moved but an attached editor was NOT repaired, so its bindings '
     + 'and parked writes still point at the old path and the next human Cmd+S can undo the move. '
     + 'The panel repairs itself; you, from another process, have no backstop. Say so.',
@@ -500,10 +537,10 @@ export function registerAssetTools(tool: ToolDef, ctx: ToolContext): void {
 
   tool(
     'modoki_create_folder',
-    'Create a folder under the project\'s asset roots — the prerequisite for the tools that take a '
-    + 'destination inside one (modoki_import_file `destFolder`, modoki_create_asset `path`), which '
-    + 'do not create it for you. Refuses a path outside the asset roots (403) and an existing '
-    + 'folder (409). Not recursive: create parents first.',
+    'Create a folder under the project\'s asset roots. Only needed for an EMPTY folder: '
+    + 'modoki_import_file `destFolder` and modoki_create_asset `path` create a missing destination '
+    + 'themselves. Refuses a path outside the asset roots (403) and an existing '
+    + 'folder (409). RECURSIVE: missing parents are created too, so a nested path needs one call.',
     { path: z.string().describe('Asset-root URL of the folder to create, e.g. /assets/textures/ui.') },
     async ({ path }) => postJson('/api/create-folder', { path }, undefined, `create the folder ${path}`),
   );
@@ -511,7 +548,7 @@ export function registerAssetTools(tool: ToolDef, ctx: ToolContext): void {
   // ── find_references (#284) ──
   tool(
     'modoki_find_references',
-    'What references this? Walks the reverse asset/entity reference graph from a target — ' +
+    'List what references an asset: walks the reverse asset/entity reference graph from a target — ' +
       'direct AND indirect chains (e.g. texture ← material ← mesh ← entity), including implicit ' +
       'edges no single file records (a UI imageSrc holding the auto-emitted whole-image sprite ' +
       "guid rather than the texture's own). Use before deleting/renaming an asset, or to find " +
@@ -519,12 +556,19 @@ export function registerAssetTools(tool: ToolDef, ctx: ToolContext): void {
       'Reads FILES ON DISK, not the live world — an unsaved edit in the running scene is not ' +
       'reflected here; modoki_save_all first if you just changed something. ' +
       'Returns {target, direct, indirect, returnedCount, totalCount, truncated, ' +
-      'unresolvedRefsFromTarget, warnings} — direct/indirect are hop-1 vs hop>1 referrer chains.',
+      'unresolvedRefsFromTarget, warnings} — direct/indirect are hop-1 vs hop>1 referrer chains — ' +
+      'plus the two fields that ANSWER the usual question outright: `unreferenced` (nothing points ' +
+      'at it, which is NOT the same as `direct.length === 0`, since that can still have indirect ' +
+      'hits) and `reachable` (whether the target survives a production build). ' +
+      'And `staleInputs` / `staleInputsUnknown` / `staleInputsNote`, which name what this pass could ' +
+      'NOT see because the editor held it unsaved — ABSENT when the editor is clean, never an empty ' +
+      'array, so their absence is what makes the disk-vs-live caveat above verifiable instead of a ' +
+      'standing worry.',
     {
       target: z.string().describe('What to find references TO: an asset GUID, an entity GUID (EntityAttributes.guid, or a prefab instance\'s own guid), or a virtual asset path starting with "/" (e.g. /assets/textures/wood.png).'),
-      limit: z.number().int().positive().optional().describe('Cap the returned referrer entries (default 50, max 1000). Sets truncated + totalCount.'),
+      limit: z.number().int().positive().optional().describe('Cap the returned referrer entries (default 50, max 1000). `returnedCount`/`totalCount` are always present; truncated when it bites.'),
       maxDepth: z.number().int().positive().optional().describe('How many reference hops back to walk (default 6, max 20). 1 = direct referrers only.'),
-      reachableOnly: z.boolean().optional().describe('Count only references that survive a production build (reachable from a scene root) — drops references living in dead/unreferenced files.'),
+      reachableOnly: z.boolean().optional().describe('List only references that survive a production build (reachable from a scene root) — drops referrers living in dead/unreferenced files and counts them in `unreachableSkipped`. `unreferenced` still counts them: an asset only a dead file uses is not safe to delete.'),
     },
     async ({ target, limit, maxDepth, reachableOnly }) => {
       const q = new URLSearchParams({ target });
@@ -555,7 +599,7 @@ export function registerAssetTools(tool: ToolDef, ctx: ToolContext): void {
         y: z.number().describe('Page CSS y.'),
       }).describe('Gesture END, in page CSS px.'),
       sampleGuid: z.string().optional().describe('Entity GUID whose Transform is sampled each frame (preferred — survives hot-reloads).'),
-      sampleEntityId: z.number().optional().describe('Entity numeric id to sample (fallback; churns across hot-reloads — prefer sampleGuid).'),
+      sampleEntityId: z.number().optional().describe('Entity numeric id to sample. Only for an entity with no guid — use sampleGuid; not together with it.'),
       steps: z.number().optional().describe('Intermediate sample count (default 12).'),
     },
     async ({ from, to, sampleGuid, sampleEntityId, steps }) => postJson('/api/capture-gesture', { from, to, sampleGuid, sampleEntityId, steps }, 60_000),

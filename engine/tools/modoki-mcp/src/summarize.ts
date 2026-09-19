@@ -9,6 +9,7 @@
  *  be imported by a test, so anything with logic in it ships unguarded. See
  *  `docs/mcp-response-budget.md` Phase 5, and the Phase-1 review that learned this the hard way. */
 
+import { describeFilter, emptyFilterHint } from '../../shared/filterDisclosure.js';
 import type { ToolErrorDetail } from './result.js';
 
 export interface AssetEntry { guid: string; path: string; name: string; type: string }
@@ -27,7 +28,7 @@ export function summarizeAssets(assets: AssetEntry[], q: AssetQuery = {}) {
     const byType: Record<string, number> = {};
     for (const a of assets) byType[a.type] = (byType[a.type] ?? 0) + 1;
     return {
-      total: assets.length,
+      totalCount: assets.length,
       byType,
       hint: 'Counts only. Narrow with type=<type>, folder=<path prefix>, or name=<substring>; or all=true for every entry.',
     };
@@ -41,12 +42,25 @@ export function summarizeAssets(assets: AssetEntry[], q: AssetQuery = {}) {
   const totalCount = filtered.length;
   let truncated = false;
   if (q.limit != null && filtered.length > q.limit) { filtered = filtered.slice(0, q.limit); truncated = true; }
+  // §2 (#1217, #1223 D3, #1266): `returnedCount` is the rows below, `totalCount` every asset the
+  // filter matched before the limit — BOTH always, so a total never exists only when truncation
+  // happened. A total that appears only on truncation is not recoverable by the caller: its
+  // absence conflates "nothing was cut" with "this tool does not report it".
   return {
-    count: filtered.length,
+    returnedCount: filtered.length,
+    totalCount,
     assets: filtered,
-    ...(truncated ? { truncated, totalCount } : {}),
-    // A zero-result filter is the silent-empty trap: say so, and say how to recover.
-    ...(filtered.length === 0 ? { hint: 'No match. Call bare for per-type counts, or widen the filter.' } : {}),
+    ...(truncated ? { truncated } : {}),
+    // A zero-result filter is the silent-empty trap: say so, with the population it missed (#1214).
+    ...(totalCount === 0 && (q.type || q.folder || needle) ? {
+      hint: emptyFilterHint({
+        what: 'asset',
+        filter: describeFilter({ type: q.type, folder: q.folder, name: q.name }),
+        unfilteredCount: assets.length,
+        live: q.type ? { type: assets.map((a) => a.type) } : undefined,
+        near: { type: q.type },
+      }),
+    } : {}),
   };
 }
 

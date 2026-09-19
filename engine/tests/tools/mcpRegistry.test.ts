@@ -17,7 +17,6 @@
  *  See `docs/debug-tools-mcp.md` (`modoki_batch`), which is why the registry exists. */
 
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { found } from '@modoki/engine/testing/inOrder';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -34,6 +33,10 @@ import { z } from '../../tools/modoki-mcp/node_modules/zod';
 // hoists (or lacks). Used only by the definition-surface ledger (#456) to walk NESTED schemas.
 import { zodToJsonSchema } from '../../tools/modoki-mcp/node_modules/zod-to-json-schema';
 import { readScannedSource } from '@modoki/engine/testing';
+import {
+  accessPath, calledNames, callsTo, declarationOf, enclosingNamedFunction, findNodes, flatText, functionsNamed, importsIn, parseSource,
+  printedText, propertyValue, stringValueOf, ts, unwrapValue,
+} from '@modoki/engine/testing/sourceAst';
 import {
   registerTool,
   getTool,
@@ -55,24 +58,6 @@ const toolModules = () =>
  *  not escape these guards just because nobody remembered to add it here. */
 const allSrcFiles = () =>
   fs.readdirSync(SRC).filter((f) => f.endsWith('.ts')).concat(toolModules());
-
-/**
- * The source between two CODE anchors, with both anchors proven to exist.
- *
- * ⚠️ **A length floor is not enough, and mutation testing is what showed it.** `indexOf` returns
- * -1 when an anchor stops matching, and `slice(a, -1)` does not give an empty string — it gives
- * everything up to the last character. So a broken END anchor silently WIDENS the slice to most of
- * the file and sails past any floor, while a `.not.toMatch` over it then checks far too much. Only
- * asserting the offsets catches both directions.
- */
-function between(src: string, startAnchor: string, endAnchor: string, label: string): string {
-  const a = found(src.indexOf(startAnchor), `${label}: start anchor ${JSON.stringify(startAnchor)} (without it the slice `
-    + 'below measures the wrong region)');
-  const b = src.indexOf(endAnchor);
-  expect(b, `${label}: end anchor ${JSON.stringify(endAnchor)} no longer appears — slice(a, -1) `
-    + 'would silently widen to the rest of the file').toBeGreaterThan(a);
-  return src.slice(a, b);
-}
 
 const okResult = { content: [{ type: 'text' as const, text: '{}' }] };
 
@@ -275,6 +260,13 @@ describe('the real registered surface', () => {
   // convention that had already converged, i.e. a blind spot waiting for its next drift. (`action`
   // and `type` were first counted among them too, but only because an undescribed param's `''` was
   // taken as the shared base — see the comparison below. Both are per-tool enums, 10 and 8 wordings.)
+  // ⚠️ #1266 took ONE meaning off `name` and it still belongs here — the entry is narrower, not gone.
+  // The five `open_*_editor` tools spelled an asset DISPLAY LABEL `name`, which was never the
+  // category this entry pardons: every other `name` is *the name of the thing the tool addresses*
+  // (an entity to filter, a trait to describe, an action to dispatch, an asset to match), with the
+  // type stated each time — `path`'s pattern exactly. A label you ASSIGN is a different job, so it
+  // became `displayName` rather than being excused here. Four addressing meanings remain, so the
+  // containment check still cannot police this word; do not read the rename as clearing it.
   const PER_TOOL_MEANING: readonly string[] = [
     'path', 'name', 'kind', 'id', 'ids', 'key', 'limit', 'all', 'from', 'to', 'clear', 'since',
     'guid', 'guids', 'quality', 'selector', 'button', 'steps', 'entity', 'parentId',
@@ -501,6 +493,34 @@ describe('the real registered surface', () => {
     }
   });
 
+  // #1223: an empty flat `guid` is ABSENT, as in the live resolver, so it does not conflict with a nested
+  // ref. Mutation: in foldEntityRef, filter the flat side on `!== undefined` alone.
+  it('an EMPTY flat guid beside a nested entity is one address, not a conflict', async () => {
+    const s2 = loadSurface();
+    try {
+      const r = await s2.call('modoki_focus_entity', { guid: '', entity: { guid: 'g-1' } });
+      expect(s2.text(r)).not.toMatch(/both `entity` and the flat/);
+      const sent = s2.requests.find((q) => q.path.startsWith('/api/editor-action'));
+      expect(sent?.body).toMatchObject({ guid: 'g-1' });
+    } finally { s2.restore(); }
+  });
+
+  // #1223: the other two nested entity refs were NOT strict, so a typo'd key was stripped and the call
+  // went out with an empty or partial ref. Mutation: drop `.strict(…)` from makeEntitySpec / set_transform's entity.
+  it('the aimed-input `entity` and set_transform `entity` are STRICT too', async () => {
+    const cases: Array<[string, Record<string, unknown>, RegExp]> = [
+      ['modoki_tap', { entity: { guid: 'g-1', surfce: 'game-3d' } }, /accepts only: guid, name, id, surface, allowOccluded/],
+      ['modoki_set_transform', { entity: { gid: 'g-1' }, space: 'local', position: [1, 2, 3] }, /accepts only: guid, name, id/],
+    ];
+    for (const [name, args, why] of cases) {
+      const s2 = loadSurface();
+      try {
+        await expect(s2.call(name, args), name).rejects.toThrow(why);
+        expect(s2.requests.filter((q) => !q.path.startsWith('/api/identity') && !q.path.startsWith('/api/editor-state')), `${name} must refuse BEFORE acting`).toEqual([]);
+      } finally { s2.restore(); }
+    }
+  });
+
   it('the alias folds `id: 0` — the ROOT entity — rather than reading it as "no address"', async () => {
     // `foldEntityRef` filters the flat side on `!== undefined`, not truthiness. Under a truthiness
     // test `{id: 0}` reads as absent, so a caller passing BOTH `id:0` and an `entity` would get the
@@ -601,7 +621,46 @@ describe('the real registered surface', () => {
   // readers that chrome is now aimable by label and readable without modoki_eval — the ~1,900 evals
   // #1152/#1153 measured are the spend this buys back. The param wording was trimmed once before
   // pinning (158,364 → 157,776); the close-out then named label/entity in the x/y descriptions (+168).
-  const DEFINITION_BYTES = 157_944;
+  // 2026-09-14 (#1208 phase 4, work-qa): RE-PINNED to 162,505 — measured. The merge base already
+  // priced 161,610 (3,666 over the old pin, inside the headroom, arriving through the 2026-09-14
+  // merges), and this change adds 895: 836 across 17 tools, then +59 on create_asset and
+  // create_registered_asset after review, for a pointer that says how to CHOOSE between them (`gen:ledger`, `ledger/work-qa.csv`): each
+  // look-alike naming its sibling in its first schema read (24 directions, #1208 §2a), first
+  // sentences rewritten to say what the tool does, and set_gizmo/focus_entity naming their
+  // read-back. The first-sentence rewrites REMOVED bytes (two issue numbers, a changelog clause);
+  // the sibling pointers are the spend.
+  // 2026-09-15 (#1223 P1–P5 close-out, work-ai3): RE-PINNED to 166,674 — measured on the merge of
+  // origin/main into work-ai3 (1346cc513). Neither side crossed alone: main arrived at ~165,057
+  // (work-qa #1215, work-ai2 #1254, inside the headroom), and #1223 adds the rest, booked in
+  // `ledger/work-ai3.csv`. P1–P4: +1,370 across the guid-address and addedTraits/alsoDeleted/handles
+  // descriptions. P5: +222 naming the renamed counts (`returnedCount`/`totalCount`,
+  // `worldEntityTotal`, `entityTotal`) in five tools. And +206 on modoki_mutate_scene and
+  // modoki_prefab, where both sides extended one description. The spend is the breaking renames being
+  // stated where an agent reads them.
+  // 2026-09-16 (#1266 + #1218, work-ai3): RE-PINNED to 171,084 — measured on `b272dba16`, booked in
+  // `ledger/work-ai3.csv`. +4,156 across 18 tools, and this one is worth reading as a WARNING about
+  // where a surface budget actually goes, because almost none of it is the renames.
+  //   The §2 renames (#1266) are ~net zero: `displayName` is longer than `name` on four tools and
+  //   `maxPresses` than `max` on two, but open_particle_editor REFUNDED 65 B by losing a param
+  //   nothing read. The count vocabulary is reply-side and costs the schema nothing.
+  //   The spend is #1218 — 13 descriptions that pointed nowhere, pointed at history, or stated what
+  //   the code does not do. Four tools are 2/3 of it: unused_assets (+585, a disk-vs-live warning it
+  //   had NONE of, on the answer that feeds a delete), find_references (+550, `unreferenced`/
+  //   `reachable` and the staleInputs trio its enumerated shape omitted), open_skin_editor (+505)
+  //   and create_registered_asset (+474, an undocumented panel-opening side effect and a swallowed
+  //   hook error).
+  //   ⚠️ Much of that is a MOVE, not new prose: `contracts.ts` notes already described the
+  //   staleInputs fields in detail, and `notes` is not part of the surface an agent reads. Moving a
+  //   fact from a place nobody reads to the place everybody does SPENDS this budget by definition —
+  //   so a "no new information" change can still cost 4 KB, and that is the spend being approved
+  //   here, not an oversight.
+  // 2026-09-18 (#1414, work-ai3): RE-PINNED to 175,280 — measured on this branch after merging
+  // origin/main. The surface measured 175,052 before #1414 (the pre-#1414 editor.ts swapped back in),
+  // inside the headroom with 32 B of it left: the rest was spent by the branches merged since the
+  // 171,084 pin (booked in their ledgers). #1414 adds 228 B to modoki_save_all's `path`, which the
+  // owner's ruling required to say that a
+  // path naming another file is a Save As with a FRESH id that OVERWRITES what is there.
+  const DEFINITION_BYTES = 175_280;
   const DEFINITION_HEADROOM = 4_000;
 
   // `sumSchemaBytes` itself now lives in `mcpSurface.ts` (imported above), not here — this ledger
@@ -845,18 +904,14 @@ describe('source guards that cannot be expressed as assertions', () => {
     // set_transform's documented `path` default fail on every call — and no test caught it
     // because every test passed an explicit `path`. It lives in `activeScenePath` so a second
     // scene-editing tool cannot re-derive it wrong.
-    // ⚠️ **Anchored on CODE, not on the comments that used to bracket this helper (#816).** The
-    // slice ran from `'/** Resolve the scene an edit should apply to'` to `'// ── mutate_scene'`
-    // — both comments — and survived only because this read was the one raw read left in the file.
-    // Stripping would have made both `indexOf` return -1 and the slice empty, so `toContain` would
-    // fail while the third assertion (`src.replace(helper, '')`) silently checked the whole file.
-    // The declaration and the next tool's registered name are the same boundary, in code.
-    const src = codeOf('tools/scene.ts');
-    const helper = between(src, 'async function activeScenePath(', "'modoki_mutate_scene'",
-      'activeScenePath helper');
-    expect(helper).toContain('scenePathRef');
-    expect(helper).not.toMatch(/\}\s*\)\.scenePath\b/); // no falling back to the raw /@fs field
-    expect(src.replace(helper, '')).not.toContain('scenePathRef');
+    // ⚠️ **Read by the function it sits in (#816, #1195).** The helper was a slice — first between two
+    // comments, then from `async function activeScenePath(` to the next tool's registered name — and
+    // "outside it" was `src.replace(helper, '')`. Now every mention is placed by its enclosing function.
+    expect(scenePathSites(parseSource(codeOf('tools/scene.ts'), 'scene.ts'))).toEqual({
+      // The type member and the read, both inside the helper.
+      scenePathRefIn: ['activeScenePath', 'activeScenePath'],
+      scenePathReadsInHelper: [],
+    });
   });
 
   it("editorAction cannot have its routing `action` clobbered by a params key", () => {
@@ -877,14 +932,20 @@ describe('source guards that cannot be expressed as assertions', () => {
     // The other half: /api/editor-action STRIPS `action` before relaying, so a param by that name
     // is structurally unreachable through it — a tool that needs one must rename it on the wire
     // (prefab uses `prefabAction`). Catch a new tool repeating the mistake.
-    // ⚠️ Code anchors, and a floor — same reason as the `activeScenePath` slice above (#816). The
-    // end anchor was `'// ── gizmo / focus'`, a COMMENT: strip it, or reword the section header,
-    // and `indexOf` returns -1. `toContain` below would catch an empty slice, but the
-    // `not.toMatch` would PASS on it — the fail-open half, checking nothing.
-    const src = codeOf('tools/editor.ts');
-    const prefab = between(src, "'modoki_prefab'", "'modoki_set_gizmo'", 'modoki_prefab tool');
-    expect(prefab).toContain('prefabAction: action');
-    expect(prefab).not.toMatch(/editorAction\('prefab', p\)/);
+    // ⚠️ **Read as each registration's own handler (#1195).** This used to check `modoki_prefab` alone, as the
+    // text between two anchors — first a section-header COMMENT (#816: strip it and the window silently
+    // widened), then the next tool's name, which a tool registered between them or a reordered file moved.
+    // Now it covers what its title says: every tool that DECLARES an `action` param, in every tool module.
+    const wires = toolModules().flatMap((f) => {
+      const sf = parseSource(codeOf(f), f);
+      return callsTo(sf, 'tool').filter((c) => ts.isIdentifier(c.expression) && !!propertyValue(c.arguments.length > 3 ? c.arguments[2] : undefined, 'action'))
+        .map((c) => stringValueOf(c.arguments[0])!)
+        .map((name) => ({ name, wires: editorActionWires(toolRegistration(sf, name)) }));
+    });
+    // Measured 2026-09-15: 11 tools declare `action`; 3 of them call editorAction.
+    expect(wires.length).toBeGreaterThanOrEqual(11);
+    expect(wires.filter((w) => w.wires.some((x) => x.leaksAction)).map((w) => w.name)).toEqual([]);
+    expect(wires.find((w) => w.name === 'modoki_prefab')?.wires).toEqual([{ op: 'prefab', routesAction: true, leaksAction: false }]);
   });
 
   it('every scene-EDITING tool defaults its path to the active scene', () => {
@@ -894,15 +955,175 @@ describe('source guards that cannot be expressed as assertions', () => {
     // `load_scene` are excluded on purpose — naming a specific file IS the call.
     // ⚠️ `codeOf` for the same reason, and it also stops the slice below from starting at a
     // COMMENT occurrence of the tool name rather than its registration.
-    const src = codeOf('tools/scene.ts');
+    // ⚠️ Each tool is its `tool('<name>', …)` registration, from the parser (#1195) — it used to run from the
+    // first `'<name>'` to the next `'\n  );'`, a fixed two-space closer.
+    const sf = parseSource(codeOf('tools/scene.ts'), 'scene.ts');
     for (const name of ['modoki_mutate_scene', 'modoki_set_transform']) {
-      const start = src.indexOf(`'${name}'`);
-      const fn = src.slice(start, src.indexOf('\n  );', start));
-      expect(fn, `${name} must accept an omitted path`).toMatch(/path: z\.string\(\)\.optional\(\)/);
-      expect(fn, `${name} must resolve it via activeScenePath`).toContain('activeScenePath(path');
+      expect(pathDefault(toolRegistration(sf, name)), `${name} must accept an omitted path, and resolve it via activeScenePath`)
+        .toEqual({ optional: true, resolvedVia: [`activeScenePath(path, '${name}')`] });
     }
   });
+
+  it('reads a registration, its handler and the helper by node, not by the text between anchors (#1195)', () => {
+    const sf = parseSource([
+      'async function activeScenePath(path, tool) { const ref = (body as { scenePathRef?: string }).scenePathRef; return ref; }',
+      "tool('modoki_a', 'd', { path: z.string()\n    .optional(), ops: z.any() },\n  async ({ path, ops }) => {\n    const t = `\n  );`;\n    const r = await activeScenePath(path, 'modoki_a'); return r;\n  },\n);",
+      "tool('modoki_b', 'd', { path: z.string() }, async (p) => { const r = await activeScenePath(p.path, 'modoki_b'); return editorAction('b', p); });",
+      "tool('modoki_c', 'd', {}, async ({ action, ...rest }) => editorAction('c', { ...rest, prefabAction: action }));",
+      "tool('modoki_d', 'd', {}, async (args) => editorAction('d', { ...args, prefabAction: args.action }));",
+      "function elsewhere(s) { return s.scenePath ?? 'scenePathRef'; }",
+      "tool('modoki_e', 'd', { path: z.string().optional() }, async ({ path }) => (async (path) => activeScenePath(path, 'modoki_e'))());",
+      "registry.tool('modoki_c', 'd', {}, async () => 1);",
+      "tool('modoki_f', 'd', {}, async ({ action, x }) => editorAction('f', { x, action }));",
+      "tool('modoki_g', 'd', {}, async ({ id, ...rest }) => editorAction('g', rest));",
+      "tool('modoki_h', 'd', {}, async (args) => editorAction('h', { 'action': args.action }));",
+      "tool('modoki_i', 'd', {}, async (args) => { const p = args; return editorAction('i', p); });",
+      "tool('modoki_j', 'd', {}, async ({ action, ...rest }) => editorAction('j', { ...rest, prefabAction: action }));",
+      "tool('modoki_k', 'd', {}, async (args) => { const { id, ...rest } = args; return editorAction('k', rest); });",
+      "tool('modoki_l', 'd', {}, async (args) => { const p = { ...args }; return editorAction('l', p); });",
+      "tool('modoki_m', 'd', {}, async (args) => { const { action, ...rest } = args; return editorAction('m', { ...rest, prefabAction: action }); });",
+      "tool('modoki_n', 'd', {}, async ({ action, ...rest }) => { const p = { ...rest, action }; return editorAction('n', p); });",
+      "tool('modoki_o', 'd', {}, async (args) => { const p = { id: args.id, action: args.action }; return editorAction('o', p); });",
+      "tool('modoki_p', 'd', {}, async (args) => { const p = Object.assign({}, args); return editorAction('p', p); });",
+      "tool('modoki_q', 'd', {}, async (args) => [args].map(({ id, ...rest }) => editorAction('q', rest)));",
+      "tool('modoki_r', 'd', {}, async ({ action, ...rest }) => { const p = Object.assign({}, rest, { prefabAction: action }); return editorAction('r', p); });",
+      "tool('modoki_s', 'd', {}, async (args) => [args].map(({ action, ...rest }) => editorAction('s', rest)));",
+      "tool('modoki_t', 'd', {}, async (args) => { const a = { ...args }; const b = { ...a }; const c = { ...b }; return editorAction('t', c); });",
+      "tool('modoki_u', 'd', {}, async (args) => [args].map((a) => editorAction('u', { ...a })));",
+      "tool('modoki_v', 'd', {}, async ({ id }) => { const send = ({ n, ...rest }) => editorAction('v', rest); return send({ n: id }); });",
+      "tool('modoki_w', 'd', {}, async (args) => { const p = {}; Object.assign(p, args); return editorAction('w', p); });",
+      "tool('modoki_x', 'd', {}, async (args) => { const p = { id: args.id }; p.action = args.action; return editorAction('x', p); });",
+      "tool('modoki_x2', 'd', {}, async (args) => { const p = {}; p['action'] = args.action; return editorAction('x2', p); });",
+      "tool('modoki_y', 'd', {}, async (args) => { let p = {}; p = args; return editorAction('y', p); });",
+      "tool('modoki_z', 'd', {}, async () => { const p = { action: 'play' }; return editorAction('z', p); });",
+      "tool('modoki_ok', 'd', {}, async ({ action, id }) => { let p = { id }; p = { ...p, prefabAction: action }; p.id = 2; Object.assign(p, { id }); return editorAction('ok', p); });",
+      "tool('modoki_dup', 'd', {}, async () => 1);\ntool('modoki_dup', 'd', {}, async () => 2);",
+    ].join('\n'), 'probe.ts');
+    expect(pathDefault(toolRegistration(sf, 'modoki_a'))).toEqual({ optional: true, resolvedVia: ["activeScenePath(path, 'modoki_a')"] });
+    // Not optional, and a path read off the args object rather than the destructured binding.
+    expect(pathDefault(toolRegistration(sf, 'modoki_b'))).toEqual({ optional: false, resolvedVia: [] });
+    expect(editorActionWires(toolRegistration(sf, 'modoki_b'))).toEqual([{ op: 'b', routesAction: false, leaksAction: true }]);
+    expect(editorActionWires(toolRegistration(sf, 'modoki_c'))).toEqual([{ op: 'c', routesAction: true, leaksAction: false }]);
+    expect(editorActionWires(toolRegistration(sf, 'modoki_d'))).toEqual([{ op: 'd', routesAction: false, leaksAction: true }]);
+    expect(editorActionWires(toolRegistration(sf, 'modoki_f'))).toEqual([{ op: 'f', routesAction: false, leaksAction: true }]);
+    // A rest that still holds `action`, a quoted key, and an alias of the args leak; a rest with `action` bound out does not.
+    expect(['modoki_g', 'modoki_h', 'modoki_i', 'modoki_j', 'modoki_k', 'modoki_l', 'modoki_m'].map((n) => editorActionWires(toolRegistration(sf, n))[0]!.leaksAction))
+      .toEqual([true, true, true, false, true, true, false]);
+    // A copy is read like the literal inline: an `action` key in it, Object.assign of the args, a rest in a nested
+    // function's parameter (its source unseen) leak; the same shapes with `action` bound out do not.
+    expect(['modoki_n', 'modoki_o', 'modoki_p', 'modoki_q', 'modoki_r', 'modoki_s'].map((n) => editorActionWires(toolRegistration(sf, n))[0]!.leaksAction))
+      .toEqual([true, true, true, true, false, false]);
+    // Spread copies three deep; a nested function's whole parameter; later writes (Object.assign into it, an `action`
+    // property, reassignment); a copy in a handler with no parameter — all leak. A local helper's rest leaks too, by
+    // design: its argument is a call this does not follow, so it is red rather than read as clean (third §2d round).
+    expect(['modoki_t', 'modoki_u', 'modoki_v', 'modoki_w', 'modoki_x', 'modoki_x2', 'modoki_y', 'modoki_z', 'modoki_ok']
+      .map((n) => editorActionWires(toolRegistration(sf, n))[0]!.leaksAction)).toEqual([true, true, true, true, true, true, true, true, false]);
+    // Out of names to follow fails loudly.
+    const deep = parseSource(`tool('modoki_deep', 'd', {}, async (args) => { const p0 = args; ${Array.from({ length: 9 }, (_, i) => `const p${i + 1} = p${i};`).join(' ')} return editorAction('deep', p9); });`, 'deep.ts');
+    expect(() => editorActionWires(toolRegistration(deep, 'modoki_deep'))).toThrow(/names deep/);
+    // A string naming it is still a mention outside the helper; a `.scenePath` read elsewhere is not the helper's.
+    expect(scenePathSites(sf)).toEqual({ scenePathRefIn: ['activeScenePath', 'activeScenePath', 'elsewhere'], scenePathReadsInHelper: [] });
+    expect(() => toolRegistration(sf, 'modoki_missing')).toThrow(/one tool\('modoki_missing'/);
+    expect(() => toolRegistration(sf, 'modoki_dup')).toThrow(/one tool\('modoki_dup'/);
+    // A `path` shadowed by an inner parameter is not the tool's own `path`.
+    expect(pathDefault(toolRegistration(sf, 'modoki_e'))).toEqual({ optional: true, resolvedVia: [] });
+  });
 });
+
+/** The ONE `tool('<name>', description, shape, handler)` registration in `sf`. */
+function toolRegistration(sf: ts.SourceFile, name: string): { shape: ts.Expression | undefined; handler: ts.ArrowFunction | ts.FunctionExpression } {
+  const calls = callsTo(sf, 'tool').filter((c) => ts.isIdentifier(c.expression) && stringValueOf(c.arguments[0]) === name);
+  expect(calls.length, `expected one tool('${name}', …) registration in ${sf.fileName}`).toBe(1);
+  const args = calls[0]!.arguments;
+  const handler = unwrapValue(args[args.length - 1]!);
+  expect(ts.isArrowFunction(handler) || ts.isFunctionExpression(handler), `${name}: the last argument is not an inline handler`).toBe(true);
+  return { shape: args.length > 3 ? args[2] : undefined, handler: handler as ts.ArrowFunction | ts.FunctionExpression };
+}
+
+/** Whether a tool's `path` schema is `.optional()`, and each `activeScenePath(…)` its handler resolves the
+ *  DESTRUCTURED `path` parameter through, printed. */
+function pathDefault(reg: ReturnType<typeof toolRegistration>): { optional: boolean; resolvedVia: string[] } {
+  const schema = propertyValue(reg.shape, 'path');
+  const param = reg.handler.parameters[0]?.name;
+  const pathBinding = param && ts.isObjectBindingPattern(param)
+    ? param.elements.find((e) => ts.isIdentifier(e.name) && e.name.text === 'path' && !e.propertyName) : undefined;
+  return {
+    optional: !!schema && calledNames(schema).includes('optional'),
+    resolvedVia: callsTo(reg.handler.body, 'activeScenePath')
+      .filter((c) => { const a = c.arguments[0]; return !!a && ts.isIdentifier(a) && !!pathBinding && declarationOf(a) === pathBinding; })
+      .map(printedText),
+  };
+}
+
+/** Each `editorAction('<op>', <params>)` in a tool's handler: whether it routes the tool's `action` on the wire
+ *  as `prefabAction: action` (the destructured binding), and whether the params could still carry a key named
+ *  `action` — the whole args object passed or spread, or an `action:` key. */
+function editorActionWires(reg: ReturnType<typeof toolRegistration>): Array<{ op: string | undefined; routesAction: boolean; leaksAction: boolean }> {
+  const isActionKey = (n: ts.PropertyName | undefined) => !!n && (ts.isIdentifier(n) || ts.isStringLiteral(n)) && n.text === 'action';
+  const bindsAction = (pattern: ts.ObjectBindingPattern) => pattern.elements.some((el) => !el.dotDotDotToken && isActionKey(el.propertyName ?? (el.name as ts.Identifier)));
+  /** Whether a value can still carry a key named `action` onto the wire — the args object itself; any parameter of a
+   *  nested function, whole or a `...rest` not binding `action` out, since its source is a call this cannot see; a
+   *  `...rest` of the handler's parameter or of a body destructure of a leaking value; a variable whose initializer
+   *  leaks, or that is later written to with one (`Object.assign(p, args)`, `p.action = …`, `p = args`); an object
+   *  literal with an `action` key or a leaking spread; an `Object.assign` with a leaking argument. One recursion, so a
+   *  copy is read the same as the literal passed inline (#1195 close-out review, then the second and third §2d rounds).
+   *  Only a name followed costs a hop, and running out of hops fails loudly instead of reading "no leak". */
+  const handlerIds = findNodes(reg.handler, ts.isIdentifier);
+  const leaks = (value: ts.Expression, hops = 0, following: ReadonlySet<ts.Node> = new Set()): boolean => {
+    const e = unwrapValue(value);
+    if (ts.isObjectLiteralExpression(e)) {
+      return e.properties.some((p) => ts.isSpreadAssignment(p) ? leaks(p.expression, hops, following) : isActionKey(p.name));
+    }
+    if (ts.isCallExpression(e) && accessPath(e.expression) === 'Object.assign') return e.arguments.some((x) => leaks(x, hops, following));
+    if (!ts.isIdentifier(e)) return false;
+    expect(hops, `${printedText(e)}: more than 8 names deep — extend editorActionWires rather than read "no leak"`).toBeLessThan(8);
+    const d = declarationOf(e);
+    // A name already being followed adds nothing new (`p = { ...p, … }`): whatever it holds is read where it was entered.
+    if (!d || following.has(d)) return false;
+    const next = new Set(following).add(d);
+    if (ts.isParameter(d)) return true;
+    if (ts.isBindingElement(d)) {
+      if (!d.dotDotDotToken || !ts.isObjectBindingPattern(d.parent) || bindsAction(d.parent)) return false;
+      const holder = d.parent.parent;
+      if (ts.isParameter(holder)) return true;
+      return ts.isVariableDeclaration(holder) && !!holder.initializer && leaks(holder.initializer, hops + 1, next);
+    }
+    if (!ts.isVariableDeclaration(d)) return false;
+    if (d.initializer && leaks(d.initializer, hops + 1, next)) return true;
+    // Written to after its declaration.
+    return handlerIds.some((r) => {
+      if (r === d.name || declarationOf(r) !== d) return false;
+      const up = r.parent;
+      if (ts.isCallExpression(up) && accessPath(up.expression) === 'Object.assign' && up.arguments[0] === r) {
+        return up.arguments.slice(1).some((x) => leaks(x, hops + 1, next));
+      }
+      const assigned = (target: ts.Node) => ts.isBinaryExpression(target.parent) && target.parent.left === target
+        && target.parent.operatorToken.kind === ts.SyntaxKind.EqualsToken;
+      if ((ts.isPropertyAccessExpression(up) && up.expression === r && up.name.text === 'action')
+        || (ts.isElementAccessExpression(up) && up.expression === r && stringValueOf(up.argumentExpression) === 'action')) return assigned(up);
+      return assigned(r) && leaks((r.parent as ts.BinaryExpression).right, hops + 1, next);
+    });
+  };
+  return callsTo(reg.handler.body, 'editorAction').map((c) => {
+    const params = c.arguments[1] && unwrapValue(c.arguments[1]);
+    const routed = params && propertyValue(params, 'prefabAction');
+    const leaksAction = !!params && leaks(params);
+    return { op: stringValueOf(c.arguments[0]), routesAction: !!routed && ts.isIdentifier(routed) && routed.text === 'action', leaksAction };
+  });
+}
+
+/** Where `scenePathRef` is named (identifiers and strings, by enclosing function), and the `.scenePath` property
+ *  reads inside `activeScenePath` itself. */
+function scenePathSites(sf: ts.SourceFile): { scenePathRefIn: Array<string | undefined>; scenePathReadsInHelper: string[] } {
+  const helpers = functionsNamed(sf, 'activeScenePath');
+  expect(helpers.length, `expected one activeScenePath in ${sf.fileName}`).toBe(1);
+  const mentions = findNodes(sf, (n): n is ts.Identifier | ts.StringLiteralLike =>
+    (ts.isIdentifier(n) || ts.isStringLiteralLike(n)) && n.text === 'scenePathRef');
+  return {
+    scenePathRefIn: mentions.map((m) => enclosingNamedFunction(m)?.name),
+    scenePathReadsInHelper: findNodes(helpers[0]!.body, ts.isPropertyAccessExpression).filter((p) => p.name.text === 'scenePath').map(flatText),
+  };
+}
 
 describe('zod resolution (issue #23)', () => {
   /** This file must build its schemas with the SAME zod the MCP server runs, which is why its
@@ -923,8 +1144,10 @@ describe('zod resolution (issue #23)', () => {
     const src = readScannedSource(
       path.join(path.dirname(fileURLToPath(import.meta.url)), 'mcpRegistry.test.ts'),
     ).code;
-    expect(src, 'import zod from tools/modoki-mcp/node_modules, not a bare specifier')
-      .not.toMatch(/^import\s+\{[^}]*\}\s+from\s+'zod';$/m);
+    // Every edge from the parse (#1193): `^import\s+\{[^}]*\}\s+from\s+'zod';$` missed a wrapped
+    // import, double quotes, no semicolon, a default/namespace import and `export … from 'zod'`.
+    const bare = importsIn(parseSource(src, 'mcpRegistry.test.ts')).filter((e) => e.spec === 'zod' || e.spec.startsWith('zod/'));
+    expect(bare.map((e) => e.spec), 'import zod from tools/modoki-mcp/node_modules, not a bare specifier').toEqual([]);
 
     const mcpZod = JSON.parse(
       fs.readFileSync(path.resolve(SRC, '../node_modules/zod/package.json'), 'utf8'),

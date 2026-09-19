@@ -164,8 +164,9 @@ with a default `limit` and a `hint`:
 ```jsonc
 {
   "scenePath": "…/tropical-island.scene.json",
-  "entityCount": 135,
-  "truncated": false,
+  "returnedCount": 136,      // counts read live 2026-09-15 (#1223 P5); the token figures below
+  "totalCount": 136,         // are from the original 135-entity measurement
+  "resourcesExcluded": 2,    // + 136 = get_editor_state's worldEntityTotal (138)
   "entities": [
     { "id": 12, "guid": "…", "name": "Island", "parentId": null, "layer": "3d",
       "traits": ["Transform", "Renderable3D", "ModelSource"] }
@@ -194,9 +195,10 @@ than requested:
 
 ```jsonc
 {
-  "count": 241,
+  "totalCount": 241,       // rects; `entityTotal` is the distinct entities behind them
+  "entityTotal": 241,
   "layerCounts": { "ui": 0, "2d": 0, "3d": 241 },
-  "offScreen": [],          // ids — cheap, and diagnose.ts depends on this key
+  "offScreen": [],          // guids (#1223) — cheap, and diagnose.ts depends on this key
   "offScreenCount": 0,
   "overlapsCount": 2625,    // computed cheaply; the PAIRS are what's expensive to serialize
   "hint": "Counts only. Pass ids=… or layer=… for rects; overlaps=1 for the pair list."
@@ -211,8 +213,8 @@ survives, only the serialized pairs are gone. `overlaps=1` costs ~19,350 tok, `l
   `layoutDump.ts`'s `computeLayoutBounds` is **guarded** so the default doesn't pay to compute
   2,625 pairs it then discards. That double-loop otherwise emits more characters than all 241
   rects combined.
-- **The `offScreen` key (array of ids) is preserved.** `diagnose.ts`'s `computeDiagnostics` reads
-  `.offScreen` off a no-arg `computeLayoutBounds()` and takes `.length` — this is the concrete
+- **The `offScreen` key (an array — of guids since #1223) is preserved.** `diagnose.ts`'s `computeDiagnostics` reads
+  `.offScreen` off a no-arg `computeLayoutBounds()` and re-reports it — this is the concrete
   instance of the architectural rule: summarize at the route, and `diagnose.ts`, which calls the
   producer in-process, never notices. `agentBridge.ts`'s `dumpSceneState` (the `scene-state?bounds=1`
   enricher) passes `ids`, so it keeps its rects.
@@ -299,7 +301,7 @@ never in the producer. The ceilings below are **measured** (bytes/entry × ring 
 
 | Tool | Producer (untouched) | Seam | Boundary default | Measured ceiling |
 |---|---|---|---|---|
-| `get_console_logs` | `dumpConsoleLogs` projecting the shared `runtime/core/consoleRing.ts` (1000 entries in the editor, 512 on a debug device build) — `diagnose` reads it directly | `console-logs` op | last 50 + `count`/`total`/`ringTotal`/`byLevel`, where `byLevel`+`ringTotal` cover the WHOLE ring even under a filter (S3.8) | ~162 B/entry *(stale — see caveat below)* → **40–54k tok** (editor) |
+| `get_console_logs` | `dumpConsoleLogs` projecting the shared `runtime/core/consoleRing.ts` (1000 entries in the editor, 512 on a debug device build) — `diagnose` reads it directly | `console-logs` op | last 50 + `returnedCount`/`totalCount`/`ringTotal`/`byLevel`, where `byLevel`+`ringTotal` cover the WHOLE ring even under a filter (S3.8) | ~162 B/entry *(stale — see caveat below)* → **40–54k tok** (editor) |
 | `watch` (`read`) | `readWatch()` — `WatchTab.tsx`'s `WatchCard` renders `samples` | `watch-read` op | stats-only; `samples:true` opts in | 39.8 B/sample × 512 series × 600–5000 → **3.1M–25.8M tok** |
 | `journal` | `journalEvents()` — cap `journal.ts`'s `MAX_EVENTS` — `JournalTab` reads it | `journal-events` op | last 100 + `byType` | 102–226 B/ev → **257k–582k tok** |
 | `editor_journal` | `readEditorJournal()` — cap `editorJournal.ts`'s `MAX_EVENTS` | `editor-journal` op | last 100 + `byType`; `merged` tails `game` + `timeline` too | 130–253 B/ev → **54k–126k tok** |

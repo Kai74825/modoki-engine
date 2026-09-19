@@ -110,6 +110,24 @@ AudioListener trait ─┘        │
   stop it, foreground Court — audio returns with **no relaunch**. Re-test that way;
   no simulator or headless test reproduces an audio-session interruption, so this
   path's only real evidence is a phone.
+  ⚠️ **"Suspended" is not the only stopped state (#1428).** Current WebKit leaves a
+  backgrounded / locked / called context in a fourth, non-standard state,
+  `'interrupted'`, and `audioService.resume()` used to resume only `'suspended'` — so
+  on a new iOS the re-arm above fired and did nothing, and Weaveling's music stayed
+  dead after a background whenever WebKit did not auto-resume the context itself
+  (it does so inconsistently, WebKit bug 263627 — hence "not 100%"). The iPhone 8
+  verification above predates the state, which is why it passed. `resume()` now
+  resumes anything not `running`/`closed`, re-kicks paused streams once that resume
+  settles (in case a `play()` while still interrupted is refused — modelled, NOT observed
+  on a device), and re-kicks them on a `statechange` to `running` for a context WebKit
+  resumes by itself, never while the page is hidden. **Device-verified** (owner,
+  2026-09-19): the music now survives background/foreground in Weaveling. That confirms
+  the FIX, not which branch of it did the work — no `ctx.state` was logged, so whether
+  the context really read `'interrupted'` is still inferred. Video shares the context and
+  needs no gesture to recover — [video.md](./video.md) § "Backgrounding needs no gesture
+  to recover" (swept for #1428, device-verified). Pinned by
+  `tests/framework/audioResumeInterrupted.test.ts`; re-test on a phone the same way
+  (background mid-bed, foreground, repeat several times) — no headless test can.
 - **Tests** — `tests/runtime/audioSystem.test.ts` (record mode: autoplay, cues,
   play-state gating, scene-swap teardown, Transform-less sources) + buffer-cache
   refcount tests.
@@ -172,12 +190,34 @@ Commits `25f3b2f` + `633abcf` (review fixes).
   kept playing the pre-conversion buffer until an editor restart. The batch/agent re-import
   paths did not call it at all. Both fixed in #304's close-out; the chain and the shared
   event behind it are in [editor.md](editor.md) § "The asset Inspector" (rule 3, the preview keyed on the PATH).
+- **…and the eviction refills an OWNED buffer clip itself (#1361).** `getCachedAudioBuffer` is
+  read-only — the audio system treats a miss as "not decoded yet" and waits — and the only other
+  refill, `retryFailedAudioDecodes`, runs from `audioService.resume()` on the next pointer, key or
+  visibility event. (Since #1397 that refill re-attempts a failed DECODE on every gesture, which is
+  the iOS unlock, but not a failed FETCH: a missing clip is remembered and an outage backs off. See
+  [architecture.md](architecture.md) § "A load failure is classified before it is remembered".) So after any re-import, new plays of that clip were silent until a click, or
+  until a scene reload when an agent drove the re-import with no input at all (reproduced live on
+  `games/audio-demo`: owned, uncached 3 s later). `invalidateAudio` now re-fetches when a scene owns
+  the clip and the manifest says `buffer`; an unowned clip stays evicted, since no
+  `releaseAudioForScene` would ever drop a refilled row. Same shape as the prefab refill in
+  [prefabs.md](prefabs.md) (#1308). **The refetch is only right because the manifest update
+  arrives FIRST**: `servedAudioUrl` builds the `?v=<hash>` from it and the load type is read from
+  it. `/api/reimport` broadcasts its rebuilt manifest before sending `invalidate-assets` on the
+  same channel, and the Inspector and Assets-panel callers run only after that route has replied.
+  Observed live: the invalidation saw the new hash, which the entry lacked before the re-import.
+  A caller that invalidates BEFORE the manifest moves would re-cache the old variant — which is
+  what `device_invalidate_assets` does, since a device gets no manifest push; it refetches the
+  old `?v=`, the same URL the input-driven retry used before. The editor paths invalidate TWICE
+  per re-import (the route's op, then the panel's own call), so the clip decodes twice and is
+  briefly uncached in between — `audioSystem` retries a play on the next frame, so nothing is
+  dropped. A settling load removes only its OWN in-flight entry, or the superseded load would
+  delete the refill's entry and let the next acquire start a third fetch.
 
 - **Pipeline parity with textures** — the scanner bakes the `audio` block (loadType
   always; format+ext once converted) into the manifest, serves the `~audio.<ext>`
   variant (dev on-demand self-heal in `staticAssets.ts` + build drop-source), and
-  the runtime resolver (`servedAudioUrl`) targets it with a **prod-only** `?v=<hash>`
-  cache-bust (`withCacheBust`). Buffer decode AND streaming both resolve through it,
+  the runtime resolver (`servedAudioUrl`) targets it with a `?v=<hash>` cache-bust
+  (`withCacheBust`; prod-only until #1022, now in dev too). Buffer decode AND streaming both resolve through it,
   so a dropped-source prod build still loads. The strict conversion-fallback gate +
   dist-file verifier cover audio (an ffmpeg failure fails the build unless
   `MODOKI_ALLOW_ASSET_FALLBACK=1`, which then correctly ships + advertises source).
@@ -244,6 +284,41 @@ trait fields controlled by built-in actions** — and every game gets it for fre
   source plays the ONE guid in `clip`, so a twelve-track bank shipped twelve tracks and played
   the first, and every game wanting background music wrote the same loop (games/court did,
   for half a day, before this replaced it).
+  - **`AudioSource.shuffleStart` picks the OPENING clip** (#921, owner 2026-09-16: *"start music
+    should be randomized"*). ⚠️ **`'shuffle'` alone only decides what comes NEXT** — autoplay starts
+    the source on the authored `clip`, so every launch opened with the same track and only the order
+    after it varied, which reads as "the music always starts with that one". With the flag, autoplay
+    picks a random bank entry ONCE and the walk order rotates to it, so the first lap still covers
+    every clip. Off by default (`clip` is also what a non-playlist source plays, and an opener can be
+    deliberate); ignored with `playlist: 'off'` or a bank under two entries.
+    `randomStartClip` + the `audioSystem` seam: `engine/tests/framework/audioPlaylist.test.ts` and
+    `engine/packages/modoki/tests/runtime/audioPlaylistSystem.test.ts`.
+  - ⚠️ **The walk RE-DERIVES when `clip` is written from outside it** (#1281). `order`/`idx` is a
+    cache of where we are, and it used to be rebuilt only when the BANK changed — so every other
+    writer left it pointing at the old position and the next advance followed a stale order. Two
+    ways in, one divergence: the `audio.setClip` action or a debug bed picker writing the trait, and
+    `rearmAudioAutoplay` (the #611 pagehide backstop) re-arming a `shuffleStart` source while its
+    playlist state survives untouched. The symptom is the wrong successor — and when the write picks
+    the clip the walk was ABOUT to play, the same track twice in a row, the one repeat
+    `shuffleRefs`'s `avoid` argument exists to prevent. `nextClip` now compares what it believes is
+    playing against what IS, and rotates. Detected rather than announced, deliberately: a
+    `rotatePlaylistTo` seam every caller had to remember would be one `a.clip = …` away from
+    reopening it, and this covers writers that do not exist yet. Two riders, both load-bearing and
+    both guarded: it ROTATES rather than rebuilds (a reshuffle would discard the rest of the lap,
+    and a lap is what makes every clip play once before any repeats), and it is **inert while a swap
+    is in flight** — that window is the one where `clip` lagging the walk is normal, and re-deriving
+    there clears the latch and tears through the bank a clip per frame.
+    ⚠️ **The adopted clip then takes that same latch, and `ended` clears the latch BEFORE the check** —
+    both learned from review, and between them they are the difference between the re-arm working and
+    only appearing to. `audioDispose()` ends every live handle before `onRealmSurvived` re-arms, so
+    the re-arm frame ALWAYS arrives with the clip ended: without the early clear a backgrounding
+    mid-cross-fade leaves `pending` set and the write is invisible, and without the latch on the
+    adopted clip the same call advances straight past it — so `randomStartClip`'s freshly-rolled
+    opener is never heard and the source starts on its successor. The first version of the re-arm
+    test re-armed over a LIVE voice, which production cannot produce, and passed while that path was
+    broken. Residual, stated: a clip shorter than `crossfadeSec` is never above the threshold, so its
+    latch clears only on `ended` and a mid-clip write is adopted at the next boundary instead of at
+    once. Nothing authored is that short.
   - ⚠️ **TWO triggers, and the second is not optional.** The cross-fade trigger fires BEFORE the
     clip ends — `remainingSec <= crossfadeSec` — because waiting for the end is too late: by then
     there is no live voice left to fade OUT, so there is nothing to cross-fade and the next clip

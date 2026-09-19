@@ -26,9 +26,13 @@ import {
   registerFrameCallback, unregisterFrameCallback, getCurrentWorld,
   findEntity, findEntityByGuid, getAllTraits, readTraitDataFull, getTime, entityRef, EntityAttributes,
 } from '@modoki/engine/runtime';
+import { describeFilter, emptyFilterHint } from '../../tools/shared/filterDisclosure';
 
 interface Sample { tick: number; value: number }
-interface Series { samples: Sample[]; last: number; despawnedAt?: number; name?: string }
+/** `holdsMoverSlot`: this series is one of the `moverCount` counted against `maxSeries`. An explicit
+ *  flag, not `samples.length > 1` — clearing a series empties its samples and a despawn freezes them,
+ *  and both must decide what happens to the slot without re-deriving it from the samples. */
+interface Series { samples: Sample[]; last: number; despawnedAt?: number; name?: string; holdsMoverSlot?: boolean }
 
 interface Watch {
   id: string;
@@ -40,15 +44,17 @@ interface Watch {
   epsilon: number;
   everyN: number;           // decimation: sample every Nth observed frame
   maxSamples: number;       // ring cap per (entity,field) series
-  maxSeries: number;        // cap on MOVER series (never-moved baselines don't count — Batch 3 B)
-  moverCount: number;       // series that have recorded ≥1 movement (counts toward maxSeries)
+  maxSeries: number;        // cap on LIVE MOVER series (never-moved baselines and despawned series don't count — Batch 3 B, #1225)
+  moverCount: number;       // series holding a mover slot (see Series.holdsMoverSlot)
   expireFrames: number;     // absolute cap on observed frames (0 = none)
   idleExpireFrames: number; // drop the watch if not read for this many frames (leak guard)
   frameCount: number;       // observed frames (for decimation + absolute expiry)
   lastReadTick: number;     // Time.frame at last read/start (for idle expiry)
-  truncated: boolean;       // hit maxSeries
+  truncated: boolean;       // hit maxSeries, or MAX_SERIES_CEIL with nothing despawned left to evict
+  evictedDespawned: number; // series dropped at MAX_SERIES_CEIL to make room — all of despawned entities
   series: Map<string, Series>;   // keyed `${guid} ${field}`
-  seen: Set<string>;             // guids ever sampled (for despawn detection)
+  seen: Set<string>;             // guids sampled and not yet marked despawned (for despawn detection)
+  despawned: Set<string>;        // guids marked despawned, oldest first — the eviction order
 }
 
 const watches = new Map<string, Watch>();
@@ -119,7 +125,7 @@ function entityNameOf(id: number): string | undefined {
  *  `guid`, and a bare id there looks like a guid that every guid-addressed op then refuses. The
  *  `id:` prefix keeps the key unique and lets `readWatch` report `guid: null` plus the id instead. */
 function seriesKeyOf(entity: Parameters<typeof entityRef>[0]): string {
-  const ref = entityRef(entity);
+  const ref = entityRef(entity) ?? entity.id(); // every caller hands a query-live entity, so never null
   return typeof ref === 'number' ? `${ID_KEY_PREFIX}${ref}` : ref;
 }
 const ID_KEY_PREFIX = 'id:';
@@ -141,7 +147,7 @@ function resolveTargets(w: Watch): { guid: string; id: number; name?: string }[]
     // Name-scoped (or guid+name): read EntityAttributes so we can match by name. New spawns whose
     // name matches auto-join — the whole point (a fresh-guid puck has no stable guid to pass).
     try {
-      world.query(w.meta.trait, EntityAttributes).updateEach((_: unknown, entity: { id(): number; get(t: unknown): { name?: string } | undefined; has(t: unknown): boolean }) => {
+      world.query(w.meta.trait, EntityAttributes).updateEach((_: unknown, entity: { id(): number; get(t: unknown): { name?: string } | undefined; has(t: unknown): boolean; isAlive(): boolean }) => {
         const guid = seriesKeyOf(entity);
         const name = String(entity.get(EntityAttributes)?.name ?? '');
         const byName = w.names?.some((n) => name.toLowerCase().includes(n));
@@ -151,7 +157,7 @@ function resolveTargets(w: Watch): { guid: string; id: number; name?: string }[]
     } catch { /* trait not present in this world */ }
   } else {
     try {
-      world.query(w.meta.trait).updateEach((_: unknown, entity: { id(): number; get(t: unknown): unknown; has(t: unknown): boolean }) => {
+      world.query(w.meta.trait).updateEach((_: unknown, entity: { id(): number; get(t: unknown): unknown; has(t: unknown): boolean; isAlive(): boolean }) => {
         out.push({ guid: seriesKeyOf(entity), id: entity.id() });
       });
     } catch { /* trait not present in this world */ }
@@ -160,16 +166,27 @@ function resolveTargets(w: Watch): { guid: string; id: number; name?: string }[]
 }
 
 function sampleWatch(w: Watch, tick: number): void {
+  const targets = resolveTargets(w);
   const present = new Set<string>();
-  for (const t of resolveTargets(w)) {
+  // Every present entity leaves the eviction queue BEFORE any series is allocated this pass. Per
+  // entity was not enough: a rejoining entity reached later in the same pass had its frozen series
+  // evicted to make room for an entity reached earlier (or for another of its own fields), and was
+  // then refused a series while present.
+  for (const t of targets) {
     present.add(t.guid);
+    w.despawned.delete(t.guid);
+  }
+  for (const t of targets) {
     const data = readTraitDataFull(t.id, w.meta) as Record<string, unknown> | null;
     if (!data) continue;
     for (const f of w.fields) {
-      const v = data[f];
-      if (typeof v !== 'number' || Number.isNaN(v)) continue;
       const k = key(t.guid, f);
       let s = w.series.get(k);
+      // Un-freeze first: a present entity is not despawned, even when this sample is not a number or
+      // the mover cap refuses its movement below — each `continue` used to skip this.
+      if (s && s.despawnedAt !== undefined) s.despawnedAt = undefined; // rejoined → un-freeze
+      const v = data[f];
+      if (typeof v !== 'number' || Number.isNaN(v)) continue;
       if (!s) {
         // Allocate a BASELINE series freely up to a hard memory ceiling. Baseline (never-moved)
         // series do NOT count toward `maxSeries` — only MOVERS do (below) — so a screen full of
@@ -179,7 +196,13 @@ function sampleWatch(w: Watch, tick: number): void {
         // the mover budget is reserved for things that actually move. (Batch 3 B) An eviction scheme
         // was rejected: at a small cap it thrashes and can drop a just-baselined mover before it
         // records its first movement.
-        if (w.series.size >= MAX_SERIES_CEIL) { w.truncated = true; continue; }
+        //
+        // At the ceiling, series of DESPAWNED entities are evicted first, oldest first (#1225). Every
+        // code spawn carries a unique runtime guid since #1210, so a per-shot spawner opens a new
+        // series per shot and none is ever reused; without eviction a long watch filled with dead
+        // shots and then went blind to everything still alive. Only frozen series go, so the thrash
+        // that rejected eviction above cannot drop a live mover.
+        if (w.series.size >= MAX_SERIES_CEIL && !evictOldestDespawned(w)) { w.truncated = true; continue; }
         s = { samples: [], last: NaN, name: t.name ?? entityNameOf(t.id) };
         w.series.set(k, s);
       }
@@ -188,27 +211,65 @@ function sampleWatch(w: Watch, tick: number): void {
       } else if (Math.abs(v - s.last) > w.epsilon) {
         // Movement. The FIRST movement promotes this series to a MOVER; enforce the mover cap there
         // so a huge world's movers stay bounded while its static baselines don't consume the budget.
-        if (s.samples.length === 1) {
+        if (!s.holdsMoverSlot) {
           if (w.moverCount >= w.maxSeries) { w.truncated = true; continue; }
           w.moverCount++;
+          s.holdsMoverSlot = true;
         }
         s.samples.push({ tick, value: v });
         if (s.samples.length > w.maxSamples) s.samples.shift(); // ring cap
         s.last = v;
       }
-      if (s.despawnedAt !== undefined) s.despawnedAt = undefined; // rejoined → un-freeze
     }
     w.seen.add(t.guid);
   }
   // Despawn (Decision B): an entity sampled before but now gone → freeze its series with a
-  // one-time despawn marker (cleared above if it later rejoins).
+  // one-time despawn marker (cleared above if it later rejoins). A frozen series cannot move, so it
+  // gives back its mover slot, and the guid moves from `seen` (walked every sample) to `despawned`
+  // (walked only to evict) — with a unique guid per spawn, `seen` otherwise grew by one per shot.
   for (const g of w.seen) {
     if (present.has(g)) continue;
+    let hasSeries = false;
     for (const f of w.fields) {
       const s = w.series.get(key(g, f));
-      if (s && s.despawnedAt === undefined) s.despawnedAt = tick;
+      if (!s) continue;
+      hasSeries = true;
+      if (s.despawnedAt !== undefined) continue;
+      s.despawnedAt = tick;
+      releaseMoverSlot(w, s);
     }
+    w.seen.delete(g);
+    // Only an entity with series is worth queueing: evicting a series-less one frees nothing, and
+    // an entity refused every series at the ceiling would otherwise buy a series past it.
+    if (hasSeries) w.despawned.add(g);
   }
+}
+
+function releaseMoverSlot(w: Watch, s: Series): void {
+  if (!s.holdsMoverSlot) return;
+  s.holdsMoverSlot = false;
+  w.moverCount--;
+}
+
+/** Drop the series of despawned entities, oldest first, until at least one series is freed. False
+ *  when the queue runs out first. Releases each evicted series' slot — a despawned series has
+ *  already given its slot back, but the queue is the eviction contract, not an assumption. */
+function evictOldestDespawned(w: Watch): boolean {
+  for (const g of w.despawned) {
+    w.despawned.delete(g);
+    let freed = false;
+    for (const f of w.fields) {
+      const k = key(g, f);
+      const s = w.series.get(k);
+      if (!s) continue;
+      releaseMoverSlot(w, s);
+      w.series.delete(k);
+      w.evictedDespawned++;
+      freed = true;
+    }
+    if (freed) return true;
+  }
+  return false;
 }
 
 // ── Public API (wired to bridge ops) ─────────────────────────────────────────
@@ -358,8 +419,10 @@ export function startWatch(p: StartWatchParams): { ok: boolean; id?: string; com
     frameCount: 0,
     lastReadTick: nowTick,
     truncated: false,
+    evictedDespawned: 0,
     series: new Map(),
     seen: new Set(),
+    despawned: new Set(),
   };
   watches.set(id, watch);
   // Count entities matching a name filter right now (informational — see above).
@@ -421,7 +484,19 @@ export function readWatch(id: string, opts?: { clear?: boolean; name?: string; g
   const out = {
     ok: true, id, component: w.component, fields: w.fields, frameCount: w.frameCount,
     truncated: w.truncated || undefined,
+    ...(w.evictedDespawned ? { evictedDespawned: w.evictedDespawned } : {}),
     seriesTotal: matchedSeries,
+    // #1214: `seriesTotal` counts the FILTERED series, so a typo'd `name=` answered `seriesTotal:0` —
+    // indistinguishable from a watch that recorded nothing.
+    ...((nameFilter || guidFilter) && matchedSeries === 0 ? {
+      hint: emptyFilterHint({
+        what: 'series',
+        filter: describeFilter({ name: opts?.name, guids: opts?.guids }),
+        unfilteredCount: w.series.size,
+        live: { name: [...w.series.values()].map((s) => s.name ?? '') },
+        near: { name: opts?.name },
+      }),
+    } : {}),
     ...(limit != null && matchedSeries > series.length ? { seriesTruncated: true } : {}),
     // Say what a `clear` actually did, so "I cleared it" is never ambiguous about scope.
     ...(opts?.clear ? { cleared: series.length, clearedScope: series.length === w.series.size ? 'all' : 'returned-only' } : {}),
@@ -438,24 +513,22 @@ export function readWatch(id: string, opts?: { clear?: boolean; name?: string; g
   // `moverCount` is only zeroed on a FULL clear: it budgets moving series across the whole watch,
   // so releasing the whole budget after a partial clear would let the cap be exceeded.
   if (opts?.clear) {
-    // Decrement the mover budget for each series we actually clear.
+    // Release the mover slot of each series we actually clear.
     //
-    // `moverCount` is incremented once per series, at its FIRST movement, and that is detected by
-    // `samples.length === 1` (the baseline). Emptying `samples` returns the series to
-    // baseline-pending, so its next movement increments the counter AGAIN — meaning a repeated
-    // read+clear loop (the natural way to poll a watch) inflated `moverCount` by the number of
-    // cleared series every cycle until it hit `maxSeries`, at which point every further movement
-    // was dropped and a MOVING entity read as settled. The original code sidestepped this by
-    // always resetting to 0; scoping the clear to the returned series (S2.36) removed that reset
-    // without replacing the bookkeeping it was doing.
-    let clearedMovers = 0;
+    // A slot is taken at a series' first movement after its baseline. Emptying `samples` returns the
+    // series to baseline-pending, so its next movement takes a slot AGAIN — a repeated read+clear
+    // loop (the natural way to poll a watch) that did not give the slot back inflated `moverCount`
+    // by the number of cleared series every cycle until it hit `maxSeries`, at which point every
+    // further movement was dropped and a MOVING entity read as settled. The original code sidestepped
+    // this by always resetting to 0; scoping the clear to the returned series (S2.36) removed that
+    // reset without replacing the bookkeeping it was doing. `holdsMoverSlot` says whether there is a
+    // slot to give back — a despawned series already returned its own (#1225).
     for (const k of emitted) {
       const s = w.series.get(k);
       if (!s) continue;
-      if (s.samples.length > 1) clearedMovers++; // it HAD moved, so it holds a mover slot
+      releaseMoverSlot(w, s);
       s.samples = [];
     }
-    w.moverCount = Math.max(0, w.moverCount - clearedMovers);
   }
   return out;
 }
@@ -469,6 +542,7 @@ export function listWatches(): unknown {
       guids: w.guids ? Array.from(w.guids) : (w.names ? undefined : 'all'),
       ...(w.names ? { names: w.names } : {}),
       fields: w.fields, frameCount: w.frameCount, seriesCount: w.series.size, truncated: w.truncated || undefined,
+      ...(w.evictedDespawned ? { evictedDespawned: w.evictedDespawned } : {}),
     })),
   };
 }

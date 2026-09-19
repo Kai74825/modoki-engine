@@ -15,6 +15,18 @@ beforeEach(() => {
 });
 afterEach(() => { fs.rmSync(tmpRoot, { recursive: true, force: true }); });
 
+/** The local sidecar's cache blocks, with the peel-schema stamp dropped.
+ *
+ *  The stamp (#1305 close-out) is asserted on its own below. It is excluded here because these
+ *  assertions are about WHICH KEYS peel, and folding an opaque content hash into each of them would
+ *  make all three churn on any future change to `LOCAL_KEYS` — noise in exactly the tests whose job
+ *  is to state the peel boundary precisely. */
+function localBlocks(): Record<string, unknown> {
+  const raw = JSON.parse(fs.readFileSync(absPath + '.meta.local.json', 'utf-8')) as Record<string, unknown>;
+  delete raw.__peel;
+  return raw;
+}
+
 describe('readMetaSidecar', () => {
   it('returns {} when the sidecar does not exist', () => {
     expect(readMetaSidecar(absPath)).toEqual({});
@@ -43,7 +55,9 @@ describe('writeMetaSidecar — atomic write', () => {
    *  sidecars churned on formatting alone depending on which tool wrote them last. Both
    *  halves must end with exactly one newline. */
   it('ends the file with a trailing newline (committed sidecars must not churn)', () => {
-    writeMetaSidecar(absPath, { id: 'guid-1', version: 2, textureCache: { variantBytes: { webp: 42 } } });
+    // `hash` alongside the stats on purpose: a block holding nothing BUT stats is dropped from both
+    // halves (#1279), so a stats-only fixture would leave no local file for this to read.
+    writeMetaSidecar(absPath, { id: 'guid-1', version: 2, textureCache: { hash: 'h', variantBytes: { webp: 42 } } });
     const committed = fs.readFileSync(absPath + '.meta.json', 'utf-8');
     expect(committed.endsWith('\n')).toBe(true);
     expect(committed.endsWith('\n\n')).toBe(false); // exactly one
@@ -116,11 +130,99 @@ describe('writeMetaSidecar — committed / machine-local byte-stat split', () =>
     // …and modelCache.hash does NOT (#127 — machine-dependent by construction).
     expect(committed.modelCache).not.toHaveProperty('hash');
     // The stats (and the model hash) live in the gitignored local sidecar.
-    const local = JSON.parse(fs.readFileSync(absPath + '.meta.local.json', 'utf-8'));
-    expect(local).toEqual({
+    expect(localBlocks()).toEqual({
       modelCache: { hash: 'h1', triCounts: [150775], lodBytes: [3628528] },
       textureCache: { variantBytes: { uastc: 223651 } },
       fontCache: { bytes: 627701 },
+    });
+  });
+
+  it('peels audioCache.durationSec, and ONLY it, out of the audio block (#1289)', () => {
+    // durationSec is not derived from (source bytes + settings) like the rest of the block — it is
+    // ffprobe's MEASUREMENT of the file ffmpeg just produced, so it moves when either binary does.
+    // Measured 2026-09-16: 4 of games/wordweave's 26 clips encode to different bytes under
+    // ffmpeg-static 6.0 vs Homebrew ffmpeg 8.1.1, and the two ffprobe builds on that Mac disagree
+    // about duration on ALL 26.
+    writeMetaSidecar(absPath, {
+      id: 'g',
+      audioCache: { hash: 'h4', ext: 'mp3', durationSec: 0.182857, channels: 1, sampleRate: 22050, bytes: 2527 },
+    });
+    const committed = JSON.parse(fs.readFileSync(absPath + '.meta.json', 'utf-8'));
+    // The accept side, and it is the half that matters: channels/sampleRate stay reviewable in git,
+    // so a peel that took the whole block would satisfy a bare not.toHaveProperty and be wrong.
+    // ⚠️ Not because the settings always force them — that reason is false for 3 of the 29 migrated
+    // sidecars (`demos/forest-camp`'s clips set `forceMono: false` and no `sampleRate`, so
+    // buildFfmpegArgs passes neither `-ac` nor `-ar` and both values are pure ffprobe readings of
+    // the source). They stay committed because their value follows the source deterministically and
+    // no divergence has ever been observed in them — not because they cannot be measurements.
+    expect(committed.audioCache).toEqual({ hash: 'h4', ext: 'mp3', channels: 1, sampleRate: 22050 });
+    expect(localBlocks()).toEqual({
+      audioCache: { durationSec: 0.182857, bytes: 2527 },
+    });
+  });
+
+  it('peels videoCache.durationSec but KEEPS bytes committed — the asymmetry is the whole fix (#1300)', () => {
+    // The obstruction #1300 had to clear: `VOLATILE_STAT_KEYS` (which contains `bytes`) used to
+    // apply to every split block unconditionally, so `videoCache` could not join the split without
+    // peeling `bytes` too. `bytes` must stay committed — `resolveDeliveryPolicy`'s `policy: 'auto'`
+    // reads it (and ONLY it — `videoUrl.ts` passes `v?.bytes`) to choose stream-vs-download with no
+    // network round-trip, so peeling it would blank that on every machine but the importing one.
+    writeMetaSidecar(absPath, {
+      id: 'g',
+      videoCache: { hash: 'v1', ext: 'mp4', bytes: 1745855, durationSec: 24.009002, width: 640, height: 360, fps: 24, hasAudio: true },
+    });
+    const committed = JSON.parse(fs.readFileSync(absPath + '.meta.json', 'utf-8'));
+    // `bytes` present is the ASSERTION, not an oversight: a future "complete the list" that moved
+    // videoCache onto VOLATILE_STAT_KEYS would regress #1279 and must fail here.
+    expect(committed.videoCache).toEqual({
+      hash: 'v1', ext: 'mp4', bytes: 1745855, width: 640, height: 360, fps: 24, hasAudio: true,
+    });
+    expect(localBlocks()).toEqual({
+      videoCache: { durationSec: 24.009002 },
+    });
+  });
+
+  it('merges videoCache.durationSec back on read, so the Video inspector still shows a duration', () => {
+    // Same reason as audio's: the only reader anywhere is VideoAssetView's duration row
+    // (VideoManifestBlock.durationSec is declared and consumed by nothing), so "peeled" has to
+    // differ from "dropped" here or the fix quietly removes a field the editor displays.
+    fs.writeFileSync(absPath + '.meta.json', JSON.stringify({
+      id: 'g', version: 2, videoCache: { hash: 'v1', ext: 'mp4', bytes: 1745855 },
+    }));
+    fs.writeFileSync(absPath + '.meta.local.json', JSON.stringify({
+      videoCache: { durationSec: 24.009002 },
+    }));
+    expect(readMetaSidecar(absPath).videoCache).toEqual({
+      hash: 'v1', ext: 'mp4', bytes: 1745855, durationSec: 24.009002,
+    });
+  });
+
+  it('a videoCache carrying ONLY durationSec peels to empty and commits no block (the truthiness seam)', () => {
+    // videoCache joining CACHE_BLOCKS brought it under the empty-block branch, and video has the
+    // same convert-or-ship truthiness audio does (staticAssets auto-bakes on a variant cache miss).
+    // Unreachable from the reimport handler — it always writes hash/ext/bytes, and `bytes` is not
+    // peeled for video — so only a wholesale external write (/api/write-meta,
+    // modoki_write_asset_meta) can land here. Pinned rather than assumed, because this is the seam
+    // where #1289's peel changed behaviour OUTSIDE the sidecar.
+    writeMetaSidecar(absPath, { id: 'g', videoCache: { durationSec: 24.01 } });
+    const committed = JSON.parse(fs.readFileSync(absPath + '.meta.json', 'utf-8'));
+    expect(committed).not.toHaveProperty('videoCache');
+    // The local half goes with it: with no committed block to merge into, those bytes are unreadable.
+    expect(fs.existsSync(absPath + '.meta.local.json')).toBe(false);
+  });
+
+  it('merges durationSec back on read, so the Audio inspector still shows a duration', () => {
+    // Its one consumer is AudioAssetView's inspector row — `AudioManifestBlock` bakes
+    // loadType/format/ext and no duration — so "peeled" has to differ from "dropped" HERE or the
+    // fix silently removes a field the editor displays.
+    fs.writeFileSync(absPath + '.meta.json', JSON.stringify({
+      id: 'g', version: 2, audioCache: { hash: 'h4', ext: 'mp3', channels: 1, sampleRate: 22050 },
+    }));
+    fs.writeFileSync(absPath + '.meta.local.json', JSON.stringify({
+      audioCache: { durationSec: 0.182857, bytes: 2527 },
+    }));
+    expect(readMetaSidecar(absPath).audioCache).toEqual({
+      hash: 'h4', ext: 'mp3', channels: 1, sampleRate: 22050, durationSec: 0.182857, bytes: 2527,
     });
   });
 
@@ -142,5 +244,110 @@ describe('writeMetaSidecar — committed / machine-local byte-stat split', () =>
     expect(fs.existsSync(absPath + '.meta.local.json')).toBe(true);
     writeMetaSidecar(absPath, { id: 'g', version: 2 }); // settings-only, no cache blocks
     expect(fs.existsSync(absPath + '.meta.local.json')).toBe(false);
+  });
+});
+
+/**
+ * #1279 — the gitignored local sidecar must not decide what a build SHIPS.
+ *
+ * Every conversion site tests a cache block's mere EXISTENCE to mean "this asset has been through
+ * the converter" (`vite-asset-scanner.ts`: `if (!hasCache) { shipSource(); continue; }`, plus the
+ * manifest's texture/audio/video/font/env baking). The merge used to create the block when only
+ * the local file had one — so a `{"audioCache":{"bytes":1236743}}` left behind by an earlier
+ * import made THIS machine convert while a fresh clone or CI, which cannot have that file, shipped
+ * the source verbatim. Same commit, different shipped bytes, and nothing reporting it.
+ *
+ * Observed on `games/wordweave` during #921: with `audioCache` stripped from all 26 committed
+ * sidecars and both caches deleted, the native build still logged `converted 26 audio clip(s)`.
+ */
+describe('readMetaSidecar — the committed sidecar decides which cache blocks EXIST (#1279)', () => {
+  const committedWithout = () => fs.writeFileSync(
+    absPath + '.meta.json', JSON.stringify({ id: 'g', version: 2, audio: { format: 'mp3' } }),
+  );
+  const localStatsOnly = () => fs.writeFileSync(
+    absPath + '.meta.local.json', JSON.stringify({ audioCache: { bytes: 1236743 } }),
+  );
+
+  it('does not create a block the committed sidecar lacks', () => {
+    committedWithout();
+    localStatsOnly();
+    // The load-bearing assertion is `audioCache` being ABSENT, not merely empty: `!!meta.audioCache`
+    // is the test the build makes, and `{}` passes it exactly as a real block does.
+    expect(readMetaSidecar(absPath)).not.toHaveProperty('audioCache');
+  });
+
+  it('reports the same blocks with the local file present and with it deleted', () => {
+    // The invariant in the build's own terms: whether this host has ever imported the asset cannot
+    // change the convert-vs-ship answer. A fresh clone is the "deleted" case, by construction.
+    committedWithout();
+    localStatsOnly();
+    const withLocal = Object.keys(readMetaSidecar(absPath));
+    fs.rmSync(absPath + '.meta.local.json');
+    expect(withLocal).toEqual(Object.keys(readMetaSidecar(absPath)));
+  });
+
+  // Every block `meta-sidecar.ts` peels, not just the one the bug was caught on. Without this the
+  // fix could have been written for `audioCache` alone and the suite would not have noticed — the
+  // review's own mutation (`block === 'audioCache' ? meta[block] : (meta[block] ??= {})`) left
+  // #1279 fully intact for the other five and every sidecar test stayed green.
+  const ALL_BLOCKS = ['textureCache', 'modelCache', 'fontCache', 'audioCache', 'environmentCache', 'atlasCache'];
+  for (const block of ALL_BLOCKS) {
+    it(`does not create ${block} either — the fix is per-seam, not per-kind`, () => {
+      fs.writeFileSync(absPath + '.meta.json', JSON.stringify({ id: 'g', version: 2 }));
+      fs.writeFileSync(absPath + '.meta.local.json', JSON.stringify({ [block]: { bytes: 4096 } }));
+      expect(readMetaSidecar(absPath)).not.toHaveProperty(block);
+    });
+  }
+
+  it('merges into modelCache too — whose local half carries the peeled HASH, not just stats', () => {
+    // modelCache is the one block with a structural local key (#127), so "the committed sidecar
+    // decides which blocks exist" has to hold for a block whose local half is load-bearing.
+    fs.writeFileSync(absPath + '.meta.json', JSON.stringify({
+      id: 'g', version: 2, modelCache: { processedPath: '/a.processed.glb', lodPaths: ['/a.processed.glb'] },
+    }));
+    fs.writeFileSync(absPath + '.meta.local.json', JSON.stringify({ modelCache: { hash: 'h1', lodBytes: [128] } }));
+    expect(readMetaSidecar(absPath).modelCache).toEqual({
+      processedPath: '/a.processed.glb', lodPaths: ['/a.processed.glb'], hash: 'h1', lodBytes: [128],
+    });
+  });
+
+  it('a non-object committed block is left alone, and the blocks AFTER it still merge', () => {
+    // The `typeof target !== 'object'` half. It reads as belt-and-braces, and is not: narrowing the
+    // guard to `if (!(block in meta)) continue` passes every other test here, then THROWS on this
+    // input (a property assignment onto `null`) into `readMetaSidecar`'s catch — which silently
+    // abandons the merge for every block later in CACHE_BLOCKS. `environmentCache` follows
+    // `audioCache` in that order, so its stats are what prove the loop survived.
+    fs.writeFileSync(absPath + '.meta.json', JSON.stringify({
+      id: 'g', version: 2, audioCache: null, environmentCache: { hash: 'h' },
+    }));
+    fs.writeFileSync(absPath + '.meta.local.json', JSON.stringify({
+      audioCache: { bytes: 1 }, environmentCache: { bytes: 2 },
+    }));
+    const meta = readMetaSidecar(absPath);
+    expect(meta.audioCache).toBeNull();
+    expect(meta.environmentCache).toEqual({ hash: 'h', bytes: 2 });
+  });
+
+  it('a write that peels a block EMPTY commits no block at all', () => {
+    // The same lie in the committed half (#1279 review, F1): `"audioCache": {}` passes `!!` on every
+    // machine, so the build would convert a clip nobody imported — CI included, where ffmpeg's
+    // absence then fails the strict gate. No reimport handler can write one (each carries a `hash`,
+    // or processedPath/lodPaths for models); a wholesale `/api/write-meta` payload can.
+    writeMetaSidecar(absPath, { id: 'g', audioCache: { bytes: 1236743 } });
+    const committed = JSON.parse(fs.readFileSync(absPath + '.meta.json', 'utf-8'));
+    expect(committed).not.toHaveProperty('audioCache');
+    // …and the stats go with it: with no committed block to merge into they are unreadable.
+    expect(fs.existsSync(absPath + '.meta.local.json')).toBe(false);
+  });
+
+  it('still merges the stats INTO a block the committed sidecar has', () => {
+    // The accept side — without it the fix could be "never merge anything" and this suite would
+    // not notice, which would silently undo #127's `modelCache.hash` peel and every live byte-size
+    // the inspector shows.
+    fs.writeFileSync(absPath + '.meta.json', JSON.stringify({
+      id: 'g', version: 2, audioCache: { hash: 'h', ext: 'mp3' },
+    }));
+    localStatsOnly();
+    expect(readMetaSidecar(absPath).audioCache).toEqual({ hash: 'h', ext: 'mp3', bytes: 1236743 });
   });
 });

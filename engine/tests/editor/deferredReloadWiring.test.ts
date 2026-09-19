@@ -1,3 +1,4 @@
+// @vitest-environment jsdom
 /** The editor's wiring of the deferred hot reload (#1164/#1169), through the REAL
  *  `registerEditorAgentOps` — the unit suites call `replaySuppressedSceneReloads` and subscribe spy
  *  listeners directly, so deleting any of the three lines below failed nothing (close-out review):
@@ -13,6 +14,8 @@ import { initAgentBridge, peekSuppressedSceneReloads, replaySuppressedSceneReloa
 import { beginWorldReplacement } from '../../packages/modoki/src/editor/scene/authoringSettle';
 import { setPrefabCache, getCachedPrefabSync } from '../../packages/modoki/src/editor/scene/prefab';
 import { useEditorStore } from '../../packages/modoki/src/editor/store/editorStore';
+import { pushAction, canUndo, swapHistory, _resetHistoryContexts } from '../../packages/modoki/src/editor/undo/undoManager';
+import { markSceneSaved, hasUnsavedChanges } from '../../packages/modoki/src/editor/scene/serialize';
 
 registerEditorAgentOps();
 
@@ -49,7 +52,7 @@ beforeEach(() => {
   const getCurrent = vi.spyOn(sceneManager, 'getCurrent').mockReturnValue({ path: SCENE_PATH } as never);
   const getLoaded = vi.spyOn(sceneManager, 'getLoadedScenes')
     .mockReturnValue(new Map([['main', { path: SCENE_PATH, role: 'primary', guid: 'main' }]]) as never);
-  loadScene = vi.spyOn(sceneManager, 'loadScene').mockResolvedValue(undefined as never);
+  loadScene = vi.spyOn(sceneManager, 'loadScene').mockResolvedValue({ keptBaseGuids: new Set<string>() });
   prefabFetch = null;
   const fetchStub = vi.spyOn(globalThis, 'fetch').mockImplementation(async (input) => {
     if (String(input).includes('.prefab.json') && prefabFetch) return prefabFetch();
@@ -68,6 +71,18 @@ afterEach(async () => {
 });
 
 describe('registerEditorAgentOps wires the deferred hot reload', () => {
+  it('a reload over a DIRTY world drops its undo history and rebaselines (#1409)', async () => {
+    _resetHistoryContexts();
+    swapHistory(SCENE_PATH);
+    markSceneSaved();
+    pushAction({ label: 'Reparent', undo: () => {}, redo: () => {} });
+    emit(SCENE_PATH, 'scene');
+    await settle();
+    expect(loadScene, 'fixture: the reload ran').toHaveBeenCalledTimes(1);
+    expect(canUndo(), 'the editor never installed the after-reload hook').toBe(false);
+    expect(hasUnsavedChanges()).toBe(false);
+  });
+
   it('a change during Play is held, and the Stop edge replays it', async () => {
     setRunMode('playing');
     emit(SCENE_PATH, 'scene');

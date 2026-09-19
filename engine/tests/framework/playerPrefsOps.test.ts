@@ -151,6 +151,31 @@ describe('player-prefs ops against a hydrated store', () => {
     expect(PlayerPrefs.keys()).toEqual([]);
   });
 
+  it('clear REFUSES a key rather than wiping the whole namespace it did not name (#1213 B-15)', async () => {
+    await write({ action: 'set', key: 'progress', value: 1 });
+    await write({ action: 'set', key: 'settings', value: 2 });
+    // Reads as "clear that one key" — and, with `key` ignored, removed BOTH.
+    const r = await write({ action: 'clear', key: 'progress', confirm: true });
+    expect(r.ok).toBe(false);
+    expect(r.code).toBe('UNKNOWN_PARAM');
+    expect(String(r.error)).toMatch(/action:'delete'/);
+    expect(PlayerPrefs.keys().sort()).toEqual(['progress', 'settings']);
+  });
+
+  it('a param another action owns is refused on every action, not only clear (#1213 B-15)', async () => {
+    await write({ action: 'set', key: 'a', value: 1 });
+    for (const bad of [
+      { action: 'delete', key: 'a', value: 2 },
+      { action: 'flush', key: 'a' },
+      { action: 'set', key: 'a', value: 3, confirm: true },
+    ]) {
+      const r = await write(bad);
+      expect(r.ok, JSON.stringify(bad)).toBe(false);
+      expect(r.code).toBe('UNKNOWN_PARAM');
+    }
+    expect(PlayerPrefs.get('a')).toBe(1);
+  });
+
   it('a missing or unknown action is refused and the real ones are listed', async () => {
     // §1: a tool whose params are all optional and whose {} has a destructive reading is a
     // hazard by construction. `action` is required at the op as well as in the zod schema,
@@ -676,5 +701,105 @@ describe('player-prefs-write: a swap landing DURING the op\'s own await is caugh
     expect(result.code).toBe('PARTIAL');
     expect(result.deleted).toBe(true);
     expect(result.durability).toBe('unknown');
+  });
+});
+
+describe('player-prefs-write clear/delete list a PROTECTED key as something the delete reaches (#1310)', () => {
+  /** One readable key plus one held by an envelope version this build cannot decode. `clear()`
+   *  removes both (#630); `keys()` lists only the readable one. `rejectProtected` makes the
+   *  backend refuse the durable remove of the protected key alone. */
+  async function seed(rejectProtected: boolean): Promise<InMemoryBackend> {
+    resetPlayerPrefsForTest();
+    const backend = new InMemoryBackend();
+    await backend.set('mk:unit-1310:coins', JSON.stringify({ v: 1, d: 10 }));
+    await backend.set('mk:unit-1310:save', JSON.stringify({ v: 999, d: { fromNewerBuild: true } }));
+    if (rejectProtected) {
+      const remove = backend.remove.bind(backend);
+      backend.remove = async (key: string) => {
+        if (key.endsWith(':save')) throw new Error('QuotaExceededError');
+        return remove(key);
+      };
+    }
+    await PlayerPrefs.init({ namespace: 'unit-1310', backend });
+    // The fixture's premise, asserted so a change to the protection rule cannot silently void it.
+    expect(PlayerPrefs.isProtected('save')).toBe(true);
+    expect(PlayerPrefs.keys()).not.toContain('save');
+    return backend;
+  }
+
+  it('the refused preview counts and lists the protected key the clear would destroy', async () => {
+    await seed(false);
+    const r = await write({ action: 'clear' });
+    expect(r.code).toBe('REFUSED_BY_OP');
+    expect(r.totalCount).toBe(2);
+    expect([...(r.keys as string[])].sort()).toEqual(['coins', 'save']);
+    expect(String(r.error)).toMatch(/remove all 2 key\(s\)/);
+  });
+
+  it('the success report counts the protected key, and the backend really lost it', async () => {
+    const backend = await seed(false);
+    const r = await write({ action: 'clear', confirm: true });
+    expect(r.ok).toBe(true);
+    expect(r.cleared).toBe(2);
+    expect([...(r.keys as string[])].sort()).toEqual(['coins', 'save']);
+    expect(Object.keys(await backend.getAll('mk:unit-1310:'))).toEqual([]);
+  });
+
+  it('a rejected remove of the protected key is attributed to THIS clear, not to an earlier one', async () => {
+    const backend = await seed(true);
+    const r = await write({ action: 'clear', confirm: true });
+    expect(r.code).toBe('PARTIAL');
+    expect(r.pendingWrites).toEqual(['save']);
+    expect(String(r.error)).toMatch(/for 1 of them: save/);
+    expect(String(r.error)).not.toMatch(/already pending before this clear ran/);
+    expect(String(r.error)).not.toMatch(/every key this clear enumerated was durably removed/);
+    // The report matches the disk: the protected save is still there.
+    expect(Object.keys(await backend.getAll('mk:unit-1310:'))).toContain('mk:unit-1310:save');
+  });
+
+  it('a CORRUPT entry is counted in the preview and really removed by the confirmed clear (#1317)', async () => {
+    // Not protected (`clear()` reaches it for a different reason), but the same failure shape:
+    // hydrate used to forget the name, so the preview undercounted and the "wiped" report sat
+    // beside a garbage entry still on disk.
+    resetPlayerPrefsForTest();
+    const backend = new InMemoryBackend();
+    await backend.set('mk:unit-1317:coins', JSON.stringify({ v: 1, d: 10 }));
+    await backend.set('mk:unit-1317:session', '{"v":1,"d":{"elapsed');
+    await PlayerPrefs.init({ namespace: 'unit-1317', backend });
+    expect(PlayerPrefs.keys(), 'fixture: the corrupt key is invisible to readers').toEqual(['coins']);
+
+    const preview = await write({ action: 'clear' });
+    expect(preview.totalCount).toBe(2);
+    expect([...(preview.keys as string[])].sort()).toEqual(['coins', 'session']);
+
+    const r = await write({ action: 'clear', confirm: true });
+    expect(r.ok).toBe(true);
+    expect(r.cleared).toBe(2);
+    expect(Object.keys(await backend.getAll('mk:unit-1317:'))).toEqual([]);
+  });
+
+  it('delete reaches a CORRUPT key it names — never NOT_FOUND with that key in its own options (#1317 review)', async () => {
+    resetPlayerPrefsForTest();
+    const backend = new InMemoryBackend();
+    await backend.set('mk:unit-1317d:coins', JSON.stringify({ v: 1, d: 10 }));
+    await backend.set('mk:unit-1317d:session', '{"v":1,"d":{"elapsed');
+    await PlayerPrefs.init({ namespace: 'unit-1317d', backend });
+
+    const r = await write({ action: 'delete', key: 'session' });
+    expect(r.ok).toBe(true);
+    expect(r.deleted).toBe(true);
+    expect(Object.keys(await backend.getAll('mk:unit-1317d:'))).toEqual(['mk:unit-1317d:coins']);
+    // Accept side of the widened guard: a key that is on disk under no name at all is still NOT_FOUND.
+    const miss = await write({ action: 'delete', key: 'nope' });
+    expect(miss.code).toBe('NOT_FOUND');
+    expect(miss.options).toEqual(['coins']);
+  });
+
+  it("delete NOT_FOUND offers the protected key as an option — it is deletable — while `keys` stays the readable index", async () => {
+    await seed(false);
+    const r = await write({ action: 'delete', key: 'sav' });
+    expect(r.code).toBe('NOT_FOUND');
+    expect(r.options).toEqual(['coins', 'save']);
+    expect(r.keys).toEqual(['coins']);
   });
 });

@@ -29,10 +29,12 @@ import path from 'node:path'
 import { findDeleteBoundaries, describeBoundary } from '../scripts/deleteBoundary.mjs'
 import { altPathSpelling } from '../scripts/pathIdentity.mjs'
 import { toolchainRootRefusal, describeToolchainRootRefusal } from '../scripts/toolchainRoot.mjs'
+import { defaultToolchainDir } from '../scripts/toolchainHome.mjs'
 import { ensureJdk, discoverJavaHome, jdkVersionDir } from './jdkProvision'
 import { ensureCmdlineTools, runSdkmanager, ANDROID_SDK_PACKAGES } from './androidSdkProvision'
 import { ensureRuby, rubyDirFor } from './rubyProvision'
 import { ensureGoIos, goIosBinFor } from './goIosProvision'
+import { ensureConversionCli, conversionCliBin, conversionCliDist, canExpand, missingConversionCliFile } from './conversionCliProvision'
 import { ensureWda, wdaBuildStatus, PINNED_WDA, type CommandRunner as WdaCommandRunner } from './wdaProvision'
 
 export type ToolId = 'toktx' | 'android-sdk' | 'npm' | 'java' | 'xcodebuild' | 'gltf-transform-cli' | 'gltfpack' | 'cocoapods' | 'ffmpeg' | 'ffprobe' | 'msdf-atlas-gen' | 'webdriveragent' | 'go-ios'
@@ -146,6 +148,44 @@ interface BinaryDescriptor {
   bin: string
   versionArgs: string[]
   missingMsg: string
+  /** Never resolve from PATH, whatever the "Use system-installed SDKs" toggle says — only the env
+   *  override or our provisioned copy. For a CONVERSION CLI whose output ships (#1297). */
+  pinnedOnly?: true
+}
+
+/** The toolchain dir an asset conversion resolves its pinned CLI under: `MODOKI_TOOLCHAIN_DIR`, else
+ *  the machine default the Electron editor provisions into. A plain `npm run dev` / `npm run build` /
+ *  vitest process sets no toolchain dir, and without this default it would find no pinned copy even
+ *  on a machine that has one — then either fail or (before #1297) silently take PATH's build.
+ *
+ *  Deliberately NOT written back to `process.env`: that would flip `systemToolchainAllowed()` and
+ *  make a dev process bundled-only for the JDK/Android SDK too. */
+export function conversionToolchainDir(): string {
+  return process.env.MODOKI_TOOLCHAIN_DIR || defaultToolchainDir()
+}
+
+const PINNED_ENV_VAR = {
+  ffmpeg: 'MODOKI_FFMPEG', ffprobe: 'MODOKI_FFPROBE', toktx: 'MODOKI_TOKTX', 'msdf-atlas-gen': 'MODOKI_MSDF_ATLAS_GEN',
+} as const
+
+/** The one "not provisioned" message for a pinned conversion CLI (#1297, #1327). The install hint
+ *  names the tool's own pair, because each pair is installed together. */
+function pinnedMissingMsg(tool: keyof typeof PINNED_ENV_VAR, neededFor: string): string {
+  const pair = tool === 'ffmpeg' || tool === 'ffprobe' ? 'ffmpeg ffprobe' : 'toktx msdf-atlas-gen'
+  return `${tool} is not provisioned — needed for ${neededFor}. Asset conversion uses ONLY the editor's ` +
+    `pinned copy (under the toolchain dir, or bundled in the packaged editor), never one on PATH, so ` +
+    `every machine converts with the same build (#1297). Install it from Build → Build Support…, or run ` +
+    `\`npm run toolchain:install -- ${pair}\`. ` +
+    `To use a specific binary on purpose, set ${PINNED_ENV_VAR[tool]}.`
+}
+
+/** Whether `id` is a PINNED conversion CLI — resolved only from its env override, the bundle or the
+ *  provisioned copy under `conversionToolchainDir()`, never PATH (#1297, #1327). Such a tool
+ *  installs into that dir even in a plain dev editor, since that is where detection looks. */
+export function isPinnedConversionTool(id: string): id is ToolId {
+  if (!Object.hasOwn(REGISTRY, id)) return false
+  const d = REGISTRY[id as ToolId]
+  return d.kind === 'binary' && d.pinnedOnly === true
 }
 
 /** A directory-located tool (e.g. the Android SDK): resolved from env vars then well-known dirs,
@@ -177,26 +217,27 @@ type ToolDescriptor = BinaryDescriptor | DirectoryDescriptor
 const REGISTRY: Record<ToolId, ToolDescriptor> = {
   toktx: {
     kind: 'binary',
+    // The packaged editor points MODOKI_TOKTX at its bundled copy (resources/bin); everywhere else
+    // the pinned install under the toolchain dir is the only candidate. PINNED-ONLY (#1327): a KTX2
+    // texture or atlas ships what this binary wrote, and the cache key does not name it.
     envVar: 'MODOKI_TOKTX',
+    extraCandidates: () => [conversionCliBin(conversionToolchainDir(), 'toktx')],
+    pinnedOnly: true,
     bin: 'toktx',
     versionArgs: ['--version'],
-    missingMsg:
-      'toktx (KTX-Software CLI) not found. Set MODOKI_TOKTX to the binary path, or install the ' +
-      'macOS package from https://github.com/KhronosGroup/KTX-Software/releases',
+    missingMsg: pinnedMissingMsg('toktx', 'KTX2 texture and atlas import (KTX-Software)'),
   },
   'msdf-atlas-gen': {
     kind: 'binary',
-    // Bundled like toktx (no npm distribution), so it's registered here for VISIBILITY in
-    // Build Support (not INSTALLABLE): macOS relocates a Homebrew build (stage-msdf.cjs),
-    // Windows ships Chlumsky's prebuilt win64 exe (release-windows.yml). resolveBundled sets
-    // MODOKI_MSDF_ATLAS_GEN → Contents/Resources/bin. font-convert.ts bakes MTSDF atlases with it.
+    // Bundled like toktx (resolveBundled sets MODOKI_MSDF_ATLAS_GEN → resources/bin) and pinned the
+    // same way everywhere else (#1327): macOS runs our own static build, Windows Chlumsky's win64
+    // zip — see conversionCliProvision.ts. font-convert.ts bakes MTSDF atlases with it.
     envVar: 'MODOKI_MSDF_ATLAS_GEN',
+    extraCandidates: () => [conversionCliBin(conversionToolchainDir(), 'msdf-atlas-gen')],
+    pinnedOnly: true,
     bin: 'msdf-atlas-gen',
     versionArgs: ['-version'], // prints "MSDF-Atlas-Gen v1.4.0", exit 0 (NOT --version-only)
-    missingMsg:
-      'msdf-atlas-gen not found — needed to bake MTSDF font atlases (dynamic / CJK text). The ' +
-      'packaged editor bundles it; in a dev checkout set MODOKI_MSDF_ATLAS_GEN, or install it ' +
-      '(macOS: `brew install msdf-atlas-gen`; https://github.com/Chlumsky/msdf-atlas-gen).',
+    missingMsg: pinnedMissingMsg('msdf-atlas-gen', 'MTSDF font atlas import (dynamic / CJK text)'),
   },
   npm: {
     kind: 'binary',
@@ -342,24 +383,26 @@ const REGISTRY: Record<ToolId, ToolDescriptor> = {
     // An `install()`-able npm-provisioned binary (audio import transcode). ffmpeg-static ships a
     // self-contained arm64 static binary — no `.bin` symlink, so resolve it at its in-package path.
     envVar: 'MODOKI_FFMPEG',
-    extraCandidates: () => (process.env.MODOKI_TOOLCHAIN_DIR ? [ffmpegToolBin(process.env.MODOKI_TOOLCHAIN_DIR)] : []),
+    // PINNED-ONLY (#1297): an asset conversion must run the same build on every machine, so the
+    // provisioned copy is looked up even without MODOKI_TOOLCHAIN_DIR and PATH is never a candidate.
+    extraCandidates: () => [ffmpegToolBin(conversionToolchainDir())],
+    pinnedOnly: true,
     bin: 'ffmpeg',
     versionArgs: ['-version'],
-    missingMsg:
-      'ffmpeg not found — needed for audio import (transcode). Install it from the Build Support ' +
-      "dialog, or run `install('ffmpeg')`.",
+    missingMsg: pinnedMissingMsg('ffmpeg', 'audio/video import (transcode)'),
   },
   ffprobe: {
     kind: 'binary',
     // The audio-import stats probe (cosmetic duration/channels). @ffprobe-installer resolves to a
     // REAL arm64 binary (ffprobe-static ships x86_64 in its arm64 slot). No `.bin` symlink either.
     envVar: 'MODOKI_FFPROBE',
-    extraCandidates: () => (process.env.MODOKI_TOOLCHAIN_DIR ? [ffprobeToolBin(process.env.MODOKI_TOOLCHAIN_DIR)] : []),
+    // PINNED-ONLY for the same reason as ffmpeg: its readings (duration, channels) are what the
+    // import writes back, and two builds disagree on them (#1297 measured 26 of 26 clips).
+    extraCandidates: () => [ffprobeToolBin(conversionToolchainDir())],
+    pinnedOnly: true,
     bin: 'ffprobe',
     versionArgs: ['-version'],
-    missingMsg:
-      'ffprobe not found — needed for audio import stats. Install it from the Build Support ' +
-      "dialog, or run `install('ffprobe')`.",
+    missingMsg: pinnedMissingMsg('ffprobe', 'audio/video import stats'),
   },
   'go-ios': {
     kind: 'binary',
@@ -671,7 +714,11 @@ function detectBinary(id: ToolId, d: BinaryDescriptor): DetectResult {
   // tool). In bundled-only mode we NEVER resolve a tool the editor provides from the machine's PATH:
   // it must come from the editor's own install/bundle (else it reads as "not found", prompting an
   // install), so a build never silently depends on whatever version happens to be on the box.
-  if (systemFallbackAllowed(id)) candidates.push({ cmd: d.bin, source: 'path' })
+  //
+  // A `pinnedOnly` tool never gets the PATH candidate at all — not even with the toggle on (#1297).
+  // The toggle is about SDKs a build can legitimately take from the machine; a conversion CLI whose
+  // output is shipped cannot, or "what we ship" depends on which laptop converted it.
+  if (!d.pinnedOnly && systemFallbackAllowed(id)) candidates.push({ cmd: d.bin, source: 'path' })
 
   for (const c of candidates) {
     // A bare name is resolved on PATH FIRST — Windows `execFile` does no PATHEXT lookup, so probing
@@ -835,14 +882,37 @@ export function resolve(id: ToolId): DetectResult & { present: true } {
 /**
  * Return `env` with a resolved tool's DIRECTORY prepended to PATH, so a child process that spawns
  * the tool by BARE NAME finds our resolved copy. This is the fix for tools invoked indirectly:
- * @gltf-transform/cli calls `toktx` on PATH internally, so a packaged build (where toktx lives at
- * MODOKI_TOKTX, not on PATH) must inject that dir. No-op when the tool is already on PATH or absent.
+ * @gltf-transform/cli 4.4 calls KTX-Software's `ktx` on PATH internally, and the pinned/bundled `ktx`
+ * sits beside toktx (#1351), so injecting toktx's dir makes that copy the one found — in a packaged
+ * build toktx lives at MODOKI_TOKTX, not on PATH. No-op when the tool is absent.
  */
 export function withToolOnPath(id: ToolId, env: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
   const d = detect(id)
   if (!d.dir) return env
-  const sep = process.platform === 'win32' ? ';' : ':'
-  return { ...env, PATH: `${d.dir}${sep}${env.PATH ?? ''}` }
+  return withPathEntry(env, d.dir)
+}
+
+/** `dir` prepended to a PATH value with the platform's delimiter. A literal `:` on win32 glues the
+ *  dir onto the first entry (`C:/sdk/bin:C:\Windows\…` is ONE bogus entry), so the dir is never
+ *  searched AND the old first entry is lost (#1444). */
+export function prependPathEntry(dir: string, existing: string | undefined, platform: NodeJS.Platform = process.platform): string {
+  return `${dir}${platform === 'win32' ? ';' : ':'}${existing ?? ''}`
+}
+
+/** `env` with `dir` first on its PATH — use this, not `{ ...env, PATH: … env.PATH … }`, for any env
+ *  that is a COPY. On win32 `process.env` itself is case-insensitive, but a spread of it is a plain
+ *  object keyed by whatever the parent used — `Path` for an editor launched from Explorer or
+ *  PowerShell — so `copy.PATH` reads undefined, and writing `PATH` beside the old `Path` hands the
+ *  child two keys of which Node keeps `PATH`: the prepended dir ALONE, every system tool gone
+ *  (#1444 close-out, observed). So on win32 the value is read under any casing and every other
+ *  casing is dropped. POSIX env names are case-sensitive, so there only `PATH` is touched. */
+export function withPathEntry<E extends NodeJS.ProcessEnv>(env: E, dir: string, platform: NodeJS.Platform = process.platform): E {
+  const out: NodeJS.ProcessEnv = { ...env }
+  const keys = platform === 'win32' ? Object.keys(env).filter((k) => k.toUpperCase() === 'PATH') : []
+  const existing = env.PATH ?? (keys.length ? env[keys[0]] : undefined)
+  for (const k of keys) delete out[k]
+  out.PATH = prependPathEntry(dir, existing, platform)
+  return out as E
 }
 
 /**
@@ -990,7 +1060,7 @@ export const TOOL_IDS = Object.keys(REGISTRY) as ToolId[]
 
 /** Tools that `install()` can provision automatically (vs `guide()`-only, like Xcode). Grows as
  *  more installers land (gltfpack, android-sdk, java/jdk, cocoapods). */
-export const INSTALLABLE: ReadonlySet<ToolId> = new Set<ToolId>(['gltf-transform-cli', 'gltfpack', 'java', 'android-sdk', 'ffmpeg', 'ffprobe', 'go-ios'])
+export const INSTALLABLE: ReadonlySet<ToolId> = new Set<ToolId>(['gltf-transform-cli', 'gltfpack', 'java', 'android-sdk', 'ffmpeg', 'ffprobe', 'go-ios', 'toktx', 'msdf-atlas-gen'])
 
 /** PINNED versions for the CLI/gem tools we install by name (unlike Node/JDK/Ruby, whose version is
  *  in the download URL). Pinning makes installs reproducible (dev == packaged) AND lets a pin bump
@@ -1092,6 +1162,14 @@ export function versionMatchesPin(version: string, pin: string): boolean {
  *  alone. */
 export function isToolStale(id: ToolId, d: DetectResult): boolean {
   if (!d.present) return false
+  // ffmpeg/ffprobe: their CLI `-version` differs per platform build, so the pin is the NPM package
+  // version, read from the installed package.json. Only our provisioned copy (`probe`) is judged — a
+  // deliberate MODOKI_FFMPEG override is the user's call (#1297).
+  const npmPin = NPM_BINARY_PINS[id as NpmBinaryToolId]
+  if (npmPin) return d.source === 'probe' && installedNpmToolVersion(conversionToolchainDir(), npmPin.pkg) !== npmPin.version
+  // toktx/msdf-atlas-gen: the versioned dir already pins the version, but an install that predates a
+  // kept file (`ktx`, #1351) runs and is incomplete — stale, so Build Support offers the repair.
+  if ((id === 'toktx' || id === 'msdf-atlas-gen') && d.source === 'probe' && missingConversionCliFile(conversionToolchainDir(), id)) return true
   const tc = process.env.MODOKI_TOOLCHAIN_DIR
   if (!tc || !d.path || !d.path.startsWith(tc)) return false // not our install → don't touch it
   // Both share the `npm-tools` tree with `ndarray-pixels`' own `sharp` (see PINNED_SHARP_OVERRIDE) —
@@ -1209,7 +1287,7 @@ export interface ToolchainStatus {
 /** Tools the editor installs UNPROMPTED when Build Support opens, so model/audio import just works.
  *  All four are cross-platform, dependency-free, and cannot fail for environmental reasons — which
  *  is what makes installing them without asking safe. */
-const AUTO_INSTALL: ReadonlySet<ToolId> = new Set<ToolId>(['gltf-transform-cli', 'gltfpack', 'ffmpeg', 'ffprobe'])
+const AUTO_INSTALL: ReadonlySet<ToolId> = new Set<ToolId>(['gltf-transform-cli', 'gltfpack', 'ffmpeg', 'ffprobe', 'toktx', 'msdf-atlas-gen'])
 
 /** Whether the editor should install `id` on its own.
  *
@@ -1226,6 +1304,9 @@ const AUTO_INSTALL: ReadonlySet<ToolId> = new Set<ToolId>(['gltf-transform-cli',
 export function autoInstallable(id: ToolId, opts: { wdaTeamAvailable?: boolean } = {}): boolean {
   if (!isInstallable(id)) return false
   if (id === 'webdriveragent') return detect('xcodebuild').present && (!!wdaTeamId() || !!opts.wdaTeamAvailable)
+  // The Windows KTX installer can only be unpacked by a 7-Zip the machine happens to have — an
+  // environmental failure, which is exactly what installing unasked must not risk.
+  if (id === 'toktx' || id === 'msdf-atlas-gen') return canExpand(conversionCliDist(id)!.kind)
   return AUTO_INSTALL.has(id)
 }
 
@@ -1276,6 +1357,8 @@ export function isInstallable(id: ToolId): boolean {
   // WDA is BUILT by xcodebuild, so it is macOS-only for the same reason CocoaPods is — and, unlike
   // every other installable tool, it also needs a signing identity, which install() checks.
   if (id === 'webdriveragent') return process.platform === 'darwin'
+  // Only where a pinned build exists for this host (#1327) — e.g. no msdf-atlas-gen on Intel macOS.
+  if (id === 'toktx' || id === 'msdf-atlas-gen') return !!conversionCliDist(id)
   return INSTALLABLE.has(id)
 }
 
@@ -1326,9 +1409,15 @@ export async function install(id: ToolId, opts: { toolchainDir: string; onLog?: 
   // version differs from the CLI's own version (ffmpeg-static@5.3.0 ships ffmpeg 6.0), so they're
   // pinned here as the npm spec — NOT in PINNED_TOOL_VERSIONS (whose values are matched against
   // `--version` output for the stale check, which would never match).
-  if (id === 'ffmpeg') return installNpmBinaryTool('ffmpeg-static', FFMPEG_NPM_VERSION, ffmpegToolBin, opts)
-  if (id === 'ffprobe') return installNpmBinaryTool('@ffprobe-installer/ffprobe', FFPROBE_NPM_VERSION, ffprobeToolBin, opts)
+  if (id === 'ffmpeg') return installNpmBinaryTool(NPM_BINARY_PINS.ffmpeg.pkg, NPM_BINARY_PINS.ffmpeg.version, ffmpegToolBin, opts)
+  if (id === 'ffprobe') return installNpmBinaryTool(NPM_BINARY_PINS.ffprobe.pkg, NPM_BINARY_PINS.ffprobe.version, ffprobeToolBin, opts)
   if (id === 'cocoapods') return installCocoapods(opts)
+  if (id === 'toktx' || id === 'msdf-atlas-gen') {
+    // Pinned + sha256-verified release assets (conversionCliProvision.ts, #1327).
+    const bin = await ensureConversionCli(id, opts.toolchainDir, { onLog: opts.onLog })
+    resetToolchainCache()
+    return { path: bin }
+  }
   if (id === 'go-ios') {
     // Pinned + sha256-verified universal binary from the GitHub release (see goIosProvision.ts).
     // NOT in AUTO_INSTALL on purpose: it is 17 MB down / 45 MB on disk and only matters when you
@@ -1402,6 +1491,8 @@ export function toolOwnedDirs(id: ToolId, toolchainDir: string): string[] {
     // out of the user's ~/Library DerivedData: "Remove all tools" must actually remove it.
     case 'webdriveragent': return [path.join(toolchainDir, 'wda')]
     case 'go-ios': return [path.join(toolchainDir, 'go-ios')]
+    case 'toktx': return [path.join(toolchainDir, 'toktx')]
+    case 'msdf-atlas-gen': return [path.join(toolchainDir, 'msdf-atlas-gen')]
     default: return []
   }
 }
@@ -1418,6 +1509,8 @@ export function isRemovable(id: ToolId): boolean {
   // cocoapods checks its source below. Ours lives under the toolchain dir; nothing else counts.
   if (id === 'go-ios') return !!process.env.MODOKI_TOOLCHAIN_DIR && !!d.path?.startsWith(process.env.MODOKI_TOOLCHAIN_DIR)
   if (id === 'cocoapods') return d.source === 'probe' // our provisioned pod (not a system one)
+  // A BUNDLED copy (the packaged editor's MODOKI_TOKTX) resolves as `env` and is not ours to remove.
+  if (id === 'toktx' || id === 'msdf-atlas-gen') return d.source === 'probe'
   return toolOwnedDirs(id, process.env.MODOKI_TOOLCHAIN_DIR).length > 0
 }
 
@@ -1608,7 +1701,7 @@ export async function uninstall(id: ToolId, opts: { toolchainDir: string; onLog?
   const log = opts.onLog ?? (() => {})
   const NPM_TOOL_PKGS: Partial<Record<ToolId, string>> = {
     'gltf-transform-cli': '@gltf-transform/cli', gltfpack: 'gltfpack',
-    ffmpeg: 'ffmpeg-static', ffprobe: '@ffprobe-installer/ffprobe',
+    ffmpeg: NPM_BINARY_PINS.ffmpeg.pkg, ffprobe: NPM_BINARY_PINS.ffprobe.pkg,
   }
   if (NPM_TOOL_PKGS[id]) {
     const pkg = NPM_TOOL_PKGS[id]!
@@ -1757,9 +1850,34 @@ async function installNpmTool(
 }
 
 /** npm spec versions for ffmpeg/ffprobe (the package version, distinct from the CLI's own version —
- *  see install()). Kept as consts (not PINNED_TOOL_VERSIONS) so the stale-check never mis-fires. */
-const FFMPEG_NPM_VERSION = '5.3.0'
-const FFPROBE_NPM_VERSION = '2.1.2'
+ *  see install()). Kept out of PINNED_TOOL_VERSIONS, whose values are matched against `--version`
+ *  output: ffmpeg-static@5.3.0 is tagged `b6.1.1` yet its darwin-arm64 binary prints `6.0`, and each
+ *  `@ffprobe-installer/<platform>` package is a different build (darwin-arm64 prints `n4.4.1`). So
+ *  `isToolStale` compares the INSTALLED package.json version against these instead.
+ *
+ *  ⚠️ This pins the same build per PLATFORM, not across platforms — a Windows and a macOS machine
+ *  still run different ffmpeg builds of the same package (#1297).
+ *
+ *  ⚠️ **Bumping either version MUST bump `AUDIO_ENCODER_VERSION` and `VIDEO_ENCODER_VERSION` too.**
+ *  The conversion cache key does not name the binary, and a cache hit returns before ffmpeg is even
+ *  resolved — so without the tag bump every warm cache keeps shipping the old build's bytes while a
+ *  fresh machine encodes new ones under the same hash, which is #1297 again. Guarded by
+ *  `conversionToolPin.test.ts` ("the pin and the encoder tags move together"). */
+export const NPM_BINARY_PINS = {
+  ffmpeg: { pkg: 'ffmpeg-static', version: '5.3.0' },
+  ffprobe: { pkg: '@ffprobe-installer/ffprobe', version: '2.1.2' },
+} as const satisfies Partial<Record<ToolId, { pkg: string; version: string }>>
+type NpmBinaryToolId = keyof typeof NPM_BINARY_PINS
+
+/** The `version` of an npm package installed in the toolchain's `npm-tools` tree, or null. */
+export function installedNpmToolVersion(toolchainDir: string, pkg: string): string | null {
+  try {
+    const json = JSON.parse(fs.readFileSync(path.join(npmToolsDir(toolchainDir), 'node_modules', pkg, 'package.json'), 'utf8')) as { version?: unknown }
+    return typeof json.version === 'string' ? json.version : null
+  } catch {
+    return null
+  }
+}
 
 /** Like installNpmTool, but for npm packages whose executable is the package PAYLOAD (no `.bin/<name>`
  *  symlink) — ffmpeg-static, @ffprobe-installer. `resolveBin(toolchainDir)` returns the in-package
@@ -1787,6 +1905,13 @@ async function installNpmBinaryTool(
   return { path: bin }
 }
 
+/** Forget ONE tool's cached detection. A conversion calls this before re-checking a tool it found
+ *  missing: the install may have run in the OTHER process (the Vite server installs, the Electron
+ *  main also converts), whose `resetToolchainCache()` cannot reach this module's cache. */
+export function forgetDetection(id: ToolId): void {
+  cache.delete(id)
+}
+
 /** Forget cached detection — for tests, or after a provisioning install changes availability. */
 export function resetToolchainCache(): void {
   cache.clear()
@@ -1801,6 +1926,10 @@ export { ensureJdk, discoverJavaHome, javaBinName, jdkVersionDir, PINNED_JDK, jd
 export { ensureRuby, rubyDistKey, rubyDirFor, PINNED_RUBY, type ProvisionedRuby } from './rubyProvision'
 // On-demand go-ios provisioning: hands-free install+launch on an iOS ≤16 device (no ⌘R handoff).
 export { ensureGoIos, goIosBinFor, goIosDirFor, PINNED_GO_IOS, type ProvisionedGoIos } from './goIosProvision'
+export {
+  ensureConversionCli, conversionCliBin, conversionCliDir, conversionCliDist, CONVERSION_CLI_PINS, canExpand, ranOk, pinLabel,
+  type ConversionCliId, type PinnedCli, type PinnedCliAsset,
+} from './conversionCliProvision'
 // On-demand Android SDK provisioning (E-3): cmdline-tools bootstrap + sdkmanager packages/licenses.
 export {
   ensureCmdlineTools, runSdkmanager, sdkmanagerPath, cmdlineToolsKey,

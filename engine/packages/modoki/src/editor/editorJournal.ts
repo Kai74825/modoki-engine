@@ -26,6 +26,24 @@ export function isEditorJournalSource(source: unknown): source is EditorJournalS
   return (EDITOR_JOURNAL_SOURCES as readonly unknown[]).includes(source);
 }
 
+/** Every event type the editor emits — the vocabulary of `EditorEvent.type` and of the `type` filter
+ *  on `editor-journal` / `wait-for-edit` (#1213). `editorEmit` takes this union, so an emit site with
+ *  a type missing from the table does not compile, and the ops can refuse a typo (`'edit'` for
+ *  `'!edit'`) instead of matching nothing — which for `wait-for-edit` meant parking the whole timeout. */
+export const EDITOR_JOURNAL_TYPES = [
+  '!edit', '!select', '!transform', '!create', '!delete', '!duplicate', '!reparent', '!sceneMove',
+  '!mutate', '!batch', '!asset-edit', '!undo', '!redo',
+  '!play', '!pause', '!stop', '!save', '!scene-load',
+  '!focus', '!gizmo', '!sceneviewmode', '!animationviewmode', '!gameviewdevice', '!skinmode',
+  '!spriteeditorselection',
+  '!hmr.discarded-unsaved', '!hmr.stale-game-code',
+] as const;
+export type EditorJournalType = typeof EDITOR_JOURNAL_TYPES[number];
+
+export function isEditorJournalType(type: unknown): type is EditorJournalType {
+  return (EDITOR_JOURNAL_TYPES as readonly unknown[]).includes(type);
+}
+
 export interface EditorEvent {
   /** Editor-local monotonic sequence — the poll cursor (use as `since`). Bumps only
    *  on editor emits, so it stays contiguous within the editor stream. */
@@ -35,8 +53,8 @@ export interface EditorEvent {
   cap: number;
   /** Wall-clock ms (editor code is not determinism-guarded). */
   ts: number;
-  /** `!`-prefixed editor event, e.g. `!edit`, `!select`, `!play`. */
-  type: string;
+  /** `!`-prefixed editor event, e.g. `!edit`, `!select`, `!play` — one of `EDITOR_JOURNAL_TYPES`. */
+  type: EditorJournalType;
   /** Who performed it — the human at the keyboard, or the AGENT via the MCP ops.
    *  So Claude can tell its own edits from the human's (avoids "I see you deleted 3
    *  crates" about crates Claude itself deleted). */
@@ -47,22 +65,96 @@ export interface EditorEvent {
 const MAX_EVENTS = 2000; // ring-drop oldest
 const buffer: EditorEvent[] = [];
 let seq = 0;
-let enabled = true;
-let actor: 'human' | 'agent' = 'human';
+/** Which LIFE of this module a `seq` belongs to (#1214 B-3). `seq` is module state, so a renderer
+ *  reload — and every game-code edit force-reloads — restarts it at 0. A cursor from before the reload
+ *  is then AHEAD of every new event, and a forward read with it filters out all of them: the agent saw
+ *  `{events:[], timedOut:true}` on every poll while the human kept editing. Replies carry this, and a
+ *  caller that sends it back gets its cursor reset when the life has changed (`resolveEditorJournalCursor`).
+ *  Editor code is not determinism-guarded; this only has to differ between two loads. */
+const epoch = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
 
+/** The current life's id — see `epoch`. */
+export function editorJournalEpoch(): string { return epoch; }
+
+/** True when a caller's `epoch` names an EARLIER life. The shared capture counter (`cap`, the
+ *  merged timeline's cursor) is module state too and restarts on the same reload, so a `sinceCap`
+ *  needs this check as much as `since` does. */
+export function editorJournalEpochChanged(callerEpoch: string | undefined): boolean {
+  return callerEpoch !== undefined && callerEpoch !== epoch;
+}
+
+export interface ResolvedEditorJournalCursor {
+  since: number | undefined;
+  /** Set when the caller's cursor belonged to an earlier life and was replaced with 0 (replay this life). */
+  cursorReset?: string;
+}
+
+/** Turn a caller's `since` (+ the `epoch` it was read under) into a cursor valid for THIS life.
+ *  - `epoch` given and different → the cursor is from before a reload: replay this life from 0.
+ *  - no `epoch`, but `since` is past the newest `seq` ever issued → it cannot be from this life
+ *    either (a cursor never runs ahead of the counter): same reset.
+ *  A caller that omits `epoch` and whose old cursor is still BELOW the new counter cannot be told
+ *  apart from a current one — the reason replies carry `epoch` and the tools say to send it back. */
+export function resolveEditorJournalCursor(since: number | undefined, callerEpoch: string | undefined): ResolvedEditorJournalCursor {
+  if (since == null) return { since };
+  if (editorJournalEpochChanged(callerEpoch)) {
+    return { since: 0, cursorReset: `since=${since} was issued under epoch ${callerEpoch}; the editor journal has restarted since (epoch ${epoch} — a renderer reload, e.g. a game-code edit), so this read replays everything from the restart. Use the returned cursor from now on.` };
+  }
+  if (since > seq) {
+    return { since: 0, cursorReset: `since=${since} is past the newest event this journal has issued (${seq}), so it is from before a restart (a renderer reload, e.g. a game-code edit); this read replays everything from the restart. Send \`epoch\` back with \`since\` so a restart is always detected.` };
+  }
+  return { since };
+}
+let enabled = true;
 /** Run `fn` with editor activity attributed to `who` — sync OR async. agentEditorOps
  *  wraps its mutating ops in this so agent-driven edits are tagged source:'agent'. For
  *  an async `fn`, the attribution holds until the returned promise settles. NOTE: that
- *  window spans the await, so a human action during it is mis-tagged 'agent' — a narrow,
- *  accepted race (agent ops are brief; a human acting mid-op is rare). */
+ *  window spans the await, so a human action during it is mis-tagged 'agent' — the accepted
+ *  race (docs/enact.md § the actor lease). It is accepted on purpose, including for the openers
+ *  that wait up to 3s: the editor's REACTION to an agent's open (a tab selected, `!focus`) runs in
+ *  React effects after the op's synchronous part returns, so narrowing the scope to that part
+ *  tagged the agent's own open as the human's (#1213 review) — the worse error of the two.
+ *
+ *  ⚠️ **Scopes are TRACKED, not saved-and-restored** (#1213 review). With save/restore, two
+ *  overlapping async ops — routine, since parallel tool calls are — interleaved as: A saves
+ *  'human', B saves 'agent', A restores 'human', B restores 'agent', and the session stayed tagged
+ *  'agent' until a reload: every later human edit was journaled as the agent's, and
+ *  `wait-for-edit {source:'human'}` could never wake. Each scope is now its own entry, so the actor
+ *  is 'agent' exactly while one is live, whatever order they settle in — and each entry carries a
+ *  DEADLINE, the lease's rule: an op whose promise never settles must not hold the label for the
+ *  rest of the session. Expiry is lazy (checked at emit), so there is no timer to leak. */
+export const AGENT_SCOPE_MAX_MS = 60_000;
+type Scope = { who: 'human' | 'agent'; deadline: number };
+/** Insertion-ordered, so the last live entry is the newest. Keyed by the scope object itself. */
+const scopes = new Set<Scope>();
+
+/** Test seam: drop every live scope (a test's never-settling scope must not outlive it). */
+export function _clearActorScopes(): void { scopes.clear(); }
+
 export function withEditorActor<T>(who: 'human' | 'agent', fn: () => T): T {
-  const prev = actor; actor = who;
-  const r = fn();
+  const scope: Scope = { who, deadline: Date.now() + AGENT_SCOPE_MAX_MS };
+  scopes.add(scope);
+  const release = (): void => { scopes.delete(scope); };
+  let r: T;
+  try { r = fn(); } catch (e) { release(); throw e; }
   if (r && typeof (r as { then?: unknown }).then === 'function') {
-    return (r as unknown as Promise<unknown>).finally(() => { actor = prev; }) as unknown as T;
+    return (r as unknown as Promise<unknown>).finally(release) as unknown as T;
   }
-  actor = prev;
+  release();
   return r;
+}
+
+/** The ambient actor: the NEWEST live scope wins (so an explicit 'human' scope inside an agent one
+ *  is human, and vice versa); with none live, 'human'. */
+function ambientActor(): 'human' | 'agent' {
+  if (!scopes.size) return 'human';
+  const now = Date.now();
+  let newest: Scope | undefined;
+  for (const sc of scopes) {
+    if (now > sc.deadline) { scopes.delete(sc); continue; }
+    newest = sc;
+  }
+  return newest?.who ?? 'human';
 }
 
 // ── Actor lease — attribution for TRUSTED INPUT ──────────────────────────────
@@ -157,7 +249,7 @@ function currentActor(): 'human' | 'agent' {
     if (Date.now() <= lease.deadline) return lease.who;
     lease = null; // expired — fall back rather than mis-attribute indefinitely
   }
-  return actor;
+  return ambientActor();
 }
 
 // ── Append listeners (#28 — wait_for_edit) ───────────────────────────────────
@@ -180,7 +272,7 @@ function onEditorJournalAppend(cb: JournalListener): () => void {
 
 /** Record an editor activity event, tagged with the current actor. Payloads should
  *  reference entities by GUID. No-op when disabled. */
-export function editorEmit(type: string, payload?: unknown): void {
+export function editorEmit(type: EditorJournalType, payload?: unknown): void {
   if (!enabled) return;
   const event: EditorEvent = { seq: ++seq, cap: nextCaptureSeq(), ts: Date.now(), type, source: currentActor(), payload };
   buffer.push(event);
@@ -212,6 +304,12 @@ export interface WaitForEditResult {
   /** Advance a subsequent wait/poll with this as `since` — contiguous with `events`,
    *  same forward-cursor convention as `readEditorJournal`/the `editor-journal` op. */
   nextSeq: number;
+  /** The journal life `nextSeq` belongs to — send it back with it. */
+  epoch: string;
+  /** On a timeout: the events that DID arrive after the cursor but did not match `type`/`source`.
+   *  Without it a wait on a type the human is not producing (or on `source:'human'` while only the
+   *  agent edits) timed out looking exactly like an idle editor. */
+  skipped?: { total: number; byType: Record<string, number>; bySource: Record<string, number> };
 }
 
 /** Park until a matching event is appended, or `timeoutMs` elapses — the long-poll
@@ -235,8 +333,20 @@ export function waitForEditorJournal(
   const baseline = filter.since ?? seq; // "now" when no cursor was given
   const already = readEditorJournal({ type: filter.type, source: filter.source, since: baseline });
   if (already.length > 0) {
-    return Promise.resolve({ events: already, timedOut: false, nextSeq: already[already.length - 1].seq });
+    return Promise.resolve({ events: already, timedOut: false, nextSeq: already[already.length - 1].seq, epoch });
   }
+  const timedOut = (): WaitForEditResult => {
+    const others = readEditorJournal({ since: baseline });
+    const count = (key: (e: EditorEvent) => string) => {
+      const out: Record<string, number> = {};
+      for (const e of others) out[key(e)] = (out[key(e)] ?? 0) + 1;
+      return out;
+    };
+    return {
+      events: [], timedOut: true, nextSeq: baseline, epoch,
+      ...(others.length ? { skipped: { total: others.length, byType: count((e) => e.type), bySource: count((e) => e.source) } } : {}),
+    };
+  };
   return new Promise((resolve) => {
     let settled = false;
     const finish = (result: WaitForEditResult): void => {
@@ -251,8 +361,8 @@ export function waitForEditorJournal(
       if (filter.source && e.source !== filter.source) return;
       if (e.seq <= baseline) return; // pre-existing event replaying through some other path
       const events = readEditorJournal({ type: filter.type, source: filter.source, since: baseline });
-      finish({ events, timedOut: false, nextSeq: events.length ? events[events.length - 1].seq : baseline });
+      finish({ events, timedOut: false, nextSeq: events.length ? events[events.length - 1].seq : baseline, epoch });
     });
-    const timer = setTimeout(() => finish({ events: [], timedOut: true, nextSeq: baseline }), timeoutMs);
+    const timer = setTimeout(() => finish(timedOut()), timeoutMs);
   });
 }

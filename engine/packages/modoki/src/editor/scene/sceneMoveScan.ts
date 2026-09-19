@@ -15,8 +15,7 @@
  *  its file until it's next saved. Advisory only (owner decision) — this never
  *  offers or performs a rekey; it only reports so the user can judge. */
 
-import { getAllEntities, subtreeIds, findEntity } from '../../runtime/core/ecs/entityUtils';
-import { getTraitByName } from '../../runtime/core/ecs/traitRegistry';
+import { getAllEntities, subtreeIds } from '../../runtime/core/ecs/entityUtils';
 import { assetUrl } from '../../runtime/loaders/assetUrl';
 import { ASSET_FETCH_INIT } from '../../runtime/loaders/assetFetch';
 import { getAllAssets } from '../../runtime/loaders/assetManifest';
@@ -28,8 +27,6 @@ export interface SceneMovePreflight {
   /** Name of the parent left behind, or null if the entity is already a root
    *  (no re-rooting will happen regardless of how the drop is routed). */
   reRootFrom: string | null;
-  /** Names of PrefabInstance ROOTS inside the moving subtree (Phase 5 limitation). */
-  prefabInstanceRoots: string[];
   /** Sibling scene files on disk (declaring the SAME base as `targetScene`) that
    *  already contain one of the moving guids. Only populated for a PROMOTE
    *  (`targetScene !== ''`) — a demote has no "sibling of the base" to collide
@@ -56,21 +53,11 @@ export async function preflightSceneMove(entityId: number, targetScene: string):
   const entityName = rootInfo?.name ?? `Entity ${entityId}`;
   const subtreeGuids = ids.map((id) => byId.get(id)?.guid || '').filter(Boolean);
 
-  const piMeta = getTraitByName('PrefabInstance');
-  const prefabInstanceRoots: string[] = [];
-  if (piMeta) {
-    for (const id of ids) {
-      const e = findEntity(id);
-      const pd = e?.has(piMeta.trait) ? (e.get(piMeta.trait) as Record<string, unknown>) : null;
-      if (pd && (pd.rootInstanceId as number) === id) prefabInstanceRoots.push(byId.get(id)?.name || `Entity ${id}`);
-    }
-  }
-
   const oldParentId = rootInfo?.parentId || 0;
   const reRootFrom = oldParentId ? (byId.get(oldParentId)?.name ?? `Entity ${oldParentId}`) : null;
 
   const result: SceneMovePreflight = {
-    entityName, subtreeCount: ids.length, reRootFrom, prefabInstanceRoots,
+    entityName, subtreeCount: ids.length, reRootFrom,
     collisions: [], scanned: 0, scanFailed: [],
   };
   if (!targetScene || subtreeGuids.length === 0) return result; // demote: no sibling-of-base hazard
@@ -108,21 +95,30 @@ export async function preflightSceneMove(entityId: number, targetScene: string):
   return result;
 }
 
+/** A reparent that crosses scenes (#1429): the new parent, and the scene file it belongs to. */
+export interface SceneMoveInto { parentName: string; sceneName: string }
+
 /** Pure string builder for the promote/demote confirm dialog — separated from
- *  `preflightSceneMove` so it's unit-testable without a fetch mock. */
-export function formatSceneMoveConfirm(pre: SceneMovePreflight, targetScene: string): string {
+ *  `preflightSceneMove` so it's unit-testable without a fetch mock. With `into`, the move is a
+ *  reparent under a parent from another scene, and the text says so first: the person asked for a
+ *  new parent, not a new scene, so the scene change is the thing they must not miss. The agent's
+ *  `reparent-entity` refusal carries this same text. */
+export function formatSceneMoveConfirm(pre: SceneMovePreflight, targetScene: string, into?: SceneMoveInto): string {
   const verb = targetScene ? 'Promote' : 'Demote';
   const dest = targetScene ? 'into the base scene' : 'to the primary scene';
   const lines: string[] = [];
-  lines.push(`${verb} "${pre.entityName}" (${pre.subtreeCount} ${pre.subtreeCount === 1 ? 'entity' : 'entities'}) ${dest}?`);
-  lines.push('');
-  if (pre.reRootFrom) {
+  if (into) {
+    lines.push(`Move "${pre.entityName}" (${pre.subtreeCount} ${pre.subtreeCount === 1 ? 'entity' : 'entities'}) into scene "${into.sceneName}"?`);
+    lines.push('');
+    lines.push(`• Its new parent "${into.parentName}" belongs to scene "${into.sceneName}". An object and its parent must be saved in the same scene file, so it moves into that scene, and Save All writes it there.`);
+  } else {
+    lines.push(`${verb} "${pre.entityName}" (${pre.subtreeCount} ${pre.subtreeCount === 1 ? 'entity' : 'entities'}) ${dest}?`);
+    lines.push('');
+  }
+  if (pre.reRootFrom && !into) { // a reparent leaving its old parent is what was asked for
     lines.push(`• It leaves its parent "${pre.reRootFrom}" behind — that parent stays where it is, so the authored parent/child relationship is gone (its world position/rotation is preserved by the move).`);
   }
   if (targetScene) lines.push('• Every level that uses this base will now show it.');
-  if (pre.prefabInstanceRoots.length > 0) {
-    lines.push(`• ${pre.prefabInstanceRoots.length} prefab instance${pre.prefabInstanceRoots.length === 1 ? '' : 's'} in the subtree: ${pre.prefabInstanceRoots.join(', ')} — its editor bookkeeping (Apply-to-Prefab, structural overrides) may not survive a later swap that keeps this base loaded (known Phase 5 limitation; the scene itself is still savable).`);
-  }
   if (pre.collisions.length > 0) {
     const names = pre.collisions.map((c) => c.name).join(', ');
     lines.push(`• ${pre.collisions.length} other scene${pre.collisions.length === 1 ? '' : 's'} already contain${pre.collisions.length === 1 ? 's' : ''} one of these guids: ${names}. At its next load the base's copy wins and that scene's copy is dropped; its file keeps a dead row until it is next saved. Refs from scenes that aren't currently loaded cannot be updated by this move.`);

@@ -13,7 +13,7 @@ import fs from 'fs';
 import crypto from 'crypto';
 import chokidar, { type FSWatcher } from 'chokidar';
 import {
-  findAssetRoots, scanAllAssets, buildManifest, resolveAssetPath, absToAssetUrl, classifySceneChange,
+  findAssetRoots, defaultSaveRootDir, scanAllAssets, buildManifest, resolveAssetPath, absToAssetUrl, classifySceneChange,
   normalizeWriteGuardKey, isUnderAssetRoot, pathToClassifyForChange, isSiblingRaisedChange,
   type AssetRoot,
   type LiveReloadKind,
@@ -25,7 +25,7 @@ export interface ElectronAssetManifest { version: 2; assets: Array<{ path: strin
 export interface ElectronAssetBackend {
   projectRoot: string;
   resolveAssetPath(urlPath: string): string | null;
-  absToAssetUrl(absPath: string): string | null;
+  absToAssetUrl(absPath: string, opts?: { onDisk?: boolean }): string | null;
   firstRootDir(): string | null;
   getManifest(): ElectronAssetManifest;
   rebuildManifest(): ElectronAssetManifest;
@@ -166,8 +166,8 @@ export function createAssetBackend(opts: {
   return {
     projectRoot,
     resolveAssetPath: (p) => resolveAssetPath(p, assetRoots),
-    absToAssetUrl: (p) => absToAssetUrl(p, assetRoots),
-    firstRootDir: () => assetRoots[0]?.absDir ?? null,
+    absToAssetUrl: (p, opts) => absToAssetUrl(p, assetRoots, opts),
+    firstRootDir: () => defaultSaveRootDir(assetRoots),
     getManifest: () => cachedManifest,
     rebuildManifest,
     computeUnused: () => computeKeptAssets(projectRoot, assetRoots),

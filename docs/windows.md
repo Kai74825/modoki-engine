@@ -51,6 +51,28 @@ probing) and `spawnable()` (decides `{shell}` and quotes accordingly), both in
 ⚠️ Node throws `EINVAL` on spawning a `.cmd`/`.bat` without `shell:true` (the CVE-2024-27980
 fix), so "just add a `.cmd` shim" is not a workaround for an unexecutable stub either.
 
+**gcloud is the same case (#1444).** On Windows the Cloud SDK's CLI is `gcloud.cmd` (beside an
+extensionless bash shim), so the two `execFileSync('gcloud', …)` calls (`/api/ota/status`, the
+OTA publish's CORS update) could never run there; they go through `execGcloudSync`
+(`engine/plugins/backend/gcloud.ts`), which is `whichSync` + `spawnable`. The same issue found the
+gcloud dir prepended to `PATH` with a literal `:` — on win32 that glues the dir onto the first
+entry, so the dir is never searched and the old first entry is lost. What still does NOT work on
+Windows: the built-in web GCS deploy (its steps are bash `find`/`for`), and gcloud auto-detection
+— a Windows user sets the gcloud path in Project Settings.
+
+### A COPY of `process.env` has no `PATH` key on Windows — it has `Path`
+
+`process.env` is case-insensitive on win32, so `process.env.PATH` always works. A **spread** of it
+is a plain object keyed however the parent spelled it — `Path` for an editor launched from Explorer
+or PowerShell (a Git Bash parent says `PATH`, which is why a terminal run hides this). So
+`{ ...process.env }.PATH` is `undefined`, and `{ ...copy, PATH: dir + ';' + copy.PATH }` hands the
+child both `Path` and `PATH`; Node keeps `PATH` — the prepended dir **alone** — and every system
+tool is gone (`'node' is not recognized`). Observed in the #1444 close-out: OTA publish's build step
+died exactly this way. Prepend onto a copied env with **`withPathEntry`**
+(`engine/toolchain/index.ts`), which reads any casing and writes one `PATH`. The
+`{ ...process.env, PATH: … process.env.PATH }` shape (read from `process.env` itself) is safe and
+is used in several places.
+
 ## A probed tool can be present and still lie about itself
 
 Two more instances of the doc's opening pattern — a probe answering confidently, and wrong —
@@ -219,6 +241,17 @@ conversion never engaged".
 
 ## Paths
 
+- ⚠️ **A native Windows path can fail a validator written for POSIX paths.** `BUILD_FIELD_RULES`
+  (`load-project-config.ts`) allows only shell-safe characters in the SDK paths, and it allowed
+  neither `:` nor `\`, so every Windows absolute path failed. Project Settings ▸ Browse… for
+  JAVA_HOME returned `D:\Downloads`, and Apply refused it (#1441, observed). Fixed at both ends:
+  the rule allows a leading drive (`FS_PATH`) but still no backslash, since a backslash can swallow
+  a closing quote; and a picked path outside the project is stored as `D:/Downloads`
+  (`portablePath`, `projectPaths.ts`). Observed: Apply accepts and stores `D:/Downloads`. Not yet
+  observed: an Android build running with `JAVA_HOME=D:/…` (it's expected to work, since Node's `path`
+  and Gradle's launcher accept `/`). A hand-typed `\` still fails, with a hint to use `/`. #1444
+  then widened `FS_PATH` to `(x86)` and non-ASCII folders (inert characters only — every
+  shell-active one is still refused), and made a stored gcloud path usable on Windows (§ PATHEXT).
 - ⚠️ **`fs.realpathSync` is NOT the canonicaliser you want on Windows — `fs.realpathSync.native`
   is.** The JS lstat-walk resolves symlinks and junctions but neither `subst` drive mappings nor
   drive-letter CASE, both of which are ordinary ways one directory acquires two spellings here.
@@ -883,10 +916,12 @@ conversion never engaged".
       discriminate. The rule chosen instead (owner, 2026-09-07) makes the class **loud, not
       absent** — it can still be written; it can no longer pass green having matched nothing. The
       alternative considered and declined was making `rel` hard to drop at the `repoFiles` API,
-      which prevents it at authoring time on any platform but costs a 32-site migration; it stays
-      on the table if a tenth instance lands. Detection is not left to a human: a push to `main`
-      auto-runs the free public CI, whose `windows-latest` leg is where a vacuous guard goes red,
-      so it surfaces within one merge cycle.
+      which prevents it at authoring time on any platform but costs a 32-site migration;
+      ~~it stays on the table if a tenth instance lands~~ — **the tenth landed and did NOT come
+      through this shape (#1435, § Instance 10 below); left declined.** ~~Detection is not left to a
+      human: a push to `main` auto-runs the free public CI, whose `windows-latest` leg is where a
+      vacuous guard goes red, so it surfaces within one merge cycle.~~ — **false for a private-only
+      test; corrected under § Instance 10 below (#1435).**
       **The underlying fix remains to thread `{ rel, abs }` through and compare on `rel`**, as
       `abandonmentIsShared.test.ts` and (since #847) `livenessTokenIsShared.test.ts` do.
       ⚠️ **Re-deriving the census: append `-- ":!*.md"` to both queries.** Run verbatim they also
@@ -947,6 +982,91 @@ conversion never engaged".
       that gap. It did not** — instance 9 landed inside the region the bullet above called covered,
       and this one sent the #849 reader looking in a gap that no longer exists.
 
+  - ⚠️ **Instance 10 landed 2026-09-19 (#1435), and it came through NEITHER shape above** —
+    `wordbankExportImports.test.ts` compared `path.relative(REPO, file)` against
+    `'games/wordweave/runtime/rarity.ts'`. It never called `repoFiles()` at all: it regex-scraped
+    `../games/...` specifiers out of `wordbank/export.mjs` and resolved them with `path.resolve`. So
+    it did not discard a `rel` (limit 1) and it did not re-derive an `abs` (#849's other half) —
+    it is a **third leak shape: a path built from a SPECIFIER STRING, then compared as a repo-rel
+    path.** Both existing guards were out of scope by construction: `corpusProducerIsShared` asks
+    "do you use the shared producer", `corpusConsumerPins` asks "what did you do with its output",
+    and the answer here is that the producer was never in the picture.
+    ⚠️ **Which means the declined 32-site `repoFiles` API migration would NOT have prevented it,**
+    so "it stays on the table if a tenth instance lands" — in the instance-9 bullet above, under
+    "What this deliberately does NOT do is detect the defect" — does not cash out the way that
+    sentence expects: the tenth landed outside the region that migration covers. Left declined, and
+    struck in place there.
+  - ⚠️ **And "it surfaces within one merge cycle" is FALSE for a private-only test — corrected here**
+    (#1435). That claim rests on the free public CI's `windows-latest` leg, and the mirror's
+    `ci/main` run for `9291aeb0c` was **green on all three OS legs** with this defect in the tree.
+    The snapshot ships neither `wordbank/` nor `games/wordweave`, so the `describe.skipIf(
+    !hasInternalGames())` skips the whole body there. The public leg gates the engine, not
+    `games/**` or `wordbank/` — exactly the gap CLAUDE.md § Build names as ungated — so for a
+    private-only suite the only detector is a **private Windows clone running `verify`**, which is
+    how this one was found (merging `origin/main` into `win`, five days of drift).
+  - ✅ **Now GUARDED on the COMPARISON rather than the producer — `posixLiteralComparison.test.ts`**
+    (#1435, `win`). It flags a `node:path` producer (`relative`/`join`/`resolve`/`normalize`/
+    `dirname`) whose value reaches a forward-slash string literal through an equality or membership
+    test, across `engine/tests`, the package tests and every project's `tests/`. Keying on the
+    comparison is what lets it see all three leak shapes at once, including one where no shared
+    producer is involved. Current population: **0**; `floor` is on `scanned` (the number of path
+    calls examined), not on the offenders, because the goal state is an empty population.
+    ⚠️ **Its reach is one expression PLUS the bindings that carry it — and "Now GUARDED" must be read
+    against that.** The first cut stopped at the enclosing statement, so
+    `const rel = path.relative(REPO, f); expect(rel).toBe('games/x/y.ts')` — instance 10's own defect
+    one refactor away — was invisible: **1,795 of 4,501 scanned producer calls (~40%) bailed there.**
+    #1439 made the walk follow the value: on reaching a declaration's initialiser it continues from
+    every read of the bound name (`readsOf`, resolved by symbol, so a same-spelled parameter in a
+    sibling function is not one), up to 4 bindings deep; the expected-value side reads through a bound
+    literal the same way (`const E = 'a/b'; …toBe(E)`). Measured after, same corpus: **4,316 producer
+    calls, 1,657 binding follows**, deepest chain 4 (the cap never reached), 56 values stopped by an
+    inline normaliser on the walk, 3 bindings refused as reassigned, population still **0**. (The
+    4,501 above over-counted by 190: a METHOD sharing a bare-imported producer's name, `xs.join(',')`,
+    was read as `node:path`'s `join` — and once bindings were followed, those fake producers were
+    carried through variables. A bare import is now matched only when it is called bare.)
+    ⚠️ **A reassigned `let`/`var` is deliberately NOT followed**
+    — any write counts (`=`, compound, a destructuring or type-assertion target, for-of, a `var`
+    redeclaration). The
+    walk is flow-insensitive, so the read after `rel = toPosix(rel)` resolves to the same declaration
+    as the one before it; refusing the binding is the honest bound, not a detection.
+    ⚠️ **Normalisation is judged by what the VALUE passes through, not by text** — the first cut
+    searched the operand's text for `toPosix(`, which pardoned `path.relative(toPosix(a), toPosix(b))`:
+    normalised inputs, a backslash output on win32. So the claim is **loud on a value that reaches its
+    comparison through expressions and stable bindings**, not "this class can no longer be written"
+    — the guard's own docblock enumerates the other out-of-reach spellings (`.not.toBe`, a `return`
+    inside a block-bodied callback, an assignment to an already-declared `let`, `String.raw`, a regex
+    literal), each currently zero.
+    ⚠️ **One arm of it shipped DEAD, and only a per-shape test caught it.** The
+    `.endsWith()`/`.startsWith()`/`.includes()` branch asked for
+    `isCallExpression(parent) && parent.expression.expression === node`, which is unsatisfiable for
+    every well-formed AST: if a node is the object of a property access then its parent IS that
+    property access, never the call around it. The corpus scan could not catch it — its healthy state
+    is an empty population, so every arm can break with the assertion still green — and the one
+    mutation run against the guard exercised the `expect()` arm only. The fix carries a
+    synthetic-source case per shape, accept and reject, because **the mutation bar is one per SHAPE,
+    not one per guard.**
+    ⚠️ **What made it adoptable was sizing the detector so the population is 0 rather than 62** —
+    #799 asked for this rule in 2026-09-06 and it was not written, because the naive shape flags
+    every benign site. Three exclusions, each measured rather than assumed:
+    - **A path interpolated into a MESSAGE is not an offender.** Only comparison operands are
+      examined, so a template literal and `expect`'s second argument are excluded structurally, not
+      by a ledger row each. That is ~20 sites (`reapScoping`, `mcpBundle`, `docCitations` and
+      friends): a backslash there reads oddly on one platform and changes no verdict.
+    - **A symmetric comparison is not an offender** — `toContain(path.join('android', 'app'))` is
+      separator-native on both sides.
+    - **A path handed to ANOTHER function as an argument is not the compared value.** The first cut
+      flagged twelve of these and all twelve were read and confirmed benign: `absToAssetUrl`,
+      `relativiseUnderProject` and `fs.readFileSync` consume the native path and what the literal
+      describes is their POSIX-producing return (one literal was a `#!/bin/sh` shebang — file
+      content, not a path). A `.map`/`.flatMap` callback, by contrast, IS value-preserving, and
+      that is the shape instance 10 wore — excluding it would have made the guard miss the very
+      defect it was written for. Confirmed by mutation: with the fix reverted, the guard names
+      `wordbankExportImports.test.ts`'s assertion as the offender.
+  - **The latent site went with it.** `reimportEvictsRig.test.ts` carried
+    `f.rel ?? path.relative(process.cwd(), f.abs)`; `repoFiles` types `rel` non-optional so it never
+    fired, but it was wrong on two axes if it ever had — backslashed on win32 **and** cwd-relative
+    rather than repo-relative, so every forward-slash `OWNERS` row would have missed at once. Dropped
+    rather than normalised: the fallback had no reachable caller to serve.
 - **A path-valued field on a PERSISTED record is normalised by the module that owns the record, on
   READ as well as on write — never by each caller** (#849). `deviceClaimsStore.mjs` does this
   (`foreignClaimFor`, `ownAdbClaim`: `path.resolve(held.clone) === clone`); `buildClaimsStore.mjs`
@@ -1344,7 +1464,9 @@ the old `engine/packages/` path is a relocation, not a dropped SDK; only the loc
     is empirically nil. `os.cpus().length` cannot answer (it reports LOGICAL cores), and the
     PowerShell `Get-CimInstance Win32_Processor` query that can costs ~1.9s per vitest launch —
     noise inside `verify`, but it would double a single-file run.
-- **`testTimeout` is 60s on Windows, 20s everywhere else — in BOTH vitest configs**
+- **`testTimeout` is 120s on Windows, 40s everywhere else — in BOTH vitest configs** (doubled
+  2026-09-16 by `080b82a67`; it was 60s/20s, and this bullet asserted the old pair for long enough
+  that a `win` session reading it would have ruled out a ceiling it was actually hitting)
   ([engine/vite.config.ts](../engine/vite.config.ts) for the app lane,
   [engine/packages/modoki/vitest.config.ts](../engine/packages/modoki/vitest.config.ts) for the
   engine lane). There are exactly two, they run CONCURRENTLY as verify.mjs's two lanes, and a
@@ -1359,9 +1481,18 @@ the old `engine/packages/` path is a relocation, not a dropped SDK; only the loc
   table above — and still exceeded **35s** inside the app lane, failing 2 of 3 `npm run verify`
   runs. It walks the whole QA corpus off disk, so it grows with the suite it checks; a budget set
   on faster hardware was always going to be the binding constraint here first.
-  - Deliberately **not** a global raise. On a machine where 20s is generous, a 60s ceiling turns a
-    real hang into a long wait instead of a failure — and the cost of that is paid on the boxes
-    most likely to notice a hang at all.
+  - ⚠️ **OVERRULED 2026-09-16 (owner: *"we should increase the timeout in general"*) — it IS a
+    global raise now.** This bullet used to argue the opposite: *"deliberately not a global raise;
+    on a machine where 20s is generous, a 60s ceiling turns a real hang into a long wait instead of
+    a failure."* That cost stands and was accepted knowingly — a per-test hang now burns twice as
+    long before reporting. What changed the call is that macOS reached the same wall (wordweave
+    `backgroundRotation` overshot 20s by **302ms** under `verify`'s two concurrent lanes while
+    `npm test` alone stayed green), so the ceiling was not a Windows accommodation after all.
+  - ⚠️ **And the ceiling was probably never the real problem.** #1285 found six such budgets widened
+    one at a time (#751, #1046, #505, #1059, #1099, plus the 2026-09-16 one) because *another
+    clone's* `verify` was saturating the box — measured load average 149 on 12 perf cores. The
+    systemic fix is the cross-clone worker budget in `engine/scripts/verifyLoad.mjs`; whether these
+    ceilings can now come back DOWN is an open question on #1285, not a settled one.
   - This is the contention bullet above *acted on* rather than restated: tests nearest the ceiling
     fail as timeouts, which is indistinguishable from a regression until somebody re-runs idle.
     Raising the Windows ceiling is what stops that re-run being the routine cost of the gate.

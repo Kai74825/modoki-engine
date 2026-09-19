@@ -191,7 +191,7 @@ function mockDeps() {
     const cacheMap = new Map<string, any>();
     const unloaded: string[] = [];
     const Assets = {
-      cache: { has: (url: string) => cacheMap.has(url), remove: (url: string) => cacheMap.delete(url) },
+      cache: { has: (url: string) => cacheMap.has(url), get: (url: string) => cacheMap.get(url), remove: (url: string) => cacheMap.delete(url) },
       get: (url: string) => cacheMap.get(url),
       load: (url: string) => {
         const t = cacheMap.get(url) ?? { width: 32, height: 32, source: { style: {} } };
@@ -228,6 +228,7 @@ function mockDeps() {
     // A 'vid:' ref stands in for a video-asset GUID: a Sprite slot that skips the
     // still-image pipeline entirely (no resolve, no Assets.load, no url retain).
     isVideoRef: (ref: string) => typeof ref === 'string' && ref.startsWith('vid:'),
+    isUnknownAssetGuid: () => false,
     isImagePath: (ref: string) =>
       typeof ref === 'string' && (ref.startsWith('sheet:') || ref.startsWith('img:') || ref.startsWith('http') || ref.startsWith('/')),
     resolveImageUrl: (ref: string) => {

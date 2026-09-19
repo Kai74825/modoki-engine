@@ -1,6 +1,6 @@
 /** Undo/Redo manager — command stack for all editor actions. */
 
-import { editorEmit } from '../editorJournal';
+import { editorEmit, type EditorJournalType } from '../editorJournal';
 import { markSceneDirty } from '../scene/sceneDirty';
 import { reportUndoThrew } from './undoFailure';
 import { notifyListeners } from '../../runtime/core/notifyListeners';
@@ -58,7 +58,7 @@ export interface UndoAction {
    *  `!create`, `!delete`, `!duplicate`, `!reparent`, `!transform`. Defaults to
    *  `!edit` (or `!select` when `_isSelection`). Only affects the journal sigil; the
    *  undo/redo of this action still emit `!undo`/`!redo`. */
-  kind?: string;
+  kind?: EditorJournalType;
   /** Extra structured journal payload for NON-trait-edit events (structural /
    *  transform) — e.g. `{ entities: [guid] }` for a delete, `{ entity, from, to }`
    *  for a reparent. Merged into the emitted event and snapshot-cloned at emit so the
@@ -627,12 +627,30 @@ const _histories = new Map<string, { undo: UndoAction[]; redo: UndoAction[] }>()
 /** Save the active stacks under the current key and load `key`'s stacks (empty
  *  on first visit). Used at genuine scene/context switches in place of
  *  clearHistory — so a returning scene restores its history. No-op if already
- *  on `key`. */
-export function swapHistory(key: string) {
-  if (key === _activeKey) return;
+ *  on `key`, unless one of the options below says the stacks are stale.
+ *
+ *  ⚠️ A parked stack is only valid on a world that matches the one it was recorded against
+ *  (#1409). A scene reloads FROM DISK, so that holds only when the outgoing world was CLEAN:
+ *  - `discardOutgoing` — the outgoing world had unsaved edits that this swap throws away, so its
+ *    stacks describe a state that no longer exists anywhere. They are DROPPED, not parked (except
+ *    `_isFileDirect` asset edits, which the swap does not touch — `parkSurvivors`) — and
+ *    that applies on a same-key reload too, which is exactly the case the early return used to
+ *    skip: one undo after a discard-reload replayed the discarded work onto the fresh world.
+ *  - `freshIncoming` — the incoming world is built from nothing (Create Scene's starter), so no
+ *    world entry recorded under `key` can match it (asset edits again survive). */
+export function swapHistory(
+  key: string,
+  { discardOutgoing = false, freshIncoming = false }: { discardOutgoing?: boolean; freshIncoming?: boolean } = {},
+) {
+  if (key === _activeKey && !discardOutgoing && !freshIncoming) return;
   _coalesce = null; // a context switch ends any in-flight edit chain
-  _histories.set(_activeKey, { undo: [...undoStack], redo: [...redoStack] });
+  if (discardOutgoing) parkSurvivors(_activeKey, undoStack, redoStack);
+  else _histories.set(_activeKey, { undo: [...undoStack], redo: [...redoStack] });
   _activeKey = key;
+  if (freshIncoming) {
+    const parked = _histories.get(key);
+    if (parked) parkSurvivors(key, parked.undo, parked.redo);
+  }
   const next = _histories.get(key);
   undoStack.length = 0;
   redoStack.length = 0;
@@ -641,6 +659,24 @@ export function swapHistory(key: string) {
     redoStack.push(...next.redo);
   }
   notifyUndoChanged();
+}
+
+/** Park only the entries that outlive a discarded world: `_isFileDirect` ones (material, clip,
+ *  particle, skin, timeline… edits), whose target is a file the swap does not touch. Dropping them
+ *  with the world's entries would strand an asset edit with no undo (#1409 review). Relative order
+ *  is kept, and an empty result parks nothing. */
+function parkSurvivors(key: string, undo: readonly UndoAction[], redo: readonly UndoAction[]) {
+  const u = undo.filter((a) => a._isFileDirect);
+  const r = redo.filter((a) => a._isFileDirect);
+  if (u.length || r.length) _histories.set(key, { undo: u, redo: r });
+  else _histories.delete(key);
+}
+
+/** Drop the stacks kept for `key`, so the next visit starts empty. For a file whose content was
+ *  replaced wholesale (an agent Save As over it, #1414): its old entries name guids the new
+ *  content does not have. No-op for the active key — that history is the live one. */
+export function forgetHistory(key: string): void {
+  if (key !== _activeKey) _histories.delete(key);
 }
 
 /** Test-only: reset the context map + active key. */

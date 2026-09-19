@@ -6,7 +6,7 @@ See also [Architecture](./architecture.md).
 
 ## Standalone Capacitor Plugin Pattern (iOS SPM)
 
-Every native SDK is wrapped in its own Capacitor plugin package. Post-#29 a plugin lives in one of two places. **Shared** plugins live under `engine/packages/` (`capacitor-game-debug`, `capacitor-modoki-ota`, `capacitor-modoki-iap`, `capacitor-appsflyer`, `capacitor-applovin-max`) and reach each consuming game as a vendored tarball ([cross-game-infrastructure.md](./cross-game-infrastructure.md) § "The vendoring pipeline, and why it is tarballs"). **Per-game** plugins live under `games/<id>/packages/capacitor-*/` (e.g. `games/3d-test/packages/capacitor-adjust`). ⚠️ `games/3d-test/packages/capacitor-applovin-max` is a per-game **fork** of the engine plugin: identical when Court's copy was promoted in #931, and deliberately not switched over, because vendoring it would put MAX into 3d-test's native build, where blank unit ids crash at init (#510). A package contains:
+Every native SDK is wrapped in its own Capacitor plugin package. Post-#29 a plugin lives in one of two places. **Shared** plugins live under `engine/packages/` (`capacitor-game-debug`, `capacitor-modoki-ota`, `capacitor-modoki-iap`, `capacitor-appsflyer`, `capacitor-applovin-max`, `capacitor-modoki-system`) and reach each consuming game as a vendored tarball ([cross-game-infrastructure.md](./cross-game-infrastructure.md) § "The vendoring pipeline, and why it is tarballs"). **Per-game** plugins live under `games/<id>/packages/capacitor-*/` (e.g. `games/3d-test/packages/capacitor-adjust`). ⚠️ `games/3d-test/packages/capacitor-applovin-max` is a per-game **fork** of the engine plugin: identical when Court's copy was promoted in #931, and deliberately not switched over, because vendoring it would put MAX into 3d-test's native build, where blank unit ids crash at init (#510). A package contains:
 
 - `Package.swift` — declares the native SDK as a **Swift Package Manager (SPM)** dependency (e.g. `AppLovin-MAX-Swift-Package`, `adjust/ios_sdk`).
 - `*.podspec` — CocoaPods fallback manifest (SPM is the primary path).
@@ -33,15 +33,26 @@ Mixing CocoaPods and SPM produces duplicate-framework conflicts. Any SDK that ha
 
 ### iOS SPM static-linking gotcha
 
-SPM static linking **strips plugin classes that have no external framework dependencies**. The class compiles and links, then is simply absent at runtime, so Capacitor reports `"GameDebug" plugin is not implemented on ios`. `capacitor-game-debug` and `capacitor-modoki-ota` both hit this — each must be registered manually in `MyViewController` (`bridge?.registerPluginInstance(...)`, which keeps the class alive), plus an Xcode file reference from the App target to the plugin source (project-relative path in the pbxproj, no copy). Edit the package source only.
+SPM static linking **stripped `GameDebugPlugin` and `ModokiOtaPlugin`**: the class compiled and linked, then was simply absent at runtime, so Capacitor reported `"GameDebug" plugin is not implemented on ios`. The explanation once given — plugin classes with no external framework dependency get stripped — is contradicted on hardware (below), so treat the cause as unknown. `capacitor-game-debug` and `capacitor-modoki-ota` both hit this — each must be registered manually in `MyViewController` (`bridge?.registerPluginInstance(...)`, which keeps the class alive), plus an Xcode file reference from the App target to the plugin source (project-relative path in the pbxproj, no copy). Edit the package source only.
 
 ⚠️ **Only the game-debug half is generated.** `engine/plugins/healNativeConfig.ts` writes the pbxproj reference and the fenced registration block for `GameDebugPlugin` in every project; it contains **no OTA wiring at all**. `capacitor-modoki-ota`'s pbxproj refs and its `ModokiOtaPlugin` registration are **hand-maintained, in `games/ota-test` only** — the heal is deliberately fenced rather than whole-file precisely because that project hand-extends `MyViewController.swift` with an OTA boot hook (see the comment on `healNativeConfig.ts`'s `healIosGameDebugRegistration`). So regenerating that project's iOS — `cap add ios`, or deleting `ios/` after a native-config problem — restores the GameDebug wiring and **silently drops OTA**. Re-add it by hand and verify the plugin registers.
+
+**`MyViewController.swift` carries a SECOND fenced block**, `modoki:text-interaction-{begin,end}`, which disables the web view's text interaction to kill the iOS double-tap selection magnifier over the game (#1360). Unlike the game-debug fence it is **not** gated on `build.debugBuild` or on `usesGameDebug` — the magnifier is equally wrong in a release build of a project with no debug bridge — and it sits at class-body scope rather than inside `viewDidLoad`, because it is a method override. Guarded by `engine/tests/architecture/iosTextInteraction.test.ts`; the measurement, and the `<input>` constraint it carries, are in [input.md](./input.md) § "The iOS text-selection magnifier".
 
 ⚠️ **Those plugins' `package.json` therefore declares `"capacitor": { "android": … }` with NO `ios` entry, and that is DELIBERATE.** The App target already compiles the `.swift` directly; adding an `ios` entry makes `cap sync ios` *also* add the SPM package, so the plugin class lands in two modules — **one `@objc` runtime class name with two implementations**. (What that then does at runtime has not been observed: the ObjC runtime resolves one name to one implementation, so expect a duplicate-class warning and a nondeterministic winner rather than, say, two `NWListener`s both binding :9095. The defect is the duplication; the symptom is unverified.)
 
 **The reading that misleads:** `npx cap sync ios` reports one fewer plugin than `cap sync android` (5 vs 6 on a typical project), because the count cannot see the pbxproj road. That gap is expected, not a defect — it was filed as one in #368, where the proposed one-line fix would have broken every iOS build it meant to repair. Guarded by `engine/tests/architecture/capacitorPlatformDeclarations.test.ts`.
 
 `capacitor-modoki-iap` is the contrasting case: it goes through SPM normally and correctly declares both platforms, and it is verified working (real store sandboxes on hardware, 2026-08-12). Note its own `Package.swift` header is deliberately agnostic about *why* — do not read it as a rule that "a system framework import is enough to keep the class"; that causal claim is untested.
+
+⚠️ **`capacitor-modoki-system` is a counter-example to the headline rule, observed on hardware** (#1204,
+iPad mini 5, iOS 26.6.2, 2026-09-14). `ModokiSystemPlugin` imports only Capacitor and UIKit, goes through
+plain SPM with both platforms declared and no manual registration, and `isPluginAvailable('ModokiSystem')`
+answered `true` with its native call working. Capacitor's own SPM plugins (haptics, local-notifications,
+app, preferences…) have the same shape and work too. So "no external framework dependency ⇒ stripped" is
+NOT the discriminator; why `GameDebugPlugin` and `ModokiOtaPlugin` were stripped remains unexplained. Do not
+move a new plugin to manual registration on the strength of that sentence — build it and check
+`isPluginAvailable` on a device first.
 
 A third case, `capacitor-litert-lm` — a podspec whose MediaPipe dependencies `Package.swift` could not
 declare, so it claimed `android` only — was deleted with its two games in #1191. The
@@ -690,7 +701,7 @@ realm genuinely must re-register. Where each of the named ones stands (a third, 
 | Latch | Guards | Status |
 |---|---|---|
 | `ads.ts:initialized` | AppLovin (native) | **Covered** — #587's `app.cleanup` task tears the SDK down before the reload |
-| `attribution.ts:initialized`/`starting`/`attPrompted` | AppsFlyer + ATT (native) | **Guarded natively — #607.** The JS latches still die with the realm and `AttributionService` still declares only `init()`, so nothing tears them down; instead the invariant moved to where the state actually lives — a per-process static in the plugin's `start()`, on both ports. ⚠️ `initialize()` is deliberately still unguarded (the SDK declines to re-set its read-only devKey/appId). **RECONCILED on Android, 2026-09-04** — the "two launch events across a reload" reading this row used to carry is REFUTED as an attribution: a re-measurement on an S22 with the guard absent from the binary showed the reload's `start()` posts NO Launch, and that the second Launch came from the RESUME that followed. AppsFlyer's Launch is driven by the foreground transition, not by `start()`. So the guard is inert for Launch counts (it still stops a second `registerSessionReadyListener`). **iOS across a reload is still unmeasured.** Full run + the limits: `games/court/attribution.md` § "#607/#654 — the Android leg measured" (private) |
+| `attribution.ts:initialized`/`starting`/`attPrompted` (closure state in `createAttribution`, `runtime/core/attribution.ts`, since #1332) | AppsFlyer + ATT (native) | **Guarded natively — #607.** The JS latches still die with the realm and `AttributionService` still declares only `init()`, so nothing tears them down; instead the invariant moved to where the state actually lives — a per-process static in the plugin's `start()`, on both ports. ⚠️ `initialize()` is deliberately still unguarded (the SDK declines to re-set its read-only devKey/appId). **RECONCILED on Android, 2026-09-04** — the "two launch events across a reload" reading this row used to carry is REFUTED as an attribution: a re-measurement on an S22 with the guard absent from the binary showed the reload's `start()` posts NO Launch, and that the second Launch came from the RESUME that followed. AppsFlyer's Launch is driven by the foreground transition, not by `start()`. So the guard is inert for Launch counts (it still stops a second `registerSessionReadyListener`). **iOS across a reload is still unmeasured.** Full run + the limits: `games/court/attribution.md` § "#607/#654 — the Android leg measured" (private) |
 
 `milestones.ts:started` looks like the same shape and is not: its `fired` ledger lives in
 `PlayerPrefs`, so a re-run is idempotent. That is the distinction to apply — not "is it a module
@@ -1023,15 +1034,18 @@ AppsFlyer 7.0.2, capacitor-swift-pm 8.4 / 8.5):
 
 | Ships its own manifest | Does not |
 |---|---|
-| Capacitor and CapacitorCordova (both empty) · AppsFlyerLib (tracking + domains, UserDefaults, FileTimestamp) · FirebaseCore, CoreInternal, Crashlytics, Auth, Installations, Firestore · GoogleUtilities · GoogleDataTransport · grpc · leveldb · gtm-session-fetcher · nanopb · promises · abseil · AppAuth · GTMAppAuth · GoogleSignIn · ~~Facebook (tracking)~~ stripped from the graph by #1062 | **`@capacitor/preferences`**, which calls `UserDefaults.standard` · the `@capacitor-firebase/*` and `capacitor-appsflyer` wrappers (no required-reason calls) · `capacitor-modoki-iap` · `GameDebugPlugin.swift` · **GoogleAppMeasurement** and GoogleAdsOnDeviceConversion (binary artifacts; no manifest in the checkout or the artifact) |
+| Capacitor and CapacitorCordova (both empty) · **GoogleMobileAds** and **UserMessagingPlatform** (Weaveling, #1309 — collected data and required-reason APIs declared, checked in the resolved artifacts 2026-09-17) · AppsFlyerLib (tracking + domains, UserDefaults, FileTimestamp) · FirebaseCore, CoreInternal, Crashlytics, Auth, Installations, Firestore · GoogleUtilities · GoogleDataTransport · grpc · leveldb · gtm-session-fetcher · nanopb · promises · abseil · AppAuth · GTMAppAuth · GoogleSignIn · ~~Facebook (tracking)~~ stripped from the graph by #1062 | **`@capacitor/preferences`**, which calls `UserDefaults.standard` · the `@capacitor-firebase/*` and `capacitor-appsflyer` wrappers (no required-reason calls) · `capacitor-modoki-iap` · `GameDebugPlugin.swift` · **GoogleAppMeasurement** and GoogleAdsOnDeviceConversion (binary artifacts; no manifest in the checkout or the artifact) |
 
 - **Required-reason APIs: UserDefaults `CA92.1` only**, for `@capacitor/preferences`. The app
   target's own Swift uses none. The guard derives this from each game's `package.json`.
 - **Tracking: `false`, with no domains.** The SDKs that track (AppsFlyer; Facebook in Court's graph
   until #1062 stripped it) declare it in their own manifests.
-- **Collected data: only the game's OWN first-party collection** (owner, 2026-09-11). Court declares
-  User ID, Gameplay Content and Purchase History (its Firestore cloud save), each linked, App
-  Functionality, not tracking. Weaveling declares none today; revisit when #927, #925 or #932 lands.
+- **Collected data: only the game's OWN first-party collection** (owner, 2026-09-11). Both games
+  declare User ID, Gameplay Content and Purchase History (their Firestore cloud save), each linked,
+  App Functionality, not tracking. Weaveling's were added by #1389 once sign-in (#927), purchases (#925)
+  and cloud save (#679) landed, each confirmed against a sender in its own code: the save keyed by the account uid,
+  the progress/settings sync groups, and the `wordweave.purchases` group's receipts. Ads (#932)
+  added no row — AdMob and UMP declare their own.
 - ⚠️ **GoogleAppMeasurement ships no manifest, so Firebase Analytics' own collection is declared by
   nothing in the graph.** That is App Store privacy-label work (#933), not something to paper over
   in the app's manifest. Confirmed in a built Court `App.app`, whose bundle carries ~45 SDK
@@ -1300,6 +1314,27 @@ harmless.
 
 Full build/deploy commands live in [build.md](./build.md) and the project `CLAUDE.md`.
 
+### Patched third-party plugins — `patch-package`, per project (#1333)
+
+When a third-party plugin is wrong in its **native** code and upstream has no fix, the project that
+depends on it carries a `patch-package` patch (owner ruling, 2026-09-17). Forking the plugin into
+`engine/packages/` was the rejected alternative: it takes the upgrade path over from upstream.
+
+- **The patch lives in the game:** `games/<id>/patches/<pkg>+<version>.patch`, applied by a
+  `postinstall: "patch-package"` in the game's own `package.json`. That keeps the game
+  self-contained (#29). Both install paths run it: `bootstrap-game-deps.mjs` and the editor's
+  `ensureProjectDeps` each run a bare `npm install`/`npm ci` with scripts on.
+- **Pin the plugin EXACTLY.** A caret lets npm move the plugin under a version-named patch.
+- **Generate with `--include`** (`npx patch-package <pkg> --include '^ios/Sources/'`). Without it the
+  patch sweeps in any local build output under the package, such as `android/build/`.
+- ⚠️ **`patch-package` exits 0 on a failed apply outside CI**, so a failed patch never fails an
+  install. Each patch therefore needs an engine guard that reads the INSTALLED copy. It also only
+  runs on a bare `npm install`: `npm install <pkg>` skips the project's own `postinstall`.
+
+The one live case is `@capacitor-community/admob` in Court and Weaveling, which fixes iOS paid-event
+revenue units ([Court ads.md](../games/court/ads.md) § "Ad revenue stops at Firebase"). Its guard is
+`engine/tests/architecture/admobRevenueUnitPatched.test.ts`.
+
 ## App Identity & Build
 
 **Per-game identity (#29).** There is no single shared app identity — each flat project
@@ -1346,7 +1381,7 @@ Notes: first build is slow (SPM downloads all SDK frameworks); use exact device 
 MODOKI_PROJECT=games/<id> npm run build -- --target native
 (cd games/<id> && npx cap sync android)
 eval "$(node engine/scripts/print-toolchain-env.mjs)"   # JAVA_HOME + ANDROID_HOME, resolved as the editor does
-games/<id>/android/gradlew -p games/<id>/android assembleDebug
+games/<id>/android/gradlew -p games/<id>/android assembleDebug $(cat games/<id>/android/.gradle/modoki-build-number.args)
 adb install games/<id>/android/app/build/outputs/apk/debug/app-debug.apk
 ```
 Notes: requires **JDK 21** (Capacitor 8 / AGP); Gradle heap is the stock **`-Xmx1536m`** (raise it, e.g. to 4GB, only when a game bundles the 12 mediation adapters); the device must show as `device` (not `unauthorized`) in `adb devices`. A game with no `ios/`/`android/` yet must scaffold it first (`cd games/<id> && npx cap add ios|android`).

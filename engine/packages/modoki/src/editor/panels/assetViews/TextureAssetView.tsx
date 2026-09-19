@@ -19,6 +19,8 @@ import { useAssetInvalidationEpoch } from '../useAssetInvalidationEpoch';
 import { parkMetaEdit, readMetaPreferringPark, flushPendingMetaFor } from '../../scene/pendingMeta';
 import { useMetaDirty } from '../useMetaDirty';
 import { UnsavedMetaBadge } from './UnsavedMetaBadge';
+import { useMissingLocalStats } from '../useMissingLocalStats';
+import { sumMeasured, MISSING_STATS_HINT } from './measuredStats';
 
 const TEXTURE_TYPE_OPTIONS: { value: TextureType; label: string }[] = [
   { value: '3d', label: '3D — model / material (mipmapped, KTX2)' },
@@ -179,6 +181,9 @@ export function TextureSettingsControls({ type, settings, mixed, onChangeType, o
 export function TextureAssetView({ path, name }: { path: string; name: string }) {
   // #870: a parked import-settings edit was invisible in the panel that MADE it.
   const metaDirty = useMetaDirty(path);
+  // #1305: this host holds no measurement for some of the rows below — say so rather than
+  // render a blank (or, as texture and model once did, a defaulted 0 B).
+  const statsIncomplete = useMissingLocalStats(path, 'textureCache');
   const [meta, setMeta] = useState<Record<string, unknown> | null>(null);
   const [settings, setSettings] = useState<TextureImportSettings>(DEFAULT_TEXTURE_SETTINGS);
   const [type, setType] = useState<TextureType>('3d');
@@ -364,7 +369,7 @@ export function TextureAssetView({ path, name }: { path: string; name: string })
       >
         {importing ? 'Converting...' : converted ? 'Re-import' : 'Apply'}
       </button>
-      {converted && <TextureImportedStats cache={meta?.textureCache as TextureCacheInfo | undefined} />}
+      {converted && <TextureImportedStats cache={meta?.textureCache as TextureCacheInfo | undefined} incomplete={statsIncomplete} />}
 
       <div style={sectionStyle}>Sprites</div>
       <button
@@ -384,7 +389,7 @@ export function TextureAssetView({ path, name }: { path: string; name: string })
 
 /** Post-conversion stats read back from the meta sidecar: actual (snapped)
  *  dimensions, baked mip levels, and on-disk size per produced variant. */
-function TextureImportedStats({ cache }: { cache: TextureCacheInfo | undefined }) {
+function TextureImportedStats({ cache, incomplete }: { cache: TextureCacheInfo | undefined; incomplete?: boolean }) {
   const rowStyle: React.CSSProperties = { display: 'flex', justifyContent: 'space-between', fontSize: '11px', padding: '1px 0' };
   const labelStyle: React.CSSProperties = { color: '#888' };
   const valStyle: React.CSSProperties = { color: '#ccc' };
@@ -394,7 +399,13 @@ function TextureImportedStats({ cache }: { cache: TextureCacheInfo | undefined }
     return <div style={{ color: '#666', fontSize: '10px', marginTop: 4 }}>Converted ✓ — re-import to compute stats</div>;
   }
   const bytes = cache.variantBytes ?? {};
-  const total = Object.values(bytes).reduce((a, b) => a + (b ?? 0), 0);
+  // ⚠️ `undefined` is NOT zero here, and defaulting it was the worse half of #1305. `variantBytes`
+  // is peeled into the gitignored local sidecar, so on a machine that has never re-derived it this
+  // reduce ran over `{}` and the Total row asserted a confident **0 B** — across 216 of 282
+  // committed texture blocks in this repo. A row that renders '—' is honest about not knowing; a
+  // row that renders 0 B is the Inspector reporting a measurement it does not have. The per-variant
+  // rows below already rendered '—' for an absent entry; only the Total did not.
+  const total = sumMeasured(Object.values(bytes));
   return (
     <>
       <div style={sectionStyle}>Imported</div>
@@ -405,8 +416,13 @@ function TextureImportedStats({ cache }: { cache: TextureCacheInfo | undefined }
         <div key={v} style={rowStyle}><span style={labelStyle}>{v}</span><span style={valStyle}>{bytes[v] !== undefined ? formatBytes(bytes[v]!) : '—'}</span></div>
       ))}
       <div style={{ ...rowStyle, borderTop: '1px solid #333', marginTop: 2, paddingTop: 3 }}>
-        <span style={{ ...labelStyle, color: '#aaa' }}>Total</span><span style={{ ...valStyle, color: '#fff' }}>{formatBytes(total)}</span>
+        <span style={{ ...labelStyle, color: '#aaa' }}>Total</span><span style={{ ...valStyle, color: '#fff' }}>{total !== undefined ? formatBytes(total) : '—'}</span>
       </div>
+      {incomplete && (
+        <div style={{ color: '#8a7', fontSize: '10px', marginTop: 4 }} data-ui-id="assetView.stats.incomplete">
+          {MISSING_STATS_HINT}
+        </div>
+      )}
     </>
   );
 }

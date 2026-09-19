@@ -10,7 +10,7 @@
  *  `convertModel` — derives a NEW optimized GLB into the gitignored model cache
  *  and NEVER touches the committed source:
  *    1. resize embedded textures to the texture setting's maxSize (downscale)
- *    2. KTX2-compress them (gltf-transform `uastc`/`etc1s`, via toktx)
+ *    2. KTX2-compress them (gltf-transform `uastc`/`etc1s`, via KTX-Software's `ktx` pinned beside toktx)
  *    3. meshopt-compress geometry + animation (EXT_meshopt_compression — the
  *       runtime already wires MeshoptDecoder)
  *  All passes preserve skinning + clips.
@@ -29,31 +29,32 @@ import os from 'os';
 import path from 'path';
 import { createHash } from 'crypto';
 import { execFileSync } from 'child_process';
-import { detect as detectTool, withToolOnPath, resetToolchainCache, gltfTransformInvocation, spawnable } from '../toolchain';
+import { detect as detectTool, forgetDetection, withToolOnPath, resetToolchainCache, gltfTransformInvocation, spawnable } from '../toolchain';
 import { resolveUastcLevel, resolveUastcRdoLambda, type TextureImportSettings } from '../packages/modoki/src/runtime/loaders/textureSettings';
 import {
   getModelCacheDir, processedCachePath, cacheDirFor, cacheHit, MODEL_PIPELINE_VERSION,
 } from './model-cache';
+import type { ConversionFailure } from './asset-conversion-strict';
 
 /** Bump when the conversion recipe changes (passes, flags, tool expectations)
  *  so the content hash changes and previously-derived cache GLBs regenerate.
- *  v2: added the submesh-merge pass (joinPrimitives by material). */
-export const RIGGED_ENCODER_VERSION = 2;
+ *  v2: added the submesh-merge pass (joinPrimitives by material).
+ *  v3 (#1337/#1351): retires entries a swallowed KTX2 failure published as raw textures under the
+ *  with-toktx key, and ones an unpinned PATH `ktx` encoded — neither is distinguishable by its key. */
+export const RIGGED_ENCODER_VERSION = 3;
 
 const GLTF_TRANSFORM_MISSING_MSG =
   "@gltf-transform/cli not found. Install it from the editor's Build Support dialog, or `npm i -D @gltf-transform/cli`.";
 const TOKTX_MISSING_MSG =
-  'toktx (KTX-Software CLI) not found on PATH — needed for KTX2 texture compression. ' +
-  (process.platform === 'win32'
-    ? 'Install the Windows release from https://github.com/KhronosGroup/KTX-Software/releases (toktx.exe + ktx.dll on PATH).'
-    : process.platform === 'darwin'
-      ? 'Install the macOS package from https://github.com/KhronosGroup/KTX-Software/releases'
-      : 'Install the Linux package from https://github.com/KhronosGroup/KTX-Software/releases');
+  'toktx (KTX-Software CLI) is not provisioned — needed for KTX2 texture compression. Asset conversion ' +
+  'uses only the pinned copy, never one on PATH (#1327): install it from Build → Build Support…, or run ' +
+  '`npm run toolchain:install -- toktx msdf-atlas-gen`.';
 
 let gltfTransformOk: boolean | null = null;
 let gltfTransformVersion = '';
 let toktxOk: boolean | null = null;
 let toktxVersion = '';
+let toktxDir = '';
 
 /** For tests — forget cached CLI-availability probes. */
 export function __resetRiggedCliChecks(): void {
@@ -61,6 +62,7 @@ export function __resetRiggedCliChecks(): void {
   gltfTransformVersion = '';
   toktxOk = null;
   toktxVersion = '';
+  toktxDir = '';
   resetToolchainCache();
 }
 
@@ -86,23 +88,43 @@ function ensureGltfTransformCli(): void {
  *  other). Resolves toktx via the shared toolchain, honouring MODOKI_TOKTX (the packaged
  *  editor's bundled binary) — NOT bare `toktx` on PATH, which is absent in a dmg. */
 function probeToktx(): boolean {
-  if (toktxOk === null) {
+  // A MISS is not cached: toktx is pinned (#1327), so a machine that used to rely on a PATH copy
+  // starts without one and gets it from Build Support / `toolchain:install` mid-session — possibly
+  // in the other process. A cached miss would ship raw textures until the editor restarted.
+  if (!toktxOk) {
+    // Forget FIRST: the shared detect cache may hold a miss another caller left there
+    // (pinnedConversionCli leaves one after a failed conversion).
+    forgetDetection('toktx');
     const d = detectTool('toktx');
     toktxOk = d.present;
     toktxVersion = d.version ?? '';
+    toktxDir = d.dir ?? (d.command ? path.dirname(d.command) : '');
   }
   return toktxOk;
 }
 
-function ensureToktx(): void {
-  if (!probeToktx()) throw new Error(TOKTX_MISSING_MSG);
+/** @gltf-transform/cli 4.4 encodes KTX2 with KTX-Software's `ktx`, looked up on PATH — not `toktx`.
+ *  `withToolOnPath('toktx')` puts the pinned toktx's dir first, so the pinned `ktx` BESIDE it is what
+ *  runs; when that dir has none, the lookup falls through to whatever `ktx` the machine has (an
+ *  unpinned encoder under a key naming the pinned toktx), or to nothing. So the encode requires it
+ *  (#1351). Returns the error to throw, or null. */
+function missingKtxBesideToktx(dir: string): string | null {
+  const ktx = path.join(dir, process.platform === 'win32' ? 'ktx.exe' : 'ktx');
+  if (dir && fs.existsSync(ktx)) return null;
+  return `KTX-Software's \`ktx\` is not provisioned beside toktx${dir ? ` (${dir})` : ''} — gltf-transform encodes ` +
+    'KTX2 with it, and asset conversion never uses one from PATH (#1351). Reinstall the pinned copy: ' +
+    '`npm run toolchain:install -- toktx msdf-atlas-gen`, or Build → Build Support….';
 }
+
+/** For tests — the rigged path's own toktx probe (#1327: a miss must not stick). */
+export { probeToktx as __probeRiggedToktx };
+
 
 function runGltfTransform(args: string[], label: string): void {
   try {
     // Resolve the CLI (packaged userData install → PATH; dev → npx --no-install). Its KTX2 passes
-    // (uastc/etc1s) spawn `toktx` by bare name, so inject the resolved toktx dir into PATH — makes
-    // the packaged bundled toktx (MODOKI_TOKTX) reachable.
+    // (uastc/etc1s) spawn KTX-Software's `ktx` by bare name (gltf-transform 4.4), so inject the
+    // resolved toktx dir into PATH — the pinned/bundled `ktx` sits beside toktx (#1351).
     const inv = gltfTransformInvocation();
     const s = spawnable(inv.command, [...inv.prefixArgs, ...args]);
     execFileSync(s.command, s.args, {
@@ -159,19 +181,30 @@ function ktxSignature(settings: TextureImportSettings): string {
   return cmd ? `${cmd} ${ktxFlags(cmd, settings).join(' ')}` : 'none';
 }
 
-/** Parse a GLB's `extensionsUsed` from its JSON chunk (no full parse / no THREE).
+/** A GLB's JSON chunk, or null for a non-GLB / unparseable one (no full parse / no THREE). */
+function glbJson(buf: Buffer): Record<string, unknown> | null {
+  if (buf.length < 20 || buf.readUInt32LE(0) !== 0x46546c67) return null; // 'glTF' magic
+  const jsonLen = buf.readUInt32LE(12);
+  if (buf.readUInt32LE(16) !== 0x4e4f534a) return null; // first chunk must be 'JSON'
+  try {
+    return JSON.parse(buf.subarray(20, 20 + jsonLen).toString('utf8'));
+  } catch {
+    return null;
+  }
+}
+
+/** Whether a GLB embeds any image — i.e. whether a KTX2 step has anything to encode. An unreadable
+ *  one counts as having images, so a skip is never hidden by a parse failure. Exported for tests. */
+export function glbHasImages(buf: Buffer): boolean {
+  const json = glbJson(buf);
+  return !json || (Array.isArray(json.images) && json.images.length > 0);
+}
+
+/** Parse a GLB's `extensionsUsed` from its JSON chunk.
  *  Returns [] for a non-GLB or a glTF without the array. Exported for tests. */
 export function glbExtensionsUsed(absPath: string): string[] {
-  const buf = fs.readFileSync(absPath);
-  if (buf.length < 20 || buf.readUInt32LE(0) !== 0x46546c67) return []; // 'glTF' magic
-  const jsonLen = buf.readUInt32LE(12);
-  if (buf.readUInt32LE(16) !== 0x4e4f534a) return []; // first chunk must be 'JSON'
-  try {
-    const json = JSON.parse(buf.subarray(20, 20 + jsonLen).toString('utf8'));
-    return Array.isArray(json.extensionsUsed) ? json.extensionsUsed : [];
-  } catch {
-    return [];
-  }
+  const json = glbJson(fs.readFileSync(absPath));
+  return json && Array.isArray(json.extensionsUsed) ? json.extensionsUsed : [];
 }
 
 /** Run the rigged optimization passes from `absInput` → `absOutput`, driven by
@@ -244,7 +277,7 @@ export function meshoptDroppedBasisu(basisuBeforeMeshopt: boolean, outputExtensi
   return basisuBeforeMeshopt && !outputExtensions.includes('KHR_texture_basisu');
 }
 
-async function runRiggedPipeline(absInput: string, absOutput: string, settings: TextureImportSettings): Promise<{ ktx2Applied: boolean; meshoptApplied: boolean }> {
+async function runRiggedPipeline(absInput: string, absOutput: string, settings: TextureImportSettings, toktxAtKey: boolean, toktxDirAtKey: string): Promise<{ ktx2Applied: boolean; meshoptApplied: boolean }> {
   ensureGltfTransformCli();
   let ktx2Applied = false;
   let meshoptApplied = true;
@@ -272,21 +305,27 @@ async function runRiggedPipeline(absInput: string, absOutput: string, settings: 
     let texInput = afterResize;
 
     // 2. KTX2 textures per settings.format (UASTC default — high quality, cheap
-    //    transcode to ASTC/BC7 on device). Needs toktx on PATH. Skipped
-    //    gracefully (keep raw textures, still meshopt) when toktx is missing,
-    //    the encode fails, or the format is a non-KTX2 (webp/png) one.
+    //    transcode to ASTC/BC7 on device). Needs the provisioned toktx. Skipped
+    //    (keep raw textures, still meshopt) when toktx is missing or the format is a
+    //    non-KTX2 (webp/png) one; an encode that FAILS with toktx present throws (#1337).
     const ktxCmd = ktxCommandFor(settings.format);
     if (ktxCmd) {
       try {
-        ensureToktx();
+        if (!toktxAtKey) throw new Error(TOKTX_MISSING_MSG);
+        const noKtx = missingKtxBesideToktx(toktxDirAtKey);
+        if (noKtx) throw new Error(noKtx);
         runGltfTransform([ktxCmd, texInput, afterTex, ...ktxFlags(ktxCmd, settings)], ktxCmd);
         texInput = afterTex;
         ktx2Applied = true;
       } catch (e) {
-        // NOTE: when toktx is missing the derived GLB ships with RAW textures. The
-        // cache key (riggedHash) includes the toktx version (empty when missing),
-        // so this no-toktx output caches under a distinct key and won't be reused
-        // by a machine that has toktx. (C3)
+        // toktx PRESENT but the encode failed: refuse. The cache key already names that toktx, so
+        // publishing the raw-texture GLB here would make every later import a cache hit on it (#1337).
+        // Throwing discards the staging dir; the build records a conversion failure and a dev
+        // reimport surfaces the error.
+        if (toktxAtKey) throw e;
+        // toktx MISSING: the derived GLB carries RAW textures, cached under the distinct `toktx:` key
+        // (riggedHash) so a machine that has toktx never reuses it (C3). convertRiggedModel reports
+        // it as `ktx2Skipped` so the production build's strict gate can refuse it.
         console.warn(`[rigged-optimize] KTX2 texture compression SKIPPED (shipping raw textures): ${e instanceof Error ? e.message : e}`);
       }
     }
@@ -369,6 +408,17 @@ export interface ConvertRiggedResult {
   processedPath: string;
   /** On-disk byte size of the derived GLB. */
   bytes: number;
+  /** Set when the settings ask for KTX2 but the GLB carries RAW textures because toktx is not
+   *  provisioned — true of a cache hit on such an output too. The build turns it into a
+   *  conversion failure (#1337); dev keeps the model loading. */
+  ktx2Skipped?: string;
+}
+
+/** The strict-gate entry a converted rigged model owes the production build, or null. Raw textures
+ *  under a KTX2 format (toktx not provisioned) ship so the model loads, but they are an unoptimized
+ *  production asset, so the gate must see them (#1337). */
+export function riggedConversionFailure(virtualPath: string, conv: Pick<ConvertRiggedResult, 'ktx2Skipped'>): ConversionFailure | null {
+  return conv.ktx2Skipped ? { virtualPath, kind: 'rigged model', error: `KTX2 skipped — ${conv.ktx2Skipped}` } : null;
 }
 
 /** Derive the optimized rigged GLB into the content-addressed model cache (the
@@ -382,13 +432,20 @@ export async function convertRiggedModel(opts: ConvertRiggedOptions): Promise<Co
   const srcBytes = fs.readFileSync(absSource);
   // Probe toktx now (best-effort, no throw) so the cache key reflects whether KTX2
   // will run + which toktx produced it (C3). Only relevant when the format is KTX2.
-  if (ktxCommandFor(settings.format)) probeToktx();
-  const hash = riggedHash(srcBytes, settings, { gltfTransform: gltfTransformVersion, toktx: toktxVersion });
+  // Captured ONCE, with the version the key names: the module globals can change under a concurrent
+  // import across the awaits below, and the encode must follow the key (#1327).
+  const toktxAtKey = ktxCommandFor(settings.format) ? probeToktx() : false;
+  const toktxDirAtKey = toktxDir;
+  const hash = riggedHash(srcBytes, settings, { gltfTransform: gltfTransformVersion, toktx: toktxAtKey ? toktxVersion : '' });
   const cacheDir = getModelCacheDir(projectRoot);
   const outPath = processedCachePath(cacheDir, sourceUrlPath, hash);
+  // An encode that fails WITH toktx throws (never published), so a result under a KTX2 format is
+  // raw exactly when toktx was missing at key time — which the key itself records.
+  // A textureless rig has nothing to skip (the skinned-test primitives are vertex-coloured).
+  const ktx2Skipped = ktxCommandFor(settings.format) && !toktxAtKey && glbHasImages(srcBytes) ? TOKTX_MISSING_MSG : undefined;
 
   if (cacheHit(cacheDir, sourceUrlPath, hash, 1)) {
-    return { hash, cached: true, processedPath: outPath, bytes: fs.statSync(outPath).size };
+    return { hash, cached: true, processedPath: outPath, bytes: fs.statSync(outPath).size, ktx2Skipped };
   }
 
   // Atomic publish: encode into a staging dir sibling to the final hash dir,
@@ -405,7 +462,7 @@ export async function convertRiggedModel(opts: ConvertRiggedOptions): Promise<Co
     // (on a CLI version that drops it) the pipeline falls back to the pre-meshopt
     // KTX2 GLB. meshoptApplied=false means that fallback fired — the cached GLB is
     // correct (textures intact), just larger (no geometry compression).
-    const { meshoptApplied } = await runRiggedPipeline(absSource, stagedOut, settings);
+    const { meshoptApplied } = await runRiggedPipeline(absSource, stagedOut, settings, toktxAtKey, toktxDirAtKey);
     if (!meshoptApplied) {
       console.warn(`[rigged-optimize] ${sourceUrlPath}: cached WITHOUT meshopt geometry compression (basisu-preserving fallback).`);
     }
@@ -422,7 +479,7 @@ export async function convertRiggedModel(opts: ConvertRiggedOptions): Promise<Co
       if (!fs.existsSync(outPath)) fs.copyFileSync(stagedOut, outPath);
       renamed = true;
     }
-    return { hash, cached: false, processedPath: outPath, bytes };
+    return { hash, cached: false, processedPath: outPath, bytes, ktx2Skipped };
   } finally {
     if (!renamed) fs.rmSync(stagingDir, { recursive: true, force: true });
   }

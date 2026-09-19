@@ -18,8 +18,8 @@
 import { describe, it, expect, afterEach, beforeEach, vi } from 'vitest';
 import { createWorld } from 'koota';
 import { AudioSource } from '../../src/runtime/traits/AudioSource';
-import { audioSystem } from '../../src/runtime/audio/audioSystem';
-import { setAudioRecordMode, clearAudioLog, endRecordedVoices } from '../../src/runtime/audio/audioService';
+import { audioSystem, rearmAudioAutoplay } from '../../src/runtime/audio/audioSystem';
+import { setAudioRecordMode, clearAudioLog, endRecordedVoices, dispose } from '../../src/runtime/audio/audioService';
 import { setPlayState } from '../../src/runtime/core/playState';
 import { stringifyClipBank } from '../../src/runtime/audio/clipBank';
 import { registerAsset, newGuid, clearManifest } from '../../src/runtime/loaders/assetManifest';
@@ -144,5 +144,133 @@ describe('a clip that ENDS advances the playlist — the recovery path', () => {
     endRecordedVoices();
     audioSystem(world!);
     expect(e.get(AudioSource)!.playing).toBe(false);
+  });
+});
+
+describe('shuffleStart — the opening clip (#921)', () => {
+  /** The seam, not the picker: `engine/tests/framework/audioPlaylist.test.ts` owns whether
+   *  `randomStartClip` varies. What this covers is whether `audioSystem` CALLS it, on the right
+   *  frame, and writes the answer onto the trait — the wiring that would otherwise be the one line
+   *  nothing fails for (the #1069 class). */
+  it('opens on a bank entry other than the authored clip when it rolls one', () => {
+    // Forced rather than sampled: Math.random is the only non-determinism, so pinning it makes the
+    // assertion exact instead of "probably different". 0.99 * 4 = index 3.
+    vi.spyOn(Math, 'random').mockReturnValue(0.99);
+    const e = world!.spawn(AudioSource({
+      clip: refs[0], bus: 'music', clips: bank, playlist: 'shuffle', shuffleStart: true, autoplay: true,
+    }));
+    audioSystem(world!);
+    expect(e.get(AudioSource)!.clip).toBe(refs[3]);
+  });
+
+  it('leaves the authored clip alone without the flag — the control', () => {
+    vi.spyOn(Math, 'random').mockReturnValue(0.99);
+    const e = world!.spawn(AudioSource({
+      clip: refs[0], bus: 'music', clips: bank, playlist: 'shuffle', autoplay: true,
+    }));
+    audioSystem(world!);
+    expect(e.get(AudioSource)!.clip).toBe(refs[0]);
+  });
+
+  it('needs a playlist: a bank used as a lookup table still opens on its authored clip', () => {
+    vi.spyOn(Math, 'random').mockReturnValue(0.99);
+    const e = world!.spawn(AudioSource({
+      clip: refs[0], bus: 'music', clips: bank, playlist: 'off', shuffleStart: true, autoplay: true,
+    }));
+    audioSystem(world!);
+    expect(e.get(AudioSource)!.clip).toBe(refs[0]);
+  });
+
+  it('picks ONCE, not on every frame', () => {
+    // The failure this guards against is a re-roll each frame, which would restart the music
+    // constantly. The mock moves after the first frame; the clip must not follow it.
+    const rolls = [0.99, 0.01, 0.01, 0.01, 0.01];
+    let i = 0;
+    vi.spyOn(Math, 'random').mockImplementation(() => rolls[Math.min(i++, rolls.length - 1)]);
+    const e = world!.spawn(AudioSource({
+      clip: refs[0], bus: 'music', clips: bank, playlist: 'shuffle', shuffleStart: true, autoplay: true,
+    }));
+    for (let f = 0; f < 5; f++) audioSystem(world!);
+    expect(e.get(AudioSource)!.clip).toBe(refs[3]);
+  });
+});
+
+/**
+ * #1281 — the walk position is re-derived when `clip` is written from OUTSIDE the playlist.
+ *
+ * The unit suite owns the rotation itself. What only the seam can answer is whether the two REAL
+ * writers reach it: the `audio.setClip` action / a debug bed picker writing the trait directly, and
+ * `rearmAudioAutoplay` — the mobile `pagehide` backstop (#611) — re-arming a `shuffleStart` source
+ * while its playlist state survives untouched. Both used to leave the walk pointing at its old
+ * position, so the next advance served the wrong clip, and could serve the one just playing.
+ *
+ * `sequential` throughout: `shuffle` would need the order pinned as well as the opener, and the
+ * question here is the SEAM, not which permutation came out.
+ */
+describe('a clip written from outside the walk (#1281)', () => {
+  it('advances from the clip that was written, not from where the walk was', () => {
+    const e = world!.spawn(AudioSource({
+      clip: refs[0], bus: 'music', clips: bank, playlist: 'sequential', autoplay: true,
+    }));
+    audioSystem(world!);
+    expect(e.get(AudioSource)!.clip).toBe(refs[0]);
+
+    e.set(AudioSource, { clip: refs[2] });     // the setClip action / a debug picker
+    audioSystem(world!);
+    endRecordedVoices();
+    audioSystem(world!);
+
+    expect(e.get(AudioSource)!.clip, 'the successor of refs[2] is refs[3] — the stale order served refs[1]')
+      .toBe(refs[3]);
+  });
+
+  it('does not serve the same clip twice when the write picks the one coming next', () => {
+    const e = world!.spawn(AudioSource({
+      clip: refs[0], bus: 'music', clips: bank, playlist: 'sequential', autoplay: true,
+    }));
+    audioSystem(world!);
+
+    e.set(AudioSource, { clip: refs[1] });     // exactly the clip the walk was about to play
+    audioSystem(world!);
+    endRecordedVoices();
+    audioSystem(world!);
+
+    expect(e.get(AudioSource)!.clip, 'refs[1] must not play twice in a row').toBe(refs[2]);
+  });
+
+  it('a shuffleStart re-arm walks the order from its NEW opener', () => {
+    // The half that reaches production: `rearmAudioAutoplay` fires from the mobile pagehide
+    // backstop, clears the autoplay guard but not the playlist state, and `shuffleStart` then rolls
+    // a fresh opener into a walk that never noticed. Both rolls are pinned so the assertion is
+    // exact: 0.5 * 4 = index 2 to open on, then 0.0 = index 0 after the re-arm.
+    //
+    // ⚠️ `dispose()` + `endRecordedVoices()` are what make this the PRODUCTION sequence, and the
+    // first version of this test omitted them. `App.tsx`'s `app.cleanup` task calls `audioDispose()`
+    // — which ends every live handle — and only then does `onRealmSurvived` re-arm, so the re-arm
+    // frame ALWAYS arrives with the clip already ended. Without them the test re-armed over a live
+    // voice, a state production never reaches, and it passed while the real path was broken: the
+    // ended clip's advance stepped straight past the opener `randomStartClip` had just rolled and
+    // the source started on its successor. (Record mode has no real handles for `dispose()`'s
+    // `stopAll()` to reach, so `endRecordedVoices()` stands in for what it does to a live one —
+    // the idiom `audioSystem.test.ts`'s own re-arm test uses.)
+    const roll = vi.spyOn(Math, 'random').mockReturnValue(0.5);
+    const e = world!.spawn(AudioSource({
+      clip: refs[0], bus: 'music', clips: bank, playlist: 'sequential', shuffleStart: true, autoplay: true,
+    }));
+    audioSystem(world!);
+    expect(e.get(AudioSource)!.clip, 'opens on refs[2]').toBe(refs[2]);
+
+    dispose();
+    endRecordedVoices();                       // the realm-death false alarm ends every handle…
+    rearmAudioAutoplay(world!);                // …and then re-arms
+    roll.mockReturnValue(0);                   // …and the re-roll opens on refs[0]
+    audioSystem(world!);
+    expect(e.get(AudioSource)!.clip, 're-opens on refs[0] — and PLAYS it, rather than advancing past it')
+      .toBe(refs[0]);
+
+    endRecordedVoices();
+    audioSystem(world!);
+    expect(e.get(AudioSource)!.clip, 'the successor of refs[0] is refs[1] — the stale order served refs[3]')
+      .toBe(refs[1]);
   });
 });

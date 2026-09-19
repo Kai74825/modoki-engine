@@ -26,6 +26,78 @@ vi.mock('pixi.js', () => ({
 
 // Import AFTER the mock is registered.
 const { loadPixiTexture, loadMtsdfAtlasTexture } = await import('../../src/runtime/rendering/pixiTextureLoad');
+const { addDirtyListener } = await import('../../src/runtime/core/renderDirty');
+
+// #1368 G1: the shim is the one Pixi texture store, so the refill wake lives here. A SUCCESSFUL
+// MISS only — a hit must never wake (Scene2D calls through here from its draw path), and neither
+// may a reject (Scene2D's material-sprite path retries a failed url on every dirty frame, #1374,
+// so a reject wake would be a self-sustaining render loop).
+describe('loadPixiTexture — the refill wake (#1368)', () => {
+  beforeEach(() => { load.mockClear(); cacheMap.clear(); });
+
+  it('a miss wakes once, after the load resolves', async () => {
+    const wake = vi.fn();
+    const off = addDirtyListener(wake);
+    const p = loadPixiTexture('/assets/miss.webp');
+    expect(wake, 'not before the texture exists').not.toHaveBeenCalled();
+    await p;
+    off();
+    expect(wake).toHaveBeenCalledTimes(1);
+  });
+
+  it('a cache HIT does not wake', async () => {
+    cacheMap.set('/assets/hit.webp', { source: {} }); // live entry
+    const wake = vi.fn();
+    const off = addDirtyListener(wake);
+    await loadPixiTexture('/assets/hit.webp');
+    await loadPixiTexture('/assets/hit.webp');
+    off();
+    expect(wake).not.toHaveBeenCalled();
+  });
+
+  it('a sourceless corpse counts as a miss, so its refetch wakes', async () => {
+    cacheMap.set('/assets/dead2.webp', { source: null });
+    const wake = vi.fn();
+    const off = addDirtyListener(wake);
+    await loadPixiTexture('/assets/dead2.webp');
+    off();
+    expect(wake).toHaveBeenCalledTimes(1);
+  });
+
+  it('is SINGLE-FLIGHT: calls made while a load is in flight share its one wake (a per-frame caller)', async () => {
+    // Pixi publishes to Assets.cache only on RESOLVE, so every call during the load reads as a miss.
+    // Scene2D's skinned-part path calls once per frame until the texture is live; without the
+    // single-flight owner each call attached its own wake and a slow load landed a burst of them.
+    let land!: (t: unknown) => void;
+    load.mockImplementationOnce(() => new Promise((res) => { land = res; }));
+    const wake = vi.fn();
+    const off = addDirtyListener(wake);
+    const calls = [1, 2, 3, 4, 5].map(() => loadPixiTexture('/assets/slow.webp')); // five frames in flight
+    land({ id: 'slow' });
+    await Promise.all(calls.map((c) => c.catch(() => {})));
+    off();
+    expect(wake).toHaveBeenCalledTimes(1);
+  });
+
+  it('a failed load frees its wake owner, so the retry that succeeds still wakes', async () => {
+    load.mockImplementationOnce(() => Promise.reject(new Error('503')));
+    const wake = vi.fn();
+    const off = addDirtyListener(wake);
+    await expect(loadPixiTexture('/assets/flaky.webp')).rejects.toThrow('503');
+    await loadPixiTexture('/assets/flaky.webp');
+    off();
+    expect(wake).toHaveBeenCalledTimes(1);
+  });
+
+  it('a REJECTED load does not wake', async () => {
+    load.mockImplementationOnce(() => Promise.reject(new Error('404')));
+    const wake = vi.fn();
+    const off = addDirtyListener(wake);
+    await expect(loadPixiTexture('/assets/missing.webp')).rejects.toThrow('404');
+    off();
+    expect(wake).not.toHaveBeenCalled();
+  });
+});
 
 describe('loadPixiTexture', () => {
   beforeEach(() => { load.mockClear(); cacheMap.clear(); });
@@ -108,7 +180,7 @@ describe('loadPixiTexture', () => {
  *  that option is what these assert.
  *
  *  ⚠️ It is invisible to every other gate: iOS 26, Android and desktop do not premultiply by
- *  default, so the repro needs a real iOS 16 device — the same blind spot as the r185 ceiling. */
+ *  default, so the repro needs a real iOS 16 device — the same blind spot as #956's clean-install black screen. */
 describe('loadMtsdfAtlasTexture — the atlas must decode UNPREMULTIPLIED (#1045)', () => {
   const url = '/assets/fonts/KleeOne-Regular.ttf~atlas.png?v=abc';
   let bitmapOpts: ImageBitmapOptions | undefined;
@@ -118,7 +190,7 @@ describe('loadMtsdfAtlasTexture — the atlas must decode UNPREMULTIPLIED (#1045
     load.mockClear();
     bitmapOpts = undefined;
     createCalls = 0;
-    vi.stubGlobal('fetch', vi.fn(() => Promise.resolve({ ok: true, status: 200, blob: () => Promise.resolve({} as Blob) })));
+    vi.stubGlobal('fetch', vi.fn(() => Promise.resolve({ ok: true, status: 200, headers: new Headers({ 'content-type': 'image/png' }), blob: () => Promise.resolve({} as Blob) })));
     vi.stubGlobal('createImageBitmap', vi.fn((_blob: Blob, opts?: ImageBitmapOptions) => {
       createCalls++;
       bitmapOpts = opts;
@@ -173,10 +245,25 @@ describe('loadMtsdfAtlasTexture — the atlas must decode UNPREMULTIPLIED (#1045
   });
 
   it('rejects on a failed fetch rather than resolving a blank texture', async () => {
-    vi.stubGlobal('fetch', vi.fn(() => Promise.resolve({ ok: false, status: 404, blob: () => Promise.resolve({} as Blob) })));
+    vi.stubGlobal('fetch', vi.fn(() => Promise.resolve({ ok: false, status: 404, headers: new Headers({ 'content-type': 'image/png' }), blob: () => Promise.resolve({} as Blob) })));
     // A resolved-but-empty texture would draw nothing and look exactly like this bug; the caller's
     // .catch() logs the URL instead.
     await expect(loadMtsdfAtlasTexture(url)).rejects.toThrow('404');
+  });
+
+  it('types every failure for the atlas failure memo (#1397)', async () => {
+    const { classifyLoadFailure } = await import('../../src/runtime/core/loadFailureMemo');
+    const outcome = async () => classifyLoadFailure(await loadMtsdfAtlasTexture(url).then(() => null, (e: unknown) => e));
+    vi.stubGlobal('fetch', vi.fn(() => Promise.resolve({ ok: false, status: 404, headers: new Headers(), blob: () => Promise.resolve({} as Blob) })));
+    expect(await outcome(), 'a 404').toBe('permanent');
+    vi.stubGlobal('fetch', vi.fn(() => Promise.resolve({ ok: true, status: 200, headers: new Headers({ 'content-type': 'text/html' }), blob: () => Promise.resolve({} as Blob) })));
+    expect(await outcome(), 'the SPA fallback').toBe('permanent');
+    vi.stubGlobal('fetch', vi.fn(() => Promise.resolve({ ok: false, status: 503, headers: new Headers(), blob: () => Promise.resolve({} as Blob) })));
+    expect(await outcome(), 'a 503').toBe('transient');
+    vi.stubGlobal('fetch', vi.fn(() => Promise.reject(new TypeError('Failed to fetch'))));
+    expect(await outcome(), 'no response').toBe('transient');
+    vi.stubGlobal('fetch', vi.fn(() => Promise.resolve({ ok: true, status: 200, headers: new Headers(), blob: () => Promise.reject(new TypeError('Load failed')) })));
+    expect(await outcome(), 'a body dropped mid-read').toBe('transient');
   });
 
   it('falls back to Assets.load where createImageBitmap does not exist — SAFELY', async () => {

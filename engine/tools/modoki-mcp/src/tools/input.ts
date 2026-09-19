@@ -10,6 +10,7 @@ import type { ToolDef } from '../toolDef.js';
 import type { ToolContext } from '../context.js';
 import { ALLOW_OCCLUDED_BASE, MODIFIERS_BASE, TIMEOUT_MS_BASE, allowOccludedParam, makeEntitySpec, makeLabelAimParam, makeWithinParam, modifierEnum, makePointSpec } from '../shapes.js';
 import { KEY_ARG_DESCRIPTION, MOUSE_BUTTONS, POINTER_ACTIONS } from '../../../shared/inputVocabulary.js';
+import { parseHandleIds } from '../../../shared/handlesReply.js';
 
 export function registerInputTools(tool: ToolDef, ctx: ToolContext): void {
   const { getJson, postJson, evalRenderer, editorAction } = ctx;
@@ -165,7 +166,7 @@ export function registerInputTools(tool: ToolDef, ctx: ToolContext): void {
   tool(
     'modoki_eval',
     'Evaluate JavaScript in the editor RENDERER and return the value — the editor twin of ' +
-      'device_eval. Reads/pokes LIVE renderer state a static file read cannot (a global like ' +
+      'device_eval; list the injected `modoki` ops with modoki_eval_api. Reads/pokes LIVE renderer state a static file read cannot (a global like ' +
       'window.__3d, window.innerWidth/devicePixelRatio, a React fiber value, WGSL validation, or ' +
       'dispatching a bridge event), so you no longer need a raw CDP client for it. Runs as a ' +
       'function body: use `return` to yield a value. The result is safe-stringified in the renderer, ' +
@@ -181,8 +182,8 @@ export function registerInputTools(tool: ToolDef, ctx: ToolContext): void {
       timeoutMs: z.number().int().positive().optional().describe(
         `${TIMEOUT_MS_BASE} — the body is abandoned then. Default 5000, max 25000 (clamped, not ` +
         'refused). Raise it when the code awaits something slow — e.g. modoki.waitForEdit(), which ' +
-        'parks by design and could never outlive the old fixed budget. The device twin caps LOWER ' +
-        '(4500): its TCP transport has a fixed 5s per-request deadline it cannot exceed.',
+        'parks by design and could never outlive the old fixed budget. The device twin has its own ' +
+        'budget — default 4000, ceiling 20000 — so a slow device eval is raised the same way.',
       ),
     },
     async ({ code, timeoutMs }) => evalRenderer(code, timeoutMs),
@@ -195,8 +196,10 @@ export function registerInputTools(tool: ToolDef, ctx: ToolContext): void {
       'generated camelCase method modoki_eval\'s injected `modoki` object exposes for it ' +
       '(`layout-bounds` -> `modoki.layoutBounds(params)`), plus the fixed helpers `modoki.call(op, params)`, ' +
       '`modoki.ops()`, `modoki.api(path, init)` (a host route with no matching op, via backendFetch), and ' +
-      '`modoki.composite(label, fn)` (collapse a script\'s edits into ONE undo entry). Call this before ' +
-      'writing a modoki_eval script instead of reading source to find the surface. Requires the Electron editor.',
+      '`modoki.composite(label, fn)` (collapse a script\'s edits into ONE undo entry), and ' +
+      '`modoki.import(path)` (import a module AS THE APP HOLDS IT — a hand-written import of an ' +
+      'engine file yields a SECOND instance whose module-level state the app never sees). ' +
+      'Call this before writing a modoki_eval script instead of reading source to find the surface.',
     {},
     async () => getJson('/api/eval-api'),
   );
@@ -270,7 +273,7 @@ export function registerInputTools(tool: ToolDef, ctx: ToolContext): void {
     'modoki_focus',
     'Move keyboard focus in the editor window: focus the element matching `selector`, or — ' +
       'with NO selector — blur the currently-focused element (focus falls back to <body>). ' +
-      'General-purpose (focus any panel/canvas/input, or defocus a text field). One common ' +
+      'General-purpose (focus any panel/canvas/input, or defocus a text field); to frame an entity in the camera use modoki_focus_entity. One common ' +
       "use is unblocking trusted key input for the GAME: the game's input sampler drops keys " +
       'while a DOM text field (Console filter, inspector) holds focus, and a viewport click ' +
       'does NOT blur it — so call this (no selector) before modoki_press_key. ⚠️ THAT IS ONLY ' +
@@ -324,7 +327,7 @@ export function registerInputTools(tool: ToolDef, ctx: ToolContext): void {
     'modoki_dnd',
     'Synthesize an HTML5 drag-and-drop (dragstart→dragover→drop) — the DnD interactions a ' +
       'trusted pointer-drag CANNOT emit: Hierarchy reparent/reorder, Assets file-move & ' +
-      'prefab-instantiate, Skin sprite-onto-part / part-reorder / bone-reparent. Address ' +
+      'prefab-instantiate, Skin sprite-onto-part / part-reorder / bone-reparent (a canvas or gizmo drag is modoki_drag). Address ' +
       'each endpoint by CSS `selector` (targets its center) OR viewport `{x,y}`. Lets the ' +
       "app's own dragstart handler fill the DataTransfer (never fabricated). Returns the " +
       'MIME `types` written (empty ⇒ wrong source element) and `accepted` (target took the ' +
@@ -390,7 +393,7 @@ export function registerInputTools(tool: ToolDef, ctx: ToolContext): void {
         + 'modoki_get_editor_state `skinMode`.',
       ),
       kind: z.string().optional().describe('Filter to one handle kind, e.g. "collider-vertex", "keyframe", "bone-joint".'),
-      ids: z.string().optional().describe('Comma-separated handle ids to restrict to.'),
+      ids: z.union([z.string(), z.array(z.string())]).optional().describe('Handle ids to restrict to — a list, or one comma-separated string. Both surfaces take both forms (device_handles too).'),
       prefix: z.string().optional().describe('Restrict to ids starting with this, e.g. "inspector." or "layout.tab." — chrome ids are <panel>.<region>.<name>.'),
       label: z.string().optional().describe('Restrict to handles whose WHOLE label matches (whitespace-collapsed, case-insensitive; not a substring) — the same rule the `label` aim on modoki_tap uses.'),
     },
@@ -398,7 +401,8 @@ export function registerInputTools(tool: ToolDef, ctx: ToolContext): void {
       const qs = new URLSearchParams();
       if (editor) qs.set('editor', editor);
       if (kind) qs.set('kind', kind);
-      if (ids) qs.set('ids', ids);
+      const idList = parseHandleIds(ids);
+      if (idList) qs.set('ids', idList.join(','));
       if (prefix) qs.set('prefix', prefix);
       if (label) qs.set('label', label);
       const q = qs.toString();

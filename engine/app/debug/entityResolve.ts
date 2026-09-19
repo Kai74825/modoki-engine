@@ -25,6 +25,7 @@
  *  `docs/enact.md` ("Aimed input has THREE target surfaces"). */
 
 import { getAllEntities, collectScreenBounds, pickAt, type BoundsSurface } from '@modoki/engine/runtime';
+import { resolveEntityAddress } from './entityRef';
 import { describeElement, occlusionAt, resolveElementPoint, NOTHING_AT_POINT } from './domResolve';
 import { uiNodesFor, namedUiSurface } from './uiSurface';
 import type { EntityPointSpec, EntityPointResolution, AimedAt } from './entityPointContract';
@@ -32,32 +33,16 @@ import type { ErrorCode } from '../../tools/shared/mcpResult';
 
 export type { EntityPointSpec, EntityPointResolution } from './entityPointContract';
 
-/** Resolve the spec to exactly one entity, or say why not.
- *
- *  `guid` wins, then `name`, then `id` — cheapest-to-most-volatile. An ambiguous `name` is an
- *  ERROR, not a first-match: silently picking one of three entities called "Enemy" produces a
- *  successful-looking click on the wrong one, which is the entire class of bug this file exists
- *  to remove. */
-function resolveEntity(spec: EntityPointSpec): { info: ReturnType<typeof getAllEntities>[number] } | { error: string; code?: ErrorCode } {
-  const all = getAllEntities();
-  if (spec.guid) {
-    const hit = all.find((e) => e.guid === spec.guid);
-    return hit ? { info: hit } : { error: `no entity with guid ${JSON.stringify(spec.guid)}`, code: 'NOT_FOUND' };
-  }
-  if (spec.name) {
-    const hits = all.filter((e) => e.name === spec.name);
-    if (hits.length === 0) return { error: `no entity named ${JSON.stringify(spec.name)}`, code: 'NOT_FOUND' };
-    if (hits.length > 1) {
-      const guids = hits.map((e) => e.guid || `id:${e.id}`).join(', ');
-      return { error: `${hits.length} entities are named ${JSON.stringify(spec.name)} (${guids}) — address by guid`, code: 'AMBIGUOUS' };
-    }
-    return { info: hits[0] };
-  }
-  if (typeof spec.id === 'number') {
-    const hit = all.find((e) => e.id === spec.id);
-    return hit ? { info: hit } : { error: `no entity with id ${spec.id}`, code: 'NOT_FOUND' };
-  }
-  return { error: 'provide an entity {guid} | {name} | {id}' };
+/** Resolve the spec to exactly one entity, or say why not — through the shared resolver
+ *  (`entityRef.ts`, #1223), so an aim follows the same rules as every other entity address: exactly
+ *  one of guid/name/id, an ambiguous name refused rather than first-matched (silently picking one of
+ *  three entities called "Enemy" is a successful-looking click on the wrong one, the class of bug this
+ *  file exists to remove), and `{id}` only for an entity with no guid. */
+function resolveEntity(spec: EntityPointSpec): { info: ReturnType<typeof getAllEntities>[number] } | { error: string; code?: ErrorCode; options?: string[]; stale?: string } {
+  const r = resolveEntityAddress(spec, { label: 'entity' });
+  if (!r.ok) return r;
+  const info = getAllEntities().find((e) => e.id === r.id);
+  return info ? { info } : { error: `entity: ${r.guid ?? `#${r.id}`} is not a scene entity that can be aimed at`, code: 'NOT_FOUND' };
 }
 
 // A UI entity's DOM node(s) come from `uiSurface.ts` — PLURAL, because the editor mounts a
@@ -162,7 +147,7 @@ function* sampleAimPoints(x: number, y: number, w: number, h: number): Generator
  *  a 400). Mirrors `resolveDomPointReport`. */
 export function resolveEntityPointReport(spec: EntityPointSpec): EntityPointResolution {
   const r = resolveEntity(spec ?? {});
-  if ('error' in r) return { ok: false, error: r.error, ...(r.code ? { code: r.code } : {}) };
+  if ('error' in r) return { ok: false, error: r.error, ...(r.code ? { code: r.code } : {}), ...(r.options ? { options: r.options } : {}), ...(r.stale ? { stale: r.stale } : {}) };
   const { info } = r;
   const entity = { id: info.id, name: info.name, guid: info.guid, layer: info.layer ?? null };
   const matched = `${info.name || '(unnamed)'}${info.guid ? ` [${info.guid}]` : ` (id:${info.id})`}`;

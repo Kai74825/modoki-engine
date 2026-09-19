@@ -12,8 +12,11 @@ import { describe, it, expect, afterEach, vi } from 'vitest';
 import { found } from '@modoki/engine/testing/inOrder';
 import { createTestWorld, type TestWorld, Transform, EntityAttributes,
   getCurrentWorld, setCurrentWorld, setTimeScale, getTimeScale, sceneManager, reparentRefusal,
-  stepOneFrame } from '@modoki/engine/runtime';
+  stepOneFrame, Time, Input, UIAction, getTraitByName } from '@modoki/engine/runtime';
+import { Transient } from '../../packages/modoki/src/runtime/core/traits/Transient';
 import { updateContactIndex } from '../../packages/modoki/src/runtime/physics/physicsContactIndex';
+import { isRuntimeGuid, deriveMemberGuid } from '../../packages/modoki/src/runtime/core/assetRefRules';
+import { setTemplateKey, templateKeyOf } from '../../packages/modoki/src/runtime/core/templateIdentity';
 import { createWorld } from 'koota';
 import { registerAllTraits } from '../../app/ecs/registerTraits';
 import { runAgentOp, hasAgentOp, listAgentOps, relayResponseFor, registerRelayResponder, simStepDefaultTimeout, SIM_STEP_MAX_TIMEOUT_MS, inferAssetDefType } from '../../app/debug/agentBridge';
@@ -29,7 +32,7 @@ afterEach(() => { game?.dispose(); game = undefined; });
 
 type CreateReply = { ok?: boolean; error?: string; options?: string[]; id?: number; guid?: string; name?: string; saved?: boolean };
 type DupReply = { ok?: boolean; error?: string; created?: number; entitiesPerCopy?: number; roots?: Array<{ id: number; guid: string | null }> };
-type DelReply = { ok?: boolean; error?: string; deleted?: number; guids?: Array<string | null> };
+type DelReply = { ok?: boolean; error?: string; deleted?: string[]; deletedNoGuidIds?: number[] };
 
 async function sceneGuids(): Promise<string[]> {
   const s = await runAgentOp('scene-state', { trait: 'Transform', full: true }) as
@@ -46,6 +49,8 @@ describe('create-entity (runtime twin)', () => {
     // An agent told only a numeric id has an address that expires on the next scene reload.
     expect(r.guid).toBeTruthy();
     expect(r.guid).not.toBe(String(r.id));
+    // …and DURABLE (#1210): spawnEntity gave it a runtime guid, which a Play→Stop revert kills.
+    expect(isRuntimeGuid(r.guid)).toBe(false);
     expect(r.saved).toBe(false);
   });
 
@@ -66,6 +71,9 @@ describe('create-entity (runtime twin)', () => {
     { spec: { kind: 'light', light: 'pont' }, option: 'point' },
     { spec: { kind: 'ui', preset: 'toString' }, option: 'view' },
     { spec: { kind: 'pyramid' }, option: 'camera' },
+    // #1216 C-3: `{kind:'primitive', mseh:'cube'}` built the default sphere and answered ok.
+    { spec: { kind: 'primitive', mseh: 'cube' }, option: 'mesh' },
+    { spec: { kind: 'empty', name: 'Probe' }, option: 'kind' },
   ])('refuses $spec in its own {ok:false, options} shape, creating nothing (#1070)', async ({ spec, option }) => {
     game = createTestWorld({});
     const before = (await sceneGuids()).length;
@@ -124,6 +132,100 @@ describe('duplicate-entity (runtime twin)', () => {
     expect((await sceneGuids()).length).toBe(6);
   });
 
+  // #1338 — the device twin of the editor duplicate. Mutations: drop the `remapGuidValues` call
+  // (both ref tests red), drop `carryEntityIdFields` (the rootInstanceId test red), or shallow-copy
+  // the snapshot again (the aliasing test red).
+  const uiActionOf = (e: { get(t: unknown): unknown }) =>
+    e.get(getTraitByName('UIAction')!.trait) as { bindings: Array<{ event: string; target: string }> };
+  const find = (pred: (ea: { name: string; guid: string }, id: number) => boolean) =>
+    [...getCurrentWorld().entities].find((e) => e.has(EntityAttributes) && pred(e.get(EntityAttributes) as never, e.id()))!;
+
+  it('carries a ref INSIDE the copy to the copy, and leaves a ref outside it alone', async () => {
+    game = createTestWorld({});
+    game.spawn(Transform(), EntityAttributes({ guid: 'out', name: 'Out' }));
+    const panel = game.spawn(Transform(), EntityAttributes({ guid: 'panel', name: 'Panel' }),
+      UIAction({ bindings: [{ event: 'click', action: 'noop', target: 'kid' }, { event: 'hover', action: 'noop', target: 'out' }] } as never));
+    game.spawn(Transform(), EntityAttributes({ guid: 'kid', name: 'Kid', parentId: panel.id() }));
+
+    const r = await runAgentOp('duplicate-entity', { guid: 'panel', count: 2 }) as DupReply;
+    expect(r.ok).not.toBe(false);
+    for (const root of r.roots!) {
+      const copy = find((_, id) => id === root.id);
+      const kid = find((ea) => ea.name === 'Kid' && (ea as unknown as { parentId: number }).parentId === root.id);
+      expect(uiActionOf(copy).bindings.map((b) => b.target)).toEqual([(kid.get(EntityAttributes) as { guid: string }).guid, 'out']);
+    }
+    expect(uiActionOf(panel).bindings.map((b) => b.target)).toEqual(['kid', 'out']);
+  });
+
+  it('a copy shares its bindings array with neither the source nor another copy', async () => {
+    game = createTestWorld({});
+    const src = game.spawn(Transform(), EntityAttributes({ guid: 'src', name: 'Src' }),
+      UIAction({ bindings: [{ event: 'click', action: 'noop', target: '' }] } as never));
+    const r = await runAgentOp('duplicate-entity', { guid: 'src', count: 2 }) as DupReply;
+    const [a, b] = r.roots!.map((root) => uiActionOf(find((_, id) => id === root.id)).bindings);
+    expect(a).not.toBe(uiActionOf(src).bindings);
+    // …nor with each other: one call's copies are cloned one by one (#1338 review).
+    expect(a).not.toBe(b);
+  });
+
+  // #1430 — a template-added node (a `TemplateAddedKey`, no PrefabInstance) inside a copied WHOLE
+  // instance keeps its key and gets the guid a reload derives; a copy of a member hands out no key.
+  // Mutations: drop `setTemplateKey` in `duplicateEntityLive` (the first red), or read the key
+  // unconditionally below the copy root in `planCopyGuids` (`const key = ctx ? keyOf(node) : ''` —
+  // the second red: the device has no member strip to hide it).
+  const KEY = 'dddddddd-0000-4000-8000-000000001430';
+  const keyedInstance = () => {
+    const PI = getTraitByName('PrefabInstance')!;
+    const root = game!.spawn(Transform(), EntityAttributes({ guid: 'aaaaaaaa-0000-4000-8000-0000000014d1', name: 'Root' }),
+      PI.trait({ source: 'p', localId: 1, rootInstanceId: 0 }));
+    root.set(PI.trait, { ...(root.get(PI.trait) as object), rootInstanceId: root.id() });
+    const member = game!.spawn(Transform(), EntityAttributes({ name: 'Member', parentId: root.id() }),
+      PI.trait({ source: 'p', localId: 2, rootInstanceId: root.id() }));
+    const extra = game!.spawn(Transform(), EntityAttributes({ name: 'Extra', parentId: member.id() }));
+    setTemplateKey(extra, KEY);
+    return { root, member, extra };
+  };
+  const copiedExtra = (sourceExtraId: number) => find((ea, id) => ea.name === 'Extra' && id !== sourceExtraId);
+
+  it('a copied instance keeps its template-added node keyed, on the guid a reload derives (#1430)', async () => {
+    game = createTestWorld({});
+    const { extra } = keyedInstance();
+    const r = await runAgentOp('duplicate-entity', { guid: 'aaaaaaaa-0000-4000-8000-0000000014d1' }) as DupReply;
+    const copy = copiedExtra(extra.id());
+    expect(templateKeyOf(copy)).toBe(KEY);
+    expect((copy.get(EntityAttributes) as { guid: string }).guid).toBe(deriveMemberGuid(r.roots![0]!.guid!, [2, `+${KEY}`]));
+  });
+
+  it('a copied member hands its template-added node no key (#1430)', async () => {
+    game = createTestWorld({});
+    const { member, extra } = keyedInstance();
+    const memberGuid = (member.get(EntityAttributes) as { guid: string }).guid;
+    const r = await runAgentOp('duplicate-entity', memberGuid ? { guid: memberGuid } : { id: member.id() }) as DupReply;
+    expect(r.ok).not.toBe(false);
+    expect(templateKeyOf(copiedExtra(extra.id()))).toBe('');
+  });
+
+  it('a copied prefab instance names ITS OWN roots in rootInstanceId (a nested instance, its own)', async () => {
+    game = createTestWorld({});
+    const PI = getTraitByName('PrefabInstance')!;
+    const root = game.spawn(Transform(), EntityAttributes({ guid: 'aaaaaaaa-0000-4000-8000-0000000000d1', name: 'Root' }),
+      PI.trait({ source: 'p', localId: 1, rootInstanceId: 0 }));
+    root.set(PI.trait, { ...(root.get(PI.trait) as object), rootInstanceId: root.id() });
+    const member = game.spawn(Transform(), EntityAttributes({ name: 'Member', parentId: root.id() }),
+      PI.trait({ source: 'p', localId: 2, rootInstanceId: root.id() }));
+    const nest = game.spawn(Transform(), EntityAttributes({ name: 'Nest', parentId: member.id() }),
+      PI.trait({ source: 'q', localId: 1, parentLocalId: 2, rootInstanceId: 0 }));
+    nest.set(PI.trait, { ...(nest.get(PI.trait) as object), rootInstanceId: nest.id() });
+
+    const r = await runAgentOp('duplicate-entity', { guid: 'aaaaaaaa-0000-4000-8000-0000000000d1' }) as DupReply;
+    const rootOf = (e: { get(t: unknown): unknown }) => (e.get(PI.trait) as { rootInstanceId: number }).rootInstanceId;
+    const cRoot = find((_, id) => id === r.roots![0]!.id);
+    const cMember = find((ea, id) => ea.name === 'Member' && id !== member.id());
+    const cNest = find((ea, id) => ea.name === 'Nest' && id !== nest.id());
+    expect([rootOf(cRoot), rootOf(cMember), rootOf(cNest)]).toEqual([cRoot.id(), cRoot.id(), cNest.id()]);
+    expect([rootOf(root), rootOf(member), rootOf(nest)]).toEqual([root.id(), root.id(), nest.id()]);
+  });
+
   it('a stale guid duplicates nothing and says so', async () => {
     game = createTestWorld({});
     game.spawn(Transform({ x: 0 }), EntityAttributes({ guid: 'src', name: 'Src' }));
@@ -150,8 +252,8 @@ describe('delete-entities (runtime twin)', () => {
     const r = await runAgentOp('delete-entities', { guids: ['a'] }) as DelReply;
 
     expect(r.ok).not.toBe(false);
-    expect(r.deleted).toBe(1);
-    expect(r.guids).toEqual(['a']);
+    expect(r.deleted).toEqual(['a']);
+    expect(r.deletedNoGuidIds).toBeUndefined();
     expect(await sceneGuids()).toEqual(['b']);
   });
 
@@ -190,6 +292,21 @@ describe('sim-step (runtime twin)', () => {
     expect(r.error).toMatch(/frame loop/i);
     expect(r.stepped).toBe(0);
     expect(r.requested).toBe(3);
+    expect(getTimeScale(world)).toBe(0);
+  });
+
+  it('REFUSES a frame count or scale it would have had to change, instead of clamping (#1213 C-9)', async () => {
+    game = createTestWorld({});
+    const world = getCurrentWorld();
+    setTimeScale(world, 0);
+    // `frames:'abc'` is the sharp one: it became NaN, which no frame count reaches, so the call sat
+    // out its whole timeout. A refusal answers at once — the short test timeout would catch a wait.
+    for (const params of [{ frames: 601 }, { frames: 0 }, { frames: 2.5 }, { frames: 'abc' }, { scale: -1 }, { scale: 0 }, { timeoutMs: 'soon' }]) {
+      const r = await runAgentOp('sim-step', params) as { ok?: boolean; code?: string; error?: string; stepped?: number };
+      expect(r, JSON.stringify(params)).toMatchObject({ ok: false, code: 'REFUSED_BY_OP' });
+      expect(r.error).toMatch(/Nothing was stepped/);
+      expect(r.stepped).toBeUndefined();
+    }
     expect(getTimeScale(world)).toBe(0);
   });
 
@@ -279,15 +396,16 @@ describe('load-scene (runtime twin)', () => {
   it('a load that RESOLVES without switching is a failure — the readback, not the throw', async () => {
     game = createTestWorld({});
     // This is the branch P5 exists for and the one the throw-path test above does NOT reach:
-    // `loadScene` resolves `void`, so a load that quietly fails to switch is indistinguishable
-    // from success unless the op looks at the active path afterwards. Mutation-checked: deleting
+    // `loadScene` resolves without saying which scene is now active, so a load that quietly
+    // fails to switch is indistinguishable from success unless the op looks at the active path
+    // afterwards. Mutation-checked: deleting
     // the `after !== p.path` check in agentBridge turns this red (the throw test alone stayed
     // green, which is how this gap was found).
     //
     // `getNext()` is stubbed to null here too — it mimics the same "couldn't read our own id"
     // fallback path that a real superseded-detection miss would take, so this exercises the
     // ORIGINAL path-comparison check rather than the myId-based branches below.
-    const loadSpy = vi.spyOn(sceneManager, 'loadScene').mockResolvedValue(undefined as never);
+    const loadSpy = vi.spyOn(sceneManager, 'loadScene').mockResolvedValue({ keptBaseGuids: new Set<string>() });
     const nextSpy = vi.spyOn(sceneManager, 'getNext').mockReturnValue(null);
     try {
       const r = await runAgentOp('load-scene', { path: '/looks/fine.scene.json' }) as
@@ -301,6 +419,30 @@ describe('load-scene (runtime twin)', () => {
     }
   });
 
+  // ── #1425 — a manager that failed to start is reported, not a failure: the scene IS loaded. ──
+
+  for (const [label, startupErrors, expected] of [
+    ['names the manager in `warnings`', [{ manager: 'boomManager', error: new Error('init boom') }],
+      ['manager "boomManager" failed to start (the scene is still loaded): init boom']],
+    ['a clean load carries no `warnings` key', [], undefined],
+  ] as const) {
+    it(`a load that swapped in: ok:true, and ${label}`, async () => {
+      game = createTestWorld({});
+      const loadSpy = vi.spyOn(sceneManager, 'loadScene').mockResolvedValue({ keptBaseGuids: new Set<string>(), startupErrors: [...startupErrors] });
+      const nextSpy = vi.spyOn(sceneManager, 'getNext').mockReturnValue({ id: 5, path: '/requested.scene.json', state: 'loading' } as never);
+      const curSpy = vi.spyOn(sceneManager, 'getCurrent').mockReturnValue({ id: 5, path: '/requested.scene.json', state: 'active' } as never);
+      try {
+        const r = await runAgentOp('load-scene', { path: '/requested.scene.json' }) as { ok?: boolean; warnings?: string[] };
+        expect(r.ok).toBe(true);
+        expect(r.warnings).toEqual(expected);
+      } finally {
+        loadSpy.mockRestore();
+        nextSpy.mockRestore();
+        curSpy.mockRestore();
+      }
+    });
+  }
+
   // ── #486 finding A — a superseded load must not blame the requested path. ──
 
   it('superseded by a load of a DIFFERENT scene — ok:false, names the active scene, never blames the path', async () => {
@@ -308,7 +450,7 @@ describe('load-scene (runtime twin)', () => {
     // `getNext()` hands back OUR allocated id (1); by the time the load resolves, `getCurrent()`
     // reports a DIFFERENT id whose path is a different scene — exactly what a later load winning
     // the swap looks like from the op's point of view.
-    const loadSpy = vi.spyOn(sceneManager, 'loadScene').mockResolvedValue(undefined as never);
+    const loadSpy = vi.spyOn(sceneManager, 'loadScene').mockResolvedValue({ keptBaseGuids: new Set<string>() });
     const nextSpy = vi.spyOn(sceneManager, 'getNext').mockReturnValue({ id: 1, path: '/requested.scene.json', state: 'loading' } as never);
     const curSpy = vi.spyOn(sceneManager, 'getCurrent').mockReturnValue({ id: 2, path: '/other.scene.json', state: 'active' } as never);
     try {
@@ -333,7 +475,7 @@ describe('load-scene (runtime twin)', () => {
     // load simply never became primary — reporting that as "a LATER scene load won the swap"
     // would assert from evidence that only says "the current id is not mine", which is the very
     // over-claim #486 A is about. This case must keep the original bad-path wording.
-    const loadSpy = vi.spyOn(sceneManager, 'loadScene').mockResolvedValue(undefined as never);
+    const loadSpy = vi.spyOn(sceneManager, 'loadScene').mockResolvedValue({ keptBaseGuids: new Set<string>() });
     const nextSpy = vi.spyOn(sceneManager, 'getNext').mockReturnValue({ id: 7, path: '/requested.scene.json', state: 'loading' } as never);
     const curSpy = vi.spyOn(sceneManager, 'getCurrent').mockReturnValue({ id: 3, path: '/old.scene.json', state: 'active' } as never);
     try {
@@ -350,20 +492,20 @@ describe('load-scene (runtime twin)', () => {
     }
   });
 
-  it('superseded by a concurrent load of the SAME path — ok:true with a note, entityCount omitted', async () => {
+  it('superseded by a concurrent load of the SAME path — ok:true with a note, worldEntityTotal omitted', async () => {
     game = createTestWorld({});
     // A different id won the swap, but it loaded the SAME requested path — the caller's requested
     // end state is actually true, just not because of THIS op's own load.
-    const loadSpy = vi.spyOn(sceneManager, 'loadScene').mockResolvedValue(undefined as never);
+    const loadSpy = vi.spyOn(sceneManager, 'loadScene').mockResolvedValue({ keptBaseGuids: new Set<string>() });
     const nextSpy = vi.spyOn(sceneManager, 'getNext').mockReturnValue({ id: 1, path: '/requested.scene.json', state: 'loading' } as never);
     const curSpy = vi.spyOn(sceneManager, 'getCurrent').mockReturnValue({ id: 2, path: '/requested.scene.json', state: 'active' } as never);
     try {
       const r = await runAgentOp('load-scene', { path: '/requested.scene.json' }) as
-        { ok?: boolean; note?: string; entityCount?: number; current?: string | null };
+        { ok?: boolean; note?: string; worldEntityTotal?: number; current?: string | null };
       expect(r.ok).toBe(true);
       expect(r.note).toMatch(/superseded/i);
       expect(r.current).toBe('/requested.scene.json');
-      expect(r.entityCount).toBeUndefined();
+      expect(r.worldEntityTotal).toBeUndefined();
     } finally {
       loadSpy.mockRestore();
       nextSpy.mockRestore();
@@ -371,21 +513,42 @@ describe('load-scene (runtime twin)', () => {
     }
   });
 
-  it('ordinary success is UNCHANGED — no false "superseded", entityCount present', async () => {
+  it('ordinary success is UNCHANGED — no false "superseded", worldEntityTotal present', async () => {
     game = createTestWorld({});
     game.spawn(Transform({ x: 0 }), EntityAttributes({ guid: 'a', name: 'A' }));
-    const loadSpy = vi.spyOn(sceneManager, 'loadScene').mockResolvedValue(undefined as never);
+    const loadSpy = vi.spyOn(sceneManager, 'loadScene').mockResolvedValue({ keptBaseGuids: new Set<string>() });
     // getNext()/getCurrent() report the SAME id — our own load won, exactly like the ordinary case.
     const nextSpy = vi.spyOn(sceneManager, 'getNext').mockReturnValue({ id: 7, path: '/requested.scene.json', state: 'loading' } as never);
     const curSpy = vi.spyOn(sceneManager, 'getCurrent').mockReturnValue({ id: 7, path: '/requested.scene.json', state: 'active' } as never);
     try {
       const r = await runAgentOp('load-scene', { path: '/requested.scene.json' }) as
-        { ok?: boolean; superseded?: boolean; note?: string; current?: string | null; entityCount?: number };
+        { ok?: boolean; superseded?: boolean; note?: string; current?: string | null; worldEntityTotal?: number };
       expect(r.ok).toBe(true);
       expect(r.superseded).toBeUndefined();
       expect(r.note).toBeUndefined();
       expect(r.current).toBe('/requested.scene.json');
-      expect(r.entityCount).toBeTypeOf('number');
+      expect(r.worldEntityTotal).toBeTypeOf('number');
+    } finally {
+      loadSpy.mockRestore();
+      nextSpy.mockRestore();
+      curSpy.mockRestore();
+    }
+  });
+
+  // The op's other success return: `getNext()` already cleared, so there is no id to compare and the
+  // path read back decides. #1223 D3 renamed its count too. Mutation: `entityCount` on that return.
+  it('a success decided by the path alone (no id to compare) also reports worldEntityTotal', async () => {
+    game = createTestWorld({});
+    game.spawn(Transform({ x: 0 }), EntityAttributes({ guid: 'a', name: 'A' }));
+    const loadSpy = vi.spyOn(sceneManager, 'loadScene').mockResolvedValue({ keptBaseGuids: new Set<string>() });
+    const nextSpy = vi.spyOn(sceneManager, 'getNext').mockReturnValue(null as never);
+    const curSpy = vi.spyOn(sceneManager, 'getCurrent').mockReturnValue({ id: 7, path: '/requested.scene.json', state: 'active' } as never);
+    try {
+      const r = await runAgentOp('load-scene', { path: '/requested.scene.json' }) as
+        { ok?: boolean; current?: string | null; worldEntityTotal?: number; entityCount?: number };
+      expect(r.ok).toBe(true);
+      expect(r.worldEntityTotal).toBeGreaterThanOrEqual(1);
+      expect(r.entityCount).toBeUndefined();
     } finally {
       loadSpy.mockRestore();
       nextSpy.mockRestore();
@@ -443,64 +606,101 @@ describe('lifecycle: findings from the close-out review', () => {
     const r = await runAgentOp('delete-entities', { guids: ['p', 'c'] }) as DelReply;
 
     expect(r.ok).not.toBe(false);
-    expect(r.guids?.sort()).toEqual(['c', 'p']);
+    expect(r.deleted?.sort()).toEqual(['c', 'p']);
     expect(await sceneGuids()).toEqual([]);
   });
 });
 
-/** #1199 — an entity with no minted guid used to report `String(id)` as its guid. That value looks
- *  addressable and every guid-addressed op refuses it (a guid-less entity is not in the guid index),
- *  so each producer must say `null` instead. One case per producer: they were four copies once. */
-describe('a guid-less entity reports guid:null, never its id disguised as a guid (#1199)', () => {
+/** #1199, reshaped by #1210. A live id reported as a guid is not addressable: every guid-addressed op
+ *  refuses it. #1199 made each producer say `null` for a guid-less entity instead. #1210 then made a
+ *  guid-less NAMED entity impossible: `spawnEntity` mints a RUNTIME guid for any entity spawned with
+ *  EntityAttributes, so the rows now carry an address that RESOLVES. `null` remains only for an entity
+ *  with no EntityAttributes at all. One case per producer: they were four copies once. */
+describe('reply rows carry an address that resolves, never an id disguised as a guid (#1199, #1210)', () => {
   type Row = { id: number; guid: string | null; name: string };
   type StateReply = { entities: Row[] };
 
-  it('scene-state INDEX and FULL rows carry null, and the id-shaped value resolves nothing', async () => {
+  it('scene-state INDEX and FULL rows carry the runtime guid, it resolves, and the id-shaped value does not', async () => {
     game = createTestWorld({});
     const bare = game.spawn(Transform({ x: 0 }), EntityAttributes({ name: 'Bare' }));
     game.spawn(Transform({ x: 0 }), EntityAttributes({ guid: 'real', name: 'Real' }));
 
+    let reported = '';
     for (const params of [{}, { full: true }]) {
       const s = await runAgentOp('scene-state', params) as StateReply;
       const row = s.entities.find((e) => e.name === 'Bare')!;
       expect(row.id).toBe(bare.id());
-      expect(row.guid).toBeNull();
+      expect(isRuntimeGuid(row.guid)).toBe(true);
+      reported = row.guid!;
       expect(s.entities.find((e) => e.name === 'Real')!.guid).toBe('real');
     }
-    // The premise of the bug, pinned: the old reported value is not an address.
+    // The address it reports is an address: it finds exactly that entity.
+    const byReported = await runAgentOp('scene-state', { guid: reported }) as StateReply;
+    expect(byReported.entities.map((e) => e.id)).toEqual([bare.id()]);
+    // The premise of #1199, still pinned: the id is not an address.
     const byOldValue = await runAgentOp('scene-state', { guid: String(bare.id()) }) as StateReply;
     expect(byOldValue.entities).toEqual([]);
   });
 
-  it('contacts list a guid-less partner as `id:<n>` — a bare null would lose WHICH body it is', async () => {
+  it('contacts name a code-spawned partner by its runtime guid, and an EntityAttributes-less one as `id:<n>`', async () => {
     game = createTestWorld({});
     const ball = game.spawn(Transform({ x: 0 }), EntityAttributes({ guid: 'ball', name: 'Ball' }));
     const floor = game.spawn(Transform({ x: 0 }), EntityAttributes({ guid: 'floor', name: 'Floor' }));
     const debris = game.spawn(Transform({ x: 0 }), EntityAttributes({ name: 'Debris' }));
+    const bare = game.spawn(Transform({ x: 0 }));
+    bare.remove(EntityAttributes); // un-guidable: since #1248 only a REMOVED EntityAttributes leaves no guid
     // The index takes PACKED entities (`valueOf()`, #868) and reports partner ids.
     updateContactIndex(getCurrentWorld(), ball.valueOf(), floor.valueOf(), false, 'enter');
     updateContactIndex(getCurrentWorld(), ball.valueOf(), debris.valueOf(), false, 'enter');
+    updateContactIndex(getCurrentWorld(), ball.valueOf(), bare.valueOf(), false, 'enter');
 
     const s = await runAgentOp('scene-state', { guid: 'ball', contacts: true }) as
       { entities: Array<{ contacts?: string[] }> };
-    expect(s.entities[0].contacts?.sort()).toEqual(['floor', `id:${debris.id()}`]);
+    const debrisGuid = (debris.get(EntityAttributes) as { guid: string }).guid;
+    expect(isRuntimeGuid(debrisGuid)).toBe(true);
+    expect(s.entities[0].contacts?.sort()).toEqual(['floor', debrisGuid, `id:${bare.id()}`].sort());
   });
 
-  it('set-traits readback rows carry null for a guid-less target', async () => {
+  it('set-traits readback rows carry the runtime guid of a code-spawned target, and null for an un-guidable one', async () => {
     game = createTestWorld({});
-    const bare = game.spawn(Transform({ x: 0 }), EntityAttributes({ name: 'Bare' }));
-    const r = await runAgentOp('set-traits', { id: bare.id(), set: { 'Transform.x': 3 } }) as
+    const named = game.spawn(Transform({ x: 0 }), EntityAttributes({ name: 'Bare' }));
+    const r = await runAgentOp('set-traits', { guid: (named.get(EntityAttributes) as { guid: string }).guid, set: { 'Transform.x': 3 } }) as
       { ok?: boolean; entities?: Row[] };
     expect(r.ok).not.toBe(false);
-    expect(r.entities?.[0].guid).toBeNull();
+    expect(r.entities?.[0].guid).toBe((named.get(EntityAttributes) as { guid: string }).guid);
+    expect(isRuntimeGuid(r.entities?.[0].guid)).toBe(true);
+
+    const bare = game.spawn(Transform({ x: 0 }));
+    bare.remove(EntityAttributes); // un-guidable (#1248: only a removed EntityAttributes leaves no guid)
+    // …which is the one entity `{id}` may still name (#1223 D2).
+    const r2 = await runAgentOp('set-traits', { id: bare.id(), set: { 'Transform.x': 3 } }) as
+      { ok?: boolean; entities?: Row[] };
+    expect(r2.ok).not.toBe(false);
+    expect(r2.entities?.[0].guid).toBeNull();
   });
 
-  it('delete-entities by id reports null for a guid-less entity', async () => {
+  // #1223 P2: named like the editor op — `deleted` lists guids and `deletedNoGuidIds` the ids of any target
+  // with none. It was a count beside `guids: [null]`, which said something was deleted and not which.
+  // Mutation: in deleteEntitiesLive, report `guidListFields` over no ids (drop the guid-less split).
+  it('delete-entities reports the runtime guid, and the id of an un-guidable entity in deletedNoGuidIds', async () => {
     game = createTestWorld({});
-    const bare = game.spawn(Transform({ x: 0 }), EntityAttributes({ name: 'Bare' }));
-    const r = await runAgentOp('delete-entities', { id: bare.id() }) as { ok?: boolean; guids?: Array<string | null> };
+    const named = game.spawn(Transform({ x: 0 }), EntityAttributes({ name: 'Bare' }));
+    const namedGuid = (named.get(EntityAttributes) as { guid: string }).guid;
+    // #1223 D2: an id for an entity that HAS a guid refuses the whole call, and deletes nothing.
+    // Mutation: in deleteEntitiesLive, push every non-ok ref to `missing` instead of returning addressFailure.
+    const byId = await runAgentOp('delete-entities', { id: named.id() }) as { ok?: boolean; code?: string; options?: string[] };
+    expect(byId).toMatchObject({ ok: false, code: 'REFUSED_BY_OP', options: [namedGuid] });
+    expect(named.isAlive()).toBe(true);
+    const r = await runAgentOp('delete-entities', { guid: namedGuid }) as DelReply;
     expect(r.ok).not.toBe(false);
-    expect(r.guids).toEqual([null]);
+    expect(isRuntimeGuid(namedGuid)).toBe(true);
+    expect(r.deleted).toEqual([namedGuid]);
+
+    const bare = game.spawn(Transform({ x: 0 }));
+    bare.remove(EntityAttributes); // un-guidable (#1248: only a removed EntityAttributes leaves no guid)
+    const r2 = await runAgentOp('delete-entities', { id: bare.id() }) as DelReply;
+    expect(r2.ok).not.toBe(false);
+    expect(r2).toMatchObject({ deleted: [], deletedNoGuidIds: [bare.id()] });
   });
 });
 
@@ -600,6 +800,51 @@ describe('hierarchy legality is ONE rule (#166 P7)', () => {
     expect(reparentRefusal(a.id(), b.id())).toBe('cycle');   // b is a's child
     expect(reparentRefusal(a.id(), c.id())).toBeNull();      // unrelated: legal
     expect(reparentRefusal(a.id(), 0)).toBeNull();           // scene root: always legal
+  });
+
+  // #1248: every entity carries EntityAttributes, so Time and Input are Hierarchy rows. A child under the
+  // Transient singleton is dropped from every save; a singleton under an entity dies with its subtree.
+  // Mutation: drop the `resource` line in hierarchy.ts's reparentRefusal.
+  it('reparentRefusal refuses a resource as the child AND as the parent, and set-traits says why', async () => {
+    game = createTestWorld({});
+    const a = game.spawn(Transform({ x: 0 }), EntityAttributes({ guid: 'a', name: 'A' }));
+    const input = game.spawn(Input(), Transient);
+    const time = getCurrentWorld().queryFirst(Time)!;
+
+    expect(reparentRefusal(a.id(), input.id())).toBe('resource');   // under Input
+    expect(reparentRefusal(a.id(), time.id())).toBe('resource');    // under Time
+    expect(reparentRefusal(input.id(), a.id())).toBe('resource');   // Input under an entity
+    expect(reparentRefusal(input.id(), 0)).toBeNull();              // a resource at the root stays legal
+
+    const r = await runAgentOp('set-traits', { guid: 'a', set: { 'EntityAttributes.parentId': input.id() } }) as { ok?: boolean; error?: string };
+    expect(r.ok).toBe(false);
+    expect(r.error).toMatch(/resource entity/);
+  });
+
+  // #1248. Mutation: drop the parentRefusal check in liveLifecycle.ts's createEntityLive.
+  it('device create-entity under a resource parentGuid is refused, and nothing is created', async () => {
+    game = createTestWorld({});
+    const input = game.spawn(Input(), Transient);
+    const guid = (input.get(EntityAttributes) as { guid: string }).guid;
+    const before = getCurrentWorld().entities.length;
+    const r = await runAgentOp('create-entity', { spec: { kind: 'empty' }, parentGuid: guid }) as { ok?: boolean; error?: string };
+    expect(r.ok).toBe(false);
+    expect(r.error).toMatch(/is a resource/);
+    expect(getCurrentWorld().entities.length).toBe(before);
+  });
+
+  // #1248. Mutation: drop the isResourceEntity refusal in liveLifecycle.ts's duplicateEntityLive.
+  it('duplicate-entity refuses a resource — a copy of Input would share its per-frame maps', async () => {
+    game = createTestWorld({});
+    const input = game.spawn(Input(), Transient);
+    const r = await runAgentOp('duplicate-entity', { guid: (input.get(EntityAttributes) as { guid: string }).guid }) as { ok?: boolean; error?: string };
+    expect(r.ok).toBe(false);
+    expect(r.error).toMatch(/is a resource/);
+    expect(getCurrentWorld().query(Input).length).toBe(1);
+    // Accept side: an ordinary entity still duplicates.
+    game.spawn(Transform({ x: 0 }), EntityAttributes({ guid: 'a', name: 'A' }));
+    const ok = await runAgentOp('duplicate-entity', { guid: 'a' }) as { ok?: boolean };
+    expect(ok.ok).not.toBe(false);
   });
 });
 

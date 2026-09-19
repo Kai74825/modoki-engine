@@ -335,20 +335,25 @@ different fixes, and the second sends you to check a cable that was never the pr
 
 - **A second concurrent build is refused — here, in front of the server's own slot.** `/api/build`
   does take a slot (#173's in-process one, plus #650's cross-process claim), but it refuses *after*
-  the request is in flight, as a `FAILED:` build status: `runBuild` fires an SSE request per call,
-  and a native OS menu is not covered by the DOM progress modal — so the modal only *looks* like it
-  is holding the door. This refusal keeps the second build from ever being sent. Before every device row was a build this took a
+  the request is in flight, as a `FAILED:` build status: `runBuild` fires an SSE request per call.
+  This refusal keeps the second build from ever being sent. ⚠️ Since #1270 the progress dialog is a
+  modal that greys the whole menu while it is up, so from the menu this refusal is no longer
+  reachable — the menu refuses first. It stays as the guard for a caller that is not the menu. Before every device row was a build this took a
   deliberate second trip through the menu; now "wrong phone — click the right one" is the natural
   gesture, and it would put two `xcodebuild`/gradle pipelines on one project dir, both reporting
-  into the single shared `buildStatus`. A build that already FAILED does not count as running: its
-  modal is merely still up, and refusing there would make "dismiss a dialog" a prerequisite for
-  retrying.
+  into the single shared `buildStatus`. A build that already FAILED does not count as running here.
+  ⚠️ Its progress dialog is a modal, though, and a modal greys the whole menu until it is closed
+  (#1270, [editor-input.md](./editor-input.md#modals-block-the-editor-underneath-them-1270)), so a
+  retry from the menu takes one click on Close first.
 - **A pick is refused while Project Settings is open.** `user.device.*` has two writers, and they
   write differently: this menu sends a partial patch, while the dialog snapshots the whole config
   when it OPENS and posts that snapshot on Save. So a pick made while it sits open is silently
   written back to the old device — even when the user only meant to edit the app name — and the
   menu then re-reads disk and quietly agrees with the stale value. A lost update nobody is told
-  about is worse than a refusal naming the reason.
+  about is worse than a refusal naming the reason. ⚠️ Since #1270 Project Settings is a modal and
+  the menu is greyed under it, so the menu refuses first, with the generic "close the open dialog"
+  message rather than this one's specific reason; this refusal stays as the guard for a caller that
+  is not the menu.
 
 The pure row-building and both refusals are `engine/app/editor/buildTargetMenu.ts` (unit-tested
 without a phone); the fetching, the patch POST and a generation guard against out-of-order
@@ -578,6 +583,152 @@ question the person in front of it was actually asking.
 
 ---
 
+## Native file choosers — Save As and Browse… (#1440)
+
+`chooseNewAssetPath` (Create Scene, Save Scene As, every "New X") asks `POST /api/save-dialog`, and
+Project Settings' Browse… asks `POST /api/pick-path`. The router decides what each ANSWERS (an
+asset-root URL; a project-relative path, #394); the host decides how the panel is SHOWN, through
+`BackendContext.nativeChooser` (`engine/plugins/backend/nativeChooser.ts`):
+
+- **Electron** injects `engine/electron/electronChooser.ts`: `showSaveDialog`/`showOpenDialog`
+  through `mainDialog.ts`, parented to the editor window — a sheet. That is what makes ⌘V paste
+  into the name field (the app's Edit menu reaches a panel this app owns), keeps the main process
+  — which also serves the backend — running while the panel is up, and gives Windows a panel.
+- **Anything else** (a browser tab on the Vite dev server) falls back to an async `osascript`
+  chooser on macOS and `{unsupported}` elsewhere, which the renderer answers with its in-app prompt.
+  ⚠️ ⌘V still does not paste there: the panel belongs to a faceless `osascript` process with no
+  menu, and nothing in its argv can change that.
+
+**While ANY native dialog is open, the app menu cannot act on the scene behind it.** A sheet this
+app owns takes the app's MAIN-MENU key equivalents — that is how ⌘V reaches it — so the editor's own
+items would fire through it too. Measured before the guard: with the save panel up, Edit ▸ Undo undid
+a SCENE edit behind the sheet (keyboard ⌘Z undid neither the scene nor the typing). So
+`engine/electron/mainDialog.ts` — the one door every main-process dialog goes through — counts open
+dialogs (save/pick panels, the Open/New Project pickers, message boxes; a count because they can
+overlap) and main rebuilds the menu with `installAppMenu`'s `nativeDialogOpen`: every editor item
+disabled and stripped of its accelerator, New/Open Project and Reload disabled, and Edit's Undo/Redo
+replaced by the standard `undo`/`redo` roles, which reach the panel's text field. Observed after: ⌘Z
+and ⌘⇧Z undo and redo the typing, Edit ▸ Undo undoes the text, the scene is untouched, and the full
+menu returns on Cancel. The same rule as the renderer's own modal gate (`RendererMenuSpec.modal`,
+#1270), for a modal main owns.
+
+**A failure is not a Cancel.** `{cancelled}` means the human pressed Cancel (Electron's `canceled`;
+osascript's `-128` and nothing else). A panel that failed answers a 500 with the reason: the save
+flow falls back to the in-app prompt, Browse… alerts. Before #1440 both routes ran
+`execFileSync('osascript')` in every host, so the panel froze the Electron editor while it was open
+(QA-PARTICLE-0011), ⌘V did nothing, and every failure read as Cancel.
+
+**Where the save panel opens.** The caller's `defaultFolder` (an Assets-panel folder, or a kind's
+own, e.g. scenes → `/assets/scenes`); with none, `firstRootDir()` = `defaultSaveRootDir`: the first
+PROJECT asset root, never the engine's `/modoki/assets`. Until #1441 it was `assetRoots[0]`, which is
+the engine root, so Create ▸ Particle (and every toolbar create with no `defaultFolder`) opened in
+`engine/packages/modoki/src/runtime/assets/`, and the default name wrote there. macOS had hidden it:
+osascript reopened at its remembered location, while Electron's panel honours the directory it is
+given. Browse… passes no start folder, so its panel opens wherever the OS last left it.
+
+**On Windows (#1441, observed 2026-09-19 on the `win` box, Electron editor, `games/anim-bug`):**
+- The panel is the common Save dialog (`#32770`), owned by the editor. With "hide extensions for
+  known types" on (the Windows default), the default `New Scene.scene.json` shows as
+  `New Scene.scene`, and saving it unchanged writes `New Scene.scene.json`; a bare `Walk` becomes
+  `Walk.spriteanim.json` through `ensureExt`, with no doubled extension either way.
+- Saving over an existing file raises Windows' own "Confirm Save As … replace it?" (so
+  `showOverwriteConfirmation` being Linux-only does not matter here), and that check folds case: an
+  all-caps spelling of `…\SCENES\main.scene.json` was asked about, and the route answered
+  `/assets/scenes/main.scene.json`.
+- While the panel is up, the menu gate holds on Windows too: Edit shows the plain `undo`/`redo`
+  roles, and Save All, Open Project, Reload and Project Settings are disabled. It comes back whole
+  after Cancel and after Save.
+- A path outside every asset root gets the in-app `alert`. It shows as a native message box titled
+  "Electron".
+- Browse… returns native `D:\…` paths. Inside the project they are stored project-relative with `/`;
+  outside, `portablePath` rewrites `\` as `/`, because the SDK-path allowlist refuses a backslash
+  (`D:\Downloads` for JAVA_HOME used to fail Apply as "invalid characters").
+- ⚠️ **Driving the panel from a script:** `WM_SETTEXT` on the name field changes what it SHOWS but
+  not what the panel returns (the default name was saved instead). `WM_CHAR` per character works.
+  And never use `SendKeys`: a background process cannot take the foreground on Windows, so the
+  keys go to whatever window has focus.
+
+An agent never opens either panel — they are modal and only a human can answer one;
+`modoki_create_registered_asset` takes an explicit path instead (#288).
+
+## Asset editors and the move gate (#1362)
+
+Seven asset editors, split by how they are mounted — and the split decides what a MOVE of the asset
+does to them:
+
+- **Five are dockable panels** (Particle, Animation, Timeline, SpriteAnim, Skin), bound by a store
+  field and listed in `ASSET_EDITOR_BINDINGS_BY_FIELD`. `applyAssetPathMoves` **re-points** them
+  through `remapEditingAssetPath`, so a move is invisible to them.
+- **Two are modals owned by a path-keyed view** — the Sprite Editor and the 9-slice editor, rendered
+  inside `<AssetInspector key={selectedAsset.path}>`. That key is deliberate: it remounts the view on
+  an asset SWITCH so no per-asset document is reused across one (#891/#897), and it is what makes a
+  texture *swap* safe (#1328, pinned by `editor-texture-modal-swap.spec.ts`).
+
+A move/rename changes the same path, so it **unmounted those two modals and destroyed their unsaved
+work**. Observed live, 2026-09-18: Sprite Editor open and re-sliced 4 → 8 slices, one
+`modoki_move_asset`, and the modal was gone — no Save, no Cancel, no prompt, `openEditors` empty,
+and `unsavedChanges` still **false**.
+
+**A move of an asset a texture editor holds unsaved edits on is REFUSED** (owner, 2026-09-18). The
+alternative — let the move through and re-point the modal — was rejected: `SpriteEditor` documents,
+and leans on in several places, that its `path` never changes for a mounted instance (its meta-load
+effect would reload from disk straight over the unsaved slices), and refusing keeps the rule the
+owner set for these dialogs on 2026-08-18, quoted in both files — *Cancel and Save are the only
+exits*. A move that survived it would be a third exit.
+
+How it is wired, and why in that order:
+
+- **`AssetEditorMount.dirty`**, published by both modals, is the **only** thing that knows. They park
+  nothing in `dirtyAsset`/`pendingMeta`, so every gate that reads those registries is blind to them.
+- The Sprite Editor compares a **digest of what a save would write**
+  (`spriteSheetDigest`, a `.ts` module beside the panel), not the slice guid list: dragging a slice's
+  edge changes its rect and keeps its guid, so a guid-keyed check reports clean for exactly the edit
+  a human most likely just made. A successful save becomes the new baseline.
+- **`openAssetEditor`** is a registry on the `resolve-unsaved` probe, so `/api/move-file` can refuse
+  with `409 HELD_BY_ASSET_EDITOR`. It is deliberately **not** a `CAUSE_REGISTRY` row (it is not one
+  of `unsavedChangeCauses()`' causes) and is excluded from `DiscardableRegistry` **by type** — a
+  discard could only mean "throw the modal's work away", which is what the refusal prevents.
+- ⚠️ It is also **not** in `DOCUMENT_UNSAVED_REGISTRIES`, which is what the stale-read disclosures
+  (`/api/validate-prefab`, `/api/scene-mutate`) ask for. A dirty Sprite Editor does not make a prefab
+  read stale, and on `scene-mutate` — which refuses on a hold — asking for everything would have
+  blocked scene edits because a texture modal was open somewhere.
+- **`setEditorMount` compares `dirty`.** It dedups on `{path, slices}` to keep `select-sprite-slice`
+  from churning, and leaving `dirty` out of that comparison made the whole mechanism inert: the
+  9-slice editor (no `slices`, and a path that never changes for a mounted instance) could never
+  register a hold, and the Sprite Editor's hold decayed to "the guid list changed" — the very
+  substitute the digest exists to replace. It looked like it worked because the live repro re-sliced
+  4 → 8, one of the few edits that does change the guid list.
+- **The refusal is `423`, not `409`.** `COLLISION_STATUS` is 409 and `undoFailure.ts` reads it as
+  `userFixable`, so an undo refused by this gate toasted *"something already exists at the original
+  path"* — false.
+- **It refuses on `unknown` too**, not only on `held`. Acting only on `held` fails OPEN against the
+  skew the probe exists to detect: a pre-#1362 renderer answers *"unknown registry — nothing was
+  checked"*, and reading that as "nothing is held" destroys the work. `absent` proceeds — with no
+  renderer there is no modal.
+- The **backend** is the guard, because the agent route never goes through the Assets panel. The
+  **four** human seams (F2/context rename, drag-into-folder, clipboard **cut**, folder rename) call
+  `assetEditorHoldMessage()` only to say WHY, since `moveFileToStatus` keeps `{ok, status}` and
+  discards the body. A **copy** is not gated — it leaves the held asset where it is.
+- **`/api/delete-asset` shares the gate** (`heldAssetEditorRefusal`), because it is the same
+  mechanism and worse — it destroys the modal's edits AND the file. It honours that route's own
+  escapes (`rendererWrite`, `discardUnsaved:true`): an explicit discard is a caller accepting the
+  loss, not the silent loss this refusal exists to stop.
+- **A dirty editor shows up in `openEditors` as `{path, dirty:true}`.** Without that, the picture
+  after the fix was the one that hid the bug: a 423 nothing on the MCP surface could corroborate,
+  since `openAssetEditor` is not an `unsavedChangeCauses()` cause and `unsavedChanges` stays false.
+
+⚠️ **The tier that matters is the ROUTE, and it is easy to leave untested.** The renderer-side
+helpers (`dirtyAssetEditorHolds`, `assetEditorHoldMessage`, the digest) have unit tests, and with
+those green the gate block could still be deleted whole with **every** suite passing —
+`unsavedGateCoverage` included, because its `needed` for this route derives from a registry list that
+cannot contain `openAssetEditor`. `engine/tests/plugins/moveFileRouter.test.ts` drives the route
+itself; that is where a test of this gate belongs. Note also that the router has its **own** prefix
+matcher, separate from the panel's, so the panel's unit test does not cover it.
+
+`/api/move-file`'s exemption row in `unsavedGateCoverage.test.ts` is now **partial**: its argument
+(gating a rename would be wrong, because the repair carries the work across) still holds for the four
+document registries and does not extend to this one, where there is nothing to re-point.
+
 ## Panels
 
 ### Tab mounting LATCHES — "unselected" is not "unmounted" (#1015)
@@ -621,7 +772,8 @@ zero-area tabset surfaces as `panelMounted: false` instead. Which is why "is it 
 neither direction of the question.
 
 **So mountedness has exactly one source of truth: the panel publishes it from its own mount effect**
-(`gameViewMounted`, `animationPanelMounted`), read back as `panelMounted`. It is **not** derivable
+(`gameViewMounted`, and `editorMounts` for the asset editors — #1213), read back as `panelMounted` /
+`openEditors`. It is **not** derivable
 from `openPanels` — that is every tab NODE in the model with no selection test — and it is not
 derivable from selection. ⚠️ Do not "simplify" `panelMounted` into either; #367 shipped the
 `openPanels` version, which answered `mounted: true` for precisely the case the field exists to
@@ -743,6 +895,24 @@ per the editor `.ts`-carries-tests rule below.
 `handlePrefabDrop`'s `type !== 'prefab'` bail is still load-bearing even though no human can reach
 it, because `modoki_dnd` dispatches `drop` unconditionally and only *reports* what `accepted` was.
 
+### A sprite ROW has no file — every selection-driven file action asks `isFileRow` (#1249, #1257)
+
+When the Assets list is narrowed to sprites (the `sprite` chip, or a search matching a slice), each
+sprite is a flat row whose path is `<texture>#<guid>` (`#default` for the whole-image sprite). No file
+exists at that path, so a rename, move, delete, duplicate or copy of it 404s at best. Select All
+reaches those rows, so **a file action must filter the selection, not trust it**, and every one asks
+the same predicate in `panels/assetListing.ts`: `isFileRow`, through `fileActionTargets` (entries) or
+`fileActionPaths` (paths — a selection Set, a drag payload). Callers today: delete/duplicate/copy
+(#1249), F2 in `resolveAssetKey`, the context menu's target count, and the folder drop (#1257).
+
+The count is the part a user sees: the menu derives `many` from it, so counting sprite rows made one
+texture plus a few sprites read as a multi-selection and hid Rename, Instantiate, Re-import, Copy Path
+and Find References for the one real file. `fileActionPaths` keeps a path with no listed entry (a
+folder, an engine built-in) — what those mean stays the caller's call. **Not filtered, on purpose:**
+the `application/editor-asset-paths` drag payload (the Skin editor's parts list takes sprites), the
+Inspector's multi-selection, and the footer's "N selected". A new selection-driven file action goes
+through the predicate rather than a local `type !== 'sprite'`.
+
 ### A panel that reads `getAllAssets()` must subscribe to `assetsVersion`
 
 `getAllAssets()` reads the module-level manifest map, and React has no idea when that map
@@ -819,7 +989,7 @@ Extracted decision modules:
 
 | module | what it decides |
 |---|---|
-| `panels/assetListing.ts` | Assets filtering, sprite/type grouping, the visible-order walk that drives keyboard nav |
+| `panels/assetListing.ts` | Assets filtering, sprite/type grouping, the file-row predicate for file actions, the visible-order walk that drives keyboard nav |
 | `panels/assetKeyCommands.ts` | every Assets keystroke → a command (platform-dependent delete chord, type-ahead) |
 | `panels/assetSelection.ts` | Assets click + drag selection policy |
 | `panels/assetOps.ts` | import/re-import planning, the delete sidecar rule, rename validation |
@@ -1214,10 +1384,28 @@ image at once. The REBUILD only happens on a frame that runs, and a GLB re-parse
 longer than the 1s grace — so re-arming on the invalidation alone still left a re-imported object
 missing indefinitely (measured on `games/space-console`: 10s+, twice, recovering only when an
 unrelated selection forced a frame). It reads as data loss, not as a stale frame. The completion edge
-is `runtime/loaders/modelLoadNotify.ts`, fired by **both** model caches — `meshTemplateCache` for
-static templates and `riggedModelCache` for skinned prototypes. A notifier wired into only the first
-would leave re-imported CHARACTERS broken while every static mesh recovered, which is why it is a
-shared leaf module rather than an export of either cache.
+is `fireDirtyListeners()` (`runtime/core/renderDirty.ts`), called by **both** model caches —
+`meshTemplateCache` for static templates and `riggedModelCache` for skinned prototypes. Wired into
+only the first it would leave re-imported CHARACTERS broken while every static mesh recovered, which
+is why both caches call it.
+
+⚠️ **That completion edge used to travel on a PRIVATE channel, and that was #1363.** A dedicated
+`modelLoadNotify.ts` / `onModelTemplatesLoaded` event existed for it, and the subscription list
+above was its ONLY subscriber in the repo — so the QA-ASSET-0008 fix covered one render-on-demand
+3D surface of two, and the **stopped GameView** (`Scene3D`, idle-gated since the T1 gate landed in
+June 2026) never got the load edge at all. Its own docblock asserted "the continuously-rendering
+GameView needs none of this", which was already false two months before it was written. Every other
+async refill in `meshTemplateCache` — `fetchEnvironment`'s success path, the material refetch —
+already called the shared `fireDirtyListeners()`, which is why none of them had the bug. The channel
+is deleted; the reasoning now lives in `renderDirty.ts`'s header, with an explicit note not to
+answer this edge with a private channel again.
+
+MEASURED on `games/alien-animal`, stopped editor, Game panel visible, the GLB refill delayed past
+the grace: **before**, the evict emptied the scene at t=1752 ms, the gate spent its ~1 s and the
+surface stopped submitting at t=2751 ms, and 30 s later the scene still held 0 meshes with
+`renderer.info.render.calls` frozen — one forced render restored it instantly, so the refilled model
+had been sitting in the cache unused. **After**, the same run recovered unaided at t=10014 ms, the
+moment the refill landed.
 
 **UNDO/REDO was missing from that list entirely, and it is the sharpest case (2026-08-18).** Undo
 reverts a transform through `gizmoUndo.ts`'s `apply`, a raw `en.set(trait, …)` — it does not go
@@ -1767,6 +1955,96 @@ line numbers and the gate rejected all 37 of them — correctly, and pointedly: 
 a cleanup range that had already rotted by four lines** between filing and being picked up, which is
 the whole argument for the rule.
 
+## The unsaved-work gate — every human world swap asks first (#1419)
+
+**Any human gesture that replaces the world or unloads the page awaits
+`confirmDiscardUnsaved(action, scope)` (`scene/unsavedGate.ts`) before it acts.** If nothing that
+gesture would destroy is unsaved, it proceeds silently. Otherwise it shows a **Save / Discard /
+Cancel** modal listing what would be lost (owner's call: a modal, not a toast with undo and not
+auto-save):
+- **Save** runs `runSaveAll()`, then re-reads the causes. It proceeds only if nothing is left. A
+  cancelled Save As on an untitled scene, a failed write, or a refused save (Play mode) all return
+  without throwing, so trusting the save's own verdict would destroy exactly the work the human
+  asked to keep.
+- **Discard** proceeds.
+- **Cancel**, Escape, or a backdrop click does nothing.
+- **Enter** means Save, because it loses nothing.
+
+It is the human twin of the agent ops' `guardUnsaved` (`agentEditorOps.ts`), and both read
+`unsavedChangeCauses()`. **Before #1419 only the agent side existed.** An agent was refused and told
+what `discardUnsaved` would drop. A human opening a scene from Assets lost the open scene's edits
+without a word, and since #1409 the undo stack went with them.
+
+**Scope is derived from the cause table, never listed** (a list here would be #972 again):
+- **`'world-swap'`** counts only the causes the scene write carries (`writtenBy: 'scene-write'`,
+  meaning the live primary world and the other loaded scenes). Parked asset docs, base-scene refs
+  and import settings are path-keyed module state that **survives** a swap. A prompt about them
+  before a scene open would warn about work nothing is about to lose.
+- **`'page-unload'`** counts every cause.
+
+| Gesture | Where it asks | Scope |
+|---|---|---|
+| Assets double-click on a scene, Inspector "Open Scene" | `openAssetInEditor` (both routes go through it) | world-swap |
+| Assets → Create Scene | `Assets.tsx` `runCreate`, before the path picker (any `create` override replaces the world) | world-swap |
+| Open a prefab for editing | `openPrefabForEditing`'s `confirmDiscard` option. It asks only about what is still dirty **after** the existing auto-save: an untitled scene or a failed save. The agent op passes no gate and refuses up front instead | world-swap |
+| Prefab edit → "Back to scene" | `SceneView.tsx` `exitPrefabEdit` | world-swap |
+| View → Reset Layout / Load Layout | `EditorApp.tsx` (both reload the page) | page-unload |
+| AI panel → toggle renderer debugging (packaged: relaunches) | `AIPanel.tsx` `toggleCdp` | page-unload |
+| Window close, quit, New / Open / Open Recent Project, View → Reload / Force Reload, update "Restart Now" | Electron main → `unsavedGateClient.ts` → the renderer's `answerUnsavedGateRequest`. "Restart Now" asks from `autoUpdate.ts` BEFORE `quitAndInstall` (on Windows the installer is spawned before the quit), and Cancel there means "Later". The install's own window close then passes the close handler (`isUpdateInstalling()`), so it is not asked twice | page-unload |
+
+**The Electron half is two-phase, because one timeout cannot serve both jobs.** A human may take
+minutes over the modal, but a **hung** renderer never answers. A gate that waited forever on a hung
+renderer would make the window unclosable. So the renderer **acks** the moment the request lands,
+and only the ack has a deadline:
+- **no mounted editor → proceed at once.** Main asks only after the editor's first menu-structure
+  push (`gateRendererReady`); a boot-error page or an editor still booting has nothing to lose,
+  and asking it would add the ack wait to every Cmd+R.
+- **no ack within 15s → proceed.** The deadline is long on purpose: a mounted editor that is slow
+  to ack is BUSY (a scene load, a shader compile), not gone.
+- **acked → wait for the human's answer with no deadline.**
+- **the question can no longer be answered → proceed.** `releaseAll` runs on the window's
+  `unresponsive` event, `render-process-gone`, `did-navigate` (a committed reload of any kind,
+  including the HMR one), and `'closed'`/a project switch (`failPendingRenderer`). ⚠️ Not
+  `did-start-navigation`: that also fires for navigations that never replace the document (one
+  `will-navigate` blocks, a download, a 204), and clearing readiness there made the next quit skip
+  the prompt — observed on Electron 43.2. The first
+  cut released only on the last two. An HMR reload under an open modal then left the question
+  pending forever, and every later close and quit was silently dropped (#1419 review).
+
+Before asking, main restores, shows and focuses the window. The modal renders inside it, so a Dock
+Quit on a minimized or hidden window would otherwise ask a question nobody can see.
+
+The two View reload items are custom menu items rather than Electron's `reload`/`forceReload`
+roles, because a role cannot ask. A startup-failure quit (`quitExitCode` set) skips the gate.
+
+**One prompt at a time.** A second request while the modal is up is **refused, not queued**. For
+example, a window close or a quit during an Assets-open prompt is dropped, and the human repeats it
+after answering the modal already on screen. A Save that throws counts as "stay", with a toast.
+
+**Deliberately not gated:**
+- The HMR game-code reload. It has its own countdown banner with Cancel (#850); it is a code
+  change, not a gesture, and a blocking modal there would stall the agent that wrote the code.
+- Crash-recovery and error-boundary reloads, and the dev-only self-HMR reloads.
+- Every agent op. They keep `discardUnsaved` and never see the modal. The agent ops that swap
+  the world are `load_scene`, `new_scene`, and `modoki_prefab` `edit-open`/`edit-exit`; `edit-exit`
+  gained its refusal in #1424.
+
+**Known limits:**
+- The **browser-hosted** editor (Chrome, no Electron) has no `beforeunload`, so closing its tab is
+  still silent. A `beforeunload` cannot be added naively: under Electron it would silently block
+  the reloads that main has already gated, and in the browser it would pop a native dialog over
+  the HMR reload's own countdown.
+- A scene load that **keeps** a dirty base scene carries its edits across the swap (#1417), but
+  which bases the target keeps is only known once `SceneManager.loadScene` has read the target's
+  base chain. So the gate still counts every dirty base (`dirtyScenes`) as lost. The result is at
+  most one prompt more than needed, never one fewer.
+
+**Adding a new world-replacing gesture:** await `confirmDiscardUnsaved('<verb phrase>', scope)`
+before it acts, at the HUMAN entry point, not inside a function the agent ops share. The decision
+is unit-tested in `tests/editor/unsavedGate.test.ts`, main's client in
+`tests/electron/unsavedGateClient.test.ts`, and the live modal in
+`tests/e2e/editor-unsaved-gate.spec.ts`.
+
 ## Selection restore across world swaps
 
 koota entity ids are scoped to their owning world, so a `SceneManager` world swap (scene
@@ -1777,6 +2055,53 @@ entity's `EntityAttributes.guid` (one pass per world, no name ambiguity); the **
 for entities lacking a guid, matches by name + ancestor path. Anything unresolved is
 cleared. This is the same GUID-keyed mechanism that lets a Stop-revert preserve the user's
 selection.
+
+### Inside one world: selection, collapse and the bound roots follow the ENTITY (#1221)
+
+A swap is not the only thing that breaks an id. Inside a world koota recycles an index LIFO, so a
+selected entity that is destroyed and replaced (a board rebuilt during Play, an agent's
+delete-and-respawn) used to leave the **newcomer** selected — outline, gizmo and Inspector on an
+entity nobody picked — and the same held for a collapsed Hierarchy row and the Animation/Timeline
+panels' bound root. The rule this follows is in [engine-concepts.md](engine-concepts.md) § Entity
+("What to hold").
+
+- **`editor/store/heldEntity.ts`** holds a pointer as `{ id, packed, guid, world }` and resolves it:
+  the same entity → unchanged; gone, and a live entity carries its guid → **follow** it (a Timeline
+  scrub or Entries row respawn, an undo respawn — owner decision 2026-09-15); gone with a guid nothing
+  carries yet → **parked** (hidden, asked again); gone without a guid → dropped.
+- **`editor/store/editorRefLiveness.ts`** does that for `selectedEntityIds`/`selectedEntityId`,
+  `animatorRootEntityId` and `directorRootEntityId`. The readers keep reading plain ids. It runs
+  ⚠️ **synchronously on every structure change** — `unregisterEntity` fires that before `destroy()`,
+  so the pointer is cleared before any spawn can take the index; a once-a-frame check would leave a
+  frame in which a gizmo drag writes to the newcomer — **and again a frame later**, because a seeded
+  prefab respawn writes its guid AFTER its spawn's structure event (that pass may rescan, so a guid
+  written without `indexEntityGuid` is followed too). A store write from anywhere else re-captures and
+  forgets a parked pointer; its own writes push no undo entry.
+  ⚠️ **A world swap re-takes every pointer still held in the old world — one tick later** (a pointer
+  already held or parked in the new world by then is kept). A hold
+  belongs to one World; a root is otherwise re-taken only when its store VALUE changes, and the
+  Timeline panel's re-resolve usually lands on the same number — so without the re-take both roots
+  held the pre-Stop world forever and the newcomer came back after the first Stop. It waits a tick
+  because `stepSimulation` swaps out and back inside one call: re-taking at the swap held the
+  transient world's entities and a destroy there unbound the Animation panel. The price is a one-tick
+  window after a real load in which a bound root's destroy-and-respawn is not caught.
+  ⚠️ **While any durable guid is parked, the frame-later pass can rescan the world** once per frame
+  in which `EntityAttributes` is added or written (`findEntityByGuid`'s gate; ~0.13 ms per 1k
+  entities, [engine-concepts.md](engine-concepts.md) § Entity identity). Accepted: it is what lets a
+  guid written without `indexEntityGuid` be followed.
+- **Selection undo** (`editorStore.ts` `resolveSnap`) resolves a durable guid first, then a HOLD
+  taken at capture when it belongs to the current world (undo history survives a CLEAN same-scene reload and
+  A→B→A — a discarding one drops it, [scene-loading.md](scene-loading.md) #1409 — and another world's number means nothing here) — never the bare raw id, which re-selected whatever took a destroyed entity's index
+  (the capture keeps durable guids only, so that reached every runtime spawn). A primary that is gone
+  falls back to the last remaining member.
+- **Hierarchy collapse** holds each id while it is in the set and re-resolves the holds before every
+  tree rebuild (`holdCollapsed`/`reconcileCollapsed` in `hierarchyCollapse.ts`). A collapsed entity
+  that is gone but has a DURABLE guid is parked, so an undo respawn comes back collapsed, and a parked
+  guid is still persisted — otherwise a game system destroying a collapsed scene entity during Play
+  re-saved the scene's collapse set without it, and Stop restored it expanded. ⚠️ The reconcile runs
+  inside a `setCollapsed` updater and must stay PURE: React runs an updater twice in development and
+  keeps the second result, and the first version wrote the holds from inside it — the newcomer stayed
+  collapsed in the running editor with every unit test green (found by the live check).
 
 ### Hierarchy collapse restore — the swap must SCHEDULE its own restore (#839)
 
@@ -2005,10 +2330,10 @@ wrapper functions #835 replaced (`serialize.ts`'s `writeFileToServer`, this modu
 duplicate, a third copy in `modelImport.ts`, `writeAssetFileOrAbort`, and an inline `post` lambda
 in `ModelAssetView.tsx`) are gone.
 
-**Binary writes (base64) never touch `jsonFileBody`** — appending a newline to a UltraHDR JPEG, an
-extracted PNG texture, or a converted GLB corrupts the asset. Three sites deliberately keep their
+**Binary writes (base64) never touch `jsonFileBody`** — appending a newline to an
+extracted PNG texture, or a converted GLB corrupts the asset. Two sites deliberately keep their
 own raw `backendFetch('/api/write-file', …)` call rather than routing through `writeAssetFile`:
-`assetViews/EnvironmentAssetView.tsx`, `scene/modelImport.ts` (its texture-extraction write only —
+`scene/modelImport.ts` (its texture-extraction write only —
 the material/mesh JSON writers in the same file DO route through the wrapper), and
 `scene/convertToGLB.ts`. `tests/architecture/clientJsonWriteSeam.test.ts` enforces the split: no
 file outside the wrapper reaches the route directly unless it is on that file's EXEMPT ledger,
@@ -3176,7 +3501,7 @@ then `makeDeleteUndo` (`panels/assetUndo.ts`) writes the whole set back on undo.
 *"Move to Trash is a filesystem operation and undo does not cover it"* and proposed confirmation
 dialogs on the strength of it. Nothing in `docs/` contradicted that. The dialogs were declined —
 see `docs/todo.md` § Deferred decisions for that call and for why the one surviving
-`window.confirm` (cross-scene move) is not an inconsistency.
+confirmation (the cross-scene move, including a reparent across scenes since #1429) is not an inconsistency.
 
 **What undo does NOT survive is an editor relaunch** — `undoStack`/`redoStack` are module state
 in `undo/undoManager.ts`. That is normal and is deliberately not treated as a defect.
@@ -3363,13 +3688,20 @@ throw — it produces nothing, and the human got a toast for a failed FOLDER del
 failed FILE delete. A `!ok` fallback covers it. Naming the paths is better; saying nothing is the
 defect.
 
-⚠️ **`failed` is populated on win32 only, and the platforms genuinely disagree.** darwin's
-`osascript` and Linux's `trash-put` are single invocations: a mid-list refusal throws as a whole,
-`parseTrashFailures` finds no marker, `moveToTrash` rethrows and the route 500s. So **an empty
-`failed` is not evidence that every path went — `ok` is**, and the partial row of the table above
-is unreachable outside Windows. That also means the toast cannot be driven from a Mac: the
-behaviour is pinned at the seam (`deleteAssetRouter.test.ts`, `assetUndo.test.ts`,
-`assetDeleteRenamePolicy.test.ts`) and end-to-end confirmation belongs to the `win` clone.
+⚠️ **`failed` is populated on win32 and darwin, not Linux, and the platforms genuinely disagree.**
+win32's script names each refused path. darwin's Finder names none, so since #1212 A-8 `moveToTrash`
+reports what is still on disk after the refusal, with Finder's own line as `reason` (the route's
+`error` / `failedReason`). **Finder's delete is all-or-nothing** — measured 2026-09-17 with a
+`chflags uchg` file, in both list orders: one refused item and nothing moves — so on darwin the
+partial row of the table above is still unreachable, and a refusal is always the total one. An
+AppleEvent timeout (`-1712`) is still a thrown failure: Finder may be mid-move, so "still on disk"
+is not an answer yet. On Linux a failing `trash-put` is NOT reported at all: `moveToTrash` falls
+back to `rmSync` — a PERMANENT delete — and names only the paths it refuses to remove (#883), so
+`ok:true, failed:[]` there can mean "deleted, not trashed". **An empty `failed` is not evidence that
+anything went to a Trash — `ok` says whether the paths are gone.** The partial toast
+is therefore reachable only on Windows, pinned at the seam (`deleteAssetRouter.test.ts`,
+`assetUndo.test.ts`, `assetDeleteRenamePolicy.test.ts`), with end-to-end confirmation on the `win`
+clone.
 
 ---
 
@@ -3479,6 +3811,7 @@ until this landed.
 | 3D collider outline | `runtime/rendering/colliderOutline3D.ts` |
 | Play / Stop / Pause | `editor/scene/playMode.ts`, `runtime/core/playState.ts` |
 | Selection restore on world swap | `editor/store/selectionRestore.ts` |
+| Selection / collapse / bound roots follow their entity inside a world | `editor/store/editorRefLiveness.ts`, `editor/store/heldEntity.ts` |
 | Console capture | `editor/consoleCapture.ts`, `editor/panels/Console.tsx` |
 | Asset editors | `editor/panels/{AnimationEditor,ParticleEditor,SpriteEditor,SpriteAnimEditor}.tsx` |
 | Material inspector / preview | `editor/panels/assetViews/MaterialAssetView.tsx`, `editor/panels/MaterialPreview.tsx` |

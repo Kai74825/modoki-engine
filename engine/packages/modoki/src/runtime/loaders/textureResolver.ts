@@ -26,6 +26,7 @@ import { warnVocabOnce } from '../core/warnVocab';
 import { hasDocKey } from '../core/docKeys';
 import { getActiveTextureSizeCap } from '../core/textureSizeCap';
 import { emitAssetInvalidated } from '../core/assetInvalidation';
+import { fireDirtyListeners } from '../core/renderDirty';
 import { createSupersessionToken, createTeardownToken } from '../core/liveness';
 export { getActiveRenderer, onRendererReady, rendererReady, getRendererGateHealth } from '../core/activeRenderer';
 export type { RendererGateHealth } from '../core/activeRenderer';
@@ -276,6 +277,15 @@ function warnUnresolvedSprite(ref: string, why: string): undefined {
   return undefined;
 }
 
+/** The DOM twin of {@link warnUnresolvedSprite}, for `resolveBrowserImageUrl`'s production path
+ *  (UI `<img>`/background). Same dedupe and same forget-on-resolve. */
+const _domUnresolvedWarned = new Set<string>();
+function warnUnresolvedDomImage(ref: string, why: string): void {
+  if (!isGuid(ref) || _domUnresolvedWarned.has(ref)) return;
+  _domUnresolvedWarned.add(ref);
+  console.warn(`[UIImage] Unknown asset guid: ${ref}\n  (${why} — deleted, dropped from the build, renamed, or never assigned an id?)`);
+}
+
 /** A ref that resolves is no longer "unresolved" — drop it so a future genuine failure warns. */
 function forgetUnresolvedSprite(ref: string): void {
   if (_unresolvedSpriteWarned.size) _unresolvedSpriteWarned.delete(ref);
@@ -286,6 +296,7 @@ function forgetUnresolvedSprite(ref: string): void {
  *  sibling test that already tripped it. */
 export function resetUnresolvedSpriteWarnings(): void {
   _unresolvedSpriteWarned.clear();
+  _domUnresolvedWarned.clear();
 }
 
 /** Resolve a 2D image-or-sprite ref to `{ url, frame, pivot }`.
@@ -366,7 +377,15 @@ export function resolveBrowserImageUrl(ref: string, warnKtx = false): string | u
   const texRef = entry?.type === 'sprite' && entry.sprite ? entry.sprite.texture : ref;
   const texEntry = getAssetEntry(texRef);
   const sourcePath = resolveRef(texRef);
-  if (!sourcePath) return undefined;
+  if (!sourcePath) {
+    // A deleted/unknown image guid on the production-DOM path (#1408): a UI image that is simply
+    // absent, with a clean console, is the shape `warnUnresolvedSprite` exists to prevent on the
+    // 2D side. Gated on the same opt-in as the KTX warning: UINode passes it (in the editor's UI
+    // preview too); the SceneView's Canvas2D draw path does not.
+    if (warnKtx) warnUnresolvedDomImage(ref, texRef !== ref ? `its parent texture ${texRef} is not in the manifest` : 'not in the manifest');
+    return undefined;
+  }
+  if (_domUnresolvedWarned.size) _domUnresolvedWarned.delete(ref);
   const settings = texEntry?.texture;
   if (settings) {
     // The WebP/PNG sibling a 2d/ui texture exposes (mirrors what the build emits).
@@ -515,11 +534,23 @@ export async function loadTexture3D(ref: string, opts?: { flipY?: boolean }): Pr
     applyTextureSettings(tex, settings, isKtx, opts?.flipY);
     (tex.userData as Record<string, unknown>)[KEY] = key;
     entry.texture = tex;
+    // The WAKE lives here, in the one store every 3D texture goes through (#1368) — not in each
+    // caller. A KTX2 transcode can outlast an idle surface's ~1 s frame grace, and the consumer's
+    // own `.then` (a particle emitter's reveal, a material's map) runs in this same microtask
+    // chain, i.e. before the woken frame. Fired AFTER the cache write, so a listener that reads
+    // back synchronously finds the texture. A MISS only: a hit returned `hit.promise` above and
+    // fires nothing, so a per-frame caller can never keep a surface awake through this.
+    fireDirtyListeners();
     return tex;
   }).catch((e) => {
     // Don't cache a rejected load forever — a later call should be free to retry
     // (e.g. once the renderer/transcoder becomes ready). Acquirers see the reject.
     if (texCache.get(key) === entry) texCache.delete(key);
+    // A reject wakes too: the particle backends reveal their radial fallback on it. ⚠️ Safe only
+    // because NO caller retries per frame (each loads once per build/setDef) — the eviction above
+    // makes the next call a fresh miss, so a per-frame retrier would turn this wake into a
+    // self-sustaining render loop on a 404. Check that before adding a per-frame caller.
+    fireDirtyListeners();
     throw e;
   });
   texCache.set(key, entry);

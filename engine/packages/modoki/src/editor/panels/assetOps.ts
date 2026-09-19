@@ -13,15 +13,18 @@
  *  the logic is unit-testable without rendering a React panel. */
 
 import { backendFetch, writeAssetFile, jsonFileBody } from '../backend/editorBackend';
-import { serializePrefab, tagEntityTreeAsInstance, untagEntityTreeAsInstance, setPrefabCache, warnInertPrefabSizes, type PrefabFile } from '../scene/prefab';
+import { serializePrefab, preloadNestedPrefabsForSubtree, tagEntityTreeAsInstance, untagEntityTreeAsInstance, detachPrefabInstance, reattachPrefabInstance, setPrefabCache, warnInertPrefabSizes, wouldCreateCycle, type PrefabFile } from '../scene/prefab';
 import { entityRef } from '../undo/entityRef';
 import { reportUndoFailure } from '../undo/undoFailure';
 import type { UndoAction } from '../undo/undoManager';
+import { dirtyAssetEditorHolds } from '../store/editorStore';
 import { registerAsset } from '../../runtime/loaders/assetManifest';
 import { firstAssetRoot } from './assetRoots';
 import { pastePathIn, splitAssetPath, type AssetEntry } from '../utils/assetPaths';
 import { isTextAsset } from './assetUndo';
 import { flushPendingMetaFor } from '../scene/pendingMeta';
+import { writeNewAssetDocument } from '../scene/createAssetDocument';
+import { migrateUIAnchorZIndexStructured } from '../../runtime/loaders/uiAnchorZIndexMigration';
 
 // ── Re-import / import planning (pure — unit-testable without IO) ─────
 
@@ -248,7 +251,7 @@ export async function deleteAssetFile(assetPath: string): Promise<boolean> {
   try {
     const res = await backendFetch('/api/delete-asset', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ path: assetPath }),
+      body: JSON.stringify({ path: assetPath, rendererWrite: true }),
     });
     if (!res.ok) return false;
     // An unparseable body is not a failed delete — the trash already happened, and the old
@@ -280,13 +283,13 @@ export type DeleteFilesResult = {
    *  with a non-empty `failed` means NONE of it went. Both are worth reporting to the human, so
    *  read `failed` before branching on `ok`, not after.
    *
-   *  ⚠️ **NOT win32-only since #1006** — this said it was, and a caller reading that would branch
-   *  wrongly on Linux. darwin's `osascript` and Linux's `trash-put` are single invocations that
-   *  throw as a whole, so a refusal from EITHER still arrives as `ok:false` with `failed` EMPTY;
-   *  an empty `failed` is therefore not evidence that every path went — check `ok` for that. What
-   *  changed is Linux's `rmSync` FALLBACK (used when `trash-put` is absent — CI, headless): it
-   *  reports per path, and names any whose subtree is not self-contained (#883). Those files are
-   *  still on disk, so the rule above applies to them in full. */
+   *  ⚠️ **NOT win32-only since #1006, and populated on darwin since #1212 A-8.** Finder names no
+   *  path when it refuses, so the backend reports whatever is still on disk (Finder's delete is
+   *  all-or-nothing, so that is the whole batch). On Linux a failing `trash-put` is not reported:
+   *  the backend falls back to a PERMANENT `rmSync`, so `failed` empty with `ok:true` can mean
+   *  "deleted, not trashed" — check `ok` for whether the paths are gone. That fallback (also used
+   *  when `trash-put` is absent — CI, headless) reports per path, naming any whose subtree is not
+   *  self-contained (#883); those files are still on disk, so the rule above applies in full. */
   failed: string[];
 };
 
@@ -298,9 +301,12 @@ export type DeleteFilesResult = {
 export async function deleteAssetFiles(paths: string[]): Promise<DeleteFilesResult> {
   if (paths.length === 0) return { ok: true, trashed: 0, missing: [], failed: [] };
   try {
+    // `rendererWrite` (here and in `deleteAssetFile`): every caller is the editor's own flow — the
+    // Assets panel, undo/redo, the model-import prune — i.e. the human deleting on purpose. The
+    // route's unsaved-work gate is for the AGENT path, which cannot see the human's edit (#1215).
     const res = await backendFetch('/api/delete-asset', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ paths }),
+      body: JSON.stringify({ paths, rendererWrite: true }),
     });
     if (!res.ok) return { ok: false, trashed: 0, missing: [], failed: [] };
     // A body we cannot parse is not a failed delete — the trash already happened.
@@ -386,6 +392,41 @@ export async function moveFileTo(from: string, to: string): Promise<boolean> {
  *  (`if (await moveFileTo(a, b))`), and an object return is ALWAYS truthy — so
  *  widening it in place would silently disarm each of those guards while
  *  typechecking cleanly. */
+/** The texture editor holding unsaved edits on any of `froms` (or on something under one, for a
+ *  folder move), as a ready-to-show message — or `null` when nothing is held.
+ *
+ *  ⚠️ NOT the guard. `/api/move-file` refuses the move itself (#1362), and it has to: the agent
+ *  route never comes through this panel. This exists because `moveFileToStatus` keeps only
+ *  `{ok, status}` and throws the reason away, so a refused human rename would look like a move that
+ *  simply did not happen. Same fact, one source — `dirtyAssetEditorHolds()`. */
+export function assetEditorHoldMessage(froms: readonly string[]): string | null {
+  // ⚠️ EXACT comparison, deliberately — do NOT fold case here, and do not "align" it with the
+  // backend's matcher, which does.
+  //
+  // The two differ because they compare different things. This one compares two values from ONE
+  // source: every `from` the panel passes comes from `asset.path` / `node.path` /
+  // `clipboard.paths`, the same manifest values the mount's `path` is set from, so they cannot
+  // differ in spelling. `assetEditorBindings.ts`'s header states that premise for this whole
+  // subsystem and its consequence in as many words: "there is no normalization to get wrong; if
+  // that ever stops being true this needs a shared canonicalizer, NOT a looser match here."
+  // `heldAssetEditorRefusal` folds case because it compares a FILESYSTEM-derived path
+  // (`absToAssetUrl` of the real `from`) against a store path, where two spellings of one file are
+  // both legitimate on a case-insensitive volume.
+  //
+  // ⚠️ Scar: a review flagged the divergence as "the two matchers can disagree" and I closed it by
+  // adding `toLowerCase()` here (7294b1921, reverted). That was the looser match the header
+  // forbids, and it BROKE the case it was meant to protect: on a case-SENSITIVE volume,
+  // `/assets/A.png` held while `/assets/a.png` moves made this panel block a move the backend would
+  // have allowed. The disagreement the review described needs a `from` cased differently from the
+  // mount path, which the shared source makes unreachable. If that premise ever breaks, reach for
+  // `samePath` (`engine/scripts/pathIdentity.mjs`), not for `toLowerCase`.
+  const holds = dirtyAssetEditorHolds().filter(({ path }) =>
+    froms.some((from) => path === from || path.startsWith(`${from}/`)));
+  if (!holds.length) return null;
+  const which = holds.map((h) => `the ${h.kind} editor (${h.path})`).join(' and ');
+  return `Unsaved edits in ${which} — Save or Cancel it first, then move the asset.`;
+}
+
 export async function moveFileToStatus(from: string, to: string): Promise<{ ok: boolean; status: number }> {
   try {
     const res = await backendFetch('/api/move-file', {
@@ -418,6 +459,11 @@ export interface CreatePrefabResult {
   /** Coalesced undo entry — caller pushes it (and may add its own refresh()
    *  to undo/redo). */
   action: UndoAction;
+  /** How many RUNTIME entities the selection contained that did not go into the prefab — pooled
+   *  UIEntries rows, timeline scrub/control spawns (#1306). Surfaced by the caller: a prefab that
+   *  silently came out with fewer members than the user selected is the surprise that gets filed
+   *  as a bug weeks later (owner, 2026-09-17). 0 in the ordinary case. */
+  runtimeExcluded: number;
 }
 
 /** Serialize an entity subtree to a `.prefab.json`, write it, register its
@@ -431,25 +477,89 @@ export interface CreatePrefabResult {
  *  so a freshly-created nested prefab flattened on the next save.
  *
  *  Returns null if the entity can't be serialized or the file write fails;
- *  callers log the appropriate panel-specific error. */
+ *  callers log the appropriate panel-specific error. Returns 'declined' when the
+ *  path already held a file and the human chose not to replace it (#1264). */
+
+/** Say so when undo could not put a prior prefab link back (#1272).
+ *
+ *  Scoping the untag by source means undo no longer DEPENDS on the GUID-keyed snapshot resolving
+ *  — a held nested instance keeps its own link rather than being stripped and restored. But a ref
+ *  can still miss (an entity deleted since the create, a guid re-minted across a reload), and a
+ *  silent skip is indistinguishable from a working undo. The entities are left as they are; this
+ *  only reports, because there is nothing left to roll back by the time it is known. */
+function reportUnrestoredLinks(unresolved: number, label: string): void {
+  if (unresolved <= 0) return;
+  reportUndoFailure({
+    direction: 'Undo', label,
+    detail: `${unresolved} prefab link${unresolved === 1 ? '' : 's'} the tree had before could not be put back — ${unresolved === 1 ? 'that entity is' : 'those entities are'} no longer addressable (deleted, or its guid was re-derived by a scene reload). Everything else was undone.`,
+  });
+}
 
 export async function createPrefabFromEntity(
   entityId: number,
-  savePath: string,
+  /** Where to write. Over an existing file of another casing the prefab lands on THAT file's on-disk
+   *  spelling (#1273), which is what the result's `savePath` reports. */
+  requestedPath: string,
   label: string,
-): Promise<CreatePrefabResult | null> {
-  const prefab = serializePrefab(entityId);
-  if (!prefab) return null;
-  warnInertPrefabSizes(prefab, savePath);
+  /** Asked when `requestedPath` already holds a file (#1264). Both callers DERIVE the path from the
+   *  entity's name, so a second entity called "Enemy" used to replace the first Enemy prefab under a
+   *  fresh guid — every placed instance of it unlinked — and this function's own undo then TRASHED
+   *  the path, taking the original prefab with it. A yes replaces the content and KEEPS the prefab's
+   *  guid (owner 2026-09-15), so placed instances stay linked; undo restores the replaced bytes. */
+  confirmReplace: (path: string) => Promise<boolean>,
+): Promise<CreatePrefabResult | 'declined' | null> {
+  // serializePrefab reads nested children from the editor prefab cache SYNCHRONOUSLY, and
+  // nothing else on this path warms it — after an ordinary scene load it is empty, so a held
+  // nested instance was flattened into copies with only a console.warn (#1284).
+  await preloadNestedPrefabsForSubtree(entityId);
+  let runtimeExcluded = 0;
+  const draft = serializePrefab(entityId, undefined, { onRuntimeExcluded: (n) => { runtimeExcluded = n; } });
+  if (!draft) return null;
+  warnInertPrefabSizes(draft, requestedPath);
+  const written = await writeNewAssetDocument(requestedPath, (guid, kept) => {
+    // ⚠️ A Replace keeps the replaced prefab's id, and `serializePrefab`'s cycle guard only runs
+    // for an `existingId` — which the draft had none of. So check it here: an entity holding an
+    // instance of the very prefab it is replacing would otherwise write a prefab that contains
+    // itself. Same test the serializer applies, over the same reference rows.
+    if (kept) {
+      const cyclic = draft.entities.find((e) => e.prefab && wouldCreateCycle(guid, e.prefab));
+      if (cyclic) {
+        console.error(`[Prefab] refusing to replace ${requestedPath} — it would nest "${cyclic.prefab}" inside itself`);
+        return null;
+      }
+    }
+    return jsonFileBody({ ...draft, id: guid });
+  }, { confirmReplace, keepPrevious: true, guid: draft.id });
+  if (written.outcome === 'declined') return 'declined';
+  if (written.outcome !== 'created' && written.outcome !== 'replaced') return null;
+  // The path the prefab really landed on — the existing file's on-disk spelling after a Replace
+  // (#1273). Registration, the instance tags and both undo directions all key on it.
+  const savePath = written.path;
+  const prefab: PrefabFile = { ...draft, id: written.guid };
   const content = jsonFileBody(prefab);
-  if (!(await writeAssetFile(savePath, content))) return null;
+  const previousContent = written.outcome === 'replaced' ? written.previousContent : null;
+  const replaced = written.outcome === 'replaced';
 
   // Register the prefab's GUID↔path first so tagEntityTreeAsInstance stores the
   // GUID (PrefabInstance.source is GUID-only).
   if (prefab.id) registerAsset(prefab.id, savePath, 'prefab');
   const cacheKey = prefab.id ?? savePath;
   setPrefabCache(cacheKey, prefab);
-  tagEntityTreeAsInstance(entityId, savePath);
+  // ⚠️ Snapshot the links the tree ALREADY has before tagging over them, so undo can put them back
+  // (#1264 close-out). Tagging overwrites every PrefabInstance in the subtree: re-running Create
+  // Prefab on an instance of the very prefab it replaces, or on a tree holding nested instances,
+  // used to come back from undo with those links gone and the next save writing plain entities.
+  // ⚠️ Snapshot WITHOUT stripping (#1278). Tagging below overwrites every row it owns, so the
+  // strip was never needed here — and it was actively wrong: a held nested instance's members
+  // are deliberately NOT retagged (a reload leaves them linked to their own prefab), so
+  // stripping first left them plain until the next scene load.
+  let priorLinks = detachPrefabInstance(entityId, { strip: false });
+  tagEntityTreeAsInstance(entityId, savePath, prefab);
+  // Whether the tree currently carries THIS prefab's tags. A failed undo returns without untagging, and
+  // the undo manager still moves it to the redo stack — so redo must not re-snapshot a tree that is
+  // still tagged, or `priorLinks` becomes this prefab's own links and the next undo re-links the tree
+  // to the file it just trashed (#1264 close-out review).
+  let tagged = true;
 
   // Resolve the tagged subtree root by guid so tag/untag hit the right entity
   // after a world rebuild (Play→Stop).
@@ -467,6 +577,30 @@ export async function createPrefabFromEntity(
     // neither before nor after — entities un-linked from a prefab still on disk, or
     // linked to one that is not. Refusing cleanly and saying so is the honest answer.
     undo: async () => {
+      if (replaced) {
+        // ⚠️ RESTORE, never trash: the path held a prefab before this action, and deleting it is
+        // exactly how the original was lost (#1264). Same shape as skinPrefab.ts's update undo.
+        if (previousContent == null || !(await writeAssetFile(savePath, previousContent))) {
+          reportUndoFailure({
+            direction: 'Undo', label,
+            detail: previousContent == null
+              ? `the prefab this replaced could not be read before the replace, so it cannot be restored: ${savePath}. The file and the entities were left as they are.`
+              : `the replaced prefab was not restored: ${savePath}. The entities were left linked to it rather than half-undone.`,
+          });
+          return;
+        }
+        // Migrate before seeding the cache — getPrefabSource returns early on a cache hit, so an
+        // un-migrated object here poisons override detection (skinPrefab.ts, same reason).
+        try {
+          const restored = JSON.parse(previousContent) as PrefabFile;
+          for (const entry of restored.entities ?? []) migrateUIAnchorZIndexStructured(entry);
+          setPrefabCache(cacheKey, restored);
+        } catch { setPrefabCache(cacheKey, null); }
+        const id = ref.resolve(); if (id != null) untagEntityTreeAsInstance(id, savePath);
+        reportUnrestoredLinks(reattachPrefabInstance(priorLinks, { rootEcsId: id ?? undefined }), label);
+        tagged = false;
+        return;
+      }
       if (!(await deleteAssetFile(savePath))) {
         reportUndoFailure({
           direction: 'Undo', label,
@@ -475,7 +609,9 @@ export async function createPrefabFromEntity(
         return;
       }
       setPrefabCache(cacheKey, null);
-      const id = ref.resolve(); if (id != null) untagEntityTreeAsInstance(id);
+      const id = ref.resolve(); if (id != null) untagEntityTreeAsInstance(id, savePath);
+      reportUnrestoredLinks(reattachPrefabInstance(priorLinks, { rootEcsId: id ?? undefined }), label);
+      tagged = false;
     },
     redo: async () => {
       // Why gating matters MORE than logging on this side: caching the prefab (and
@@ -493,10 +629,24 @@ export async function createPrefabFromEntity(
       }
       if (prefab.id) registerAsset(prefab.id, savePath, 'prefab');
       setPrefabCache(cacheKey, prefab);
-      const id = ref.resolve(); if (id != null) tagEntityTreeAsInstance(id, savePath);
+      const id = ref.resolve();
+      if (id != null) {
+        if (!tagged) priorLinks = detachPrefabInstance(id, { strip: false });
+        // tagEntityTreeAsInstance re-runs planPrefabRows, whose nested-instance lookup is the
+        // same sync cache read as the original create (#1284). Cold, the plan drops the nested
+        // row, planMatchesFile then disagrees with the file that was written WARM, and the redo
+        // tags nothing at all — leaving the subtree unlinked from the prefab it just restored.
+        await preloadNestedPrefabsForSubtree(id);
+        // Re-resolve: a cold source makes that warm do real I/O, and entityRef exists in this
+        // file precisely because a raw id goes stale across a world rebuild (Play->Stop, a
+        // watcher reload). Tagging the pre-await id could hit a different entity, or none.
+        const tagId = ref.resolve(); if (tagId == null) return;
+        tagEntityTreeAsInstance(tagId, savePath, prefab);
+        tagged = true;
+      }
     },
   };
-  return { savePath, prefab, action };
+  return { savePath, prefab, action, runtimeExcluded };
 }
 
 /** The unsaved-work staleness a `/api/unused-assets` answer disclosed, or `null` when it disclosed

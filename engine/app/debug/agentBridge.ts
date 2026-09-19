@@ -57,6 +57,8 @@ import {
   dispatchUIAction,
   isActionRefusal,
   getUIActionNames,
+  isControlLessAction,
+  actionControlOnScreen,
   getUIActionParams,
   getReadSourceNames,
   getReadValue,
@@ -69,12 +71,11 @@ import {
   getCurrentWorld,
   pendingPhysics,
   ensurePhysicsReady,
+  ensurePhysicsModuleReady,
   getContactState,
   registerHandleProvider,
-  invalidateModel,
-  invalidateTexture,
-  invalidateAudio,
-  invalidateEnvironment,
+  REIMPORT_INVALIDATORS,
+  type ReimportableAssetKind,
   switchableClipNames,
   ANIMATOR_CLIP_TRAITS,
   type OffscreenRenderOpts,
@@ -87,6 +88,7 @@ import {
   invalidateAnimSet,
   invalidateMaterial,
   invalidateShader,
+  invalidateMeshAsset,
   invalidatePrefab,
   fireDirtyListeners,
   findEntityByGuid,
@@ -96,6 +98,7 @@ import {
   type JsonValue,
   raycast2D, shapeCast2D, pointQuery2D, hasPhysics2D,
   raycast3D, shapeCast3D, pointQuery3D, hasPhysics3D,
+  RigidBody2D, RigidBody3D, getPlayState,
   findEntityById,
   EntityAttributes,
   makeAssetRefResolver,
@@ -107,6 +110,7 @@ import {
   getAnimSet,
   getSpriteMaterialProgram,
   isGuid,
+  isRuntimeGuid,
   getGuidForPath,
   startInputWatch,
   stopInputWatch,
@@ -114,8 +118,13 @@ import {
   readInputPresses,
   isUnresolvedPress,
 } from '@modoki/engine/runtime';
+import { classifyWorldAbsence } from './sceneQueryAbsence';
 import { applyLiveMutate } from './liveMutate';
 import { createEntityLive, duplicateEntityLive, deleteEntitiesLive, liveGuidOf } from './liveLifecycle';
+import { resolveEntityAddress, type EntityAddress } from './entityRef';
+import type { ErrorCode } from '../../tools/shared/mcpResult';
+import { INVALIDATABLE_ASSET_TYPES, type InvalidatableAssetType } from '../../tools/shared/invalidateAssets';
+import { describeFilter, emptyFilterHint, histogram } from '../../tools/shared/filterDisclosure';
 import { computeLayoutBounds, type LayoutBoundsParams, type LayoutEntry } from './layoutDump';
 import { tailWithCounts, tailHint, CONSOLE_TAIL_DEFAULT, JOURNAL_TAIL_DEFAULT } from './streamSummary';
 import { roundFloats, resolvePrecision } from './roundFloats';
@@ -123,6 +132,7 @@ import { computeHandles, type HandlesDumpParams } from './handlesDump';
 import { resolveDomPointReport, type DomPointSpec } from './domResolve';
 import { layoutSettleReport } from './layoutSettle';
 import { resolveEntityPointReport, type EntityPointSpec } from './entityResolve';
+import { coveredCarriers } from './carrierCover';
 import { readConsoleSource } from './consoleSource';
 import { getConsoleRingEntries, getConsoleRingDropped, installConsoleRing } from '@modoki/engine/runtime/core/consoleRing';
 import { chromeHandles } from './chromeHandles';
@@ -132,14 +142,15 @@ import { makeSchemaPusher } from './schemaPusher';
 // SAME default when a caller omits `timeoutMs`) — see `engine/tools/shared/simStepTiming.ts`
 // (#822). A VALUE import from `tools/shared`, not `import type`: see that file's docblock for why
 // this is a deliberate exception to the app→tools/shared "types only" convention.
-import { SIM_STEP_MAX_TIMEOUT_MS, simStepDefaultTimeout } from '../../tools/shared/simStepTiming';
+import { SIM_STEP_MAX_TIMEOUT_MS, SIM_STEP_MAX_FRAMES, simStepDefaultTimeout } from '../../tools/shared/simStepTiming';
+import { PROFILER_ACTIONS, isProfilerAction } from '../../tools/shared/profilerActions';
 import {
   startCapture, stopCapture, clearCapture, getCapture, readPerfProfile,
   resetProfilerMarkers, resetMarkerAggregate, resetFrameProfile, type MarkerSample,
   getBootTimeline, getBootOrigin, bootSpansOverlapping, resetBootTimeline, getWorstStallWindow,
   getFrameProfile,
   setGpuTimingEnabled, resetGpuTimings,
-  collectHitRegions, hitRegionProviders, isHitRegionOverlayVisible, setHitRegionOverlayVisible,
+  collectHitRegions, collectHitRegionsReport, hitRegionProviders, isHitRegionOverlayVisible, setHitRegionOverlayVisible,
   regionsAt, nearestRegionTo,
   getFrameLoopHealth,
 } from '@modoki/engine/runtime';
@@ -184,7 +195,7 @@ interface SceneStateParams {
    *  singletons Time/Physics/NPRPostFX). They're excluded from the DEFAULT untargeted
    *  listing only — any id/trait/name/where filter already includes them. */
   resources?: boolean;
-  /** Cap the number of entities returned; sets `truncated` + `totalCount` when hit.
+  /** Cap the number of entities returned; sets `truncated` when hit (`returnedCount`/`totalCount` are always present).
    *  In INDEX mode (the untargeted default) this defaults to `DEFAULT_INDEX_LIMIT`;
    *  a targeted/enriched query stays uncapped unless you pass one. */
   limit?: number;
@@ -434,11 +445,15 @@ export function dumpSceneState(params: SceneStateParams = {}) {
   const enriched = !!(params.full || params.world || params.bounds || params.contacts);
   const indexMode = !targeted && !enriched;
   let wanted = (params.resources || targeted) ? all : all.filter((e) => !e.isResource);
+  // How many the DEFAULT resource exclusion left out — the constant F8 measured between this read and
+  // the editor state's world count (136 vs 137), which nothing in the reply used to explain.
+  const resourcesExcluded = all.length - wanted.length;
+  let guidMissed = false; // already explained by its own warning — the empty-filter hint would repeat it
   if (params.id != null) wanted = wanted.filter((e) => e.id === params.id);
   if (params.guid) {
     const ent = findEntityByGuid(params.guid);
     if (ent) { const gid = ent.id(); wanted = wanted.filter((e) => e.id === gid); }
-    else { wanted = []; warnings.push(`guid "${params.guid}" matched no entity in the live world (it may be stale — ids/entities rebuild on scene reload).`); }
+    else { wanted = []; guidMissed = true; warnings.push(`guid "${params.guid}" matched no entity in the live world (it may be stale — ids/entities rebuild on scene reload).`); }
   }
   if (params.name) {
     const q = params.name.toLowerCase();
@@ -494,9 +509,12 @@ export function dumpSceneState(params: SceneStateParams = {}) {
   };
   // A contact partner with no guid is `id:<n>`, not null (#1199 review). A row's `guid: null` has
   // its `id` beside it; a bare array element has nothing else, so null would lose WHICH body it is
-  // (and two such partners would read `[null, null]`). `id:<n>` is this file's existing
-  // non-address form (see the `exclude` refusal's options) and cannot be mistaken for a guid.
+  // (and two such partners would read `[null, null]`). `id:<n>` cannot be mistaken for a guid.
+  // Since #1248 every spawn has a guid (#1210's runtime mint, on EntityAttributes spawnEntity adds), so
+  // only an entity whose EntityAttributes was REMOVED after spawn reaches it.
   const contactRefOf = (id: number): string => guidOf(id) ?? `id:${id}`;
+  // The parent named by guid beside `parentId` (#1223 P2); `null` for a root (parentId 0) or a guid-less parent.
+  const parentGuidOf = (parentId: number | undefined): string | null => (parentId ? guidOf(parentId) : null);
   const contactWorld = params.contacts ? getCurrentWorld() : null;
   // An unknown or WRONG-CASE `trait=` was applied silently: every entity came back with
   // `traits:{}` and no warning, which reads as "nothing in this scene has that trait" rather than
@@ -519,7 +537,7 @@ export function dumpSceneState(params: SceneStateParams = {}) {
     // address an entity (runtime ids are reassigned on every reload), and previously buried
     // inside `traits.EntityAttributes` where the untargeted caller could never cheaply see it.
     if (indexMode) {
-      return { id: info.id, guid: guidOf(info.id), name: info.name, parentId: info.parentId, layer: info.layer ?? null, traits: info.traits };
+      return { id: info.id, guid: guidOf(info.id), name: info.name, parentId: info.parentId, parentGuid: parentGuidOf(info.parentId), layer: info.layer ?? null, traits: info.traits };
     }
     const traits: Record<string, unknown> = {};
     for (const name of info.traits) {
@@ -541,7 +559,7 @@ export function dumpSceneState(params: SceneStateParams = {}) {
     // tool that tells agents "address entities by guid, ids are reassigned on every hot-reload"
     // handed back id-only rows in its most common drill-down (the live smoke suite's own shape).
     // One memoized lookup, already implemented.
-    const out: Record<string, unknown> = { id: info.id, guid: guidOf(info.id), name: info.name, parentId: info.parentId, layer: info.layer ?? null, traits };
+    const out: Record<string, unknown> = { id: info.id, guid: guidOf(info.id), name: info.name, parentId: info.parentId, parentGuid: parentGuidOf(info.parentId), layer: info.layer ?? null, traits };
     if (params.world) {
       // Resolved world TRS + effective active state (S3). worldTransforms is empty
       // until transformPropagationSystem has run a frame; omit `world` if so.
@@ -579,12 +597,29 @@ export function dumpSceneState(params: SceneStateParams = {}) {
       (truncated ? ` Showing ${entities.length} of ${totalCount}; raise limit=N.` : '')
     : truncated
       ? `Showing ${entities.length} of ${totalCount}; raise limit=N or narrow the filter.`
-      : undefined;
+      // #1214: a targeted query that matched nothing answered `totalCount:0` with nothing beside it, so
+      // a typo'd `name=Plyer` read exactly like "that entity is gone". Say which one it was.
+      : targeted && totalCount === 0 && !guidMissed
+        ? emptyFilterHint({
+          what: 'entity',
+          filter: describeFilter({ id: params.id, guid: params.guid, name: params.name, where: params.where }),
+          unfilteredCount: all.length,
+          // A targeted query searches every entity, resources included — which a BARE read hides.
+          unfilteredLabel: 'exist in the world, resources included',
+          live: params.name ? { name: all.map((e) => e.name ?? '') } : undefined,
+          near: { name: params.name },
+        })
+        : undefined;
   return {
     scenePath: sceneManager.getCurrent()?.path ?? null,
-    entityCount: entities.length,
+    // §2 (#1217, #1223 D3): `returnedCount` is the rows below, `totalCount` every entity the query
+    // matched before the limit — both always, so a total never exists only when truncation happened.
+    // Never `entityCount`: it meant these rows here and the whole world in the editor state.
+    returnedCount: entities.length,
+    totalCount,
+    ...(resourcesExcluded ? { resourcesExcluded } : {}),
     entities,
-    ...(truncated ? { truncated, totalCount } : {}),
+    ...(truncated ? { truncated } : {}),
     ...(warnings.length ? { warnings } : {}),
     ...(hint ? { hint } : {}),
   };
@@ -625,6 +660,18 @@ let _prefabSourceRefresher: ((urlPath: string) => Promise<void>) | null = null;
 /** Editor-only: install the editor-side prefab refresh. Called from `agentEditorOps.ts`. */
 export function setPrefabSourceRefresher(fn: ((urlPath: string) => Promise<void>) | null): void {
   _prefabSourceRefresher = fn;
+}
+
+/** Editor-only: told when a hot reload has REPLACED the current world from disk (#1409), and which
+ *  bases it kept (#1417), so the editor can drop discarded work's undo entries and rebaseline —
+ *  `adoptWorldReloadedFromDisk`.
+ *  Installed the way the suppressor is; unset in the game runtime, which has no undo. */
+type WorldReloadedFromDisk = (scenePath: string, keptBaseGuids: ReadonlySet<string>) => void;
+let _worldReloadedFromDisk: WorldReloadedFromDisk | null = null;
+
+/** Editor-only: install the after-reload hook. Called from `agentEditorOps.ts`. */
+export function setWorldReloadedFromDiskHook(fn: WorldReloadedFromDisk | null): void {
+  _worldReloadedFromDisk = fn;
 }
 
 /** Why scene hot-reload is currently suppressed (editor Play mode), or null when
@@ -767,12 +814,14 @@ registerAgentOp('console-logs', (params) => {
   // from a filtered read. Same three-number contract as modoki_journal (count/total/ringTotal),
   // because two tools answering the same question must answer it the same way (§8).
   const ring = p.level || p.since ? dumpConsoleLogs({}).logs : logs;
-  const byLevel: Record<string, number> = {};
-  for (const e of ring) byLevel[e.level] = (byLevel[e.level] ?? 0) + 1;
+  const byLevel = histogram(ring, (e) => e.level);
   return {
     logs: r.items,
-    count: r.items.length,
-    total: r.total,
+    // §2 (#1217, #1223 D3, #1266): `returnedCount` is the rows here, `totalCount` everything the
+    // filter matched before the tail. `ringTotal` is a THIRD population — the whole ring, filter
+    // ignored — so it keeps its own name rather than being folded into either.
+    returnedCount: r.items.length,
+    totalCount: r.total,
     ringTotal: ring.length,
     byLevel,
     // The ring is `[pinned boot prefix] ++ [rolling tail]` — once it wraps, that is DISCONTIGUOUS,
@@ -872,9 +921,11 @@ registerAgentOp('journal-events', (params) => {
   const captures = verboseCaptureState();
   const idle = captures.types.filter((t) => !captures.active.includes(t));
   return {
-    count: r.items.length,
+    // §2 (#1217, #1223 D3, #1266): `returnedCount`/`totalCount` everywhere; `ringTotal` below is a
+    // THIRD population (the whole ring, filter ignored) and keeps its own name.
+    returnedCount: r.items.length,
     /** Events MATCHING the filter (the whole ring when unfiltered). */
-    total: r.total,
+    totalCount: r.total,
     /** Every event in the ring, and the histogram over ALL of them — unchanged by a filter, so
      *  a filtered read still shows what else is in there. */
     ringTotal: ring.total,
@@ -912,6 +963,15 @@ registerAgentOp('resolve-refs', (params) => {
   for (const e of getAllEntities()) {
     if (wantNum.has(e.id)) liveNum.set(e.id, e.name ?? '');
     if (e.guid && wantGuid.has(e.guid)) liveGuid.set(e.guid, e.name ?? '');
+  }
+  // A runtime guid (#1210) whose entity a save has since re-minted is not in the list under that
+  // string, but findEntityByGuid still names it — the @spawn journal refs carry exactly those.
+  for (const g of wantGuid) {
+    // Runtime guids only: a DURABLE guid the pass above did not match is not live under any string,
+    // and asking findEntityByGuid would rebuild the whole guid index once per despawned ref.
+    if (liveGuid.has(g) || !isRuntimeGuid(g)) continue;
+    const e = findEntityByGuid(g);
+    if (e && e.has(EntityAttributes)) liveGuid.set(g, ((e.get(EntityAttributes) as { name?: string }).name) ?? '');
   }
   const resolved: Record<string, { name: string; alive: boolean }> = {};
   const unresolved: (string | number)[] = [];
@@ -1005,14 +1065,46 @@ registerAgentOp('dispatch-action', (params) => {
   if (!p.name) return { ok: false, dispatched: false, reason: 'missing action name' };
   if (!isSimRunning()) return { ok: false, dispatched: false, reason: 'not playing — press Play first', simRunning: false };
   if (!getUIActionNames().includes(p.name)) return { ok: false, dispatched: false, reason: `unknown action '${p.name}'`, known: getUIActionNames() };
+  // #1406 — a player can only reach a control-bound action through its control, so an agent may not
+  // reach it with that control off screen either (owner ruling on #1406: the ENGINE refuses, not each
+  // game). Checked here and not in `dispatchUIAction`: a real press (`applyBindings`) has a mounted
+  // control by construction, and the debug menu and headless tests have no screen to ask about. An
+  // action no control carries opts out with `noControl` at registration (every engine built-in does).
+  if (!isControlLessAction(p.name)) {
+    const world = getCurrentWorld();
+    const seen = actionControlOnScreen(world, p.name);
+    if (!seen.onScreen) {
+      return {
+        ok: false, dispatched: false, gate: 'no-control-on-screen', carriers: seen.carriers, simRunning: true,
+        reason: seen.carriers.length > 0
+          ? `no control that triggers '${p.name}' is on screen (${seen.carriers.slice(0, 5).join(', ')}${seen.carriers.length > 5 ? ` and ${seen.carriers.length - 5} more` : ''} ${seen.carriers.length === 1 ? 'is' : 'are'} hidden), so a player could not press it — open the screen that shows it first`
+          : `no UI control in the current world triggers '${p.name}', so a player could not press it — open the screen that shows it first. If a timeline, a zone, a collision or code fires it instead, register it with \`noControl: true\``,
+      };
+    }
+    // #1418 — shown is not reachable: a HUD button under a full-screen modal is drawn, and a
+    // player's tap lands on the modal. Hit-test each shown carrier the way a tap would; refuse only
+    // when EVERY one is positively covered (anything the DOM cannot judge fails open — see
+    // carrierCover.ts).
+    const covers = coveredCarriers(world, seen.shown);
+    if (covers) {
+      const list = covers.slice(0, 5).map((c) => `${c.carrier} under ${c.coveredBy}`).join(', ');
+      return {
+        ok: false, dispatched: false, gate: 'control-covered', carriers: covers.map((c) => c.carrier),
+        coveredBy: [...new Set(covers.map((c) => c.coveredBy))], simRunning: true,
+        reason: `every control that triggers '${p.name}' is covered (${list}${covers.length > 5 ? ` and ${covers.length - 5} more` : ''}), so a player's tap would land on the cover instead — close it first`,
+      };
+    }
+  }
   // Resolve targetGuid HERE so a phantom guid is reported, not obeyed. dispatchUIAction
   // scans for it and, finding nothing, calls the handler with target:undefined — the handler
   // console.warns and returns, and this op used to answer {dispatched:true}. The agent then
   // read back, saw no change, and had no way to tell "guid didn't resolve" from "the handler
   // ignored me" from "the clip name was wrong". Stale guids are routine (any hot-reload or
   // play→stop rebuilds the world). (C7)
-  if (p.targetGuid && !findEntityByGuid(p.targetGuid)) {
-    return { ok: false, dispatched: false, reason: `targetGuid '${p.targetGuid}' matched no entity in the live world — it may be stale (ids/entities are rebuilt on scene reload and play→stop). Re-read it with get_scene_state.`, simRunning: true };
+  // Through the shared resolver (#1223), so a stale runtime guid says which kind of stale it is.
+  const target = p.targetGuid ? resolveEntityAddress({ guid: p.targetGuid }, { label: 'targetGuid', accept: ['guid'] }) : null;
+  if (target && !target.ok) {
+    return { ok: false, dispatched: false, code: 'NOT_FOUND', ...(target.stale ? { stale: target.stale } : {}), reason: `targetGuid '${p.targetGuid}' matched no entity in the live world — it may be stale (ids/entities are rebuilt on scene reload and play→stop). Re-read it with get_scene_state.`, simRunning: true };
   }
   // The HANDLER decides whether it acted, and says so by returning a refusal (#1129). This op used to
   // re-derive that answer for two actions with hand-written pre-flights (engine.playClip's animator and
@@ -1037,30 +1129,52 @@ registerAgentOp('clear-journal', () => { clearJournal(); return { ok: true }; })
 // successful bake — the server writes new bytes but has no other channel to the renderer,
 // so the mesh/texture cache (keyed by path, "bytes never change mid-session without an
 // explicit invalidate") would otherwise keep serving the stale geometry until restart.
-// Mirrors the Assets-panel button path (assetViews/reimport.ts), so MCP/curl reimports now
-// refresh identically. invalidateModel disposes the model's templates + LOD siblings + mesh
-// entries and notifies onModelInvalidated listeners, which drop the live meshes for re-sync.
+// SHARES the Assets-panel button path's table rather than mirroring it (#1366): this used to be a
+// second hand-written copy, kept in step by a comment in each, and they drifted — `model` mapped to
+// `invalidateModel` alone in both, so the rigged prototype was never evicted and a re-imported
+// SKINNED GLB kept its pre-import skeleton and clips. `invalidateModelAndRig` is now the `model`
+// row for every entry point; see `runtime/loaders/reimportInvalidation.ts`.
+//
+// This is where the runtime table is pinned against the MCP surface's own
+// `INVALIDATABLE_ASSET_TYPES` tuple (tools/shared/invalidateAssets.ts, which
+// `device_invalidate_assets` derives its enum from — #1216 C-13). Both directions are pinned, and
+// they need DIFFERENT mechanisms:
+//
+//   `satisfies`  — every MCP kind has a row here (a MISSING row fails).
+//   `_KindPin`   — every row here is an MCP kind (an EXTRA row fails).
+//
+// ⚠️ **`satisfies` alone does NOT give the second direction, though it did before #1366.** Excess-
+// property checking applies only to a FRESH OBJECT LITERAL; this used to be one, and is now a
+// reference to the shared table, so the extra-key check silently evaporated. Measured during that
+// change's close-out review: adding a `video` kind to `REIMPORT_INVALIDATORS` without touching the
+// MCP tuple produced ZERO diagnostics from the root typecheck, where the old literal form errored
+// TS2353. The drift that would ship is a kind the shared table accepts and
+// `device_invalidate_assets`'s enum rejects at runtime — exactly what #1216 C-13 put a pin here for.
+type _KindPin = ReimportableAssetKind extends InvalidatableAssetType ? true : never;
+const _kindPin: _KindPin = true; void _kindPin;
+const INVALIDATORS = REIMPORT_INVALIDATORS satisfies Record<InvalidatableAssetType, (path: string) => void>;
+const isInvalidatableAssetType = (t: unknown): t is InvalidatableAssetType =>
+  typeof t === 'string' && (INVALIDATABLE_ASSET_TYPES as readonly string[]).includes(t);
+
 registerAgentOp('invalidate-assets', (params) => {
   const p = (params ?? {}) as { items?: Array<{ path?: string; type?: string }> };
-  let models = 0, textures = 0, audio = 0, environments = 0;
+  // THE list of cache-holding kinds for the server-driven path — the /api/reimport route forwards
+  // every baked type and lets this decide (#304 close-out). A type with no row is ignored on purpose:
+  // `font` refreshes through the manifest-hash channel, and atlas/video hold no engine-side cache. Keep
+  // in step with assetViews/reimport.ts, which is the same decision for the client-side path. Typed
+  // against the shared tuple `device_invalidate_assets` derives its enum from (#1216 C-13).
+  const counts: Record<InvalidatableAssetType, number> = { model: 0, texture: 0, audio: 0, environment: 0 };
   for (const it of p.items ?? []) {
-    if (!it?.path) continue;
-    // THE list of cache-holding kinds for the server-driven path — the /api/reimport
-    // route now forwards every baked type and lets this decide (#304 close-out). A type
-    // with no branch here is ignored on purpose: `font` refreshes through the
-    // manifest-hash channel, and atlas/video hold no engine-side cache. Keep in step
-    // with assetViews/reimport.ts, which is the same decision for the client-side path.
-    if (it.type === 'model') { invalidateModel(it.path); models++; }
-    else if (it.type === 'texture') { invalidateTexture(it.path); textures++; }
-    else if (it.type === 'audio') { invalidateAudio(it.path); audio++; }
-    else if (it.type === 'environment') { invalidateEnvironment(it.path); environments++; }
+    if (!it?.path || !isInvalidatableAssetType(it.type)) continue;
+    INVALIDATORS[it.type](it.path);
+    counts[it.type]++;
   }
-  return { ok: true, models, textures, audio, environments };
+  return { ok: true, models: counts.model, textures: counts.texture, audio: counts.audio, environments: counts.environment };
 });
 
 // ── Phase B: numeric screen-space layout/bounds (turn "is it laid out right?" into data) ──
 registerAgentOp('layout-bounds', (params) => {
-  // Same reasoning as scene-state. `diagnose` reads `computeLayoutBounds().offScreen` (ids, ints)
+  // Same reasoning as scene-state. `diagnose` reads `computeLayoutBounds().offScreen` (guids)
   // from the PRODUCER, so it is unaffected either way — but keep the rounding here regardless.
   const p = (params ?? {}) as LayoutBoundsParams & { precision?: number };
   const result = roundFloats(computeLayoutBounds(p), resolvePrecision(p.precision)) as Record<string, unknown>;
@@ -1114,6 +1228,16 @@ registerAgentOp('layout-settling', () => layoutSettleReport());
 // entity's LIVE screen rect so a viewport tap never has to be aimed from coordinates read in
 // an earlier round-trip. Renderer-side because only the renderer holds the camera, the
 // PixiJS bounds, and the DOM. ──
+/** Resolve ONE entity address — `{guid}` | `{name}` | `{id}` — with the shared resolver and nothing
+ *  else (#1223). For a HOST route that must name its target before it acts and has no world of its
+ *  own to look in: `capture_gesture`'s sample. It replaced a `scene-state` probe filtering
+ *  `EntityAttributes.guid=<g>` by string, which missed a runtime guid a save had since re-minted and
+ *  let a guid beside an id silently win. */
+registerAgentOp('resolve-entity', (params) => {
+  const r = resolveEntityAddress((params ?? {}) as EntityAddress, { label: 'entity' });
+  return r.ok ? { ok: true, id: r.id, guid: r.guid, name: r.name } : r;
+});
+
 registerAgentOp('resolve-entity-point', (params) => {
   const result = resolveEntityPointReport((params ?? {}) as EntityPointSpec) as unknown as Record<string, unknown>;
   // #682 close-out (LOW 6): a 2D/3D entity's rect comes from the same registered bounds
@@ -1204,7 +1328,10 @@ registerAgentOp('diagnose', (params) => {
       available: true,
       usedBytes: cache.usedBytes(),
       budgetBytes: cache.budgetBytes(),
-      count: entries.length,
+      // §2 (#1266): the cache is listed whole — no filter, no limit — so the two agree, and both
+      // are emitted rather than leaving an absent total that reads as "not reported".
+      returnedCount: entries.length,
+      totalCount: entries.length,
       entries,
     },
   };
@@ -1222,7 +1349,26 @@ registerAgentOp('diagnose', (params) => {
 // the whole capture is still exportable as JSON for the cases that genuinely need it.
 registerAgentOp('profiler', (raw: unknown) => {
   const params = (raw ?? {}) as Record<string, unknown>;
-  const action = String(params.action ?? 'read');
+  const action = params.action ?? 'read';
+  // An unknown action is REFUSED, not served as a read (#1213 B-6): `default: read` answered
+  // `capture-strat` with a live aggregate, so the caller believed a capture had started. The MCP
+  // enum hid it from tool calls; a POST, an eval and a device relay all reached it. Coded, because
+  // this op answers a GET relay too (an uncoded `ok:false` there reads as success).
+  if (!isProfilerAction(action)) {
+    return {
+      ok: false, code: 'REFUSED_BY_OP',
+      error: `profiler: unknown action ${JSON.stringify(params.action)} — nothing was read, started or reset.`,
+      options: [...PROFILER_ACTIONS],
+    };
+  }
+  // A count that is not a number used to reach `Math.max(1, NaN)` — which is NaN, so `slice(0, NaN)`
+  // returned nothing and the read looked empty. The GET route strips such values; a POST, an eval and
+  // a device relay did not.
+  for (const k of ['limit', 'markers'] as const) {
+    if (params[k] !== undefined && (typeof params[k] !== 'number' || !Number.isFinite(params[k]))) {
+      return { ok: false, code: 'REFUSED_BY_OP', error: `profiler: ${k} must be a finite number — got ${JSON.stringify(params[k])}. Nothing was read.` };
+    }
+  }
   switch (action) {
     case 'capture-start':
       startCapture();
@@ -1323,8 +1469,7 @@ registerAgentOp('profiler', (raw: unknown) => {
       // destroyed by the routine call an agent makes before measuring anything. `boot-reset`
       // exists for the deliberate case (re-arming across a scene swap).
       return { reset: true };
-    case 'read':
-    default: {
+    case 'read': {
       const result = readPerfProfile({ markers: Number(params.markers ?? 12) }) as Record<string, unknown>;
       // #682: `frame`/`gpu`/`restBreakdown` are all sampled from frames that actually ran — a dead
       // loop stops filling the ring and this would otherwise report the last healthy reading
@@ -1373,11 +1518,16 @@ registerAgentOp('watch-read', (params) => {
     return staleness ? { ...rounded, warnings: [staleness] } : rounded;
   }
   const totalSamples = out.series.reduce((n, s) => n + (typeof s.count === 'number' ? s.count : 0), 0);
+  // An empty-filter hint from `readWatch` (#1214) is the answer to "why is this empty?" and wins —
+  // the stats sentence below used to overwrite it on every default (samples:false) read.
+  const producerHint = (out as { hint?: unknown }).hint;
   const rounded = roundFloats({
     ...out,
     series: out.series.map(({ samples: _samples, ...rest }) => rest),
     totalSamples,
-    hint: `Stats only (${totalSamples} samples across ${out.series.length} series). Pass samples=true for the raw time-series.`,
+    hint: typeof producerHint === 'string'
+      ? producerHint
+      : `Stats only (${totalSamples} samples across ${out.series.length} series). Pass samples=true for the raw time-series.`,
   }, sig) as Record<string, unknown>;
   return staleness ? { ...rounded, warnings: [staleness] } : rounded;
 });
@@ -1389,7 +1539,7 @@ registerAgentOp('watch-clear', (params) => clearWatch((params as { id?: string }
 // coordinates). Response shaping (limit/unresolvedOnly/precision) lives HERE, in the op, same
 // split as watch-read: `readInputPresses()` (the producer, `runtime/input/pointerRecorder.ts`)
 // stays a pure ring-buffer read with no agent-surface concerns. ──
-registerAgentOp('input-watch-start', (params) => startInputWatch((params ?? {}) as { max?: number }));
+registerAgentOp('input-watch-start', (params) => startInputWatch((params ?? {}) as { maxPresses?: number }));
 
 const DEFAULT_INPUT_WATCH_LIMIT = 20;
 /** Shared by `read` and `stop` (stop reports what was captured, same shape as a read). */
@@ -1404,7 +1554,7 @@ function shapeInputWatchRead(params: unknown): unknown {
   const presses = matched.slice(Math.max(0, matched.length - limit));
   const result: Record<string, unknown> = {
     open: out.open,
-    max: out.max,
+    maxPresses: out.maxPresses,
     // Recomputed against what THIS call actually returns (post-filter, post-limit) — `totalCount`
     // stays the producer's true all-time count, per §2 ("both present whenever a filter applied").
     returnedCount: presses.length,
@@ -1469,8 +1619,23 @@ registerAgentOp('hit-regions', (raw: unknown) => {
     setHitRegionOverlayVisible(action === 'show');
     return { ok: true, visible: action === 'show', providers: hitRegionProviders() };
   }
+  // A non-array `ids` is the caller's mistake — refused here, not blamed on each provider in turn
+  // (#1214). Reachable only schema-less (`modoki.call`, eval): both MCP tools send an array.
+  // `null` is "no ids", as it always was — only a PRESENT non-array is refused.
+  if (p.ids === null) p.ids = undefined;
+  if (p.ids !== undefined && !(Array.isArray(p.ids) && p.ids.every((id) => typeof id === 'string'))) {
+    return {
+      ok: false, code: 'REFUSED_BY_OP',
+      error: `hit-regions: ids must be an array of region id strings, got ${Array.isArray(p.ids) ? 'an array with a non-string entry' : typeof p.ids} — nothing was read.`,
+      options: ['ids: ["<region id>", …]', 'omit ids to read every region'],
+    };
+  }
   const providers = hitRegionProviders();
-  const all = collectHitRegions({ provider: p.provider, kind: p.kind, ids: p.ids });
+  const report = collectHitRegionsReport({ provider: p.provider, kind: p.kind, ids: p.ids });
+  const all = report.regions;
+  // A provider that THREW has UNKNOWN regions. Named in the reply, so an empty or short list is not
+  // read as the surface's answer when part of it could not be asked.
+  const failedNames = new Set(report.failed.map((f) => f.provider));
   const limit = typeof p.limit === 'number' && Number.isFinite(p.limit) && p.limit > 0
     ? Math.floor(p.limit) : DEFAULT_HIT_REGION_LIMIT;
   const regions = all.slice(0, limit);
@@ -1480,6 +1645,7 @@ registerAgentOp('hit-regions', (raw: unknown) => {
     returnedCount: regions.length,
     totalCount: all.length,
     regions,
+    ...(report.failed.length ? { failedProviders: report.failed } : {}),
   };
   // The question a miss investigation actually asks, answered here rather than by making the
   // caller re-implement point-in-shape against the returned geometry — which is where a second,
@@ -1504,8 +1670,49 @@ registerAgentOp('hit-regions', (raw: unknown) => {
       + 'has no hit regions — nobody was able to answer. A game publishes them by calling '
       + 'registerHitRegionProvider() from the code that owns its hitTest geometry.';
   } else if (all.length === 0) {
-    result.hint = `Provider(s) [${providers.join(', ')}] registered but reported no regions — the `
-      + 'surface is not hit-testable right now (no level loaded, or a modal is swallowing input).';
+    // ⚠️ `all` is the FILTERED list, so an empty one is only evidence about the surface when no
+    // filter applied. A typo'd `kind`/`provider`/`ids` used to earn "not hit-testable right now" —
+    // a confident wrong cause (§0 rank 2, #1208 B-4). So decide in the order the filter narrows:
+    //  1. a `provider` nobody registered is a spelling question, not a surface one;
+    //  2. the SCOPE is that provider's regions (or every provider's) — if the scope itself is empty,
+    //     the surface diagnosis is the true one, however the rest of the filter is spelled
+    //     (#1208 review: checking "any regions anywhere" told a correct `provider=board` on an
+    //     unloaded board to check its spelling, because another provider had a region);
+    //  3. only then is a `kind`/`ids` miss the filter's, with the kinds named FROM THE SCOPE.
+    // `ids` is an array of strings by here — anything else was refused above.
+    const idsText = p.ids ? p.ids.join(',') : '';
+    const filterText = [p.provider && `provider=${p.provider}`, p.kind && `kind=${p.kind}`, idsText && `ids=${idsText}`]
+      .filter(Boolean).join(' ');
+    // Decide "a filter applied" by PRESENCE, not by the joined text: `ids: []` filters to nothing
+    // in `collectHitRegions` while joining to '' (#1208 close-out review F1).
+    const scope = p.provider ? collectHitRegions({ provider: p.provider }) : (p.kind || p.ids != null ? collectHitRegions() : all);
+    if (p.provider && !providers.includes(p.provider)) {
+      result.hint = `No hit-region provider is named "${p.provider}". Registered: {${providers.join(', ')}} — `
+        + 'check the spelling, or drop provider=.';
+    } else if (scope.length === 0) {
+      const inScope = p.provider ? [p.provider] : providers;
+      const threw = inScope.filter((n) => failedNames.has(n));
+      const quiet = inScope.filter((n) => !failedNames.has(n));
+      result.hint = [
+        threw.length ? `Provider(s) [${threw.join(', ')}] FAILED while reporting (see failedProviders and the console) — their regions are UNKNOWN, not absent.` : '',
+        quiet.length ? `${p.provider ? `Provider "${p.provider}" is` : `Provider(s) [${quiet.join(', ')}]`} registered but reported no regions — the `
+          + 'surface is not hit-testable right now (no level loaded, or a modal is swallowing input).' : '',
+      ].filter(Boolean).join(' ');
+    } else {
+      const kinds = [...new Set(scope.map((r) => r.kind))].sort();
+      // With no provider filter, a correctly spelled kind can belong to a provider that is
+      // registered but EMPTY right now (an unloaded board beside a live HUD). Name those, so
+      // "check the spelling" is not the only reading offered (close-out review F2). `provider`
+      // is stamped from the registry key, so it is safe to compare against `providers`.
+      const reporting = new Set(scope.map((r) => r.provider));
+      const empty = p.provider ? [] : providers.filter((n) => !reporting.has(n) && !failedNames.has(n));
+      const threw = p.provider ? [] : providers.filter((n) => failedNames.has(n));
+      result.hint = `No region matches the filter (${filterText || 'ids=[]'}), but ${scope.length} region(s) exist`
+        + `${p.provider ? ` from "${p.provider}"` : ''}. Live kinds there: {${kinds.join(', ')}} — `
+        + 'check the spelling, or drop the filter.'
+        + (empty.length ? ` Provider(s) [${empty.join(', ')}] reported NO regions right now (not hit-testable — no level loaded, or a modal is swallowing input), so a kind that only they draw cannot match yet.` : '')
+        + (threw.length ? ` Provider(s) [${threw.join(', ')}] FAILED while reporting, so a kind only they draw is unknown, not absent (see failedProviders).` : '');
+    }
   } else if (regions.length < all.length) {
     result.hint = `${all.length} region(s) matched; showing the first ${regions.length}. Raise limit=, or filter by kind=/provider=.`;
   }
@@ -1553,20 +1760,26 @@ function queryHitRef(entityId: number): { entityId: number; guid: string | null;
 }
 
 /** Resolve the `exclude` argument — a name or guid, never a raw id — to a runtime id.
- *  An ambiguous NAME is REFUSED rather than first-matched (§3, on every path). */
-function resolveExclude(spec: string): { id: number } | { error: string; options?: string[] } {
-  const byGuid = findEntityByGuid(spec);
-  if (byGuid) return { id: byGuid.id() };
-  const matches = getAllEntities().filter((e) => e.name === spec);
-  if (matches.length === 0) return { error: `exclude: no entity named or guid'd '${spec}' in the live world` };
-  if (matches.length > 1) {
-    return {
-      error: `exclude: '${spec}' matches ${matches.length} entities — an ambiguous name is refused everywhere, never first-matched`,
-      options: matches.map((m) => m.guid || `id:${m.id}`),
-    };
-  }
-  return { id: matches[0].id };
+ *
+ *  One string that may be either, so it cannot go to the shared resolver (`entityRef.ts`) as one
+ *  address: a guid-shaped string is tried as a guid and falls back to a name only when it misses, as
+ *  before. Both halves use that resolver, so an ambiguous NAME is refused rather than first-matched
+ *  (§3, on every path), and a miss is `NOT_FOUND` — it used to reach the caller coded `AMBIGUOUS`. */
+function resolveExclude(spec: string): { id: number } | { error: string; code: ErrorCode; options?: string[]; stale?: string } {
+  const byGuid = resolveEntityAddress({ guid: spec }, { label: 'exclude', accept: ['guid'] });
+  if (byGuid.ok) return { id: byGuid.id };
+  const byName = resolveEntityAddress({ name: spec }, { label: 'exclude', accept: ['name'] });
+  if (byName.ok) return { id: byName.id };
+  if (byName.code === 'AMBIGUOUS') return { error: byName.error, code: 'AMBIGUOUS', options: byName.options ?? [] };
+  return {
+    error: `exclude: no entity named or guid'd '${spec}' in the live world${byGuid.stale ? ` — a runtime guid that is stale (${byGuid.stale})` : ''}`,
+    code: 'NOT_FOUND', ...(byGuid.stale ? { stale: byGuid.stale } : {}),
+  };
 }
+
+/** How long `scene-query` waits on a Rapier module that has not loaded, to tell "still loading" from
+ *  "failed for good" (#1260). Short: the caller is told to retry either way. */
+const SCENE_QUERY_PHYSICS_WAIT_MS = 1500;
 
 registerAgentOp('scene-query', (params) => {
   const p = (params ?? {}) as {
@@ -1586,17 +1799,39 @@ registerAgentOp('scene-query', (params) => {
   const is2d = p.dim === '2d';
   const n = is2d ? 2 : 3;
 
-  // 1. "There is no physics world" — NOT a miss. A world exists only once the physics system has
-  //    run, i.e. while the sim is PLAYING, so a stopped editor legitimately has none. Answering
-  //    `hit:null` here would tell the agent the ray passed through empty space.
+  // 1. "There is no physics world" — NOT a miss. Answering `hit:null` here would tell the agent the
+  //    ray passed through empty space. `reason` says WHICH absence, because the remedies differ
+  //    (#1260) — the rule lives in `sceneQueryAbsence.ts`.
   if (!(is2d ? hasPhysics2D(world) : hasPhysics3D(world))) {
-    return {
-      ok: false, code: 'NOT_AVAILABLE_HERE', kind: p.kind, dim: p.dim,
-      error: `no ${p.dim.toUpperCase()} physics world exists on this surface, so nothing could be queried — this is NOT "the query missed".`,
-      hint: 'A Rapier world is built by the physics system on its first tick and freed on Stop, so '
-        + 'a STOPPED editor has none. Start the sim (modoki_play_control action:"play"), or check '
-        + `the scene actually has ${p.dim.toUpperCase()} colliders.`,
-    };
+    const refuse = (a: { reason: string; hint: string }) => ({
+      ok: false, code: 'NOT_AVAILABLE_HERE', kind: p.kind, dim: p.dim, reason: a.reason,
+      error: `no ${p.dim!.toUpperCase()} physics world exists on this surface, so nothing could be queried — this is NOT "the query missed".`,
+      hint: a.hint,
+    });
+    const base = {
+      dim: p.dim,
+      hasBodies: world.queryFirst(is2d ? RigidBody2D : RigidBody3D) !== undefined,
+      moduleInBuild: is2d ? __MODOKI_MODULE_PHYSICS2D__ : __MODOKI_MODULE_PHYSICS3D__,
+      playState: getPlayState(),
+    } as const;
+    const moduleName = is2d ? 'physics2D' : 'physics3D';
+    // Nothing to wait for: loaded (or stripped — `pendingPhysics` filters on the same flag), or a
+    // stopped sim, whose answer is "start the sim" whatever Rapier is doing.
+    if (base.playState === 'stopped' || !pendingPhysics(world).some((m) => m.name === moduleName)) {
+      return refuse(classifyWorldAbsence({ ...base, rapier: { state: 'ready' } }));
+    }
+    // Rapier is not loaded. Waiting is what tells "still loading" from "gave up" — the loader
+    // settles a permanent failure fast — bounded so a slow download reads as loading, not a hang.
+    // THIS dimension's module only: the other one's slow load must not mask this one's failure.
+    return (async () => {
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const outOfTime = new Promise<'loading'>((res) => { timer = setTimeout(() => res('loading'), SCENE_QUERY_PHYSICS_WAIT_MS); });
+      const r = await Promise.race([ensurePhysicsModuleReady(moduleName), outOfTime]);
+      clearTimeout(timer);
+      const rapier = r === 'loading' ? { state: 'loading' as const }
+        : r.ok ? { state: 'ready' as const } : { state: 'failed' as const, error: r.error };
+      return refuse(classifyWorldAbsence({ ...base, rapier }));
+    })();
   }
 
   const vec = (v: unknown, what: string): number[] | string => {
@@ -1651,7 +1886,7 @@ registerAgentOp('scene-query', (params) => {
       return { ok: false, code: 'REFUSED_BY_OP', error: "exclude is not supported for kind:'shapecast' — the underlying castShape takes no exclusion filter. Use kind:'raycast', or offset the origin past your own collider." };
     }
     const r = resolveExclude(p.exclude);
-    if ('error' in r) return { ok: false, code: 'AMBIGUOUS', error: r.error, options: r.options };
+    if ('error' in r) return { ok: false, code: r.code, error: r.error, ...(r.options ? { options: r.options } : {}), ...(r.stale ? { stale: r.stale } : {}) };
     excludeId = r.id;
   }
 
@@ -1783,6 +2018,18 @@ registerAgentOp('player-prefs-write', async (params) => {
   if (!p.action || !ACTIONS.includes(p.action)) {
     return { ok: false, code: 'REFUSED_BY_OP', error: `player-prefs-write requires action (one of ${ACTIONS.join(', ')}); got ${JSON.stringify(p.action)}`, options: ACTIONS };
   }
+  // A param the action does not use is REFUSED, not ignored (#1213 B-15). The case that made this a
+  // bug: `{action:'clear', key:'progress', confirm:true}` reads as "clear that key" and wiped the
+  // whole namespace — the destructive action was the one that dropped its argument silently.
+  const ACTION_PARAMS: Record<string, readonly string[]> = { set: ['key', 'value'], delete: ['key'], clear: ['confirm'], flush: [] };
+  const stray = (['key', 'value', 'confirm'] as const).filter((k) => p[k] !== undefined && !ACTION_PARAMS[p.action!].includes(k));
+  if (stray.length) {
+    return {
+      ok: false, code: 'UNKNOWN_PARAM',
+      error: `player-prefs-write: action '${p.action}' does not take ${stray.join(' or ')} — nothing was written.`
+        + (p.action === 'clear' && stray.includes('key') ? " clear removes EVERY key in the namespace; to remove one key use action:'delete'." : ''),
+    };
+  }
   const refusal = prefsUnhydrated();
   if (refusal) return refusal;
   // Distinct from `prefsUnhydrated()` above: `isHydrated()` stays `true` for the whole swap
@@ -1885,7 +2132,13 @@ registerAgentOp('player-prefs-write', async (params) => {
     // installed app holding a real player's save data, namespaced by appId, and this is neither
     // undoable nor journaled as a scene edit. A REQUIRED `action` stops the `{}`-typo hazard; only
     // an explicit acknowledgement stops a deliberate clear aimed at the wrong lease.
-    const keys = PlayerPrefs.keys();
+    // ⚠️ **`keysIncludingProtected()`, never `keys()`** (#1310). This listing describes a DELETE —
+    // the preview the operator acknowledges, the `cleared` count, and the `failed`/`alsoPending`
+    // split below — and `clear()` also removes a key protected by a save this build cannot decode
+    // (#630). `keys()` omits that key, so it went unlisted in the preview and a rejected remove of
+    // it was narrated as "already pending before this clear ran" beside "every key this clear
+    // enumerated was durably removed" — a wipe reporting success over a save still on disk (#1276).
+    const keys = PlayerPrefs.keysIncludingProtected();
     if (p.confirm !== true) {
       return {
         // REFUSED_BY_OP, not REQUIRES_SAVE. §5 documents REQUIRES_SAVE for a world-swapping or
@@ -1950,7 +2203,11 @@ registerAgentOp('player-prefs-write', async (params) => {
     // way left to clear a protected key is `action:'clear'`, which wipes the whole namespace.
     // `PlayerPrefs.delete()` itself already treats a protected key like any other (it drops the
     // protection unconditionally), so falling through to the ordinary delete path below is correct.
-    if (!PlayerPrefs.has(p.key) && !PlayerPrefs.isProtected(p.key)) {
+    // #1317 — the same holds for a CORRUPT entry: absent from `has()`, not protected, still on disk.
+    // So the test is the delete listing itself (readable ∪ protected ∪ corrupt), the same one that
+    // builds `options` below — otherwise NOT_FOUND offered a corrupt key as a target and then refused
+    // it again on every retry, leaving `clear` as the only way to remove it.
+    if (!PlayerPrefs.keysIncludingProtected().includes(p.key)) {
       // A key absent from the cache but still DIRTY is not a missing key — but it is NOT proof of
       // a rejection either. `PlayerPrefs.delete()` does `cache.delete; dirty.add; scheduleFlush()`
       // on a 150ms debounce, so an ordinary in-flight delete (the game's own `PlayerPrefs.delete()`,
@@ -1976,10 +2233,13 @@ registerAgentOp('player-prefs-write', async (params) => {
         };
       }
       const keys = [...PlayerPrefs.keys()].sort();
+      // `options` are delete TARGETS, and a protected or corrupt key is one (the check above lets
+      // it through, #630 review finding 4, #1317) — so they come from the same listing (#1310).
+      // `keys` stays the readable index, the same answer `player-prefs-read` gives.
       return {
         ok: false, code: 'NOT_FOUND', namespace, key: p.key, keys,
         error: `no key '${p.key}' in namespace '${namespace}' — nothing was deleted`,
-        options: keys,
+        options: [...PlayerPrefs.keysIncludingProtected()].sort(),
       };
     }
     PlayerPrefs.delete(p.key);
@@ -2079,6 +2339,37 @@ export function inferAssetDefType(path: string): 'material' | 'particle' | 'anim
   return null;
 }
 
+/** The kinds `read-asset-def` can read from the live cache — every inferable kind but `material`,
+ *  whose authored JSON is not retained (both twins refuse it with their own explanation). */
+export const READABLE_ASSET_DEF_TYPES = ['particle', 'animation', 'spriteanim', 'timeline', 'rig2d', 'shader', 'animset'] as const;
+
+/** `read-asset-def`'s kind, from an explicit `type` or the path's suffix — shared by the runtime and
+ *  editor twins so they refuse the same inputs the same way. An explicit `type` that CONTRADICTS the
+ *  suffix is refused (#1213 C-23): it used to win, peek the wrong cache, and report "nothing in the
+ *  running scene has loaded it" about an asset that was loaded — under the other kind. A path with no
+ *  recognised suffix (a bare shader guid) takes the explicit type as given. */
+export function resolveAssetDefKind(path: string, type: unknown):
+  { kind: string } | { ok: false; code: ErrorCode; error: string; options: string[] } {
+  const inferred = inferAssetDefType(path);
+  if (type !== undefined) {
+    if (type !== 'material' && !(READABLE_ASSET_DEF_TYPES as readonly unknown[]).includes(type)) {
+      return { ok: false, code: 'REFUSED_BY_OP', error: `read-asset-def: unsupported type '${String(type)}' — nothing was read. Valid: ${READABLE_ASSET_DEF_TYPES.join(', ')}.`, options: [...READABLE_ASSET_DEF_TYPES] };
+    }
+    if (inferred && inferred !== type) {
+      return {
+        ok: false, code: 'REFUSED_BY_OP',
+        error: `read-asset-def: type '${String(type)}' contradicts the path — '${path}' is a ${inferred} by its suffix. Nothing was read; omit type, or pass type:'${inferred}'.`,
+        options: [inferred],
+      };
+    }
+    return { kind: type as string };
+  }
+  if (!inferred) {
+    return { ok: false, code: 'REFUSED_BY_OP', error: `read-asset-def: cannot tell what kind of asset '${path}' is — pass type explicitly (${READABLE_ASSET_DEF_TYPES.join(', ')}).`, options: [...READABLE_ASSET_DEF_TYPES] };
+  }
+  return { kind: inferred };
+}
+
 // ── read-asset-def (#166 P7) — what the RUNNING build actually resolved.
 //
 // Runtime twin: reads the live cache and nothing else. The editor replaces this with its own
@@ -2089,14 +2380,9 @@ export function inferAssetDefType(path: string): 'material' | 'particle' | 'anim
 registerAgentOp('read-asset-def', (params) => {
   const { path, type } = (params ?? {}) as { path?: string; type?: string };
   if (!path) return { ok: false, error: 'read-asset-def requires { path }.' };
-  const kind = type ?? inferAssetDefType(path);
-  if (!kind) {
-    return {
-      ok: false,
-      error: `cannot tell what kind of asset '${path}' is — pass type explicitly.`,
-      options: ['particle', 'animation', 'spriteanim', 'timeline', 'rig2d', 'shader', 'animset'],
-    };
-  }
+  const resolved = resolveAssetDefKind(path, type);
+  if (!('kind' in resolved)) return resolved;
+  const { kind } = resolved;
   // PEEK, don't load. The plain getters treat a miss as "not loaded YET" and kick off a background
   // fetch, so asking about an absent asset would queue a load that can only fail and log into the
   // console — for a question this op then refuses anyway.
@@ -2108,7 +2394,7 @@ registerAgentOp('read-asset-def', (params) => {
     return {
       ok: false,
       error: "read-asset-def: material defs are not readable from the live cache — only the compiled THREE.Material is retained, the authored .mat.json is discarded once built. Read the file directly (it is the authoritative copy; a parked edit shows in modoki_get_editor_state's dirtyAssetPaths).",
-      options: ['particle', 'animation', 'timeline', 'spriteanim', 'rig2d', 'shader', 'animset'],
+      options: [...READABLE_ASSET_DEF_TYPES],
     };
   }
   const peek = { load: false } as const;
@@ -2134,11 +2420,7 @@ registerAgentOp('read-asset-def', (params) => {
     : kind === 'animset' ? getAnimSet(path, peek)
     : undefined;
   if (def === undefined) {
-    return {
-      ok: false,
-      error: `unsupported type '${kind}'.`,
-      options: ['particle', 'animation', 'timeline', 'spriteanim', 'rig2d', 'shader', 'animset'],
-    };
+    return { ok: false, error: `unsupported type '${kind}'.`, options: [...READABLE_ASSET_DEF_TYPES] };
   }
   if (def === null) {
     // NOT an empty answer: nothing has loaded this asset into the live cache, so there is no live
@@ -2164,12 +2446,13 @@ registerAgentOp('load-scene', async (params) => {
   }
   const before = sceneManager.getCurrent()?.path ?? null;
   const loading = sceneManager.loadScene(p.path);
+  let startupErrors: readonly { manager: string; error: unknown }[]; // assigned in the try; the catch always returns
   // SceneManager allocates THIS attempt's id into `nextLoad` synchronously, before loadScene's
   // first await (SceneManager.loadScene's step-2 `nextSceneId`/`nextLoad` allocation) — so reading it here, between the call and the await,
   // names OUR load specifically, not whichever load happens to win a later swap (#486 finding A).
   const myId = sceneManager.getNext()?.id ?? null;
   try {
-    await loading;
+    startupErrors = (await loading).startupErrors ?? [];
   } catch (e) {
     const cur = sceneManager.getCurrent();
     if (cur?.path === before) {
@@ -2188,7 +2471,12 @@ registerAgentOp('load-scene', async (params) => {
   if (myId !== null && cur !== null) {
     if (cur.id === myId) {
       // Our load won the swap — unchanged success reply.
-      return { ok: true, current: after, previous: before, entityCount: getAllEntities().length };
+      // #1425: a manager that failed to start is reported, not a failure; the scene IS loaded.
+      return {
+        ok: true, current: after, previous: before, worldEntityTotal: getAllEntities().length,
+        ...(startupErrors.length ? { warnings: startupErrors.map(({ manager, error }) =>
+          `manager "${manager}" failed to start (the scene is still loaded): ${(error as Error)?.message ?? String(error)}`) } : {}),
+      };
     }
     // ⚠️ `> myId`, NOT `!== myId`. Scene ids come from a monotonic `this.nextSceneId++`
     // (loadScene's `nextSceneId` bump), so only an id GREATER than ours is evidence that a LATER load won
@@ -2205,7 +2493,7 @@ registerAgentOp('load-scene', async (params) => {
       // says nothing about whether `p.path` exists.
       if (cur.path === p.path) {
         // The same requested path won, so the caller's requested end state IS true — just not
-        // because of THIS op's load. `entityCount` is deliberately omitted: it would be a live
+        // because of THIS op's load. `worldEntityTotal` is deliberately omitted: it would be a live
         // read of a world this op did not load.
         return {
           ok: true, current: after, previous: before,
@@ -2227,7 +2515,7 @@ registerAgentOp('load-scene', async (params) => {
   if (after !== p.path) {
     return { ok: false, error: `load-scene did not switch to "${p.path}" — the active scene is ${after ?? 'null'}. Check the path exists in this build.`, current: after, previous: before };
   }
-  return { ok: true, current: after, previous: before, entityCount: getAllEntities().length };
+  return { ok: true, current: after, previous: before, worldEntityTotal: getAllEntities().length };
 });
 
 // SIM_STEP_MAX_TIMEOUT_MS / simStepDefaultTimeout are imported at the top of this file (from
@@ -2258,9 +2546,26 @@ registerAgentOp('sim-step', (params) => {
       timeScale: getTimeScale(world),
     });
   }
-  const frames = Math.max(1, Math.min(600, Math.floor(Number(p.frames ?? 1))));
-  const scale = typeof p.scale === 'number' && Number.isFinite(p.scale) && p.scale > 0 ? p.scale : 1;
-  const budgetMs = Math.max(100, Math.min(SIM_STEP_MAX_TIMEOUT_MS, Number(p.timeoutMs ?? simStepDefaultTimeout(frames))));
+  // Refused, not clamped (#1213 C-9): `frames:1000` stepped 600 and `scale:-1` stepped at 1, both
+  // answering ok about a run the caller did not ask for — and `frames:'abc'` became NaN, which no
+  // frame count ever reaches, so the call sat out its whole timeout. `duplicate-entity` refuses a bad
+  // count for the same reason.
+  const bad = (field: string, value: unknown, want: string) => Promise.resolve({
+    ok: false, code: 'REFUSED_BY_OP',
+    error: `sim-step: ${field} must be ${want} — got ${JSON.stringify(value)}. Nothing was stepped.`,
+  });
+  if (p.frames !== undefined && !(Number.isInteger(p.frames) && p.frames >= 1 && p.frames <= SIM_STEP_MAX_FRAMES)) {
+    return bad('frames', p.frames, `an integer from 1 to ${SIM_STEP_MAX_FRAMES}`);
+  }
+  if (p.scale !== undefined && !(typeof p.scale === 'number' && Number.isFinite(p.scale) && p.scale > 0)) {
+    return bad('scale', p.scale, 'a finite number above 0');
+  }
+  if (p.timeoutMs !== undefined && !(typeof p.timeoutMs === 'number' && Number.isFinite(p.timeoutMs))) {
+    return bad('timeoutMs', p.timeoutMs, 'a finite number of milliseconds');
+  }
+  const frames = p.frames ?? 1;
+  const scale = p.scale ?? 1;
+  const budgetMs = Math.max(100, Math.min(SIM_STEP_MAX_TIMEOUT_MS, p.timeoutMs ?? simStepDefaultTimeout(frames)));
 
   // Physics readiness (#1175): a body whose Rapier WASM has not instantiated is SKIPPED by the
   // physics system, so these frames would come back physics-free and read as real. Wait for it like
@@ -2387,7 +2692,7 @@ const handleOp = runAgentOp;
  *  in `engine/plugins/vite-asset-scanner.ts` (the producer) — kept as a local union rather than
  *  a type import because the plugin is a Node module and the app tsconfig has no node types.
  *  Keep the two in sync; a new kind that lands here without a branch below is simply ignored. */
-type SceneChangedKind = 'scene' | 'prefab' | 'animation' | 'timeline' | 'particle' | 'spriteanim' | 'rig2d' | 'animset' | 'material' | 'shader';
+type SceneChangedKind = 'scene' | 'prefab' | 'animation' | 'timeline' | 'particle' | 'spriteanim' | 'rig2d' | 'animset' | 'material' | 'shader' | 'mesh';
 
 /**
  * Kinds whose ONLY stale thing is a cached asset definition → drop that entry and stop. Never a
@@ -2423,6 +2728,10 @@ const ASSET_CACHE_INVALIDATORS: Partial<Record<SceneChangedKind, (urlPath: strin
   // write never invalidated the cache and a stale parked edit was never dropped at the next save.
   material: invalidateMaterial,
   shader: invalidateShader,
+  // Ninth (#1380): `.mesh.json` is not an ASSET_SCHEMA_TYPE, so #842's schema ⊆ kind check could
+  // not see it — only a plain file edit writes one externally. The invalidator also tells the
+  // renderer, because its built object is cached by the unchanged ref string.
+  mesh: invalidateMeshAsset,
 };
 
 /** The file on disk for `urlPath` just changed, so its cached def is being dropped — any
@@ -2630,15 +2939,18 @@ async function handleSceneChanged(msg: SceneChangedMsg, evictAlso: readonly stri
     const lateReason = sceneReloadSuppressedReason();
     if (lateReason) { defer(lateReason); return; }
     evictRuntimePrefabs();
-    await sceneManager.loadScene(current, {
+    // The kept bases carried their unsaved edits across, so the editor keeps their dirty flags (#1417).
+    const { keptBaseGuids } = await sceneManager.loadScene(current, {
       ...(preloaded ? { preloaded } : undefined),
       ...(changedBaseGuid ? { forceReloadBases: [changedBaseGuid] } : undefined),
     });
+    _worldReloadedFromDisk?.(current, keptBaseGuids);
     console.log(`[agentBridge] hot-reloaded scene (${msg.kind} change: ${msg.urlPath})`);
   } catch (e) {
-    // A newer reload superseding this one aborts the in-flight load
+    // A newer load superseding this one aborts the in-flight load
     // (SceneManager throws DOMException 'AbortError'). That's expected — the
-    // superseding reload logs its own success — not a failure. This fires
+    // superseding load logs its own success — not a failure, and it inherits this
+    // load's `forceReloadBases`, so a changed base is still reloaded (#1422). This fires
     // routinely when several files change at once (e.g. deleting a batch of
     // unused prefabs), so keep it quiet rather than an alarming "failed" warn.
     if (e instanceof DOMException && e.name === 'AbortError') {

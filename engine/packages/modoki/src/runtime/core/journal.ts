@@ -213,14 +213,22 @@ export function journalTick(world: World | null = peekCurrentWorld()): number {
 // exists to make trustworthy. So conversion happens at the call site, where the
 // caller actually knows the value is an entity.
 
-type EntityLike = { id(): number; get(t: unknown): unknown; has(t: unknown): boolean };
+type EntityLike = { id(): number; get(t: unknown): unknown; has(t: unknown): boolean; isAlive(): boolean };
 
 /** Stable journal/Percept reference for an entity: its GUID when it has one
  *  (survives scene hot-reloads), else its current numeric id as a fallback for an
  *  un-guidable (fresh, unsaved) entity. Call this on entities before emitting them
  *  in a payload — a raw entity is a primitive number the journal cannot safely
- *  auto-detect. */
-export function entityRef(entity: EntityLike): string | number {
+ *  auto-detect.
+ *
+ *  **`null` for a handle that is no longer alive** (#1227). koota's `has()`/`get()`/`id()` mask the
+ *  generation off, so a dead handle whose index a new entity reclaimed would otherwise answer with
+ *  the NEWCOMER's guid — a live entity that never took part in the event. Nothing about the dead
+ *  entity can be derived from its handle any more, so this refuses rather than guesses. A caller
+ *  that needs the dead entity's ref must have taken it while the entity was alive: an exit
+ *  callback reads `otherRef` (`ctx.params`, or the event bus's `refs`), which the producer cached. */
+export function entityRef(entity: EntityLike): string | number | null {
+  try { if (!entity.isAlive()) return null; } catch { return null; } // a destroyed world's handle throws
   const nid = entity.id();
   let ref: string | number = nid;
   let name = '';
@@ -240,14 +248,11 @@ export function entityRef(entity: EntityLike): string | number {
   if (name && _enabled) {
     try {
       const w = getCurrentWorld();
+      // ONE key: the ref this call returns. There used to be a second, numeric-id alias, because
+      // the synthesized despawn-exit (physicsContactEvents/zoneTriggerCore `refOf`) emitted the
+      // cached numeric id; it now emits the ref cached from a live call, so every journaled ref
+      // was recorded here under exactly that string (#1225).
       recordRefName(w, ref, name);
-      // Dual-key: also alias under the NUMERIC id. A guidable entity emits its GUID here (while
-      // alive), but the synthesized-exit path (physicsContactEvents `refOf`) emits the cached
-      // numeric `entityId` once the entity is DEAD — so a reader resolving that numeric ref would
-      // miss the name recorded only under the GUID. Aliasing both key forms keeps a despawned
-      // guidable entity nameable (the feature's headline case) and lets enter (guid) correlate
-      // with exit (numeric id). No-op when ref already IS the numeric id.
-      if (ref !== nid) recordRefName(w, nid, name);
     } catch { /* no current world */ }
   }
   return ref;

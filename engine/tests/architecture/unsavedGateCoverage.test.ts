@@ -50,6 +50,12 @@ const ROUTER = 'engine/plugins/backend/editorBackendRouter.ts';
  *  beats a trigger tuned until nothing inconvenient matches. */
 const CONTENT_CALLS = /\b(writeMetaSidecar|readMetaSidecar|duplicateAssetFile|getReimportHandler|readFileSync|computeUnused|computeRefEdges|validateSceneData|validatePrefabData|moveToTrash|moveAssetFile|writeFileSync)\s*\(/;
 
+/** Every registry name in the vocabulary, and the subset that holds an unsaved DOCUMENT. The split
+ *  exists because `openAssetEditor` (#1362) is not a registry of parked documents — it is "a modal
+ *  is holding edits in component state" — so the callers that mean "every document" say so. */
+const DOCUMENT_REGISTRY_NAMES = ['dirtyAsset', 'pendingMeta', 'pendingBaseScene', 'liveScene'] as const;
+const ALL_REGISTRY_NAMES = [...DOCUMENT_REGISTRY_NAMES, 'openAssetEditor'] as const;
+
 /** The registries each trigger symbol's INPUTS can live in.
  *
  *  ⚠️ **This is the hole the old guard could not see, and it is not hypothetical.**
@@ -104,8 +110,11 @@ const HELPER_REGISTRIES: Record<string, readonly string[]> = {
   // that doc list read as a ledger the guard keeps when for those three it was prose. All three
   // turn out to be exempt, and the point is that they are now exempt ON THE RECORD rather than
   // merely unexamined. The difference shows up the day one of them grows a branch.
-  moveToTrash: ['dirtyAsset', 'pendingMeta', 'pendingBaseScene', 'liveScene'],
-  moveAssetFile: ['dirtyAsset', 'pendingMeta', 'pendingBaseScene', 'liveScene'],
+  // ⚠️ DERIVED, not copied. These two decide `needed` for the move and delete routes, so a stale
+  // copy here is the one whose staleness costs most — a registry added to the vocabulary would never
+  // reach those routes' `needed` and the gap would be silent (#1362 review, F12).
+  moveToTrash: DOCUMENT_REGISTRY_NAMES,
+  moveAssetFile: DOCUMENT_REGISTRY_NAMES,
   // Same argument as readFileSync: a raw write says nothing about WHAT was written.
   writeFileSync: [],
 };
@@ -117,9 +126,15 @@ const HELPER_REGISTRIES: Record<string, readonly string[]> = {
  *  exact vacuity being fixed. Spell it inline at the call site. */
 function declaredRegistries(body: string): string[] {
   const out = new Set<string>();
-  for (const m of body.matchAll(/registries:\s*(ALL_UNSAVED_REGISTRIES|\[([^\]]*)\])/g)) {
+  for (const m of body.matchAll(/registries:\s*(ALL_UNSAVED_REGISTRIES|DOCUMENT_UNSAVED_REGISTRIES|\[([^\]]*)\])/g)) {
     if (m[1] === 'ALL_UNSAVED_REGISTRIES') {
-      for (const r of ['dirtyAsset', 'pendingMeta', 'pendingBaseScene', 'liveScene']) out.add(r);
+      for (const r of ALL_REGISTRY_NAMES) out.add(r);
+      continue;
+    }
+    // #1362: the stale-read disclosures ask for the DOCUMENT registries by name, because
+    // `openAssetEditor` is a modal holding component state and says nothing about a stale read.
+    if (m[1] === 'DOCUMENT_UNSAVED_REGISTRIES') {
+      for (const r of DOCUMENT_REGISTRY_NAMES) out.add(r);
       continue;
     }
     for (const q of (m[2] ?? '').matchAll(/'([^']+)'/g)) out.add(q[1]);
@@ -139,21 +154,38 @@ const EXEMPT: Record<string, { reason: string; registries?: readonly string[] }>
   // ── The two move/delete routes. FULLY exempt (no `registries`), because the reasoning is total
   //    rather than per-registry — and note they can never satisfy `gapsNowGated`, since the
   //    correct implementation of these routes calls no gate at all. ──
-  '/api/move-file': { reason:
-    'GATING IT WOULD BE WRONG: the gate would refuse a rename BECAUSE the file being renamed has '
-    + 'unsaved edits, which is precisely the case the repair exists to carry across. A file must '
-    + 'stay renameable while it is being edited. Instead the route REPAIRS every path-keyed '
-    + 'registry, and does so by DERIVATION — `PARKED_MOVE_REPAIRS` (assetEditorBindings.ts) '
-    + '`satisfies Record<PathKeyedCause, ...>`, where `PathKeyedCause` is the `keying:\'path\'` '
-    + 'slice of `CAUSE_SPECS` — so a fourth path-keyed registry cannot compile without a repair. '
+  // ⚠️ PARTIALLY exempt since #1362 (owner, 2026-09-18) — the four REGISTRY registries only. The
+  //    route gates `openAssetEditor`, so this row no longer covers it.
+  '/api/move-file': { registries: ['dirtyAsset', 'pendingMeta', 'pendingBaseScene', 'liveScene'], reason:
+    'GATING THESE FOUR WOULD BE WRONG: the gate would refuse a rename BECAUSE the file being '
+    + 'renamed has unsaved edits, which is precisely the case the repair exists to carry across. A '
+    + 'file must stay renameable while it is being edited. Instead the route REPAIRS every '
+    + 'path-keyed registry, and does so by DERIVATION — `PARKED_MOVE_REPAIRS` '
+    + '(assetEditorBindings.ts) `satisfies Record<PathKeyedCause, ...>`, where `PathKeyedCause` is '
+    + 'the `keying:\'path\'` slice of `CAUSE_SPECS` — so a fourth path-keyed registry cannot '
+    + 'compile without a repair. '
     + '⚠️ VOID if that repair stops being derived: "it repairs them" was true of the hand-written '
-    + 'version too, right up until it was two of three (#972) and nothing said so.', },
-  '/api/delete-asset': { reason:
-    'the same seam as /api/move-file with `to: null` (unbindDeletedAssetEditors), exempt on the '
-    + 'same three grounds: a file must be deletable while it is being edited, the repair covers '
-    + 'every path-keyed registry by derivation, and the exemption is void if that stops being '
-    + 'true. Its drops are REPORTED, never silent (#898) — destroying pending work is exactly the '
-    + 'thing that must reach the human.', },
+    + 'version too, right up until it was two of three (#972) and nothing said so. '
+    + '⚠️ AND IT DOES NOT EXTEND TO `openAssetEditor` (#1362): that reasoning rests entirely on the '
+    + 'repair being able to carry the work across, and the Sprite/9-slice editors hold their edits '
+    + 'in component state, in NO registry, so there is nothing to re-point — observed live, a move '
+    + 'unmounted the modal and its unsaved slices were gone with `unsavedChanges` still false. The '
+    + 'owner ruled the move REFUSES there (2026-09-18), on the modals\' own rule that Save and '
+    + 'Cancel are the only exits. So: renameable while edited, EXCEPT when the only copy of the '
+    + 'edit would die with the move.', },
+  // ⚠️ NOT the move-file exemption any more (#1215 A-7, owner 2026-09-15). A move CARRIES the work
+  // across; a delete DESTROYS it, and the "drops are reported" note reached only the agent that
+  // caused them. The AGENT path now gates the three path-keyed registries the repair drops; the
+  // renderer's own deletes (`rendererWrite`) do not. What is left exempt is `liveScene` alone.
+  '/api/delete-asset': { registries: ['liveScene'], reason:
+    'trashing the file the live world was loaded from destroys nothing in the live world — the '
+    + 'human\'s next save writes it back — so refusing on it would be a false alarm. The three '
+    + 'path-keyed registries the delete repair actually DROPS are gated.', },
+  // ⚠️ REINSTATED (#1305, owner 2026-09-17). The close-out briefly deducted this row, because an
+  // automatic local-half heal was scheduled from here and that heal DID need the gate. The owner
+  // then chose the button over the automatic heal, so the route went back to reading only — it
+  // reports the gap in a header and repairs nothing — and the original reasoning is load-bearing
+  // again, unchanged.
   '/api/read-meta': { registries: ['pendingMeta'], reason:
     "the EDITOR'S OWN disk read — `readMetaPreferringPark` calls it FROM the renderer, so probing "
     + 'the renderer back would be circular for every real caller it has. It is also the read whose '
@@ -176,8 +208,10 @@ const EXEMPT: Record<string, { reason: string; registries?: readonly string[] }>
   //    touch, and "most" is a gap, not an exemption. ──
   '/api/write-file': { reason:
     'renderer-only. It has NO entry in engine/tools/modoki-mcp/src/contracts.ts, so no agent tool '
-    + 'reaches it; its callers are the editor OWN saves (postWriteFile — saveScene, '
-    + 'writePrefabFile), and it fingerprints EVERY write through markEditorWrite, which is the '
+    + 'calls it DIRECTLY. Three reach it THROUGH the renderer — create_registered_asset, prefab '
+    + 'create and save_all (an earlier version of this reason said "no agent tool reaches it", '
+    + 'which was false; #1215) — but every one of those writes is issued BY the renderer, which '
+    + 'holds the registries, and the route fingerprints EVERY write through markEditorWrite, the '
     + 'same assertion selfWrite makes on /api/asset-write: a write issued from the renderer is '
     + 'never blind to the registry. VOID the day it gains an MCP contract — it would then need '
     + 'asset-write selfWrite split, because the renderer half must not be gated.', },
@@ -421,6 +455,7 @@ describe('the sidecar park gate covers every Node route that could clobber a par
       { item: 'engine/plugins/backend/wdaLauncher.ts', reason: '#889 widened trigger: build-time converter / native-config writer / device tooling, behind no editor route' },
       { item: 'engine/plugins/detect-modules.ts', reason: '#889 widened trigger: build-time converter / native-config writer / device tooling, behind no editor route' },
       { item: 'engine/plugins/env-convert.ts', reason: '#889 widened trigger: build-time converter / native-config writer / device tooling, behind no editor route' },
+      { item: 'engine/plugins/env-ultrahdr.ts', reason: '#1314: reads the source .hdr only (the encoder behind reimport-environment.ts, itself reached only through the gated /api/reimport); writes nothing, touches no sidecar' },
       { item: 'engine/plugins/font-convert.ts', reason: '#889 widened trigger: build-time converter / native-config writer / device tooling, behind no editor route' },
       { item: 'engine/plugins/font-instance.ts', reason: '#889 widened trigger: build-time converter / native-config writer / device tooling, behind no editor route' },
       { item: 'engine/plugins/healNativeConfig.ts', reason: '#889 widened trigger: build-time converter / native-config writer / device tooling, behind no editor route' },
@@ -433,6 +468,7 @@ describe('the sidecar park gate covers every Node route that could clobber a par
       { item: 'engine/plugins/vendorPlugins.ts', reason: '#889 widened trigger: build-time converter / native-config writer / device tooling, behind no editor route' },
       { item: 'engine/plugins/video-convert.ts', reason: '#889 widened trigger: build-time converter / native-config writer / device tooling, behind no editor route' },
       { item: 'engine/plugins/stripFirebaseAuthFacebook.ts', reason: '#1062: build heal step 6 (reached from /api/build via healNativeProject, under the build claim) — reads capacitor.config.json and reads/writes node_modules/@capacitor-firebase/authentication/Package.swift only; no asset, sidecar or document a panel can hold unsaved' },
+      { item: 'engine/plugins/backend/loginShellProbe.ts', reason: '#1449: reads back only the one-line answer file its own login-shell probe wrote into a fresh mkdtemp dir; no asset, sidecar or document a panel can hold unsaved' },
       { item: 'engine/plugins/backend/iosUsbForward.ts', reason: '#1065: reads/writes only this clone\'s .modoki/ios-forward.json pid record for the go-ios forward' },
     ];
     assertExemptionLedger({
@@ -445,7 +481,7 @@ describe('the sidecar park gate covers every Node route that could clobber a par
     });
   });
 
-  it('the registry VOCABULARY is the same four everywhere it is spelled (#889 close-out review)', () => {
+  it('the registry VOCABULARY is the same everywhere it is spelled, documents included (#889 close-out review)', () => {
     // ⚠️ **The exhaustiveness derivation covers CAUSES; this covers REGISTRIES, and nothing did.**
     // `CAUSE_REGISTRY`/`CAUSE_HOLDS` `satisfies Record<keyof UnsavedCauses, …>`, so a sixth CAUSE
     // is a compile error. But the axis Node actually asks along is the REGISTRY, and that union is
@@ -476,17 +512,24 @@ describe('the sidecar park gate covers every Node route that could clobber a par
     const renderer = source('engine/app/editor/agentEditorOps.ts');
     const node = source(ROUTER);
 
-    const EXPECTED = ['dirtyAsset', 'liveScene', 'pendingBaseScene', 'pendingMeta'];
+    const EXPECTED = [...ALL_REGISTRY_NAMES].sort();
+    const DOCUMENTS = [...DOCUMENT_REGISTRY_NAMES].sort();
 
     expect(union(renderer, 'UnsavedRegistry'), 'the RENDERER union').toEqual(EXPECTED);
     expect(union(node, 'UnsavedRegistry'), 'the NODE union — it is asked along this axis').toEqual(EXPECTED);
     expect(arrayLiteral(renderer, 'ALL_REGISTRIES'), "the renderer's runtime list").toEqual(EXPECTED);
     expect(arrayLiteral(node, 'ALL_UNSAVED_REGISTRIES'), "the Node runtime list").toEqual(EXPECTED);
+    // #1362: and the DOCUMENT subset, which is a fifth spelling and the one the stale-read
+    // disclosures ask for. Left out, a registry added to the full vocabulary would silently start
+    // being asked about by those routes — the spillover this split exists to stop.
+    expect(arrayLiteral(node, 'DOCUMENT_UNSAVED_REGISTRIES'), "the Node document subset").toEqual(DOCUMENTS);
 
     // …and this guard's OWN expansion, which decides what `registries: ALL_UNSAVED_REGISTRIES`
     // means when it reads a route. A stale copy here would silently under-report `needed`.
     const mine = declaredRegistries("registries: ALL_UNSAVED_REGISTRIES").sort();
     expect(mine, "this guard's own expansion of ALL_UNSAVED_REGISTRIES").toEqual(EXPECTED);
+    expect(declaredRegistries("registries: DOCUMENT_UNSAVED_REGISTRIES").sort(),
+      "this guard's own expansion of DOCUMENT_UNSAVED_REGISTRIES").toEqual(DOCUMENTS);
 
     // ⚠️ …and the SIXTH spelling, which the title's "everywhere" was over-claiming without
     // (close-out review 2). `HELPER_REGISTRIES.duplicateAssetFile` is a fourth literal list of all
@@ -495,8 +538,10 @@ describe('the sidecar park gate covers every Node route that could clobber a par
     // to stop, in this file.
     expect(
       [...HELPER_REGISTRIES.duplicateAssetFile].sort(),
-      'duplicateAssetFile reads DOCUMENTS as well as sidecars, so it needs every registry',
-    ).toEqual(EXPECTED);
+      'duplicateAssetFile reads DOCUMENTS as well as sidecars, so it needs every DOCUMENT registry '
+      + '— but NOT openAssetEditor (#1362): a duplicate leaves the held asset where it is, so an '
+      + 'open modal is no reason to refuse one',
+    ).toEqual(DOCUMENTS);
   });
 
   it('the RENDERER side of the gate is wired — the exemption and the flush (#872/#882 review)', () => {
@@ -519,6 +564,26 @@ describe('the sidecar park gate covers every Node route that could clobber a par
       "the renderer's own /api/write-meta POST must declare `rendererWrite: true`, or the park gate "
       + "refuses the editor's own saves — the Sprite Editor and 9-slice editor cannot save while an "
       + 'Inspector import-settings edit is parked').toBe(true);
+
+    // The renderer's own DELETES must say so too (#1215). The route gates the agent path on unsaved
+    // work; without `rendererWrite` the human deleting a file they have a parked edit on gets a 409,
+    // and `deleteAssetFile` reports it only as `false`. Checked per CALL, not per file: each POST
+    // to the route must carry the flag within its own request body, so a second call added without
+    // it cannot hide behind the first.
+    for (const file of [
+      'engine/packages/modoki/src/editor/panels/assetOps.ts',
+      'engine/packages/modoki/src/editor/panels/CleanupAssetsDialog.tsx',
+    ]) {
+      const src = source(file);
+      const calls = [...src.matchAll(/['"]\/api\/delete-asset['"]/g)];
+      expect(calls.length, `${file} no longer POSTs /api/delete-asset — re-point this guard`).toBeGreaterThan(0);
+      for (const m of calls) {
+        const body = src.slice(m.index, m.index + 200);
+        expect(/rendererWrite:\s*true/.test(body),
+          `${file}: a /api/delete-asset call without \`rendererWrite: true\` — the agent-path unsaved gate `
+          + 'would refuse the human\'s own delete of a file they have unsaved edits on').toBe(true);
+      }
+    }
 
     const assetOps = source('engine/packages/modoki/src/editor/panels/assetOps.ts');
     expect(/flushPendingMetaFor\s*\(/.test(assetOps),

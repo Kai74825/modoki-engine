@@ -3,8 +3,9 @@
 import { useState, useEffect, useCallback, useRef, useMemo } from 'react';
 import { readTraitData, readTraitDataFull, findEntity } from '../../runtime/core/ecs/entityUtils';
 import { pinEntityAt } from '../../runtime/core/ecs/entityPin';
+import { traitRemoveRefusal, traitWriteRefusal } from '../../runtime/core/ecs/traitEditPolicy';
 
-import { getCurrentWorld } from '../../runtime/core/ecs/world';
+import { getCurrentWorld, findEntityByGuid } from '../../runtime/core/ecs/world';
 import { writeTraitFieldWithUndo as writeField, writeTraitFieldMultiWithUndo as writeFieldMulti, writeTraitFieldPerEntityWithUndo as writeFieldPerEntity, removeTraitFromEntitiesWithUndo, deleteEntitiesWithUndo, pasteTraitValuesWithUndo } from '../undo/entityActions';
 import { type ContextMenuItem } from '../components/ContextMenu';
 import { useTraitClipboard, setTraitClipboard, isTraitCopyable } from './traitClipboard';
@@ -15,18 +16,21 @@ import { pushAction } from '../undo/undoManager';
 import { makePrefabInstantiateAction } from '../undo/prefabInstantiateUndo';
 import { getAnimSet } from '../../runtime/loaders/animSetCache';
 import { useEditorStore } from '../store/editorStore';
-import { getPrefabSource, getCachedPrefabSync, getOverrides } from '../scene/prefab';
+import { getPrefabSource, getCachedPrefabSync, getOverrides, baseTokenResolver } from '../scene/prefab';
 import { getEditorViewportCamera } from '../scene/sceneViewBus';
-import { instantiatePrefabAsync, setPrefabSource, type PrefabFile } from '../scene/prefab';
+import { isSkippedByPrimarySave } from '../scene/serialize';
+import { instantiatePrefabInstance, type PrefabFile } from '../scene/prefab';
 import { parseAssetJson, isMissingAsset } from '../../runtime/loaders/assetFetch';
 import { getModelPostprocessorIds } from '../../runtime/loaders/modelPostprocessorRegistry';
 import { isGuid, resolveGuidToPath, getAssetEntry } from '../../runtime/loaders/assetManifest';
+import { durableGuid } from '../../runtime/core/assetRefRules';
+import { describeEntityGuid } from './entityGuidLabel';
 // Which anchors stretch which axis is decided ONCE, in anchorLayout — the same import
 // anchorCss makes, and for the same reason: the Inspector's "this field is inert" gating
 // must not be able to disagree with the layout that makes it inert.
 import { STRETCH_X, STRETCH_Y, isSizeInert } from '../../runtime/ui/anchorLayout';
 import { inertUIAnchorBooleanReason } from '../../runtime/ui/anchorCss';
-import { BufferedTextInput, BufferedNumberInput, inputStyle, readOnlyFieldStyle, MIXED_PLACEHOLDER } from './fields';
+import { BufferedTextInput, BufferedNumberInput, BufferedFieldScope, inputStyle, readOnlyFieldStyle, MIXED_PLACEHOLDER } from './fields';
 import { type TraitEntry, sameTraitResult, readMergedTraits } from './inspectorMerge';
 import { AssetRefField } from './AssetRefField';
 import { parseClipBank, stringifyClipBank, type ClipBankEntry } from '../../runtime/audio/clipBank';
@@ -326,7 +330,7 @@ function VecField({ label, fields, data, onChange, overriddenKeys, mixedKeys, tr
           return (
             <div key={f.key} style={{ flex: 1, display: 'flex', alignItems: 'center', gap: 2, minWidth: 0 }}>
               <span style={{ color: isOv ? '#5dade2' : '#666', fontSize: '10px', flexShrink: 0, fontWeight: isOv ? 'bold' : 'normal' }}>{labels[i]}</span>
-              <BufferedNumberInput value={parseFloat(displayVal.toFixed(2))} step={f.hint.step || 0.1} mixed={isMixed} readOnly={f.hint.readOnly}
+              <BufferedNumberInput value={displayVal} precision={2} step={f.hint.step || 0.1} mixed={isMixed} readOnly={f.hint.readOnly}
                 onChange={(v) => onChange(f.key, isDeg ? v * (Math.PI / 180) : v)}
                 min={isDeg ? undefined : f.hint.min} max={isDeg ? undefined : f.hint.max}
                 dataUiId={`inspector.field.${traitName}.${f.key}`}
@@ -398,11 +402,8 @@ function DirectorTimelineButton({ timeline, entityId }: { timeline: string; enti
 /** GUID → entity id (mirrors applyBindings' resolution). */
 function guidToEntityId(guid: string): number | undefined {
   if (!guid) return undefined;
-  let found: number | undefined;
-  getCurrentWorld().query(EntityAttributes).updateEach(([ea]: [{ guid: string }], e: { id: () => number }) => {
-    if (ea.guid === guid) found = e.id();
-  });
-  return found;
+  // findEntityByGuid also follows a runtime guid whose entity was since re-minted (#1210).
+  return findEntityByGuid(guid)?.id();
 }
 
 /** Resolve a field's dynamic enum options at Inspector render time. Per-entity
@@ -821,8 +822,10 @@ function CameraFrameGizmoToggle({ entityIds }: { entityIds: number[] }) {
   const shownSet = useEditorStore((s) => s.cameraGizmoShown);
   const setShown = useEditorStore((s) => s.setCameraGizmoShown);
   // Single-select only (a frame's gizmo is per-entity); read the primary's guid.
+  // Durable only (#1210): the toggle is persisted, and a runtime guid would name another entity
+  // next session — so a never-saved runtime spawn shows no toggle, as a guid-less one did.
   const guid = entityIds.length === 1
-    ? (findEntity(entityIds[0])?.get(EntityAttributes)?.guid ?? '')
+    ? durableGuid(findEntity(entityIds[0])?.get(EntityAttributes)?.guid)
     : '';
   if (!guid) return null;
   const on = shownSet.has(guid);
@@ -1544,8 +1547,7 @@ function AssetInspector({ asset }: { asset: SelectedAsset }) {
                   const res = await fetch(asset.path);
                   const prefab = await parseAssetJson(res, asset.path) as PrefabFile;
                   // Preload nested children before the sync expand (nested prefabs).
-                  const rootId = await instantiatePrefabAsync(prefab);
-                  setPrefabSource(rootId, asset.path);
+                  const rootId = await instantiatePrefabInstance(prefab, asset.path);
                   // Make it undoable via the shared helper (prefab F4) — same
                   // reassign-on-redo semantics as Hierarchy/Assets so Cmd+Z removes
                   // the instance and redo respawns + retracks the new id.
@@ -1562,8 +1564,7 @@ function AssetInspector({ asset }: { asset: SelectedAsset }) {
                         if (isMissingAsset(e)) return null;
                         throw e;
                       }
-                      const id = await instantiatePrefabAsync(p);
-                      setPrefabSource(id, asset.path);
+                      const id = await instantiatePrefabInstance(p, asset.path);
                       return id;
                     },
                     remove: (id) => { deleteEntity(id); },
@@ -1785,7 +1786,9 @@ export default function Inspector() {
         if (meta.category === 'tag' || !data) continue;
         currentTraits[meta.name] = data;
       }
-      setOverrides(getOverrides(lid, currentTraits, prefab));
+      // A base ref held as a member token compares against the guid it resolved to (#1352).
+      const root = (piNow?.['rootInstanceId'] as number) || 0;
+      setOverrides(getOverrides(lid, currentTraits, prefab, root ? baseTokenResolver(root) : undefined));
     };
 
     // Capture selection at fetch time; on resolution, only apply the result if
@@ -1902,6 +1905,9 @@ export default function Inspector() {
     // Keyed here rather than on each child so it also covers this component's OWN per-asset state
     // (the postprocessor row's `metaRef`/`metaLoaded`, which is member 1) and the `.mat.json`-side
     // views, whose `if (!data) return <Loading…/>` gate is honest again once `data` resets.
+    // It also remounts any MODAL a view owns (the Sprite Editor, the 9-slice editor) when an agent
+    // op re-points it at another texture, so none of them carries one asset's undo history or save
+    // into the next (#1328; `editor-texture-modal-swap.spec.ts` goes red without this key).
     return <AssetInspector key={selectedAsset.path} asset={selectedAsset} />;
   }
 
@@ -1955,6 +1961,10 @@ export default function Inspector() {
     : 'Copy Component';
 
   return (
+    // Every buffered field below is keyed by FIELD NAME, not by entity, so one field instance
+    // survives a selection change — and with it, its record of pending commits. The scope tells it
+    // the owner changed, so a late echo from the previous entity cannot shadow this one's value (#1411).
+    <BufferedFieldScope.Provider value={selectedIds.join(',')}>
     <div style={containerStyle}>
       {/* Header with delete button */}
       <div style={{ height: 32, padding: '0 8px', borderBottom: '1px solid #333', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
@@ -2041,6 +2051,32 @@ export default function Inspector() {
         <span style={{ color: '#555', fontSize: '10px', flexShrink: 0 }}>{multi ? `×${selectedIds.length}` : `id:${selectedId}`}</span>
       </div>
 
+      {/* The entity's guid (#1210) — what every guid-addressed tool takes. Read-only; click copies.
+          A runtime guid is badged, because it expires on reload (entityGuidLabel.ts decides). */}
+      {!multi && entityAttr?.data && (() => {
+        const label = describeEntityGuid(entityAttr.data['guid'] as string, isSkippedByPrimarySave(selectedId!));
+        return (
+          <div style={{ padding: '2px 8px 5px', borderBottom: '1px solid #333', display: 'flex', alignItems: 'center', gap: 6, fontSize: '10px' }}
+            title={label.title}>
+            <span style={{ color: '#666', flexShrink: 0 }}>guid</span>
+            <span
+              onClick={() => { if (label.kind !== 'none') void navigator.clipboard?.writeText(label.text).catch(() => {}); }}
+              style={{
+                flex: 1, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
+                fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace', userSelect: 'all',
+                color: label.kind === 'durable' ? '#aaa' : '#777', cursor: label.kind === 'none' ? 'default' : 'copy',
+              }}
+              data-ui-id="inspector.header.guid" data-ui-kind="text" data-ui-label="entity guid"
+            >{label.text}</span>
+            {label.badge && (
+              <span style={{ flexShrink: 0, color: label.kind === 'runtime' ? '#e0a030' : '#888', border: '1px solid currentColor', borderRadius: 3, padding: '0 4px' }}>
+                {label.badge}
+              </span>
+            )}
+          </div>
+        );
+      })()}
+
       {/* Base-scene ghost banner (Phase 9, unlock added Phase 13) — selectable +
           inspectable always; fields disabled UNLESS unlocked for this exact
           selection. The failure mode this guards against: a human changing SHARED
@@ -2075,8 +2111,8 @@ export default function Inspector() {
       <div style={{ flex: 1, overflow: 'auto', ...(ghosted && !unlocked ? { pointerEvents: 'none', opacity: 0.5 } : {}) }}>
         {components.map(({ meta, data, mixed }) => {
           if (!data) return null;
-          // Don't allow removing core traits
-          const isCore = ['Transform', 'EntityAttributes'].includes(meta.name);
+          // No remove button for a core trait or the prefab link (#1454: Detach Prefab cuts that)
+          const isCore = traitRemoveRefusal(meta.name) !== null;
           // Copy reads the FIRST selected entity's live values (see copyLabel);
           // Paste writes every selected entity that carries the trait.
           const menuItems: ContextMenuItem[] | undefined = isTraitCopyable(meta) ? [
@@ -2120,7 +2156,7 @@ export default function Inspector() {
         {/* Add Component picker */}
         <AddComponentPicker
           addable={getAllTraits().filter(t =>
-            t.category === 'component' && !new Set(traits.map(x => x.meta.name)).has(t.name)
+            t.category === 'component' && !traitWriteRefusal(t.name) && !new Set(traits.map(x => x.meta.name)).has(t.name)
           )}
           selectedIds={selectedIds}
           clipboard={clipboard}
@@ -2142,6 +2178,7 @@ export default function Inspector() {
         )}
       </div>
     </div>
+    </BufferedFieldScope.Provider>
   );
 }
 

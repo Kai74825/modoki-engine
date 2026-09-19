@@ -37,17 +37,20 @@
 // which is exactly how a correct shader fix ended up looking broken.
 
 import * as THREE from 'three';
-import { RenderPipeline, QuadMesh } from 'three/webgpu';
-import { pass, mrt, output, normalView, add, mul, mix, float, vec3, uniform, rtt, materialReference, vec4 } from 'three/tsl';
+import { RenderPipeline, QuadMesh, type NodeMaterial } from 'three/webgpu';
+import { pass, mrt, output, normalView, add, mul, mix, float, vec3, uniform, rtt, vec4 } from 'three/tsl';
 import { bloom } from 'three/examples/jsm/tsl/display/BloomNode.js';
 import { dof } from 'three/examples/jsm/tsl/display/DepthOfFieldNode.js';
 import { vignette } from 'three/examples/jsm/tsl/display/CRT.js';
 import { ao } from 'three/examples/jsm/tsl/display/GTAONode.js';
 import { buildViewZNode } from './dofViewZ';
+import {
+  ownedTextureInput, disposeGtaoNode, trackDofNode, disposeNodeOwned, disposeRenderTarget,
+} from './nodeOwnedResources';
 import { buildCompositeNode, type NPRCompositeUniforms } from '../npr/compositeNodes';
 import { buildFXAANode } from '../npr/fxaaNode';
 import { ParticlePassNode } from '../npr/ParticlePassNode';
-import { ensureLineColorOnMaterials, computeNprTexelSize } from '../npr/NPRPostProcess';
+import { nprLineColorTarget, computeNprTexelSize } from '../npr/NPRPostProcess';
 import { PARTICLE_LAYER } from '../layers';
 import {
   planStages, requiredMrtTargets, needsRebuild, aoPassSettings,
@@ -58,9 +61,10 @@ import {
   stageCompileJobsFromDraws, driveNodeUpdates, MAX_STAGE_COMPILES, MAX_STAGE_COMPILE_ROUNDS,
 } from './stageCompileJobs';
 import {
-  beginPrecompile, runExclusivePrecompile, type PrecompileSession,
+  beginPrecompile, runExclusivePrecompile, borrowRendererTarget, PRECOMPILE_MAX_HOLD_MS, type PrecompileSession,
 } from './precompileSession';
 import { rawNow } from '../../core/clock';
+import { withRendererState } from '../rendererState';
 
 /** One assembled stage.
  *  - `applyConfig` pushes this stage's own config into live uniforms (a no-op
@@ -102,6 +106,8 @@ interface ScenePassLike {
   dispose?(): void;
   renderTarget: THREE.RenderTarget;
   compileAsync(renderer: unknown): Promise<void>;
+  /** The MRT `compileAsync` binds (three's `PassNode.getMRT`) — what a rejected compile leaves bound. */
+  getMRT?(): unknown;
   /** three calls this from inside the terminal pipeline's quad draw, and it is where the pass
    *  renders the scene. Wrapped once per app to read the renderer's call depth AT that moment —
    *  see `observePassCallDepth` in `passCompileContext`. */
@@ -115,6 +121,9 @@ interface StageCtx {
   depthTextureNode: unknown;
   normalTextureNode: unknown;
   lineColorTextureNode: unknown;
+  /** The lineColor MRT target's emissive pass-through gain (#1416). Built with the MRT, so it
+   *  lives here for the 'npr' stage's `applyConfig` to write; null when NPR is off. */
+  emissivePassthrough: { value: number } | null;
   isOrthographic: boolean;
 }
 
@@ -203,27 +212,31 @@ export class PostFXStack {
     this.rawRenderer = renderer;
     this.renderer = renderer as RendererLike;
     const scenePass = pass(scene, camera);
-
+    // Everything from here on can throw (three's own TSL build bugs reach `ensureLineColorOnMaterials`
+    // and every stage builder), and a constructor that throws hands the caller NO instance to
+    // dispose — so the scene pass allocated on the line above, and every stage built below, would be
+    // unreachable. `Scene3D` builds inside the frame callback and `frameDriver` retries the next
+    // frame, so that leak repeats per episode rather than once.
+    const stages: StageHandle[] = [];
+    try {
     const targets = requiredMrtTargets(req);
     // 'output' is always present and needs no MRT call — a bare pass() already
     // exposes it. Only build an MRT dict when a stage needs a second target.
     // I2: this is the UNION for the whole chain, computed once — never a
     // per-effect target set (changing the layout is a global cost, and a
     // material that doesn't write every target has its draw silently dropped).
+    let emissivePassthrough: { value: number } | null = null;
     if (targets.length > 1) {
       const mrtDict: Record<string, unknown> = { output };
       if (targets.includes('normal')) mrtDict.normal = normalView;
       if (targets.includes('lineColor')) {
-        // Per-material outline color (rgb) + color-preserve amount (a).
-        // `materialReference` reads material.lineColor / material.nprColorPreserve
-        // at fragment time; the prototype patch guarantees EVERY material answers
-        // to both (defaults black / 0). Custom fragmentNode shaders write this
-        // target themselves via `nprFragmentOutput`, which packs the same fields.
-        ensureLineColorOnMaterials();
-        mrtDict.lineColor = vec4(
-          materialReference('lineColor', 'color'),
-          materialReference('nprColorPreserve', 'float'),
-        );
+        // Per-material outline color (rgb) + color-preserve amount (a), both pulled
+        // toward the fragment's emissive so NPR does not outline or grey a glow
+        // (#1416 — see `nprLineColorTarget`). Custom fragmentNode shaders write this
+        // target themselves via `nprFragmentOutput`, which packs the plain fields.
+        const gain = uniform(req.npr?.emissivePassthrough ?? 1).setName('nprEmissivePassthrough');
+        emissivePassthrough = gain as unknown as { value: number };
+        mrtDict.lineColor = nprLineColorTarget(gain);
       }
       (scenePass as unknown as { setMRT(m: unknown): void }).setMRT(mrt(mrtDict as never));
     }
@@ -253,11 +266,11 @@ export class PostFXStack {
       depthTextureNode: scenePass.getTextureNode('depth'),
       normalTextureNode: targets.includes('normal') ? scenePass.getTextureNode('normal') : null,
       lineColorTextureNode: targets.includes('lineColor') ? scenePass.getTextureNode('lineColor') : null,
+      emissivePassthrough,
       isOrthographic: (camera as { isOrthographicCamera?: boolean }).isOrthographicCamera === true,
     };
 
     let color = scenePass.getTextureNode('output') as ColorNode;
-    const stages: StageHandle[] = [];
     for (const kind of planStages(req)) {
       const built = this.buildStage(kind, color, req, ctx);
       color = built.color;
@@ -273,6 +286,11 @@ export class PostFXStack {
     // Read the pass's real call depth off the first frame it draws — what `compileSceneAsync`
     // pins depends on it. See `passCompileContext`.
     observePassCallDepth(this.scenePass, renderer);
+    } catch (err) {
+      for (const stage of stages) stage.dispose?.();
+      disposeNodeOwned(scenePass);
+      throw err;
+    }
   }
 
   private buildStage(
@@ -349,14 +367,12 @@ export class PostFXStack {
               uniforms.lineStrength.value = c.lineStrength;
               uniforms.grayscaleGamma.value = c.grayscaleGamma;
               uniforms.grayscaleLift.value = c.grayscaleLift;
+              if (ctx.emissivePassthrough) ctx.emissivePassthrough.value = c.emissivePassthrough;
               (uniforms.clearColor.value as THREE.Color).setHex(c.clearColor);
             },
-            // RTTNode's inherited dispose() only fires an event — it does NOT
-            // free `renderTarget` — so dispose the target directly too. (T3)
-            dispose: () => {
-              ownedRtt?.renderTarget?.dispose();
-              ownedRtt?.dispose?.();
-            },
+            // RTTNode's inherited dispose() only fires an event — it frees neither
+            // `renderTarget` nor its own quad material. (T3, #1269)
+            dispose: () => { if (ownedRtt) disposeNodeOwned(ownedRtt); },
           },
         };
       }
@@ -390,15 +406,21 @@ export class PostFXStack {
               const w = Math.max(1, Math.floor(_size.x * pr));
               const h = Math.max(1, Math.floor(_size.y * pr));
               if (stylizedRT.width !== w || stylizedRT.height !== h) stylizedRT.setSize(w, h);
-              const prevRT = this.renderer.getRenderTarget();
-              this.renderer.setRenderTarget(stylizedRT);
-              inner.render(); // everything upstream → stylizedRT (working space)
-              this.renderer.setRenderTarget(prevRT);
+              // ⚠️ The restore must survive a THROW (#1298). `inner.render()` is the entire
+              // upstream post-FX chain, so a shader-compile failure or a lost device inside it
+              // used to leave the renderer bound to `stylizedRT` — and every later frame then drew
+              // into that offscreen target instead of the canvas, with nothing in the log. The
+              // save/restore pair was here already; what it lacked was a `finally`.
+              // `ParticlePassNode`, the consumer of this very target, has always done it this way.
+              withRendererState(this.renderer, () => {
+                this.renderer.setRenderTarget(stylizedRT);
+                inner.render(); // everything upstream → stylizedRT (working space)
+              });
             },
             dispose: () => {
               inner.dispose();
-              (particlePass as unknown as { dispose?(): void }).dispose?.();
-              stylizedRT.dispose();
+              disposeNodeOwned(particlePass);
+              disposeRenderTarget(stylizedRT);
             },
           },
         };
@@ -420,7 +442,8 @@ export class PostFXStack {
         // #962 — the two cost knobs, clamped by `aoPassSettings` because a scene file can hold what
         // the Inspector would refuse. Both are LIVE: `samples` is a uniform, and `resolutionScale`
         // is a plain field GTAONode reads in `setSize`, which its own `updateBefore` calls every
-        // frame — so a change lands on the next frame with no rebuild. Left at three's defaults
+        // frame — so a change lands on the next frame with no rebuild. ⚠️ r186 bakes `samples` into
+        // the shader and rebuilds GTAO's material on a change — re-read this when three moves past r185. Left at three's defaults
         // (1 / 16) this pass renders at full resolution, which is what made an Adreno 730 slow.
         const applyAoKnobs = (c: AoStageConfig) => {
           const s = aoPassSettings(c);
@@ -449,7 +472,8 @@ export class PostFXStack {
             // GTAONode owns its own render target + material (GTAONode.js's
             // dispose() frees `_aoRenderTarget` + `_material`) — not reachable
             // from RenderPipeline.dispose(). Same leak class as bloom/dof above.
-            dispose: () => (aoPass as unknown as { dispose?(): void }).dispose?.(),
+            // Plus the noise texture its own dispose() misses (#1269).
+            dispose: () => disposeGtaoNode(aoPass),
           },
         };
       }
@@ -473,7 +497,7 @@ export class PostFXStack {
             // reachable from RenderPipeline.dispose(). Because this stack rebuilds
             // on ANY stage-set change (toggling vignette/DOF/NPR/FXAA in the
             // Inspector), skipping this leaks the entire pyramid per checkbox click.
-            dispose: () => (bloomPass as unknown as { dispose?(): void }).dispose?.(),
+            dispose: () => disposeNodeOwned(bloomPass),
           },
         };
       }
@@ -513,14 +537,13 @@ export class PostFXStack {
         const focusDistanceU = uniform(cfg.focusDistance);
         const focalLengthU = uniform(cfg.focalLength);
         const bokehScaleU = uniform(cfg.bokehScale);
-        // ⚠️ dof() runs its input through `convertToTexture`, which mints an RTTNode
-        // when the input is not ALREADY a texture node — and DepthOfFieldNode.dispose()
-        // does not free that RTT. Today it always is one (planStages puts 'dof'
-        // straight after the scene color / the NPR particle texture, with nothing
-        // between), so nothing leaks. If a stage is ever inserted directly BEFORE dof
-        // (e.g. Phase 4's 'ao'), wrap the input explicitly the way 'fxaa' does and
-        // dispose that RTT here, or this starts leaking a full-screen target per rebuild.
-        const dofNode = dof(color, viewZ, focusDistanceU, focalLengthU, bokehScaleU);
+        // dof() runs its input through `convertToTexture`, which mints an RTTNode that
+        // DepthOfFieldNode.dispose() never frees. AO is ordered straight before DOF and
+        // ends in a `mul`, not a texture, so resolve the input HERE and own the RTT (#1269).
+        const input = ownedTextureInput(color);
+        const dofNode = dof(input.tex, viewZ, focusDistanceU, focalLengthU, bokehScaleU);
+        // Before the node is first built: setup() is where it makes the blur nodes it leaks.
+        const disposeDof = trackDofNode(dofNode);
         return {
           color: dofNode as ColorNode,
           handle: {
@@ -541,8 +564,11 @@ export class PostFXStack {
             },
             // DepthOfFieldNode owns 6 render targets + 5 materials (CoC, blurred CoC,
             // blur64, blur16 near/far, composite) — same non-recursing-dispose hazard
-            // as bloom above.
-            dispose: () => (dofNode as unknown as { dispose?(): void }).dispose?.(),
+            // as bloom above — plus a GaussianBlurNode per build that its dispose() misses.
+            dispose: () => {
+              disposeDof();
+              input.dispose();
+            },
           },
         };
       }
@@ -554,11 +580,7 @@ export class PostFXStack {
         // particle pass's texture node, or an SS composite RTT) use it directly;
         // otherwise resolve the chain into an RTT first. Skipping the redundant
         // wrap saves a full-screen blit on the common NPR path.
-        const alreadyTexture = (color as { isTextureNode?: boolean } | null)?.isTextureNode === true;
-        const inputTex = alreadyTexture ? color : rtt(color);
-        const ownedRtt = alreadyTexture
-          ? null
-          : inputTex as unknown as { dispose?(): void; renderTarget?: THREE.RenderTarget };
+        const { tex: inputTex, dispose: disposeInput } = ownedTextureInput(color);
 
         // Display-resolution texel size (superSampleScale 1): `planFxaaEnabled`
         // only admits this stage at SS=1, and it runs at the tail — after the SS
@@ -586,10 +608,7 @@ export class PostFXStack {
               edgeThresholdMin.value = c.edgeThresholdMin;
               blendStrength.value = c.blendStrength;
             },
-            dispose: () => {
-              ownedRtt?.renderTarget?.dispose();
-              ownedRtt?.dispose?.();
-            },
+            dispose: disposeInput,
           },
         };
       }
@@ -622,8 +641,15 @@ export class PostFXStack {
    *  the node graph is first BUILT — i.e. during the first `render()`, which is precisely the
    *  frame this call exists to get ahead of. Compiling before that leaves `samples` at the
    *  RenderTarget default, and a sample-count mismatch is a different pipeline key: the compile
-   *  would succeed, warm the wrong set, and look exactly like a fix that did not work. */
+   *  would succeed, warm the wrong set, and look exactly like a fix that did not work.
+   *
+   *  ⚠️ **Must run inside `runExclusivePrecompile`, and does NOT take it itself** (#957). The
+   *  target/MRT swap above stays bound across three's `await`s, so running beside
+   *  `compileStagesAsync` builds scene materials against a bloom target — #956's black screen.
+   *  Its caller `compileLiveScene` holds the lock; locking here too would deadlock on that. */
   async compileSceneAsync(): Promise<void> {
+    // Queued behind other compiles, so a rebuild can dispose this stack before its turn (#957).
+    if (this.disposed) return;
     const rt = this.scenePass.renderTarget;
     rt.samples = this.renderer.samples;
     if (this.renderer.getOutputBufferType) rt.texture.type = this.renderer.getOutputBufferType();
@@ -632,10 +658,46 @@ export class PostFXStack {
     // draws at depth 1, and `context.id` is part of every material's node-builder cache key — so
     // without it the first frame rebuilds every shader graph synchronously (513 ms of an 807 ms
     // block on the A23). Full mechanism + measurement: `passCompileContext.ts`.
-    await pinPassCallDepth(
-      this.rawRenderer, rt, getPassCallDepth(),
-      () => this.scenePass.compileAsync(this.rawRenderer),
-    );
+    const r = this.rawRenderer as {
+      getRenderTarget?(): unknown; setRenderTarget?(t: unknown): void; getMRT?(): unknown; setMRT?(m: unknown): void;
+    };
+    // `has*` distinguishes "no accessor" from "nothing bound": a renderer without the getter is
+    // left alone on the restore rather than bound to null (#1302 ②, same as `withRendererState`).
+    const hasTarget = typeof r.getRenderTarget === 'function';
+    const hasMrt = typeof r.getMRT === 'function';
+    const prevTarget = hasTarget ? r.getRenderTarget!() : null;
+    const prevMrt = hasMrt ? r.getMRT!() : null;
+    const passMrt = typeof this.scenePass.getMRT === 'function' ? this.scenePass.getMRT() : null;
+    const knowsPassMrt = typeof this.scenePass.getMRT === 'function';
+    try {
+      // Borrowed for the whole compile: three keeps the pass target + MRT bound across its awaits,
+      // and a frame drawn inside that window crashed an iPad mini 5's GPU process (#1246, #1239 A).
+      await borrowRendererTarget(this.rawRenderer, () => pinPassCallDepth(
+        this.rawRenderer, rt, getPassCallDepth(),
+        () => this.scenePass.compileAsync(this.rawRenderer),
+      ));
+    } catch (e) {
+      // ⚠️ three's `PassNode.compileAsync` binds the pass target + MRT and restores them only on
+      // SUCCESS. A rejection (a shader-graph throw, a lost device) left the live renderer drawing
+      // every later frame into this pass's own target — a black canvas for the rest of the session.
+      //
+      // ⚠️ Each binding is guarded by its OWN identity (#1302): the target is undone while the pass
+      // target is still bound, the MRT while the pass's MRT is still bound. They are independent
+      // state — a foreign binder such as `PMREMGenerator` saves and restores the target only, so it
+      // never owns the MRT, and nesting the MRT restore inside the target check left the scene MRT
+      // bound under it. A foreign target here should not happen at all: every other binder either
+      // holds its frame or takes a queue turn (#1239), so say so when it does.
+      const ownsTarget = hasTarget && r.getRenderTarget!() === rt;
+      if (ownsTarget) r.setRenderTarget?.(prevTarget);
+      else if (hasTarget && import.meta.env?.DEV) {
+        console.warn('[PostFXStack] a scene-pass compile rejected with a foreign render target bound — '
+          + 'something wrote the renderer binding during a compile (#1239)');
+      }
+      // A pass that cannot say which MRT it binds falls back to the target's verdict.
+      const ownsMrt = hasMrt && (knowsPassMrt ? r.getMRT!() === passMrt : ownsTarget);
+      if (ownsMrt) r.setMRT?.(prevMrt);
+      throw e;
+    }
   }
 
   /** Compile the pipelines the stack's OWN STAGE QUADS will need, without drawing a frame (#323).
@@ -701,10 +763,24 @@ export class PostFXStack {
     // renderer-global state permanently (a `render` stub restored over the real one) and would
     // also interleave their `setRenderTarget` calls, compiling each other's jobs against the wrong
     // attachment state. See `precompileSession.ts`.
-    return runExclusivePrecompile(this.rawRenderer, () => this.compileStagesInner());
+    //
+    // ⚠️ The kick time travels with the call, because the queue can hold it for seconds (#957: the
+    // scene compile queues here too). `PRECOMPILE_MAX_HOLD_MS` is a promise about when the stub is
+    // gone RELATIVE TO THE GATE'S KICK — a session begun late would hold frames past the gate's
+    // release, after the scene was already revealed. So a wait that used the budget skips.
+    const kickedAt = rawNow();
+    return runExclusivePrecompile(this.rawRenderer, () => {
+      if (rawNow() - kickedAt >= PRECOMPILE_MAX_HOLD_MS) {
+        if (import.meta.env?.DEV) {
+          console.debug('[PostFXStack] stage precompile skipped: queued past its hold budget (#957)');
+        }
+        return Promise.resolve();
+      }
+      return this.compileStagesInner(kickedAt);
+    });
   }
 
-  private async compileStagesInner(): Promise<void> {
+  private async compileStagesInner(kickedAt: number): Promise<void> {
     if (this.disposed) return;
     const pipeline = this.pipeline as unknown as RenderPipelineInternals;
     const r = this.rawRenderer as RendererInternals;
@@ -721,7 +797,7 @@ export class PostFXStack {
     // RECORDER. Refcounted per renderer and deadline-bounded — the deadline is what stops a slow
     // compile from letting `liveCompileGate`'s own ceiling release a frame through a stubbed
     // `render` (a blank submit, then `markScenePainted`: #334's bug). Restores everything itself.
-    const session: PrecompileSession | null = beginPrecompile(this.rawRenderer, rawNow());
+    const session: PrecompileSession | null = beginPrecompile(this.rawRenderer, kickedAt);
     if (!session) { warnStageCompileUnavailable(); return; }
 
     const prevRT = this.renderer.getRenderTarget();
@@ -809,7 +885,7 @@ export class PostFXStack {
           // instanced/batched/morph meshes, and `QuadMesh` shares one module-level geometry, so
           // `getGeometryCacheKey()` matches too. Verified by the 0-pipelines-created measurement
           // in this method's header.
-          const quad = new QuadMesh(job.material as unknown as THREE.Material);
+          const quad = new QuadMesh(job.material as unknown as NodeMaterial);
           quad.frustumCulled = false; // sharp edge 2, as above
           quad.updateMatrixWorld(true);
           // ⚠️ RETAINED, never disposed here. three refcounts a pipeline by the render objects
@@ -862,10 +938,18 @@ export class PostFXStack {
     // Hand-free every node-owned render target: RenderPipeline.dispose() does
     // NOT recurse into the node graph, so without this an SS-scale rebuild
     // (dispose + reconstruct) leaks a target per rebuild.
-    for (const stage of this.stages) stage.dispose?.();
-    this.scenePass.dispose?.();
+    // Every stage is freed even if one throws — a skipped tail is a leaked pyramid, and each
+    // disposer now does more work than a single call. The first error is rethrown afterwards, so a
+    // broken disposer still surfaces instead of being swallowed.
+    let failure: unknown;
+    const free = (fn: () => void) => {
+      try { fn(); } catch (err) { failure ??= err; }
+    };
+    for (const stage of this.stages) free(() => stage.dispose?.());
+    free(() => disposeNodeOwned(this.scenePass));
     // Drop the precompile quads' references only — see the field's own note on why nothing here
     // is disposed.
     this.compiledQuads.length = 0;
+    if (failure !== undefined) throw failure;
   }
 }

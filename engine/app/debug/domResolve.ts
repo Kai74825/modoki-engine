@@ -206,6 +206,15 @@ export function occlusionAt(owner: Element, x: number, y: number, gesture: AimGe
   return describeOccluder(top) ?? NOTHING_AT_POINT;
 }
 
+/** The same hit test as `occlusionAt`, answering with the covering ELEMENT rather than its name —
+ *  for a caller that must ask WHERE the cover sits before it counts it (the dispatch-action carrier
+ *  gate, #1418, counts only a cover inside the game's own UI host). `undefined` = cleanly hit;
+ *  `null` = nothing at the point (outside the window, or clipped away). */
+export function coveringElementAt(owner: Element, x: number, y: number, gesture: AimGesture | undefined): Element | null | undefined {
+  const top = effectiveHit(x, y, gesture);
+  return isOccluded(owner, top) ? top : undefined;
+}
+
 /** The element the gesture would REALLY reach — `elementFromPoint`, then the runtime's tap-zone
  *  redirect where it applies.
  *
@@ -356,7 +365,9 @@ function resolveLabel(label: string, within: string | undefined): CoreResolution
     const sharedId = new Set(many.map((c) => c.id)).size < many.length;
     return {
       error: `${asked} matches ${many.length} on-screen chrome elements: ${named}${more}. Narrow it with `
-        + '`within` (a CSS selector for the panel or dialog, e.g. \'[data-panel-scope="inspector"]\')'
+        + '`within` (a CSS selector for the panel or dialog, e.g. \'[data-panel-scope="inspector"]\', or '
+        + '\'[data-modal-shell="sprite-editor"]\' for a modal — a modal is portalled to <body>, so it is '
+        + 'NOT under its panel\'s data-panel-scope)'
         + (sharedId ? ' — some of these SHARE a data-ui-id, so a selector cannot separate them.' : ', or aim by selector at one of these data-ui-ids.'),
       code: 'AMBIGUOUS',
     };

@@ -24,7 +24,7 @@ let leaseCalls: { open?: boolean; id?: number }[];
 /** What the fake `probe-key-reach` answers. Default = the open world (no panel owns the
  *  keyboard, so the gate lets input through); a test that needs the QA-PHYS-0003 world
  *  reassigns it before posting. */
-let keyReach: { focusedPanel: string | null; editorBinding: string | null; gameInputSuppressed: boolean; simRunning: boolean };
+let keyReach: { focusedPanel: string | null; editorBinding: string | null; gameInputSuppressed: boolean; simRunning: boolean; modalOpen?: boolean };
 /** Which panels the fake renderer reports as having an open tab. `set-focus-scope` refuses
  *  anything outside this list, exactly as the real op does (#301). Case-sensitive on purpose:
  *  a miscased id is the failure that motivated the guard. */
@@ -137,6 +137,9 @@ function makeRenderer(overrides?: Record<string, unknown>) {
         };
       }
       if (spec.name === 'Enemy') return { ok: false, error: '3 entities are named "Enemy" (g-a, g-b, g-c) — address by guid' };
+      // #1223 P3: the resolver's §5 fields on a refusal — an ambiguous name's guids, a stale runtime guid.
+      if (spec.name === 'Twin') return { ok: false, code: 'AMBIGUOUS', options: ['g-t1', 'g-t2'], error: '2 LIVE entities are named "Twin"' };
+      if (spec.guid === '00000000-0002-0000-0000-000000000001') return { ok: false, code: 'NOT_FOUND', stale: 'world-swapped', error: 'no live entity has that guid' };
       return { ok: false, error: `no entity with guid ${JSON.stringify(spec.guid ?? spec.name ?? spec.id)}` };
     }
     if (op === 'probe-key-reach') {
@@ -1245,6 +1248,19 @@ describe('entity-aimed input (the third target surface)', () => {
   });
 });
 
+describe('an entity aim refusal is relayed whole (#1223 P3)', () => {
+  /** `bad(r.error, r.code)` passed two of the resolver's four fields: the guids an ambiguous name
+   *  offers and the `stale` a runtime guid carries stopped at this host. */
+  it('options and stale reach the 400 body, on tap and on a drag endpoint', async () => {
+    const amb = await post('/api/input/tap', { entity: { name: 'Twin', surface: 'game-3d' } }) as { status: number; body: Record<string, unknown> };
+    expect(amb.status).toBe(400);
+    expect(amb.body).toMatchObject({ code: 'AMBIGUOUS', options: ['g-t1', 'g-t2'] });
+    const stale = await post('/api/input/drag', { from: { entity: { guid: '00000000-0002-0000-0000-000000000001', surface: 'game-3d' } }, to: { x: 1, y: 2 } }) as { body: Record<string, unknown> };
+    expect(stale.body).toMatchObject({ code: 'NOT_FOUND', stale: 'world-swapped' });
+    expect(calls.filter((c) => !c.startsWith('renderer:'))).toEqual([]);
+  });
+});
+
 describe('resolvePoint (the shared resolver)', () => {
   it('turns a renderer throw into an error result, never a rejection', async () => {
     const throwing = vi.fn(async () => { throw new Error('renderer wedged'); });
@@ -1404,6 +1420,25 @@ describe('press_key: warning when the press reached NOTHING', () => {
     keyReach = { focusedPanel: 'game', editorBinding: null, gameInputSuppressed: false, simRunning: true };
     const r = await post('/api/input/key', { key: 'd' }) as { body: Record<string, unknown> };
     expect(r.body).not.toHaveProperty('chord');
+  });
+
+  /** A modal dialog is open (#1270): the keymap yields every editor scope and the input gate is shut,
+   *  so the press reached nothing — and the old answer for that was a bare `ok:true`. */
+  it('names an open MODAL as the cause, and still echoes the chord so a misspelling stays visible', async () => {
+    keyReach = { focusedPanel: 'scene', editorBinding: null, gameInputSuppressed: true, simRunning: true, modalOpen: true };
+    const r = await post('/api/input/key', { key: 'w' }) as { body: { warning?: string; chord?: string } };
+    expect(r.body.warning).toMatch(/modal dialog is open/);
+    // Without the chord, `{key:'UpArro'}` under a dialog reads as "the dialog ate it" and the caller
+    // closes the dialog, presses again, and still has no idea the key name was wrong.
+    expect(r.body.chord).toBe('w');
+    // The scope warning would send them to `panel:"game"`, which fixes nothing while the dialog is up.
+    expect(r.body.warning).not.toMatch(/panel:"game"/);
+  });
+
+  it('says nothing about a modal when none is open', async () => {
+    keyReach = { focusedPanel: 'game', editorBinding: null, gameInputSuppressed: false, simRunning: true };
+    const r = await post('/api/input/key', { key: 'd' }) as { body: { warning?: string } };
+    expect(r.body.warning ?? '').not.toMatch(/modal/);
   });
 
   it('claims only what the GATE proves — never that the press did nothing at all', async () => {

@@ -3,7 +3,7 @@
 
 import { registerTrait, UI_LENGTH_UNITS, type FieldHint } from '@modoki/engine/runtime';
 import {
-  Transform, Renderable3D, SkinnedModel, SkinnedMeshRenderer, SkeletalAnimator, AnimationLibrary, BoneAttachment, Bone, SkinnedSprite2D, Bone2D, Billboard3D, GroupAlpha, Mask2D, FlatSprite3D, Zone3D, Zone2D, ZoneOccupant, OnZone3D, OnZone2D, Director, OnSequence, Renderable3DPrimitive, Renderable2D, Text3D, Text2D, TextAnimation, RenderableUI, Camera, CameraFrame, Time, HapticSettings, AudioSettings, UISettings, Paused, Persistent, PrefabInstance, EntityAttributes, Light, Environment, Fog, ModelSource,
+  Transform, Renderable3D, SkinnedModel, SkinnedMeshRenderer, SkeletalAnimator, AnimationLibrary, BoneAttachment, Bone, SkinnedSprite2D, Bone2D, Billboard3D, GroupAlpha, Mask2D, FlatSprite3D, Zone3D, Zone2D, ZoneOccupant, OnZone3D, OnZone2D, Director, OnSequence, Renderable3DPrimitive, Renderable2D, Text3D, Text2D, TextAnimation, RenderableUI, Camera, CameraFrame, Time, Input, HapticSettings, AudioSettings, UISettings, Paused, Persistent, PrefabInstance, EntityAttributes, Light, Environment, Fog, ModelSource,
   UIElement, UIBinding, UIAction, UIFocusable, UIToggle, UIScrollView, UIEntries, UIEntry, TouchControl, TOUCH_CONTROL_ACTIONS, TOUCH_CONTROL_SHOW_ON, UIAnchor, Canvas2D, NPRPostFX, BloomPostFX, VignettePostFX, DepthOfFieldPostFX, AmbientOcclusionPostFX, Rotate3D, Tint, MaterialInstance, ParticleEmitter, FlameMesh, BlobShadow, Animator, SpriteAnimator,
   RigidBody2D, Collider2D, Physics2D, Joint2D, OnCollision2D, CharacterController2D, CharacterAnimator2D,
   RigidBody3D, Collider3D, Physics3D, OnCollision3D, Joint3D, CharacterController3D,
@@ -748,6 +748,7 @@ export function registerAllTraits() {
       autoplay: { type: 'boolean', tooltip: 'Play automatically when the game starts.' },
       crossfadeSec: { type: 'number', min: 0, step: 0.1, tooltip: 'Crossfade duration (s) when the clip changes while playing. 0 = hard cut. With a playlist this ALSO sets how early the next clip starts, so 0 means the swap only happens once the current clip has ended.' },
       playlist: { type: 'enum', options: ['off', 'sequential', 'shuffle'], tooltip: 'Walk the clip bank instead of playing only Clip. The next clip starts crossfadeSec before this one ends (or right after it ends, if that window was missed). ⚠️ Leave Loop OFF — a looping clip never ends, so a playlist can never advance.' },
+      shuffleStart: { type: 'boolean', tooltip: 'Open on a random bank entry instead of Clip, once, when autoplay starts the source. Without it a shuffled playlist still begins with the same track every session. Needs a playlist and at least two banked clips.' },
       playOnCue: { type: 'string', tooltip: 'Named cue that fires this as a one-shot (raised via cueSound). Empty = none.' },
       spatial: { type: 'boolean', tooltip: '3D positional audio — attenuates by distance from the AudioListener.' },
       refDistance: { type: 'number', min: 0, step: 0.5, section: 'Spatial', showWhen: { spatial: ['true'] }, tooltip: 'Distance at which volume is full.' },
@@ -848,6 +849,12 @@ export function registerAllTraits() {
       },
     },
   });
+
+  // Registered since #1248, with NO fields. Every entity carries EntityAttributes now, so the Input
+  // singleton shows in the Hierarchy. Registering it as a resource makes it read "Input (resource)",
+  // and the Hierarchy refuses to delete, drag or duplicate it, the same as Time. Its per-frame maps
+  // (AoS) stay out of the Inspector, and it is spawned `Transient`, so it never reaches a scene file.
+  registerTrait({ name: 'Input', trait: Input, category: 'resource', fields: {} });
 
   registerTrait({
     name: 'HapticSettings', trait: HapticSettings, category: 'resource',
@@ -970,6 +977,8 @@ export function registerAllTraits() {
       localId: { type: 'number', readOnly: true },
       rootInstanceId: { type: 'number', readOnly: true, entityId: { onMissing: 'stripTrait' } },
       parentLocalId: { type: 'number', readOnly: true },
+      homeParent: { type: 'string', readOnly: true },
+      homeSteps: { type: 'string', readOnly: true },
     },
   });
 
@@ -1072,6 +1081,7 @@ export function registerAllTraits() {
       // ── Image section (collapsed by default) ──
       imageSrc: { type: 'string', accept: ['sprite'], tooltip: 'Image asset (GUID) — a sprite (a texture\'s whole-image sprite or a slice). Rendered as a CSS background. Drag a sprite here', ...S('Image', { sectionDefaultOpen: false }) },
       imageMode: { type: 'enum', options: ['cover', 'contain', 'fill', 'none'], tooltip: 'How the image fills the element', ...S('Image') },
+      imageAlign: { type: 'enum', options: ['center', 'top', 'bottom', 'left', 'right'], tooltip: 'Which edge of the image stays in view when imageMode crops it. cover crops top and bottom on a screen wider than the image, and the sides on a taller one: bottom keeps a painting\'s foreground, top its sky. Also applies to a video backdrop.', ...S('Image') },
 
       // ── Size Constraints section (collapsed by default) ──
       minWidth: { type: 'number', step: 1, tooltip: 'Minimum width, in minWidthUnit. 0 = none.\n⚠️ Defaults to px while width/height default to %.', ...S('Size Constraints', { sectionDefaultOpen: false }), sectionDivider: true },
@@ -1397,6 +1407,7 @@ export function registerAllTraits() {
       lineStrength: { type: 'number', step: 0.05, min: 0, max: 1, section: 'Lines', tooltip: 'Multiplier on the line mask. 1 = full black, 0 = no lines.' },
       grayscaleGamma: { type: 'number', step: 0.05, min: 0.1, max: 2, section: 'Grayscale Fill', tooltip: 'Luminance remap exponent. <1 lifts midtones toward highlights.', showWhen: { fillMode: ['grayscale'] } },
       grayscaleLift: { type: 'number', step: 0.05, min: 0, max: 1, section: 'Grayscale Fill', tooltip: 'Black lift. Higher pushes shadows toward white.', showWhen: { fillMode: ['grayscale'] } },
+      emissivePassthrough: { type: 'number', step: 0.1, min: 0, max: 4, section: 'Emissive', tooltip: 'How strongly glowing (emissive) surfaces escape the stylization: kept in full HDR colour so bloom sees them, with no line drawn on them. 0 = stylize emissive like everything else.' },
       fxaa: { type: 'boolean', section: 'FXAA', tooltip: 'Post-process antialiasing on the composite output. Reduces silhouette aliasing during rotation.' },
       fxaaEdgeThreshold: { type: 'number', step: 0.005, min: 0, max: 0.5, section: 'FXAA', tooltip: 'Relative-contrast threshold. Higher = AA only on stronger edges. Typical 0.05–0.25.', showWhen: { fxaa: ['true'] } },
       fxaaEdgeThresholdMin: { type: 'number', step: 0.001, min: 0, max: 0.1, section: 'FXAA', tooltip: 'Absolute luma floor — pixels below this are treated as flat. Typical 0.01–0.05.', showWhen: { fxaa: ['true'] } },

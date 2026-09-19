@@ -7,9 +7,10 @@
  *  Cmd+S (Save All), like every other authored surface. It used to autosave on a 400ms debounce —
  *  see useParkedAssetDoc.ts and docs/mcp-persistence.md for why that went. */
 
-import { useEffect, useRef, useState, useCallback } from 'react';
+import { useEffect, useRef, useState, useCallback, useContext } from 'react';
 import { AssetLoadRefusedBanner } from './AssetLoadRefusedBanner';
-import { writeAssetFile, jsonFileBody } from '../backend/editorBackend';
+import { jsonFileBody } from '../backend/editorBackend';
+import { writeNewAssetDocument } from '../scene/createAssetDocument';
 import { createPortal } from 'react-dom';
 import * as THREE from 'three';
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
@@ -25,15 +26,15 @@ import { normalizeParticleDef } from '../../runtime/loaders/particleCache';
 import { newGuid, registerAsset } from '../../runtime/loaders/assetManifest';
 import { parseAssetJson } from '../../runtime/loaders/assetFetch';
 import { classifyParticleFetchSuccess, classifyParticleFetchFailure } from './particleLoadPersist';
-import { saveAssetDialog } from '../utils/saveDialog';
+import { chooseNewAssetPath } from '../utils/saveDialog';
 import { useParkedAssetDoc, saveStatusLabel } from './useParkedAssetDoc';
-import { applyWheelStep, useWheelStep } from './fields';
+import { applyWheelStep, useWheelStep, BufferedFieldScope } from './fields';
+import { resyncBuffered, ECHO_WINDOW_MS, type PendingCommit } from './bufferedEcho';
 import { AssetRefField } from './AssetRefField';
 import { useEditorStore } from '../store/editorStore';
 import { SectionIdContext, particleFieldSlug, useFieldId } from './particle/fieldIds';
 import { pendingAssetDoc, adoptParkedDoc } from './pendingAssetDoc';
 import { ParkAdoptedBanner } from './AssetLoadRefusedBanner';
-import { assetWrittenToDisk } from '../scene/dirtyAssets';
 import { pushAction, peekUndo, isExecutingUndoRedo, type UndoAction } from '../undo/undoManager';
 import { runUndoCommand } from '../undo/undoCommand';
 import CurveEditor from './particle/CurveEditor';
@@ -50,6 +51,14 @@ type ParticleAction = UndoAction & { _after: ParticleEffectDef };
 export default function ParticleEditor() {
   const asset = useEditorStore((s) => s.editingParticleAsset);
   const nonce = useEditorStore((s) => s.particleEditNonce);
+  // Publish "mounted, showing this asset" for the agent ops (#1213): the store naming an asset is
+  // not the panel showing it — a tab that was never opened this session does not mount.
+  const setEditorMount = useEditorStore((s) => s.setEditorMount);
+  const mountedAssetPath = asset?.path ?? null;
+  useEffect(() => {
+    setEditorMount('particle', { path: mountedAssetPath });
+    return () => setEditorMount('particle', null, mountedAssetPath);
+  }, [setEditorMount, mountedAssetPath]);
 
   const containerRef = useRef<HTMLDivElement | null>(null);
   const rendererRef = useRef<Awaited<ReturnType<typeof makeWebGPURenderer>> | null>(null);
@@ -476,17 +485,14 @@ export default function ParticleEditor() {
 
   // Create a new .particle.json via the native Save dialog, then open it.
   const newParticle = useCallback(async () => {
-    const path = await saveAssetDialog({ defaultName: 'New Particle.particle.json', ext: '.particle.json', prompt: 'Create Particle Effect' });
-    if (!path) return;
-    const guid = newGuid();
-    const def = { ...defaultParticleEffect(), id: guid };
-    const ok = await writeAssetFile(path, jsonFileBody(def));
-    if (!ok) return;
-    // CREATE still writes immediately — the file has to exist for registerAsset + the manifest to
-    // see it — so the file is authoritative: drop any parked write for that path, or the next save
-    // flushes a stale doc over the one just created.
-    assetWrittenToDisk(path);
-    registerAsset(guid, path, 'particle');
+    const pick = await chooseNewAssetPath({ defaultName: 'New Particle.particle.json', ext: '.particle.json', prompt: 'Create Particle Effect' });
+    if (!pick) return;
+    // Create-only, asking before a Replace, which keeps the replaced effect's guid (#1264).
+    const r = await writeNewAssetDocument(pick.path, (guid) => jsonFileBody({ ...defaultParticleEffect(), id: guid }), { confirmReplace: pick.confirmReplace });
+    if (r.outcome !== 'created' && r.outcome !== 'replaced') return;
+    // `r.path`: a Replace lands on the existing file's on-disk spelling (#1273).
+    const { path } = r;
+    registerAsset(r.guid, path, 'particle');
     const name = (path.split('/').pop() || 'Effect').replace(/\.particle\.json$/i, '');
     useEditorStore.getState().openParticleEditor({ path, type: 'particle', name });
   }, []);
@@ -507,6 +513,9 @@ export default function ParticleEditor() {
   savedMarkRef.current = markSaved; // let the load effect seed the saved reference
 
   return (
+    // NumInput instances survive a retarget (Sections are not re-keyed by asset), so the scope tells
+    // them the owner changed and their pending commits are the previous effect's (#1411).
+    <BufferedFieldScope.Provider value={asset?.path ?? null}>
     <div style={{ display: 'flex', width: '100%', height: '100%', background: '#1a1a2e', fontFamily: 'monospace', fontSize: 12, color: '#ccc' }}>
       {/* Viewport */}
       <div style={{ position: 'relative', flex: 1, minWidth: 0 }}>
@@ -786,6 +795,7 @@ export default function ParticleEditor() {
         </div>
       )}
     </div>
+    </BufferedFieldScope.Provider>
   );
 }
 
@@ -873,16 +883,29 @@ function NumInput({ uiId, uiLabel, value, on, title, min, max, step, disabled, w
   // ⭐ So the guard is the ECHO: when the text on screen would commit exactly the value already in
   // the store, re-syncing can only reformat it, which is the destruction itself and never new
   // information. A real external change (a preset load, an undo, retargeting the panel) does not
-  // match and still re-syncs. Same fix as `useBufferedValue` in `fields.tsx`.
+  // match and still re-syncs. Same fix as `useBufferedValue` in `fields.tsx`, through the same
+  // `resyncBuffered` — which also skips a LATE echo of an earlier keystroke (#1411: the echo of
+  // `…3` arriving after `…35` was typed would otherwise rewrite it and drop the `5`).
+  const localRef = useRef(local);
+  localRef.current = local;
+  const pendingRef = useRef<PendingCommit<number | null>[]>([]);
+  const scope = useContext(BufferedFieldScope);
+  const scopeRef = useRef(scope);
   useEffect(() => {
+    if (scopeRef.current !== scope) { scopeRef.current = scope; pendingRef.current = []; }
     if (focused.current) return;
-    setLocal((cur) => (Object.is(committedValueOf(cur, min, max), value) ? cur : String(value)));
-  }, [value, min, max]);
+    const r = resyncBuffered<number | null>(localRef.current, value, pendingRef.current, (raw) => committedValueOf(raw, min, max), performance.now());
+    pendingRef.current = r.pending;
+    if (r.text !== null) setLocal(r.text);
+  }, [value, min, max, scope]);
   const handle = (raw: string) => {
     setLocal(raw);
+    localRef.current = raw;
     const c = committedValueOf(raw, min, max);
     if (c === null) return; // mid-typing ("", "-", ".") — keep the text, push nothing
     on(c);
+    const now = performance.now(); // after the write — see useBufferedValue
+    pendingRef.current = [...pendingRef.current.filter((p) => now - p.at <= ECHO_WINDOW_MS), { value: c, at: now }];
   };
   // Mouse-wheel adjust (focused only); Shift = ×10. Steps from the shown value, falling
   // back to the committed value mid-typing. Writes local + upstream directly (the wheel
@@ -900,7 +923,7 @@ function NumInput({ uiId, uiLabel, value, on, title, min, max, step, disabled, w
       data-ui-id={uiId} data-ui-kind="field" data-ui-label={uiLabel}
       type="text" inputMode="decimal" title={title} value={local} disabled={disabled}
       onFocus={() => { focused.current = true; }}
-      onBlur={() => { focused.current = false; setLocal(String(value)); }}
+      onBlur={() => { focused.current = false; pendingRef.current = []; setLocal(String(value)); }}
       onChange={(e) => handle(e.target.value)}
       style={{ ...input, width }}
     />

@@ -6,7 +6,7 @@ import fs from 'fs';
 import os from 'os';
 import path from 'path';
 import { fileURLToPath } from 'url';
-import { spawn, execFileSync } from 'child_process';
+import { spawn } from 'child_process';
 import crypto, { randomUUID } from 'crypto';
 import { normalizePath, type Plugin } from 'vite';
 import { resolveModuleUrl } from './backend/moduleUrl';
@@ -18,15 +18,15 @@ import { resolveModules } from './detect-modules';
 import { findGamesEntry } from './findGamesEntry';
 // The leaf module, not './subgameBuild': that file's shared-key list would reach the Electron main bundle (#1035).
 import { subgameOutDir } from './subgameOutDir';
-import { samePath, canonicalPath } from '../scripts/pathIdentity.mjs';
-import { resolveGcloudDir, deriveGcsBucketFromBaseUrl, OTA_SAFE_TOKEN } from './backend/gcloud';
+import { samePath, canonicalPath, pathCaseKey } from '../scripts/pathIdentity.mjs';
+import { resolveGcloudDir, withGcloudOnPath, execGcloudSync, deriveGcsBucketFromBaseUrl, OTA_SAFE_TOKEN } from './backend/gcloud';
 import { projectAssetRoots, discoverProjects, PROJECT_ROOT_DIRS } from '../scripts/projectRoots.mjs';
 import { listAndroidDevices, resolveBuildAndroidSerial } from './backend/androidDevices';
 // Through the typed shell, not the .mjs directly: TypeScript consumers all enter the claim store
 // by one door, so a future caller cannot pick up a differently-typed view of the same rules.
 import { foreignClaimFor, describeConflict, adbDeviceId, adbSerialOf, iosDeviceId, ownAdbClaim } from './backend/deviceClaims';
 import { acquireBuildSlot, releasePolicy } from './backend/buildLock';
-import { detect as detectTool, detectAdb, ensureNode, preflight as preflightBuild, install as installTool, isInstallable, cocoapodsEnv, goIosBinFor, wdaTeamId, writeToolchainSettings, type BuildTarget, type ToolId } from '../toolchain';
+import { detect as detectTool, detectAdb, ensureNode, preflight as preflightBuild, install as installTool, isInstallable, cocoapodsEnv, goIosBinFor, prependPathEntry, withPathEntry, wdaTeamId, writeToolchainSettings, conversionToolchainDir, isPinnedConversionTool, type BuildTarget, type ToolId } from '../toolchain';
 import { registerReimportHandler, type ReimportContext } from './reimport-registry';
 // From the standalone zero-import file, NOT assetManifest.ts — that module transitively
 // imports assetFetch.ts/assetUrl.ts (browser-only globals), which would drag DOM/vite-client
@@ -70,7 +70,7 @@ import { atlasPageUrlPath } from './atlas-cache';
 import { getModelCacheDir, lodCachePath } from './model-cache';
 import { convertTexture } from './texture-convert';
 import { convertModel } from './model-convert';
-import { convertRiggedModel } from './rigged-model-optimize';
+import { convertRiggedModel, riggedConversionFailure } from './rigged-model-optimize';
 import { resolveTextureSettings, resolveTextureType, variantSuffix, variantsToEmit, sizesToEmit, type TextureImportSettings, type TextureType, type TextureVariant } from '../packages/modoki/src/runtime/loaders/textureSettings';
 import { isPlayableBuild, playableTextureSettings, playableEnvSettings } from './playable-profile';
 import { shouldEmitTextureTierVariants } from './textureTierEmit';
@@ -82,10 +82,12 @@ import { type SceneSchema } from '../packages/modoki/src/runtime/loaders/sceneVa
 import { handleBackendRequest, assetJsonBytes, type BackendContext, type BackendResult } from './backend/editorBackendRouter';
 import { reclaimStaleDeviceStateAtStartup, shouldReclaimDeviceStateHere } from './backend/deviceConnection';
 import { healNativeProject } from './healNativeProject';
+import { injectedBuildNumbers, writeBuildNumberArgFiles } from './healNativeConfig';
 import { spawnBuildCommand, killBuildProcess, resolveBuildStep, type BuildStep } from './buildStepShell';
+import { catchMiddlewareRejection, runSsePipeline } from './ssePipeline';
 import {
   parseBuildVariant, keystoreRefusal, renderKeystoreProperties, renderExportOptionsPlist,
-  androidReleaseSteps, iosReleaseSteps, debugBuildReleaseWarning,
+  androidReleaseSteps, iosReleaseSteps, iosDebugBuildStep, androidDebugBuildStep, debugBuildReleaseWarning,
   IOS_EXPORT_OPTIONS_PATH, IOS_EXPORT_DIR, ANDROID_AAB_PATH, ANDROID_RELEASE_APK_PATH,
 } from './releaseBuild';
 import { PROJECT_USER_CONFIG_FILENAME } from '../project-config';
@@ -482,7 +484,7 @@ export function detectType(relPath: string, ext: string): string | null {
 /** What a watched .json change asks the live renderer to do. 'scene'/'prefab' hot-reload the
  *  world; 'animation', 'timeline' and 'particle' only invalidate their asset cache (reloading
  *  the scene would be wrong — and would discard unsaved work). */
-export type LiveReloadKind = 'scene' | 'prefab' | 'animation' | 'timeline' | 'particle' | 'spriteanim' | 'rig2d' | 'animset' | 'material' | 'shader';
+export type LiveReloadKind = 'scene' | 'prefab' | 'animation' | 'timeline' | 'particle' | 'spriteanim' | 'rig2d' | 'animset' | 'material' | 'shader' | 'mesh';
 
 export function classifySceneChange(rel: string): LiveReloadKind | null {
   const type = detectType(rel, '.json');
@@ -538,6 +540,13 @@ export function classifySceneChange(rel: string): LiveReloadKind | null {
   // invalidation ever fired for an agent shader write.
   if (type === 'material') return 'material';
   if (type === 'shader') return 'shader';
+  // `.mesh.json` (#1380) — the one render-affecting document here that is NOT an
+  // ASSET_SCHEMA_TYPE, which is how it slipped past #842's schema ⊆ kind check: no agent tool
+  // writes it and it is never parked, so the only external writer is a plain file edit (the
+  // user's own Claude Code, a shell, a git checkout). Without this case an edited model/mesh
+  // binding kept rendering until the next scene swap. The editor's OWN write (modelImport) is
+  // `markEditorWrite`-suppressed and invalidates itself.
+  if (type === 'mesh') return 'mesh';
   if (type === 'scene') return 'scene';
   return null;
 }
@@ -799,8 +808,8 @@ export async function buildStepEnv(extra: NodeJS.ProcessEnv = {}): Promise<NodeJ
   if (process.env.MODOKI_PROVISION_NODE !== '1' || !dir) return base;
   try {
     const { nodeBin, npmCli } = await ensureNode(path.join(dir, 'node'));
-    const sep = process.platform === 'win32' ? ';' : ':';
-    return { ...base, MODOKI_NODE: nodeBin, MODOKI_NPM_CLI: npmCli, PATH: `${path.dirname(nodeBin)}${sep}${base.PATH ?? ''}` };
+    // `base` is a SPREAD of process.env — on win32 its key may be `Path`, so never read `base.PATH`.
+    return withPathEntry({ ...base, MODOKI_NODE: nodeBin, MODOKI_NPM_CLI: npmCli }, path.dirname(nodeBin));
   } catch {
     return base; // offline / provisioning failed → fall back to system Node
   }
@@ -1241,8 +1250,16 @@ function scanDir(dir: string, base: string, urlPrefix: string): AssetEntry[] {
           };
           if (cache) {
             video.ext = cache.ext ?? VIDEO_EXTENSION;
-            // Size/duration are what let `policy: 'auto'` decide without a network
-            // round-trip, so carry them even though they read as "stats".
+            // `bytes` is what lets `policy: 'auto'` decide without a network round-trip, so carry
+            // it even though it reads as a "stat" — and it is why `videoCache.bytes` is the one
+            // volatile-looking field NOT peeled into the gitignored local sidecar
+            // (`meta-sidecar.ts` § LOCAL_KEYS). ⚠️ This used to say "Size/duration", which is
+            // wrong and cost a re-investigation under #1305: `resolveDeliveryPolicy`
+            // (`runtime/loaders/videoSettings.ts`) resolves auto against encoded SIZE alone, and
+            // `durationSec` is Inspector-only. Naming a peeled field as load-bearing is exactly
+            // what stops the next reader touching it — or, here, made a correct peel look like a
+            // shipped regression. `durationSec` is carried below for the editor's benefit; when
+            // conversion runs this whole entry is rebuilt from a fresh probe anyway.
             if (cache.bytes != null) video.bytes = cache.bytes;
             if (cache.durationSec != null) video.durationSec = cache.durationSec;
             if (cache.width != null) video.width = cache.width;
@@ -1496,6 +1513,21 @@ export function resolveModokiAssetsDir(
   ].find((d): d is string => !!d && exists(d));
 }
 
+/** URL prefix of the engine's built-in, read-only asset root. */
+export const ENGINE_ASSETS_URL_PREFIX = '/modoki/assets';
+
+/** Where a Save dialog opens when its caller names no folder: the first PROJECT root, never the
+ *  engine's. `findAssetRoots` pushes the engine root FIRST (it must resolve whatever project is
+ *  open), so `roots[0]` — the old answer — opened every toolbar "Create Particle" etc. inside
+ *  `engine/packages/modoki/src/runtime/assets/`, and accepting the default name wrote the new asset
+ *  into the engine's source (#1441). macOS hid it until #1440: osascript's panel reopened at its
+ *  remembered location, while Electron's honours the directory it is given. The renderer applies
+ *  the same rule for Create Prefab / Import (`firstAssetRoot`, assetRoots.ts). Null when the
+ *  project has no asset root — the caller then has nowhere writable to suggest. */
+export function defaultSaveRootDir(roots: readonly AssetRoot[]): string | null {
+  return roots.find((r) => r.urlPrefix !== ENGINE_ASSETS_URL_PREFIX)?.absDir ?? null;
+}
+
 /** Walk the project tree to find all directories named "assets".
  *  Returns URL prefix → absolute path mappings. */
 export function findAssetRoots(projectRoot: string): AssetRoot[] {
@@ -1506,7 +1538,7 @@ export function findAssetRoots(projectRoot: string): AssetRoot[] {
   // GUID-resolvable regardless of which project is open. See resolveModokiAssetsDir.
   const modokiAssets = resolveModokiAssetsDir(projectRoot);
   if (modokiAssets) {
-    roots.push({ urlPrefix: '/modoki/assets', absDir: modokiAssets });
+    roots.push({ urlPrefix: ENGINE_ASSETS_URL_PREFIX, absDir: modokiAssets });
   }
 
   // Flat one-game project: <projectRoot>/runtime/assets → /assets. A single-game
@@ -1558,18 +1590,51 @@ export function resolveAssetPath(assetPath: string, roots: AssetRoot[]): string 
 }
 
 /** Reverse of resolveAssetPath: map an absolute file path back to its asset-root
- *  URL path, or null if it lives outside every root. */
-export function absToAssetUrl(absPath: string, roots: AssetRoot[]): string | null {
+ *  URL path, or null if it lives outside every root. Spelled as `absPath` is, unless `onDisk`.
+ *
+ *  ⚠️ **`onDisk: true` spells an EXISTING path the way the DISK does, not the way the caller did**
+ *  (#1261, #1273). `resolveAssetPath` is lexical, so on a case-insensitive filesystem (APFS, NTFS)
+ *  `/assets/FX/spark.particle.json` resolves to — and an fs op then acts on — the file the manifest
+ *  and every renderer registry key as `/assets/fx/spark.particle.json` (`scanDir` keys by
+ *  `readdirSync` names). A url echoing the request's casing matched none of them: a delete or move
+ *  repaired nothing, and a create-only 409 could not say which asset was really there. With the
+ *  option the relative part is taken from `canonicalPath` (`realpathSync.native`).
+ *
+ *  ⚠️ **Opt-in, and the WATCHER must never pass it** (#1261 close-out review, observed). A chokidar
+ *  path is already the disk's spelling at the moment of its event, so canonicalising it can only
+ *  change it AFTER a rename — and after `Level.scene.json` → `level.scene.json` it turns the
+ *  `unlink` of the OLD name into the NEW one: the editor's handler, which matches exactly, never
+ *  hears about `Level`, and a world loaded from it stays stale until a save writes it back. "What is
+ *  there now" is right for a route acting on a request; "what changed" is right for an event.
+ *
+ *  Only while it stays under the root: `canonicalPath` resolves symlinks, so a linked subfolder, or a
+ *  root reached through a link (`/var` → `/private/var`), canonicalises OUTSIDE the lexical root —
+ *  compared against the canonical root it stays inside. And the on-disk spelling is taken only when
+ *  it differs from the caller's by CASE alone — a link INSIDE the root (`a` → `b`) canonicalises to
+ *  a different name that `scanDir` never keyed (it lists `a`), so there the lexical spelling is kept,
+ *  never a url derived from a link target. A missing path keeps the caller's spelling: there is no
+ *  on-disk name to prefer. */
+export function absToAssetUrl(absPath: string, roots: AssetRoot[], opts?: { onDisk?: boolean }): string | null {
   for (const root of roots) {
     const rel = path.relative(root.absDir, absPath);
     if (rel === '' || rel === '..' || rel.startsWith('..' + path.sep) || path.isAbsolute(rel)) continue;
-    // NFC-normalize, matching scanDir's normalization of the SAME urlPath — on macOS a
-    // filename with non-ASCII characters is stored NFD on disk, and without this the two
-    // disagree: the watcher's urlPath here misses the NFC-keyed pathToGuid lookup, so
-    // invalidateShader falls back to a wholesale cache clear instead of a per-key eviction.
-    return (root.urlPrefix + '/' + rel.split(path.sep).join('/')).replace(/\/+/g, '/').normalize('NFC');
+    if (opts?.onDisk !== true) return toAssetUrl(root.urlPrefix, rel);
+    const onDisk = path.relative(canonicalPath(root.absDir), canonicalPath(absPath));
+    if (onDisk !== '' && onDisk !== '..' && !onDisk.startsWith('..' + path.sep) && !path.isAbsolute(onDisk)
+      && pathCaseKey(onDisk.normalize('NFC')) === pathCaseKey(rel.normalize('NFC'))) {
+      return toAssetUrl(root.urlPrefix, onDisk);
+    }
+    return toAssetUrl(root.urlPrefix, rel);
   }
   return null;
+}
+
+function toAssetUrl(urlPrefix: string, rel: string): string {
+  // NFC-normalize, matching scanDir's normalization of the SAME urlPath — on macOS a
+  // filename with non-ASCII characters is stored NFD on disk, and without this the two
+  // disagree: the watcher's urlPath here misses the NFC-keyed pathToGuid lookup, so
+  // invalidateShader falls back to a wholesale cache clear instead of a per-key eviction.
+  return (urlPrefix + '/' + rel.split(path.sep).join('/')).replace(/\/+/g, '/').normalize('NFC');
 }
 
 /** True when `file` sits inside one of the asset roots. Separators are normalized on
@@ -2008,7 +2073,10 @@ export function assetScannerPlugin(): Plugin {
         listAssets: () => scanAllAssets(assetRoots),
       };
 
-      server.middlewares.use(async (req, res, next) => {
+      // `catchMiddlewareRejection` (#1259): connect catches only a SYNCHRONOUS throw, so without it a
+      // rejection in this async handler — e.g. between an SSE route's headers and its pipeline —
+      // left the request open and the dialog spinning. See ssePipeline.ts.
+      server.middlewares.use(catchMiddlewareRejection(async (req, res, next) => {
         // Serve project asset bytes (files, Basis transcoder, cached LOD GLB /
         // texture variants) via the SAME shared function the Electron backend
         // uses — parity. Returns null ⇒ fall through to Vite module serving.
@@ -2076,8 +2144,8 @@ export function assetScannerPlugin(): Plugin {
             projectRoot,
             editorRoot,
             resolveAssetPath: (p) => resolveAssetPath(p, assetRoots),
-            absToAssetUrl: (p) => absToAssetUrl(p, assetRoots),
-            firstRootDir: () => assetRoots[0]?.absDir ?? null,
+            absToAssetUrl: (p, opts) => absToAssetUrl(p, assetRoots, opts),
+            firstRootDir: () => defaultSaveRootDir(assetRoots),
             getManifest: () => cachedManifest,
             rebuildManifest,
             requestBrowser,
@@ -2241,38 +2309,36 @@ export function assetScannerPlugin(): Plugin {
             proc.on('error', (e) => { activeProc = null; send(`ERROR: ${e.message}`); resolve(false); });
           });
 
-          scaffoldRelease.onPipelineStart();
-          (async () => {
+          // The client left during setup: the slot is already released, so start nothing (#1259 close-out).
+          if (!scaffoldRelease.onPipelineStart()) return;
+          // `runSsePipeline` (#1259) turns a throw — scaffoldNativeTarget refuses by throwing — into the
+          // final `FAILED:` status and ends the stream.
+          void runSsePipeline(res, `Add ${platform} target`, async () => {
             const TOTAL = 5;
-            try {
-              // #581: existsSync(nativeDir) alone can't tell a genuine target from a folder a
-              // killed `cap add`/`cap sync` left half-written — isNativeTargetScaffolded checks
-              // for the platform's real project file. An incomplete folder falls through into
-              // scaffoldNativeTarget below, which removes it and re-scaffolds cleanly.
-              if (isNativeTargetScaffolded(projectRoot, platform)) {
-                sendStatus(`FAILED:${platform}/ already exists`);
-                send(`This project already has a ${platform}/ folder — nothing to do.`);
-                res.end();
-                return;
-              }
-              if (fs.existsSync(nativeDir)) {
-                send(`Found an incomplete ${platform}/ folder from an earlier interrupted scaffold — repairing it.`);
-              }
-              // Progress is coarse-grained here (the shared helper streams its own
-              // per-step `── label ──` lines); nudge the step bar around the phases.
-              sendStep(1, TOTAL); sendStatus('Scaffolding native target…');
-              const { warnings: fb } = await scaffoldNativeTarget({ projectRoot, platform, buildCwd, cfg, send, runShell });
-              for (const w of fb) send(`⚠️  ${w}`);
-
-              sendStep(TOTAL, TOTAL);
-              sendStatus('DONE');
-              send(`✅ ${platform} target added for "${cfg.app.appName}" (${cfg.app.appId}).${fb.length ? ' See Firebase warning(s) above.' : ''}`);
+            // #581: existsSync(nativeDir) alone can't tell a genuine target from a folder a
+            // killed `cap add`/`cap sync` left half-written — isNativeTargetScaffolded checks
+            // for the platform's real project file. An incomplete folder falls through into
+            // scaffoldNativeTarget below, which removes it and re-scaffolds cleanly.
+            if (isNativeTargetScaffolded(projectRoot, platform)) {
+              sendStatus(`FAILED:${platform}/ already exists`);
+              send(`This project already has a ${platform}/ folder — nothing to do.`);
               res.end();
-            } catch (e) {
-              sendStatus(`FAILED:${e instanceof Error ? e.message : String(e)}`);
-              res.end();
+              return;
             }
-          })().finally(scaffoldRelease.onPipelineEnd);
+            if (fs.existsSync(nativeDir)) {
+              send(`Found an incomplete ${platform}/ folder from an earlier interrupted scaffold — repairing it.`);
+            }
+            // Progress is coarse-grained here (the shared helper streams its own
+            // per-step `── label ──` lines); nudge the step bar around the phases.
+            sendStep(1, TOTAL); sendStatus('Scaffolding native target…');
+            const { warnings: fb } = await scaffoldNativeTarget({ projectRoot, platform, buildCwd, cfg, send, runShell });
+            for (const w of fb) send(`⚠️  ${w}`);
+
+            sendStep(TOTAL, TOTAL);
+            sendStatus('DONE');
+            send(`✅ ${platform} target added for "${cfg.app.appName}" (${cfg.app.appId}).${fb.length ? ' See Firebase warning(s) above.' : ''}`);
+            res.end();
+          }, scaffoldRelease.onPipelineEnd);
           return;
         }
 
@@ -2291,7 +2357,12 @@ export function assetScannerPlugin(): Plugin {
           const send = (d: string) => { try { res.write(`data: ${JSON.stringify(d)}\n\n`); } catch { /* disconnected */ } };
           const sendStatus = (s: string) => { try { res.write(`event: status\ndata: ${JSON.stringify(s)}\n\n`); } catch { /* disconnected */ } };
 
-          const toolchainDir = process.env.MODOKI_TOOLCHAIN_DIR;
+          // A pinned conversion CLI (ffmpeg/ffprobe/toktx/msdf-atlas-gen) is looked for under
+          // conversionToolchainDir() even in a plain dev editor (#1297, #1327), so it installs there too — otherwise Build Support would
+          // report it missing and refuse the one install that fixes it.
+          // `||`, matching conversionToolchainDir(): an EMPTY env value is unset for the resolver too.
+          const toolchainDir = process.env.MODOKI_TOOLCHAIN_DIR
+            || (id && isPinnedConversionTool(id) ? conversionToolchainDir() : undefined);
           // Use isInstallable (DYNAMIC) not the static INSTALLABLE set — CocoaPods is installable on
           // macOS (provisioned Ruby) but deliberately NOT in INSTALLABLE, so the static check wrongly
           // rejected it here even though the dialog offered an Install button.
@@ -2306,45 +2377,40 @@ export function assetScannerPlugin(): Plugin {
             // Installs land in the packaged editor (where main shares MODOKI_TOOLCHAIN_DIR);
             // opt in for dev with MODOKI_PROVISION_NODE=1 + MODOKI_TOOLCHAIN_DIR.
             sendStatus('FAILED:No toolchain dir');
-            send('No toolchain directory configured (MODOKI_TOOLCHAIN_DIR). This is expected in a plain dev editor — tool installs run in the packaged app.');
+            send('No toolchain directory configured (MODOKI_TOOLCHAIN_DIR). This is expected in a plain dev editor — tool installs run in the packaged app (only ffmpeg/ffprobe install from a dev editor).');
             res.end();
             return;
           }
 
-          (async () => {
-            try {
-              // Ensure a provisioned Node first so install()'s npm runs on it (not system
-              // npm) in the packaged editor — the Vite process can't inherit main's
-              // MODOKI_NODE, so mirror buildStepEnv's ensureNode and publish the result onto
-              // process.env (idempotent; npmSpawnSpec reads it).
-              const stepEnv = await buildStepEnv();
-              if (stepEnv.MODOKI_NODE) process.env.MODOKI_NODE = stepEnv.MODOKI_NODE;
-              if (stepEnv.MODOKI_NPM_CLI) process.env.MODOKI_NPM_CLI = stepEnv.MODOKI_NPM_CLI;
-              // WebDriverAgent is signed per MACHINE, but the Team ID is only ever authored
-              // per PROJECT — so seed the machine setting from the open project the first time,
-              // HERE rather than inside install(). install() deliberately takes no project
-              // context (no other installer does, and threading it through would widen the
-              // toolchain contract for one tool); this route already knows the project.
-              // Only seeds when unset, so a team chosen in Build Support is never overwritten
-              // by whichever project happens to be open.
-              if (id === 'webdriveragent' && !wdaTeamId()) {
-                const team = loadProjectConfig(projectRoot).build.appleTeamId.trim();
-                if (team) {
-                  writeToolchainSettings({ wdaTeamId: team });
-                  send(`Signing WebDriverAgent with Apple Team ${team} (from this project; it is now the machine default).`);
-                }
+          // `runSsePipeline` (#1259): an install failure throws, and becomes the final `FAILED:` status.
+          void runSsePipeline(res, `Install ${id}`, async () => {
+            // Ensure a provisioned Node first so install()'s npm runs on it (not system
+            // npm) in the packaged editor — the Vite process can't inherit main's
+            // MODOKI_NODE, so mirror buildStepEnv's ensureNode and publish the result onto
+            // process.env (idempotent; npmSpawnSpec reads it).
+            const stepEnv = await buildStepEnv();
+            if (stepEnv.MODOKI_NODE) process.env.MODOKI_NODE = stepEnv.MODOKI_NODE;
+            if (stepEnv.MODOKI_NPM_CLI) process.env.MODOKI_NPM_CLI = stepEnv.MODOKI_NPM_CLI;
+            // WebDriverAgent is signed per MACHINE, but the Team ID is only ever authored
+            // per PROJECT — so seed the machine setting from the open project the first time,
+            // HERE rather than inside install(). install() deliberately takes no project
+            // context (no other installer does, and threading it through would widen the
+            // toolchain contract for one tool); this route already knows the project.
+            // Only seeds when unset, so a team chosen in Build Support is never overwritten
+            // by whichever project happens to be open.
+            if (id === 'webdriveragent' && !wdaTeamId()) {
+              const team = loadProjectConfig(projectRoot).build.appleTeamId.trim();
+              if (team) {
+                writeToolchainSettings({ wdaTeamId: team });
+                send(`Signing WebDriverAgent with Apple Team ${team} (from this project; it is now the machine default).`);
               }
-              sendStatus(`Installing ${id}…`);
-              const result = await installTool(id, { toolchainDir, onLog: (line) => send(line) });
-              sendStatus('DONE');
-              send(`✅ Installed ${id} → ${result.path}`);
-            } catch (e) {
-              sendStatus(`FAILED:${e instanceof Error ? e.message : String(e)}`);
-              send(`ERROR: ${e instanceof Error ? e.message : String(e)}`);
-            } finally {
-              res.end();
             }
-          })();
+            sendStatus(`Installing ${id}…`);
+            const result = await installTool(id, { toolchainDir, onLog: (line) => send(line) });
+            sendStatus('DONE');
+            send(`✅ Installed ${id} → ${result.path}`);
+            res.end();
+          });
           return;
         }
 
@@ -2737,33 +2803,30 @@ export function assetScannerPlugin(): Plugin {
             ...(androidIconStep ? [androidIconStep] : []),
             { label: 'Syncing Capacitor Android...', cmd: 'npx cap sync android', cwd: androidCwd },
           ];
+          // The build number goes to xcodebuild/gradle on the command line, never into a committed
+          // file (#1226) — see injectedBuildNumbers. Resolved per platform because each store's
+          // never-lower floor is the platform's own committed value.
+          const buildNumbers: ReturnType<typeof injectedBuildNumbers> = (platform === 'ios' || platform === 'android')
+            ? injectedBuildNumbers(projectRoot, cfg)
+            : { notes: [], platformNotes: { android: [], ios: [] } };
           const stepsByPlatform: Record<string, BuildStep[]> = {
             // iOS is macOS-only (preflight blocks it off-darwin), so its bash-only steps
             // (`$(…)`, `~`, xcodebuild/xcrun) never run on Windows — no winCmd needed.
             ios: isRelease ? [
               ...iosPrefixSteps,
-              ...iosReleaseSteps({ iosCwd, iosXcodeTarget }),
+              ...iosReleaseSteps({ iosCwd, iosXcodeTarget, buildNumber: buildNumbers.ios }),
             ] : [
               ...iosPrefixSteps,
-              { label: 'Building Xcode project...', cmd: `xcodebuild ${iosXcodeTarget} -scheme App -configuration Debug -destination 'id=${IOS_DEST}' -allowProvisioningUpdates build`, cwd: iosCwd },
+              iosDebugBuildStep({ iosCwd, iosXcodeTarget, deviceId: IOS_DEST, buildNumber: buildNumbers.ios }),
               ...iosDeploySteps,
             ],
             android: isRelease ? [
               ...androidPrefixSteps,
-              ...androidReleaseSteps({ androidCwd, buildCwd, env: androidBuildEnv, ota: cfg.ota.enabled }),
+              ...androidReleaseSteps({ androidCwd, buildCwd, env: androidBuildEnv, ota: cfg.ota.enabled, buildNumber: buildNumbers.android }),
             ] : [
               ...androidPrefixSteps,
-              // gradlew wrapper: posix `android/gradlew` vs Windows `android\gradlew.bat`.
-              // JAVA_HOME/ANDROID_HOME are injected via env (not a bash export prefix).
-              // --no-daemon: don't leave a persistent Gradle daemon (a java.exe running from the
-              // provisioned JDK) after the build. On Windows that daemon keeps the JDK's files LOCKED,
-              // so "Remove Java SDK" (and any manual delete) fails half-way. The build JVM exits when
-              // the build finishes, releasing the lock. Small perf cost on repeat builds; worth it.
-              // `clean` when ota.enabled: Gradle's incremental asset-merge task has been observed to
-              // miss a NEW file (ota-embedded-manifest.json) added to dist/ between builds, serving a
-              // stale merged-assets APK with no error (plan doc's "Gradle asset-merge staleness"
-              // gotcha) — costs a slower build only for OTA-enabled projects.
-              { label: 'Building Android APK...', cmd: `android/gradlew -p android ${cfg.ota.enabled ? 'clean ' : ''}assembleDebug --no-daemon`, winCmd: `android\\gradlew.bat -p android ${cfg.ota.enabled ? 'clean ' : ''}assembleDebug --no-daemon`, env: androidBuildEnv, cwd: androidCwd },
+              // The flags and why each is there: androidDebugBuildStep (releaseBuild.ts).
+              androidDebugBuildStep({ androidCwd, env: androidBuildEnv, ota: cfg.ota.enabled, buildNumber: buildNumbers.android }),
               // adb path + apk-relative path use forward slashes, which adb accepts on
               // Windows too; adb is an absolute exe path, so these run on both shells.
               { label: 'Installing on device...', cmd: `${adb} install -r android/app/build/outputs/apk/debug/app-debug.apk`, cwd: androidCwd },
@@ -3060,7 +3123,7 @@ export function assetScannerPlugin(): Plugin {
             if (podEnv) {
               const basePath = (buildEnv as Record<string, string>).PATH ?? process.env.PATH ?? '';
               for (const step of steps) {
-                step.env = { ...step.env, GEM_HOME: podEnv.GEM_HOME, GEM_PATH: podEnv.GEM_PATH, PATH: `${podEnv.binPath}:${step.env?.PATH ?? basePath}` };
+                step.env = { ...step.env, GEM_HOME: podEnv.GEM_HOME, GEM_PATH: podEnv.GEM_PATH, PATH: prependPathEntry(podEnv.binPath, step.env?.PATH ?? basePath) };
               }
             }
           }
@@ -3082,7 +3145,7 @@ export function assetScannerPlugin(): Plugin {
             }
             const basePath = (buildEnv as Record<string, string>).PATH ?? process.env.PATH ?? '';
             for (const step of steps) {
-              step.env = { ...step.env, PATH: `${gcloudDir}:${step.env?.PATH ?? basePath}` };
+              step.env = { ...step.env, PATH: prependPathEntry(gcloudDir, step.env?.PATH ?? basePath) };
             }
           }
 
@@ -3110,8 +3173,12 @@ export function assetScannerPlugin(): Plugin {
           // From here the pipeline owns the build slot (see the two-owners note above) — set
           // SYNCHRONOUSLY, before the first `await`, so a disconnect can never observe a started
           // pipeline as un-started and release the slot out from under it.
-          slotRelease.onPipelineStart();
-          (async () => {
+          // The client left during setup (the `await` above): the slot is already released, so start nothing.
+          if (!slotRelease.onPipelineStart()) return;
+          // `runSsePipeline` (#1259): a rejection anywhere below still ends the stream with a `FAILED:`
+          // status (the observed one: `healNativeProject` on a malformed project package.json), and the
+          // slot goes back exactly once either way.
+          void runSsePipeline(res, `${platform}${isRelease ? ' release' : ''} build`, async () => {
             // First native build with no ios/android folder → scaffold it inline,
             // then PAUSE if it flags something the user must supply (missing
             // Firebase config) so they can act before the build runs against it.
@@ -3189,36 +3256,55 @@ export function assetScannerPlugin(): Plugin {
                 return;
               }
             }
-            // #370: write the two GENERATED, GITIGNORED inputs a release build needs. Both are
-            // re-derived every run rather than hand-maintained, so the upload key and the Team ID
-            // each have exactly one home (`project.user.json`) and the native files that consume
-            // them cannot go stale. Placed HERE — after the auto-scaffold and the heal — because
-            // `android/` or `ios/` may not have existed when the request arrived.
-            //
-            // ⚠️ Both files hold private values (the key passwords; the Apple Team ID, which is a
-            // PRIVATE_BUILD_FIELDS value). They are written to paths the project's own `.gitignore`
-            // covers — `android/keystore.properties` and `ios/App/build/` — and `verify:publish` is
-            // the backstop for that, not the defence. Do not relocate either without checking the
-            // ignore rules first.
-            if (isRelease && platform === 'android') {
-              const propsPath = path.join(projectRoot, 'android', 'keystore.properties');
-              // `mode` applies only when writeFileSync CREATES the file, so a keystore.properties
-              // that already exists keeps whatever mode it had (0644 from an earlier engine, or
-              // from a hand-written one). chmod unconditionally afterwards — this file holds the
-              // upload key's passwords, and "it was already there" is not a reason to leave it
-              // world-readable. Best-effort: a filesystem without POSIX modes must not fail a build.
-              fs.writeFileSync(propsPath, renderKeystoreProperties(user.keystore), { mode: 0o600 });
-              try { fs.chmodSync(propsPath, 0o600); } catch { /* non-POSIX fs — the write still landed */ }
-              send(`[build] wrote ${path.relative(buildCwd, propsPath)} from project.user.json (user.keystore)`);
+            // What the build number resolved to, and why when a committed value outranked it (#1226) —
+            // the heal no longer prints it, because it no longer writes it.
+            if (platform === 'ios' || platform === 'android') {
+              for (const n of [...buildNumbers.notes, ...buildNumbers.platformNotes[platform]]) send(`[build] ${n}`);
+              send(`[build] build number passed to the ${platform} build: ${buildNumbers[platform] ?? '(none — the committed value is used)'}`);
             }
-            if (isRelease && platform === 'ios') {
-              const optsPath = path.join(projectRoot, IOS_EXPORT_OPTIONS_PATH);
-              fs.mkdirSync(path.dirname(optsPath), { recursive: true });
-              fs.writeFileSync(optsPath, renderExportOptionsPlist({
-                teamId: cfg.build.appleTeamId.trim(),
-                method: cfg.build.iosExportMethod,
-              }));
-              send(`[build] wrote ${path.relative(buildCwd, optsPath)} (method: ${cfg.build.iosExportMethod})`);
+            // Every GENERATED input below is written inside ONE try, so a failed write is reported in the
+            // words below rather than as a bare error. `runSsePipeline` would still end the stream with a
+            // `FAILED:` status without it (#1259); this try is for the message, not the guard.
+            try {
+              // The gradle steps name the init script (gradleBuildNumberArg), and a hand-run build reads the
+              // args files. Written after the heal and the auto-scaffold, like the release inputs below.
+              if (platform === 'ios' || platform === 'android') writeBuildNumberArgFiles(projectRoot, buildNumbers);
+              // #370: write the two GENERATED, GITIGNORED inputs a release build needs. Both are
+              // re-derived every run rather than hand-maintained, so the upload key and the Team ID
+              // each have exactly one home (`project.user.json`) and the native files that consume
+              // them cannot go stale. Placed HERE — after the auto-scaffold and the heal — because
+              // `android/` or `ios/` may not have existed when the request arrived.
+              //
+              // ⚠️ Both files hold private values (the key passwords; the Apple Team ID, which is a
+              // PRIVATE_BUILD_FIELDS value). They are written to paths the project's own `.gitignore`
+              // covers — `android/keystore.properties` and `ios/App/build/` — and `verify:publish` is
+              // the backstop for that, not the defence. Do not relocate either without checking the
+              // ignore rules first.
+              if (isRelease && platform === 'android') {
+                const propsPath = path.join(projectRoot, 'android', 'keystore.properties');
+                // `mode` applies only when writeFileSync CREATES the file, so a keystore.properties
+                // that already exists keeps whatever mode it had (0644 from an earlier engine, or
+                // from a hand-written one). chmod unconditionally afterwards — this file holds the
+                // upload key's passwords, and "it was already there" is not a reason to leave it
+                // world-readable. Best-effort: a filesystem without POSIX modes must not fail a build.
+                fs.writeFileSync(propsPath, renderKeystoreProperties(user.keystore), { mode: 0o600 });
+                try { fs.chmodSync(propsPath, 0o600); } catch { /* non-POSIX fs — the write still landed */ }
+                send(`[build] wrote ${path.relative(buildCwd, propsPath)} from project.user.json (user.keystore)`);
+              }
+              if (isRelease && platform === 'ios') {
+                const optsPath = path.join(projectRoot, IOS_EXPORT_OPTIONS_PATH);
+                fs.mkdirSync(path.dirname(optsPath), { recursive: true });
+                fs.writeFileSync(optsPath, renderExportOptionsPlist({
+                  teamId: cfg.build.appleTeamId.trim(),
+                  method: cfg.build.iosExportMethod,
+                }));
+                send(`[build] wrote ${path.relative(buildCwd, optsPath)} (method: ${cfg.build.iosExportMethod})`);
+              }
+            } catch (e) {
+              sendStatus('FAILED:could not write a generated build input');
+              send(`Build failed — could not write a generated build input: ${(e as Error).message}`);
+              res.end();
+              return;
             }
             // Provision go-ios the moment a build actually needs it — this build targets an iOS
             // device `devicectl` cannot reach, and without go-ios the deploy ends in a manual ⌘R.
@@ -3306,10 +3392,10 @@ export function assetScannerPlugin(): Plugin {
             // "built" for the playable (nothing is deployed — the one HTML file IS the artifact); "deployed" for the rest.
             send(`\n✅ ${label} ${platform === 'playable' ? 'built' : 'build deployed'} successfully!`);
             res.end();
-            // `finally`, not a tail call: the body has ~9 early `return`s (an aborted step, a failed
+            // `onEnd`, not a tail call: the body has ~9 early `return`s (an aborted step, a failed
             // step, a paused scaffold) and can reject, and every one of them must give the slot
             // back — a leaked slot refuses every future build until the editor restarts.
-          })().finally(slotRelease.onPipelineEnd);
+          }, slotRelease.onPipelineEnd);
           return;
         }
 
@@ -3463,7 +3549,7 @@ export function assetScannerPlugin(): Plugin {
           res.on('close', otaRelease.onResponseClose);
 
           const baseEnv = await buildStepEnv({ MODOKI_PROJECT: projectRoot });
-          const gcloudEnv = { ...baseEnv, PATH: `${gcloudDir}:${baseEnv.PATH ?? ''}` };
+          const gcloudEnv = withGcloudOnPath(baseEnv, gcloudDir);
           const steps = otaPublishSteps({
             target, projectRoot, subgameDir, gcloudEnv, buildCwd, bucket, bundleName, version, keyName,
             shellEngineApi: cfg.ota.engineApi, mandatory: mandatoryParam,
@@ -3486,8 +3572,10 @@ export function assetScannerPlugin(): Plugin {
 
           // From here the publish pipeline owns the slot, not the socket — see the two-owners note
           // on /api/build's acquire. Set synchronously, before the first `await`.
-          otaRelease.onPipelineStart();
-          (async () => {
+          // The client left during setup: the slot is already released, so start nothing (#1259 close-out).
+          if (!otaRelease.onPipelineStart()) return;
+          // `runSsePipeline` (#1259): e.g. the CORS step's temp-file write throws on an unwritable TMPDIR.
+          void runSsePipeline(res, 'OTA publish', async () => {
             // Step 1: build FRESH from the CURRENTLY OPEN project's project.config.json.
             // Never publish an arbitrary pre-built dist/ — that's how a stale pre-fix
             // build once silently overwrote a freshly-fixed native install over the air.
@@ -3533,7 +3621,7 @@ export function assetScannerPlugin(): Plugin {
               const corsFile = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-ota-cors-')), 'cors.json');
               fs.writeFileSync(corsFile, JSON.stringify([{ origin: ['*'], method: ['GET', 'HEAD'], responseHeader: ['Content-Type'], maxAgeSeconds: 3600 }]));
               try {
-                execFileSync('gcloud', ['storage', 'buckets', 'update', bucketRoot, `--cors-file=${corsFile}`], { env: gcloudEnv, stdio: 'ignore' });
+                execGcloudSync(['storage', 'buckets', 'update', bucketRoot, `--cors-file=${corsFile}`], { env: gcloudEnv, stdio: 'ignore' });
                 send(`CORS verified on ${bucketRoot}.`);
               } catch (e) {
                 send(`⚠️  Could not set CORS on ${bucketRoot} (non-fatal, continuing): ${e instanceof Error ? e.message : String(e)}`);
@@ -3577,12 +3665,12 @@ export function assetScannerPlugin(): Plugin {
               `Verify with modoki_ota_status.`,
             );
             res.end();
-          })().finally(otaRelease.onPipelineEnd);
+          }, otaRelease.onPipelineEnd);
           return;
         }
 
         next();
-      });
+      }));
     },
 
     // On build: tree-shake assets, convert textures, copy only what's referenced
@@ -3897,11 +3985,11 @@ export function assetScannerPlugin(): Plugin {
           : resolveEnvSettings(meta as { environment?: Partial<EnvImportSettings> });
         try {
           if (settings.format === 'ultrahdr') {
-            // UltraHDR is encoded browser-side (the Node build can't regenerate it), so
-            // the `~ultrahdr.jpg` variant is COMMITTED next to the source — copy it from
-            // the source dir into dist + drop the source. Missing ⇒ throw → ship source.
+            // The `~ultrahdr.jpg` variant is COMMITTED next to the source (written by the
+            // environment reimport handler, #1314) — copy it from the source dir into dist +
+            // drop the source. The build does not re-encode it. Missing ⇒ throw → ship source.
             const committed = srcAbs + ULTRAHDR_VARIANT_SUFFIX;
-            if (!fs.existsSync(committed)) throw new Error('committed ~ultrahdr.jpg variant not found (re-encode in the Environment Inspector)');
+            if (!fs.existsSync(committed)) throw new Error('committed ~ultrahdr.jpg variant not found (re-import the environment: Inspector Apply, Assets-panel re-import, or modoki_reimport_asset)');
             const destPath = path.join(distDir, (virtualPath + ULTRAHDR_VARIANT_SUFFIX).replace(/^\//, ''));
             fs.mkdirSync(path.dirname(destPath), { recursive: true });
             fs.copyFileSync(committed, destPath);
@@ -4099,6 +4187,8 @@ export function assetScannerPlugin(): Plugin {
             },
           });
           console.log(`[asset-shaker] rigged GLB optimized → ${virtualPath}${lodUrlSuffix(0)} (${(fs.statSync(srcAbs).size / 1e6).toFixed(1)} → ${(conv.bytes / 1e6).toFixed(1)} MB)`);
+          const skipped = riggedConversionFailure(virtualPath, conv);
+          if (skipped) conversionFailures.push(skipped);
         } catch (e) {
           const msg = e instanceof Error ? e.message : String(e);
           console.warn(`[asset-shaker] rigged convert failed for ${virtualPath} — shipping raw source. ${msg}`);

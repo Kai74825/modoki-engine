@@ -12,6 +12,7 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
 import { useEditorStore } from '../store/editorStore';
 import { backendFetch, backendEventSource } from '../backend/editorBackend';
+import { ModalShell } from '../components/ModalShell';
 
 interface GuideLink { label: string; url: string }
 interface GuideDoc { id: string; title: string; steps: string[]; links?: GuideLink[]; canAutoInstall: boolean }
@@ -64,7 +65,7 @@ const GROUPS: { title: string; subtitle: string; ids: string[]; adb?: boolean; i
   // also provisions it on its own, so this row is the discoverable path, not the only one.
   { title: 'iOS Build Support', subtitle: 'Build & deploy iOS apps (macOS only)', ids: ['xcodebuild', 'cocoapods', 'go-ios', 'webdriveragent'], iosOnly: true },
   { title: 'Model Tools', subtitle: 'GLB import / KTX2 compression', ids: ['toktx', 'gltf-transform-cli'] },
-  { title: 'Text Tools', subtitle: 'MTSDF font-atlas baking (dynamic / CJK text) — bundled', ids: ['msdf-atlas-gen'] },
+  { title: 'Text Tools', subtitle: 'MTSDF font-atlas baking (dynamic / CJK text) — bundled in the packaged editor', ids: ['msdf-atlas-gen'] },
   { title: 'Audio Tools', subtitle: 'Audio import — auto-installed by the editor', ids: ['ffmpeg', 'ffprobe'] },
   { title: 'Core', subtitle: 'Auto-installed by the editor (Node / npm)', ids: ['npm'] },
 ];
@@ -146,7 +147,7 @@ export default function BuildSupportDialog() {
   // while the onboarding dialog is open (packaged) and the user hasn't opted out;
   // installs the missing tools ONE AT A TIME via the same SSE flow + progress log as
   // the Install button (installTool serializes on `installing`, and each DONE →
-  // refresh() re-runs this effect for the next tool). toktx is bundled and the MOBILE
+  // refresh() re-runs this effect for the next tool). toktx/msdf-atlas-gen are bundled here (packaged) and the MOBILE
   // modules (Android/iOS) stay opt-in — everything ELSE auto-installs. A tool that
   // fails isn't retried in a loop (autoInstalledRef).
   useEffect(() => {
@@ -272,7 +273,7 @@ export default function BuildSupportDialog() {
   return (
     // Backdrop does NOT close on click — the dialog is dismissed only via the Close button (and never
     // while an install/remove is in flight). A stray outside click shouldn't lose your place mid-setup.
-    <div style={{ position: 'fixed', inset: 0, zIndex: 9999, background: 'rgba(0,0,0,0.5)', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+    <ModalShell kind="build-support">
       <div style={{
         position: 'relative',
         background: '#1e1e30', border: '1px solid #555', borderRadius: 6, padding: '16px 20px',
@@ -365,8 +366,10 @@ export default function BuildSupportDialog() {
 
             {data && !data.toolchainDir && (
               <div style={{ marginTop: 8, color: '#e0a030', fontSize: 10 }}>
-                No toolchain directory configured (dev editor). Tool installs run in the packaged editor;
-                to enable them in dev, launch with MODOKI_PROVISION_NODE=1 and MODOKI_TOOLCHAIN_DIR set.
+                No toolchain directory configured (dev editor). Tool installs run in the packaged editor —
+                except ffmpeg/ffprobe, which install into the machine toolchain dir here too (removing them
+                needs the packaged editor). To enable the rest in dev, launch with MODOKI_PROVISION_NODE=1
+                and MODOKI_TOOLCHAIN_DIR set.
               </div>
             )}
           </div>
@@ -409,6 +412,6 @@ export default function BuildSupportDialog() {
           <button data-ui-id="buildSupport.footer.close" data-ui-kind="button" data-ui-label="Close" onClick={close} style={btn()}>Close</button>
         </div>
       </div>
-    </div>
+    </ModalShell>
   );
 }

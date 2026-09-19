@@ -460,7 +460,11 @@ Field groups (representative fields, verified against `UIElement.ts`):
   names, a separator computed with `repeat`/`padStart` — nor engine code that passes game text
   through without a write marker; `tools/`, `editor/` and tests are out of scope.
 
-- **Image** — `imageSrc`, `imageMode` (`cover | contain | fill | none`).
+- **Image** — `imageSrc`, `imageMode` (`cover | contain | fill | none`), `imageAlign`
+  (`center | top | bottom | left | right`): which edge stays in view when the mode crops or
+  letterboxes. `cover` crops one axis only (top and bottom on a screen wider than the image, the
+  sides on a taller one), so `bottom` keeps a painting's foreground on a wide screen. It becomes CSS
+  `background-position` (`imageAlignPosition`, `traits/UIElement.ts`); an unknown value is `center`.
 - **Element type** — `elementType` (`div | input | range`) and `placeholder`. Most
   elements are `div`; `input` renders an `<input>` text field and `range` renders an
   `<input type="range">` slider (`rangeMin`/`rangeMax`/`rangeStep`).
@@ -594,6 +598,69 @@ arrival. ⚠️ **A handler whose required input only an ENGINE dispatcher can s
 is absent** (#1185) — the physics demos' zone reactions need `params.self`, an Entity that the collision or zone
 dispatch passes and an agent's JSON params never can, so every agent dispatch of them used to tint
 nothing, journal a crossing that never happened, and answer `dispatched:true`.
+
+**An agent dispatch refuses when no control carrying the action is on screen** (#1406, owner ruling).
+A player can reach a control-bound action only through its control, and a hidden control is
+unmounted, so a handler written to be reached through its button used to run with that button
+hidden: a panel's Confirm with no confirmation up, a result screen's Next on an unsolved board. The
+`dispatch-action` op now asks `actionControlOnScreen` (`runtime/ui/actionCarriers.ts`) first and
+answers `ok:false, gate:'no-control-on-screen'`, with `carriers` naming the controls it found hidden.
+- **A carrier** is a `UIElement` whose `UIAction` has a `call` row naming the action, on any
+  event. It counts when it is not `pointerThrough`, and it is shown **now** (itself and every
+  ancestor `isVisible !== false`, not in a deactivated subtree) **or at the last UI sync** (the
+  projected tree the renderer drew).
+- **Both readings are load-bearing.** "Now" lets an agent open a panel and press in it in one turn.
+  "Last sync" covers a Confirm whose own `set` rows close its dialog BEFORE its `call` row runs, so
+  the panel the player pressed is already hidden when the check runs.
+- **Only the op asks.** `dispatchUIAction` is unchanged: a real press (`applyBindings`) has a
+  mounted control by construction, and the debug menu's Cheats tab and `createTestWorld` have no
+  screen to ask about.
+- ⚠️ **An action no control carries must be registered `noControl: true`**, or every agent dispatch
+  of it is refused. That covers an action fired by a timeline signal, an `OnSequence`, a zone or
+  collision trait, or code. Every engine built-in is registered through `registerEngineAction`,
+  which sets it: those are general verbs an agent aims with a `targetGuid` (`modoki_play_clip`
+  dispatches `engine.playClip`), not a game intent tied to one button. The refusal names the flag.
+- **Not seen:** a `UIBinding.visibleBinding` hide, which `UINode` evaluates at render time from
+  the store. A control hidden only that way still counts, so the dispatch runs, as before. And
+  `EntityAttributes.isActive` is read through `deactivatedEntities`, which the transform pass
+  refreshes once a frame: a subtree re-activated and dispatched into in the same turn (one
+  `modoki_eval`) is refused until a frame runs.
+- **Shown is not reachable: a COVERED carrier refuses too** (#1418). An always-drawn HUD button
+  under a full-screen modal is shown, and a player's tap lands on the modal. Measured on Wordweave
+  before the fix: `wordweave.dictionaryOpen` opened the Dictionary UNDER the open Settings. So the
+  op hit-tests every shown carrier's DOM node at its centre with the aim tools' own occlusion
+  recipe (`coveringElementAt` in `engine/app/debug/domResolve.ts`, via `carrierCover.ts`) and,
+  when EVERY one is covered, answers `ok:false, gate:'control-covered'` with `carriers` and
+  `coveredBy` (the covering UI entity by name, e.g. `SettingsPanel`). Sharing the recipe is what
+  makes the gate agree with a tap: `pointer-events` pass-through (a `pointerThrough` FX canvas, a
+  painted backdrop with no `UIAction`/`swallowClicks`) is not a cover, and the `minTapSize`
+  tap-zone redirect applies.
+  - **It lives in the op, not in `actionCarriers.ts`**, because the hit test is DOM code in
+    `engine/app` and the runtime may not import it; `actionControlOnScreen` hands the op the shown
+    carriers by id (`shown`). A carrier is always a DOM node (nothing on the 2D/3D layers carries a
+    registry action), so the canvas branches of the occlusion test are not needed.
+  - ⚠️ **It refuses only on a positive observation and fails open everywhere else.** The DOM is the
+    LAST render: a carrier shown, or a modal opened, in the same agent turn is not drawn yet, so
+    both read as "cannot judge". **So does the converse: a cover CLOSED this turn is still drawn**,
+    so the cover is the first entity, walking the covering element's `[data-entity-id]` ancestors
+    OUTWARD, that the ECS still shows (`uiEntityShownNow`: not hidden, deactivated or destroyed),
+    and a cover with none left is not counted. Outward, not just the innermost: a child hidden this
+    frame inside a modal that stays up still leaves the modal covering. The walk stops at the
+    carrier's OWN ancestor (shown by construction, and never over its descendant): otherwise an
+    overlay closed this frame beside the carrier under a shared HUD root reads "under HUD Root". Without that, `modoki_batch [settingsClose, dictionaryOpen]`
+    was refused as "under SettingsPanel" one frame before a player's tap would reach the button
+    (found in close-out review, observed live). Likewise a zero rect, a centre off the window or
+    outside a scrolling ancestor's clip (a player can scroll to it), and a run with no document or
+    no hit test (jsdom implements no `elementFromPoint`).
+  - **Only a cover inside the game's own UI host counts.** In the editor that is the Game panel's
+    `[data-game-view-area]`: editor chrome over the Game panel is the editor's state, not the
+    game's. A shipped game has no host marker, so any cover counts. Where the editor mounts the
+    entity twice, SceneView's preview copy is never the one judged.
+- A game may keep a stricter check of its own on top. Court's `CONTROL_SHOWN` (#1405) is **not**
+  made redundant by #1418 and stays: it gates Pixi board targets (cells, the tray) that no engine
+  carrier describes, it reads game state and so is right in the same turn a modal opens, and it
+  also applies to real presses, e.g. the title intro, where `GameRoot` sits at alpha 0 and still
+  takes a tap (opacity is not a cover to a hit test).
 (Bindings are inert unless the game is running — `applyBindings` early-returns when the
 sim is stopped, so editor Stopped/Paused states never mutate the scene.)
 
@@ -641,7 +708,7 @@ empty list space does — a feel call, not a refactor.
 
 #### Engine built-in `UIAction`s
 
-Four stateless lifecycle/animator handlers are registered once at startup by
+Five stateless lifecycle/animator handlers are registered once at startup by
 `registerEngineActions()` (`runtime/actions/engineActions.ts`), callable from any
 `kind:'call'` binding by name:
 
@@ -716,6 +783,70 @@ Four stateless lifecycle/animator handlers are registered once at startup by
 Scene navigation (`engine.loadScene` / `engine.navigateBack`) is **not** here — it lives
 in `NavigationManager`, which owns the history stack (see
 [Managers & Systems](./managers-and-systems.md)).
+
+**`system.openUrl`** (#1196, `runtime/actions/systemControls.ts`, registered app-wide by
+`registerSystemControls()`) opens a web page in the system browser. The page address is the
+binding's typed `url` param, so a Privacy Policy or Terms link is authored data: change where it goes
+in the Inspector, not in code. Both shipping games' settings panels use it for their footer links.
+- **Where it opens.** On iOS and Android it goes through `capacitor-modoki-system`'s `openUrl`
+  (Safari, or the default Android browser). On the web and in the editor it uses `window.open`, and
+  the Electron editor's `setWindowOpenHandler` forwards that to `shell.openExternal`, so the Game
+  panel opens the OS browser and never navigates the editor window. The plugin is reached by name,
+  as `capacitorStore.ts` reaches the IAP plugin, so the engine has no build dependency on it.
+- ⚠️ **It refuses anything that is not a literal `https://`, a host, and nothing outside RFC 3986's
+  ASCII allow-list** (every `%` a two-hex-digit escape, at most one `#`). Refused: `http:`,
+  `javascript:`, a bare `example.com/page`, an unfilled param, and also `https:example.com/…`,
+  `https:///…`, a leading space, `|`, `"`, `{}`, `^`, `<>`, non-ASCII paths and hosts (write IDN hosts in
+  punycode), and bad escapes. The browser's `new URL()` repairs or encodes all of those, but the
+  phone does not. Foundation finds no host in the first group (`https:x`, `https:///x`, a leading space)
+  on every iOS version. iOS 16's `URL(string:)` returns nil for the character group, while iOS 17+
+  encodes those like a browser, so a new phone does not show it. Court's floor is 16.4. Accepting them gave a link that opened in the editor and did nothing
+  on an older iPhone (#1196 close-out, two review rounds). The rule only has to be at least as strict as
+  the strictest native side. The plugin's web copy is replayed against the same vectors
+  (`tests/runtime/openUrlVectors.ts`); Swift and Java keep their own looser checks behind this gate.
+- **It never registers the plugin a second time.** On a device, both native bridges write a plain
+  `Capacitor.Plugins.ModokiSystem` object at document start, and a game that imports the plugin's
+  JavaScript (wordweave) replaces it with a `registerPlugin` proxy at boot. The action calls whichever
+  is there. A second `registerPlugin` would warn "already registered", and a shipped build reports
+  every `console.warn` to Crashlytics. It falls back to `registerPlugin` only when the entry has no
+  `openUrl`, which is an OTA bundle running on an older native binary.
+- **Refusals are synchronous; the outcome is journaled.** Both refusals are decided before the
+  plugin call, so `modoki_dispatch_action` answers `ok:false` for them (#1129). What the OS then
+  did arrives as a `system.openUrl` journal entry, `{ url, opened }`, logged at `warn` when nothing
+  opened. On the web `opened` is always `true`: a popup blocker and the editor's deny-and-forward
+  handler both make `window.open` return `null`, so the web cannot tell them apart.
+
+**`copyToClipboard(text, world?)`** (#1398, same file) puts plain text on the system clipboard and
+resolves `true` only when it got there. It never rejects. Both games' Settings "Player ID" row uses it.
+It is a function a game's own action calls, **not** a built-in action, because what it copies is
+runtime data (a player's ID) that a scene binding cannot carry.
+- **Native goes through the plugin, not `navigator.clipboard`.** `capacitor-modoki-system`'s
+  `copyText` writes `UIPasteboard.general` on iOS and `ClipboardManager` on Android. A UI action runs
+  from the ECS dispatch, which can fall outside the tap's user-activation window that WebKit
+  requires for a web-view clipboard write. It was also never measured whether the app's
+  `capacitor://` page counts as a secure context. The native pasteboard depends on neither.
+- **It never reports a copy that did not happen.** A native build without the plugin, an OTA bundle
+  on a binary whose plugin predates `copyText`, a plugin rejection, a web page outside a secure
+  context (`navigator.clipboard` is then *absent*, and `?.writeText` would resolve `undefined` and
+  read as success), or empty text: each answers `false`. The two native build defects also log at
+  `error`.
+- **Journaled as `system.copyText` `{ copied }`, never with the text.** The value is an identifier,
+  and the journal travels in bug reports.
+- The debug overlay's copy-IP button (`DeviceTab.tsx`) deliberately keeps its own
+  `navigator.clipboard` call. It runs inside a React `onClick`, so it still holds the user
+  activation, and it has to work in debug builds of games that do not bundle the plugin.
+
+**Which ID a "Player ID" row shows** is the engine's `supportId(uid, appInstanceId)` in
+`runtime/account/`. The owner's ruling (2026-09-18) is the account uid when signed in, otherwise
+this install's Firebase Analytics app-instance ID, and `none` with neither. Today `none` means
+off-native (the editor, the web, a playable) or a native build whose Firebase call failed or is not
+configured. Firebase would also withhold the ID if ANALYTICS_STORAGE consent were denied, but neither
+game sets analytics consent today (#1398 close-out: no `setConsent` and no consent plist keys in
+either). `supportIdView` turns that
+decision and the last copy's outcome into the row's text. The **whole** ID is shown and copied, never
+a shortened one. There is no Copy button for `none`, because a Copy that copies nothing is a control
+that does nothing. Like the rest of that module, neither function carries any player-visible copy:
+each game passes its own authored words.
 
 #### Global input lock (#466)
 
@@ -1825,7 +1956,7 @@ inert under `autoFitText`, so they do not compose.
 
 ⚠️ **The second is easy to talk yourself out of, and that is how it was missed.** "A child with its
 own authored width cannot be squeezed by its text" is true of the row and irrelevant to the child:
-wordweave's `SettingsHapticsValue` gives an owner-editable On/Off word an authored `width: 88` at
+wordweave's `SettingsHapticsValue` (now a `UIToggle` switch; `SettingsNotificationsValue` keeps the same box) gave an owner-editable On/Off word an authored `width: 88` at
 `fontSize: 18`, where `"On"` needs 23.99 px and about ten characters is the ceiling — so
 `settingsOnLabel = "Vibration on"` (~103 px) spills out of its own box with nothing clipping. A
 row-only guard drops it from the population and stays green.
@@ -3135,6 +3266,12 @@ rebuild and is never per-frame.
   fetch that failed. It is exactly the diagnostic #344 lacked — Court's level selector rendered an
   empty grid with `npm run verify` green at 8,462 tests, because every one of those tests reads the
   prefab FILE and the file was well-formed.
+  ⚠️ **An editor Apply-to-Prefab used to trigger exactly this warning for a REAL reason (#1308).**
+  The write evicted the runtime cache entry, and only a scene load refills it, so the pool parked
+  every row and the view stayed blank. The write now replaces the entry instead
+  ([prefabs.md](prefabs.md) § "A prefab EDIT replaces the runtime cache entry"). The provider's
+  `revision` changes with it, and the system rebuilds the view's whole pool so the rows show the
+  applied edit rather than the old prefab.
   ⚠️ **#344's recorded cause — "a `version: 2` makes the loader decline to cache" — is not real,
   and the belief had spread to four places.** `fetchPrefab` (`meshTemplateCache.ts`) fetches,
   parses and caches without ever inspecting `version`; `editor/scene/prefab.ts` *wrote* `2` for
@@ -3840,6 +3977,11 @@ The **baked/image** path had the same two holes and a describable route:
   cache. **That one is NOT a defect, and the close-out initially "fixed" it and was wrong** — the
   episode is recorded here because the wrong fix is the intuitive one:
 
+  > *(Historical: the per-caller `waiters` set this describes was replaced in #1368 by an
+  > `inFlight` dedupe set plus the shared `markTextDirty(fontId)` hub. The lesson carries over
+  > unchanged — `inFlight` and the text-dirty key are both the font GUID, so the load still
+  > wakes on a disposed provider, for P2's sake.)*
+  >
   > Settling those waiters with `wake: false` looks right (there is no texture to draw, same as
   > the `.catch` path) and is a regression. `waiters` is keyed by the font **GUID**, so it
   > outlives the provider *instance* while the cache entry does not: the set can hold a waiter
@@ -3938,6 +4080,17 @@ of them worded and deliberate.
 
 ⚠️ **A tap on the dialog BODY must do nothing** — it is neither the ✕ nor "outside". This is the
 part the engine cannot yet express cleanly: see the gap below before you author it.
+
+⚠️ **A dimmed backdrop blocks NOTHING unless it takes the tap** (#1423). A container with neither a
+click `UIAction` nor `swallowClicks` keeps the UIRenderer root's inherited `pointer-events: none`,
+so a full-screen scrim is paint only: it looks modal, and a tap on the dimmed area lands on the HUD
+under it. Observed in wordweave: with the "Too easy?" card up, the zoom button stayed on top of the
+hit stack. So every backdrop picks one of three, per the rules above: a click `UIAction` (tapping
+outside dismisses), `swallowClicks` (it doesn't — a decision dialog, or one with a worded dismiss),
+or `pointerThrough: true` (taps are MEANT to reach the layer below — sling's "Tap to play again").
+`engine/tests/assets/overlayBackdropTakesTap.test.ts` fails on any painted full-screen overlay in
+`games/`/`demos/` that picks none — "overlay" meaning it or an ancestor has `zIndex > 0`, starts
+hidden, or is shown by a `UIBinding.visibleBinding`.
 
 ### Why a dialog body dismisses today, if nothing is done about it
 

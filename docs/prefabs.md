@@ -56,8 +56,12 @@ Each `PrefabEntity` stores its traits with `EntityAttributes.parentId` remapped
 from ECS ids to `localId`s. `serializePrefab()` clears `EntityAttributes.guid`
 on every prefab entity — a prefab is a template, so per-instance identity is
 assigned on the live entity at instantiation, not baked into the file (otherwise
-every instance would start with the same stale guid). The prefab file never
-carries `PrefabInstance` traits; those are added programmatically on spawn.
+every instance would start with the same stale guid). The same holds for an `added` node inside a
+nested row: it carries a template `key` instead of a guid, and each instance derives the guid from
+that key (#1387). A ref from one member to another is written as a member token
+(`@member:<path>`) and resolved per instance (#1352). Both are in [scene-loading.md](scene-loading.md)
+§ "Guid uniqueness is a PER-FILE rule", "Template identity". The prefab file never carries
+`PrefabInstance` traits; those are added programmatically on spawn.
 
 ## localId stability — an external address space
 
@@ -75,6 +79,66 @@ consumer below resolves a member BY localId, and each is a place a renumber goes
   `overrides[localId]` rather than its `traits`.
 - **`editor/panels/ApplyPrefabDialog.tsx`** — pairs a live instance entity to its template row.
 - The live **`PrefabInstance.localId`** trait, which carries the id on every spawned entity.
+- **`editor/scene/prefab.ts`'s `tagEntityTreeAsInstance`** — stamps that trait after a Create
+  Prefab, so it must assign the SAME ids the file just got.
+
+⚠️ **That last one had its own numbering and they disagreed (#1278).** `serializePrefab` collapses
+a nested instance below the root to one reference row and drops its members from the numbering;
+`tagEntityTreeAsInstance` numbered the full `collectTree`. So after Create Prefab on a tree holding
+a nested instance, every member ordered after it was live-tagged one higher than its row — and
+because BFS visits a nested instance's members *last*, the divergence only appears when a surviving
+entity sits deeper than the dropped ones (`R → A, Hull(instance), B → C`: `C` is row 5 and was
+tagged 6). `captureInstanceOverrides` on the next save then paired each live entity with the wrong
+row and wrote overrides under an id denoting a different member, silently.
+
+The first fix had tagging mirror the written file row-by-row, and **close-out review found that
+still wrong** — it inferred membership from the hierarchy, and "every descendant of a nested root"
+is wrong in both directions:
+
+- An **owned** grand-nested instance (`parentLocalId > 0`) is *not* dropped by the serializer.
+  `captureInstanceStructure`'s `captureChild` returns `null` for those, so they never enter
+  `consumedEcsIds`, and being self-rooted they are not members either — they get a reference row
+  of their own. Skipping it shifted every later row by one, and the entity whose row went missing
+  was left with **no `PrefabInstance` at all**.
+- `memberEcsIds` is a **world-wide query on `rootInstanceId`**, not a subtree walk, so a member
+  reparented out of its instance is dropped while sitting outside the subtree.
+
+So the inference is gone. **`planPrefabRows` owns the decision and both `serializePrefab` and
+`tagEntityTreeAsInstance` call it.** **Anything that needs a member's localId calls the planner;
+nothing re-derives it.**
+
+⚠️ **One decision procedure is NOT one answer, and this is the part that is easy to get wrong
+twice.** The callers must also feed it the same inputs, at the same time, and they do neither for
+free:
+
+- **Different arguments.** The planner takes `preserveLocalIds` and `existingId`; tagging passes
+  neither. Safe today only because the paths that preserve (prefab-edit re-save) never tag and the
+  paths that tag never preserve — pinned by
+  `engine/tests/architecture/prefabTagNeverPreservesLocalIds.test.ts`, because a prefab-edit "save
+  and relink" would reintroduce #1278 silently.
+- **Different times.** `serializePrefab` plans, then the caller **`await`s the file write** — on a
+  Replace that await contains the `confirmReplace` **dialog**, an unbounded wait during which MCP
+  ops and the file-watcher's scene reload keep running. Tagging then plans again over world and
+  prefab-cache state that may have moved. So tagging takes the written `PrefabFile` and checks its
+  plan against it (`planMatchesFile`), and **refuses to tag on a mismatch**. That degradation is
+  chosen deliberately: an *untagged* entity round-trips as an `added` node and loses nothing,
+  whereas an entity tagged with a localId the file has no row for is written to **neither** the
+  scene entry (serialize drops it as a prefab child) **nor** the overrides — it is simply gone on
+  the next load.
+
+A nested row is not retagged onto the new prefab: it keeps its link to its own child prefab and
+receives only `parentLocalId`, exactly as `instantiatePrefabIntoWorld` does on reload, and its
+members are left alone. **The invariant to hold on to is that the live world after Create Prefab
+equals the world after a save + reload** — that is the only bar that catches this class. Holding it
+meant splitting capture from strip: `detachPrefabInstance(root, { strip: false })` snapshots for
+undo without severing links the tagging deliberately will not restore.
+
+⚠️ **Dropping the strip means the tag write must name every field.** koota's generated setter is a
+**partial merge** (`if ('k' in value) store.k[i] = value.k`), so an omitted field silently keeps its
+previous value — which the old strip-then-add had reset. A surviving `parentLocalId` makes
+`serialize.ts` classify the row as an *owned* nested instance (`parentIsMember && parentLocalId`),
+which writes **no scene entry for it at all**, and the freshly created prefab link is gone on the
+next reload.
 
 `serializePrefab`'s default numbering (no `opts`) is **positional** (`i + 1` over the BFS-ordered
 tree) — correct for "create a prefab from an entity", where there is no prior numbering to
@@ -143,9 +207,14 @@ In the scene file a whole instance collapses to **one entry** — an ordinary
   "prefab": "062bd887-…",                 // source .prefab.json GUID
   "overrides": { "3": { "Transform": { "px": 4.2 } } },  // localId → trait → field → value
   "removed": [7],                          // prefab-member localIds this instance deleted
-  "removedTraits": { "5": ["Light"] }      // localId → trait names deleted from a member
+  "removedTraits": { "5": ["Light"] },     // localId → trait names deleted from a member
+  "moved": { "3": "9f1c…" }                // localId → guid of the parent a linked member was moved to (#1437)
 }
 ```
+
+A prefab FILE can carry a `moved` map of its own (v4, #1437): `"<member path>": "@member:<path>"`,
+for a member it places under a parent no row relation can express. Both halves are member paths in
+the prefab's frame. See [prefab-structural-overrides.md § Moved members](./prefab-structural-overrides.md#moved-members-1437).
 
 The marking is **presence-based, not a flag**: a field is "overridden" purely by
 appearing in `overrides` (`localId → traitName → field → value`), and it stores **only
@@ -255,46 +324,72 @@ re-applies the root's extra traits, and replays the `overrides` map per localId.
 Override tracking is per-localId, so edits to a sub-entity (not just the root)
 survive a reload.
 
-## ⚠️ A prefab EDIT empties the runtime cache, and nothing refills it
+## ⚠️ A prefab EDIT replaces the runtime cache entry — it used to empty it (#1308)
 
-**Saving a prefab in the editor drops it out of the runtime cache, and only a SCENE LOAD puts it
-back.** A game that spawns prefab instances at runtime therefore stops being able to, silently,
-for the rest of the session — the symptom is whatever that game does when the prefab is missing.
+**An editor write of a prefab a scene owns now puts the written bytes straight into the runtime
+cache.** Before #1308 it DELETED the entry, and only a scene load put it back, so every
+synchronous runtime reader silently read nothing for the rest of the session.
 
-The mechanism, verified in a running editor (2026-08-19):
+The mechanism:
 
 - A prefab write goes through `setPrefabCache()` / `writePrefabFile()`
-  (`editor/scene/prefab.ts`), which calls `invalidatePrefab(source)` — deleting the entry from
-  the **runtime** `prefabCache` in `runtime/loaders/meshTemplateCache.ts`.
-- `acquirePrefab` is the only thing that refills it, and it is called from just two kinds of
-  place: `SceneManager` during a scene load, and games that preload deliberately
-  (`games/sling`, `demos/forest-camp`, each with its own owner-id sentinel).
-- So after such a write, `getCachedPrefab()` returns `undefined` until the next scene load.
-  **Nothing warns.**
+  (`editor/scene/prefab.ts`), which calls `replaceCachedPrefab(source, prefab)`
+  (`runtime/loaders/meshTemplateCache.ts`).
+  - **If a scene owns the prefab**, it seats a JSON copy of the written bytes. The copy is run
+    through the same load-path migration `fetchPrefab` applies. The #863 key token is still bumped,
+    so an in-flight fetch of the pre-write bytes is refused.
+  - **If nothing owns it**, it evicts as before. Seating an entry nothing owns would leave a row
+    that no `releaseAllForScene` ever drops.
+  - A delete (`setPrefabCache(src, null)`) still evicts.
+- **Why this matters:** an eviction left the scene's owner hold intact and the bytes gone.
+  `acquirePrefab` is the only thing that refills the cache, and outside games that preload
+  deliberately, only `SceneManager`'s scene load calls it. The readers stranded by that:
+  - the `UIEntries` pool: its stride went to 0, every slot parked, and the view went blank (#1308);
+  - timeline scrub and control-track spawns;
+  - a nested row inside any runtime spawn.
+- **Every replace or evict bumps a per-key content revision** (`getPrefabRevision`). A runtime
+  spawner compares it to tell that its live instances were built from OLD bytes.
+  - `EntryPrefabProvider.revision` is a `guid@revision` list over the entry prefab and every
+    prefab it nests. It is a list, not a sum: a sum let a removed nested row cancel the parent's
+    bump, so the pool kept stale rows.
+  - `entriesSystem` releases and rebuilds a view's whole pool when that signature changes. The
+    rebuild keeps the view's per-frame scroll baseline; a fresh 0 there, on a rebuild first seen
+    by a scroll-event drive, ballooned the pool to its raise cap.
+  - ⚠️ **A rebuild does not re-target keyboard/gamepad focus.** The focused row is destroyed
+    before the focus capture runs. Focus usually survives anyway, because the respawned row in
+    the same slot gets the same seeded guids, and `uiFocusSystem` finds it again. It can land
+    on a DIFFERENT entry when the Apply arrives mid-scroll: the rebuilt drive starts with minimum
+    overscan, so the window origin moves. It falls back to the scope's autoFocus when the edit
+    removed the focused member. Both need an editor Apply during Play; read from code, not
+    observed.
+  - This is needed because the Apply refresh skips Transient subtrees on purpose (§ Authoring
+    scope, #1301), so nothing else would rebuild pooled rows.
 
-⚠️ **WHICH writes actually strand it — this matters, and an earlier draft of this section got it
-wrong.** The invalidate's own comment states the intended contract ("so the NEXT scene load
-re-reads the new file"), and **prefab-EDIT MODE honours it**: `exitPrefabEditing` calls
-`loadScene(target)`, which re-acquires. So the open-edit-save-exit loop is safe, and
-`games/court/art.md`'s claim that the tray "picks the new offsets up when you leave edit mode"
-is **correct for that workflow**.
+**Paths that write an in-use prefab without reloading.** Since #1308 all of these keep the cache
+warm:
+- **Apply to Prefab** on a scene instance: `applyToPrefabWithUndo` → `writePrefabFile`.
+- **`modoki_prefab action:'apply'`** (and `'create'`).
+- Create Prefab → Replace, and the skin-prefab writes (both through `setPrefabCache`).
 
-The paths that invalidate an in-use prefab and do **not** reload are:
-- **Apply to Prefab** on a scene instance — `applyToPrefabWithUndo` → `writePrefabFile`, live-only.
-- **`modoki_prefab action:'apply'`** (and `'create'`), the agent surface for the same op.
+Paths that also reload:
+- Prefab-EDIT mode reloads on exit (`exitPrefabEditing` → `loadScene(target)`).
+- Undo/redo of an Apply reloads (`restoreSnapshot` → `loadScene`).
 
-Creating a NEW prefab from an entity (`assetOps.ts`) also invalidates, but only its own
-freshly-minted guid, which nothing is using yet — harmless.
+**An external `.prefab.json` write** (a hand edit, `git checkout`) goes through the scene hot
+reload. `handleSceneChanged` evicts and then reloads (#1169, [editor-hmr.md](editor-hmr.md)), and
+that path is unchanged: the reload is what refills the cache there.
 
-⚠️ **There is NO file-watcher path.** Editing a `.prefab.json` on disk does not invalidate
-anything, so the runtime keeps serving the OLD prefab until a scene load — a staleness problem,
-not a fallback one, and the opposite failure to the above.
+**Game code still owns two cases.** Instances a game spawned at runtime keep the art they were
+built with: the cache is warm again, but nothing re-spawns them. And a prefab that really is
+missing still reads `undefined`. So the guidance below (re-acquire on a miss; remember what each
+instance was built FROM) still applies, and the incidents below are the pre-#1308 shape of the
+failure.
 
 **What this looks like in a game.** Court's guard flag falls back to drawn primitives when its
 prefab is uncached, so after an Apply-to-Prefab the flags already planted keep the real art while
 every new one draws a placeholder, and the board stays mixed until a scene load. Fixed there by
 recording the art each instance was spawned with, retiring on a mismatch, and asking for the
-prefab back once on a miss (`syncFlags`, `games/court/runtime/systems.ts`).
+prefab back through `requestPrefab` on a miss (`syncFlags`, `games/court/runtime/systems.ts`).
 
 **Measured on Court's tray badge, 2026-08-19** — the wholesale version of the same failure. With
 the prefab cached, a board build gives the authored instance (`Coin` ×6, `CountBadge`, `CountBanner`,
@@ -307,24 +402,61 @@ same cache and both fall back.
 **If you spawn prefab instances at runtime, handle the miss on purpose.** Two things, and the
 first alone is not enough:
 
-1. **Re-acquire on a cache miss** — `void acquirePrefab(<your owner sentinel>, guid)`, guarded so
-   it fires once per guid rather than every frame.
-   ⚠️ **Re-arm that guard on the fetch POPULATING the cache — never in a `.catch`.** Measured
-   2026-08-19: `acquirePrefab` on an unresolvable guid **RESOLVES**, with the cache still empty —
-   `fetchPrefab` swallows `!res.ok` and parse errors and never rejects. So a `.catch(() => rearm)`
-   is dead code, and a guard that is never re-armed heals only the FIRST invalidation: a second
-   Apply-to-Prefab in the same session stays broken. Re-arming unconditionally is the opposite
-   trap, refetching a genuinely-missing prefab every frame forever. `.finally(() => { if
-   (getCachedPrefab(ref)) rearm; })` is the shape that does neither.
+1. **Re-acquire on a cache miss — call `requestPrefab(<your owner sentinel>, guid, { world })`**
+   (`@modoki/engine/runtime`, #1376) wherever you would have read `getCachedPrefab`. It returns the
+   cached document or null, and on a miss it asks for the prefab back. Call it every time you need
+   the prefab (every frame is fine). **Do not hand-write this latch.** Seven spawners across four
+   projects did, from an earlier version of this section, and every copy was wrong in at least one
+   of the three ways below. The helper exists so the next spawner cannot repeat them:
+   - **In-flight dedup, released on EVERY settle.** Without it a per-frame caller refetches every
+     frame (#1373).
+   - **A bounded give-up budget, per world, refunded on a hit, and never spent on an outage
+     (#1397).** `acquirePrefab` on an unresolvable guid **RESOLVES**, with the cache still empty
+     (measured 2026-08-19). It still never rejects. What changed is that `fetchPrefab` now
+     classifies its failures: it remembers a 404 or a bad file until the prefab is invalidated,
+     and backs off a 5xx or a dropped connection. `requestPrefab` refunds an attempt that ended
+     transiently. So the three attempts are spent only on a prefab that is not coming, and an
+     outage retries on the shared backoff (1 s doubling to 10 min) instead of giving the prefab up.
+     The rule: [architecture.md](architecture.md) § "A load failure is classified before it is
+     remembered". Before #1397 a 404, a 5xx and an offline blip looked identical here. Re-arming only on success (`.finally(() => { if
+     (getCachedPrefab(ref)) rearm; })`, the shape this section used to prescribe) reads every
+     transient failure as a deletion and disables the prefab for the session (#1359). Re-arming
+     unconditionally refetches a deleted guid forever. A `.catch` re-arm (or a `.catch` warning,
+     #1375) is dead code. Three attempts per world, then it stops. ⚠️ **"Per world" is an EDITOR
+     safety net:** a built game never swaps its world, so there the give-up lasts the session.
+     That is accepted because this is a recovery path. The scene load already acquired the prefab.
+     It is a real change for `games/court`, whose hand-written guards were cleared on every board
+     build. That gave a missing prefab one more try per level, forever. A per-frame caller (the
+     flag layer, the win confetti, the debug-menu preview) now spends its three tries in about
+     three fetch round-trips and stops until the next Play. Since #1397 that is true of a prefab that
+     is NOT THERE; an outage backs off and does not spend the tries. A preview of a prefab that gave up
+     stays parked, and the tap looks dead until then.
+   - **The hit test and the re-arm test are ONE predicate.** The default is "has at least one
+     entity", since an entity-less document spawns nothing. A caller whose miss test is stricter
+     passes it as `isHit`: Court's tray badge passes its layout parse, because a cached document
+     that does not parse is as useless there as a missing one. A re-arm on bare truthiness accepts
+     such a document, releases the guard and refetches forever (#1359). A caller that reports an
+     unspawnable document separately passes `isHit: () => true` (forest-camp's
+     `arrow-spawn-failed`).
    ⚠️ **The re-acquire is async, so the action that found the miss still fails — record it.** The
    shot, spawn or build that hit the empty cache cannot wait for the fetch, and dropping it silently
    makes it read as a dead control. `demos/forest-camp` journals `archery.shot-refused` with
    `reason: 'arrow-prefab-not-cached'` for exactly this window (#996).
-   ⚠️ Whether you are exposed depends on **what else clears your guard**: `games/court` clears its
-   on every board build, so it was safe either way; `games/sling` clears its only on unregister and
-   `demos/forest-camp` only on world swap — and an Apply-to-Prefab is neither.
+   ⚠️ **The miss itself is not the useful signal; the give-up is.** A miss is also what a healthy
+   cold cache looks like one frame before it fills. So `requestPrefab` stays silent through the
+   miss and journals **`prefab/unavailable`** (`warn`, payload `{prefab, owner, attempts}`) once,
+   when the budget is spent and the prefab still has not arrived. That is also the only way a
+   failed PRELOAD is ever seen, because `acquirePrefab` never rejects. Where the refused action is
+   a *player* action, record it anyway, as forest-camp does, because the player really did lose
+   something.
+   **What stays on `acquirePrefab`:** a preload that AWAITS a batch (a scene load, sling's
+   bootstrap `Promise.all`) is not a latch. `engine/tests/architecture/prefabRequestSites.test.ts`
+   fails when a game or demo calls `acquirePrefab(` outside its short list of such sites.
 2. **Remember what each live instance was built FROM**, and retire instances whose source no
-   longer matches. Without this, the window between the invalidation and the re-acquire leaves a
+   longer matches. ⚠️ **Key that record on the prefab's REVISION, not only its guid**
+   (`${guid}@${getPrefabRevision(guid)}`). An editor Apply replaces the entry in place, so the guid
+   never changes; Court's flag layer keys `art` this way so that an edit made during Play still
+   retires every planted flag (`syncFlags`). Without this, the window between the invalidation and the re-acquire leaves a
    mixed population that never converges, because "this cell already has an instance" is true and
    says nothing about which art that instance wears.
 
@@ -335,8 +467,7 @@ guid)` adds that sentinel to the prefab's owner set, so the scene's own `release
 never evict it and the prefab outlives the game. Drop the holds wholesale when the game
 unregisters — `releaseAllForScene(<sentinel>)`, not `releasePrefab` per guid, because a per-guid
 release leaks anything the acquire pulled in transitively (`games/sling` records this at its own
-call site, and `games/court` had to add it after missing it). Two other games still spawn prefabs
-at runtime without the re-acquire half: #265.
+call site, and `games/court` had to add it after missing it).
 
 ## Mesh sharing
 
@@ -411,7 +542,44 @@ exposed as the `prefab` agent op / `modoki_prefab` MCP tool's `prefabAction: 'ed
 [debug-tools-mcp.md](./debug-tools-mcp.md)'s generated tool catalog. `edit-open` swaps the world
 exactly as `load-scene` does (refuses on unsaved work, takes `discardUnsaved`) and additionally saves the
 current scene on the way in, deliberately, so the return trip's reload-from-disk is
-non-destructive; `modoki_save_all` refuses outright while in prefab-edit mode. This is what
+non-destructive. In prefab-edit mode `modoki_save_all` writes any parked work (asset docs, base-scene
+refs, import settings) and then refuses the scene half, because `edit-save` is the save for that
+world.
+`edit-exit` refuses the same way while the prefab world holds unsaved edits, because its reload of
+the return scene discards that world (#1424). Before that fix it answered `ok:true` over an unsaved
+delete, with the undo stack gone. `edit-save` first, or pass `discardUnsaved:true` to drop them
+deliberately. Inside prefab-edit mode the refusal's remedy is split by cause: `edit-save` for the
+prefab-world edits, `save_all` for parked work (`edit-save` does not write parked work). The human
+"Back to scene" button asks through the #1419 modal ([editor.md](./editor.md) § "The unsaved-work
+gate"). That modal counts only the world edits, because parked work survives the swap, while the
+agent refusal also counts parked work, as every agent world swap does.
+
+**Editing the template from an agent (#1254).** The prefab-edit world has no scene file. Prefab-edit
+sets the editor's scene path to `null`, so a normal save cannot target a real file. That world is
+therefore addressed by its synthetic handle, `/__prefab-edit__/<prefab guid>`, which
+`modoki_get_editor_state` reports as `prefabEditWorld` only while that world is loaded AND its edit
+session is open (`prefabSessionWorldPath(editingPrefab)`: the world and the session must name the same
+prefab). An exit whose return-scene reload fails, or that has no scene to return to, clears the session
+but leaves the world loaded. Nothing can persist an edit there (`edit-save` needs the session, and
+`save_all` refuses the prefab world), so that world is deliberately not reported as editable.
+- `modoki_mutate_scene` and `modoki_set_transform` with `path` **omitted** target it.
+- `/api/scene-mutate` treats that handle as **LIVE-ONLY**. It applies through `apply-scene-ops` only
+  when the renderer reports that exact world, and otherwise refuses: 409, or 400 for `setBaseScene`.
+  It never falls back to a file write, because the template reaches disk only through `edit-save`.
+- A stale handle therefore cannot edit whatever world happens to be live. That covers a handle left
+  over after `edit-exit` (including the failed-reload exit above) and a handle for a different prefab.
+- **Parent new entities UNDER the prefab root.** `edit-save` serializes only the root's subtree
+  (`serializePrefab` → `collectTree(rootId)`), so an `addEntity` with `parentId: 0` succeeds live and
+  is silently absent from the saved file.
+- **Prefer `space: 'local'`.** A 2D template's root is re-parented under the editor-only
+  `__PrefabEditStage` scaffold, so a `'world'` transform converts against the stage offset and
+  `edit-save` bakes that offset into the template.
+- The live entity tools (`create_entity`, `duplicate_entity`, `delete_entities`, `reparent_entity`)
+  never needed a path, and work unchanged.
+- `modoki_validate_scene` does not apply here: it validates files, so use `modoki_validate_prefab`
+  on the `.prefab.json`.
+
+This is what
 `engine/scripts/resave-prefabs.sh` drives to bulk-migrate prefabs to the current serializer
 format — see [scene-loading.md](./scene-loading.md) § "Re-saving legacy prefabs".
 
@@ -482,7 +650,12 @@ the file.**
   pass sets `rootInstanceId` only on its *own* members so inner ids aren't
   stomped.
 - **Cycle safety** is two-layered: `wouldCreateCycle` rejects a *save* that would
-  nest a prefab inside one of its own descendants (A → B → A), and a `_stack` of
+  nest a prefab inside one of its own descendants (A → B → A) — a prefab-edit save,
+  Create Prefab's Replace, and Apply's promotion of an added node (`addedNestsPrefab`,
+  #1446: it used to write the row, which expanded to nothing, so the user's instance
+  vanished on the refresh). Both read every prefab a file EXPANDS (`expandedPrefabRefs`:
+  rows, and the reference nodes rows add, in `added` or `nestedStructure`), never trait
+  data — a spawner trait's `prefab` field is not nesting. A SCENE may hold such a nesting; only a file may not. A `_stack` of
   prefab GUIDs in the instantiate path is the backstop (an on-disk cycle can never
   hang the loader). Because a prefab can never transitively contain itself,
   refreshing every instance of one source is order-independent.
@@ -495,9 +668,114 @@ the file.**
   its members from the flat output. The selection root itself is never collapsed.
 - **Resource acquisition** is transitive: `SceneManager` walks each fetched
   prefab for nested `prefab` refs and acquires them under the scene id.
-- **Caching:** the editor's sync instantiate reads nested children from the
-  editor `prefabCache`; async entry points call `preloadNestedPrefabs()` first so
-  they're present (also why edit-mode save references rather than flattens).
+- **Caching — and it cuts BOTH ways, which is the part that bit (#1284).** The editor's
+  `prefabCache` is read *synchronously* by code on both sides of the nesting, and every
+  one of those readers treats "not in the cache" as "not a prefab":
+  - **instantiate** — `instantiatePrefab` skips a nested row whose child is not cached
+    (it warns). `instantiatePrefabAsync` exists so UI entry points cannot get this wrong.
+  - **serialize + capture** — `planPrefabRows` **flattens** a held nested instance into
+    copies, `captureNestedRef` drops a user-added nested subtree from `added[]`, and
+    `captureNestedInstanceOverrides` / `reapplyNestedInstanceOverrides` lose a nested
+    instance's per-copy overrides across a rebuild *with no warning at all*.
+
+  ⚠️ **There are two warmers, and they answer different questions.**
+  `preloadNestedPrefabs(prefabFile)` walks a prefab FILE's reference rows;
+  `preloadNestedPrefabsForSubtree(entityId)` walks the LIVE tree. **The sync readers above
+  all walk the live tree**, so the file walk alone leaves anything live-but-not-in-the-file
+  cold — and an ordinary scene load leaves the *whole* cache cold, because the loader fills
+  the RUNTIME cache (`meshTemplateCache`), not this one.
+
+  That gap is what #1284 was: Create Prefab warmed nothing, so on a freshly-loaded scene it
+  silently wrote copies instead of a reference, and the author found out weeks later when
+  editing the child prefab moved nothing. The rebuild paths warmed from the file, so they
+  lost only *user-added* nested instances — the same defect at a smaller amplitude.
+
+  **Serializing a live tree therefore means `await preloadNestedPrefabsForSubtree(id)`
+  first**, and `serializePrefab` stays synchronous so the obligation sits with the caller
+  who can actually await. The scene save does the same thing its own way — `serialize.ts`
+  collects every live instance source and awaits `getPrefabSource` over the set before its
+  capture loop — which is why a scene save has never lost nesting to a cold cache.
+
+  The live walk does **not** recurse into each fetched file's rows, deliberately:
+  `collectTree` is a full descendant walk and every nested root is its own
+  `PrefabInstance`, so depth is already covered. A recursion was written and removed —
+  with both present, neither could be shown to fail, which is the shape of a line that is
+  load-bearing only in appearance.
+
+  Guarded two ways: `coldPrefabCacheWarming.test.ts` (behaviour, starting from a cold
+  cache — note every OTHER nested test calls `setPrefabCache` by hand and so only ever
+  exercised the warm path) and `prefabCacheWarm.test.ts` (the swap warm and the instantiate
+  helper — the two mechanisms that make the cache populated by construction).
+
+  ⚠️ **Every entry point that reaches one of these readers now warms — including the undo/redo
+  closures.** Those were deferred three times as "synchronous closures that can never await",
+  and that was simply false: `UndoAction.undo/redo` are typed `(): void | Promise<void>`,
+  `undoManager`'s `runStep` does `await run()`, and the comment beside its in-flight mutex says
+  an action's undo/redo may await, *"e.g. prefab instantiate redo"*. A wrong premise survived
+  three passes because each one restated it instead of checking the type.
+
+  Each closure that warms then **re-resolves its `entityRef`**: a cold source makes the warm do
+  real I/O, and `entityRef` exists in those files precisely because a raw ecs id goes stale
+  across a world rebuild (Play→Stop, a watcher reload).
+
+
+  ⚠️ **The cache is now populated BY CONSTRUCTION, and the per-call-site warms are belt-and-braces
+  rather than the mechanism** (#1295). Two things make it so, and they are what to keep working if
+  this ever regresses:
+  - **`instantiatePrefabInstance`** — every path that spawns a prefab from an asset path caches it
+    under the ref the new instance actually CARRIES. `setPrefabSource` resolves a path to a GUID
+    whenever the manifest can, and nothing used to cache under that guid, so a prefab dropped in
+    mid-session was unreachable however warm the scene load had been.
+  - **`installEditorPrefabCacheWarm`** — a `beforeSwap` hook (the loader awaits it, so the swap
+    cannot complete half-warm) that takes each prefab from the RUNTIME cache the loader has already
+    filled. A `Map.get` plus a `Map.set`; it only fetches for a source the runtime cache cannot key.
+
+  ⚠️ **"By construction" is NOT universal, and the exceptions are why the per-call-site warms stay.**
+  Three spawners put a live instance into the CURRENT world *after* the swap, so the beforeSwap hook
+  structurally cannot reach them: the timeline scrub preview and its control-track edge
+  (`runtime/timeline/timelineSystem.ts`), and the UIEntries scroll pool
+  (`runtime/loaders/entryPrefabProvider.ts` → `runtime/ui/entriesSystem.ts`). All three go through
+  `spawnPrefabInstance`, which writes a non-empty `source`, and none goes through
+  `instantiatePrefabInstance`. A game spawning a prefab from `onSceneReady` is the same shape.
+
+  ⚠️ **Those three spawners are deliberately NOT made to seed the editor cache** (#1301). Seeding
+  would make the sync readers read them *correctly*, and reading them at all is the defect: every
+  instance those three create is `Transient`, and a `Transient` instance is not authoring input.
+  The rule in § Authoring scope (end of this file) is what closes that hole — at the reader rather
+  than at the spawner.
+
+  The ~15 `await preloadNestedPrefabsForSubtree(...)` calls are therefore deliberately KEPT: each
+  is a `Map.has` once warm, the failure they guard against is SILENT, and the paragraph above does
+  not cover everything. They are the cheap half of the defence; the census that policed them was
+  the expensive half, and only that was removed. ⚠️ Nothing now detects their removal — that was
+  the census's one uncovered job, recorded here rather than left implicit.
+
+  ⚠️ **Do not trust a census that anchors on ONE reader — this paragraph shipped a wrong count
+  three times doing exactly that.** The sync reads are not three; in `prefab.ts` alone there are
+  **seven** (`planPrefabRows`, `instantiatePrefab`, `wouldCreateCycle`, `captureNestedRef`,
+  `applyStructureByRootInstance`, and two inside the nested-override capture/replay pair), plus
+  `Inspector.tsx` and the prefab-edit save. They are reached by different call chains, so a sweep
+  anchored on `captureInstanceStructure` cannot see the one that reaches `planPrefabRows` through
+  `tagEntityTreeAsInstance` — which is how `assetOps`' async redo survived a manual sweep AND an
+  adversarial review. A source census used to pin three anchors separately for that reason; it was
+  **deleted** once the cache became populated by construction (see below), because it needed a new
+  anchor per reader and that treadmill was its own maintenance defect.
+
+  ⚠️ **`applyToPrefab` is the one worth remembering**, because it shows what the cold read
+  actually costs. It captures the structure and uses the result to BUILD the key set it hands
+  to `applyToPrefabSelective`, so a cold miss did not merely hide a row — it silently dropped
+  a hand-added nested subtree from an action whose entire promise is "apply all of it". It was
+  found by a source census on its first run, having been missed by both a manual sweep and an
+  adversarial review — which is the argument for the construction-level fix below rather than for
+  keeping the census.
+
+  ⚠️ **One behaviour change worth knowing, because warming changes what a GUARD can see.**
+  `planPrefabRows` runs `wouldCreateCycle` BEFORE the cache lookup, and that guard returns
+  `false` on a miss — so a cold cache made it blind. With the tree warmed it now has the data
+  to refuse: `modoki_prefab create` over an EXISTING path, on an entity holding an instance of
+  a prefab that nests the target guid, used to flatten-and-succeed and now fails the op with
+  `could not serialize prefab from entity N`. That is the guard working, but it is a new
+  refusal rather than a silent mis-save.
 - **A prefab's effective ROOT, without spawning** (#1031): `effectivePrefabRootTraits`
   in `runtime/loaders/prefabOverrides.ts` answers "what traits would a spawned
   instance's root carry?" — for code that must not spawn: the `UIEntries` pool
@@ -568,3 +846,89 @@ the file.**
   nested copy (outer override capture is scoped to the outer instance's own
   members). Overrides authored in the outer prefab file's nested row, and edits
   made in the child's own edit session, both survive normally.
+
+
+## Authoring scope — a runtime instance is not authoring input
+
+**Rule: a reader that treats the LIVE TREE as authoring input asks one shared predicate,
+`collectTransientSubtreeIds` / `filterAuthoringVisible` (`editor/scene/authoringScope.ts`).**
+A `Transient` entity — a UIEntries pooled row, a timeline scrub or control-track spawn, anything a
+system spawned inside a tick — is a live artifact, and its subtree goes with it.
+
+| Reader | What it does | Before #1301/#1306 |
+|---|---|---|
+| `serializeScene` | writes the scene file | hand-rolled copy of the walk |
+| `captureInstanceStructure` | diffs an instance against its prefab | hand-rolled copy (added by #1295's review) |
+| `collectInstanceRoots` | Apply-to-Prefab's fan-out to every instance | **never asked** |
+| `serializePrefab` -> `collectTree` | Create Prefab | **never asked** |
+
+The two misses look unrelated at the symptom level — one saves a scene, one writes a prefab file —
+which is exactly why two hand-rolled copies were not enough. What each one did:
+
+- **`collectInstanceRoots`** handed a pooled/scrub instance to `refreshInstances` -> `rebuildInstance`,
+  which carried the durable guid and `source` forward but **not the tag**. The rebuilt root was an
+  ordinary serializable entity, so the next save wrote a preview artifact into the authored scene —
+  defeating the guarantee `spawnPrefabInstance` sets `Transient` for. `rebuildInstance` now carries
+  it over the respawn as well, on the same reasoning that already carries the guid: transience
+  belongs to the identity, not to the id.
+- **`serializePrefab`** wrote them into the new `.prefab.json` as ordinary authored members. It now
+  **reports** what it left out (a toast on both human entry points through one shared wording, a
+  `warnings` entry on the agent op) rather than quietly producing a smaller prefab.
+
+  ⚠️ **The unit of exclusion is a generated REGION, not a tagged entity** — a region being a tagged
+  subtree whose top's parent is not tagged. Create Prefab excludes every region that STARTS inside
+  the selection, except one starting at the selection root itself, which is the deliberate "bake
+  this". Both simpler rules are wrong, and both were written before this one:
+  - *"drop every tagged entity in the selection"* destroys the bake case, because in production
+    **every** member of a region carries the tag (`spawnEntity` tags whatever is spawned inside a
+    system tick), not just its top — so baking a pooled row would write a one-entity prefab.
+  - *"skip filtering whenever the selection sits anywhere inside a region"* re-opens this very
+    issue: an unrelated region deeper in the selection is then written into the file as an authored
+    member **and** tagged as an instance member, silently, with the report suppressed. Measured by
+    the close-out re-review on a `PooledRow → Middle → InnerPooled` tree.
+
+  The count is scoped to the selection for the same reason the exclusion is: a world-wide tally made
+  every Create Prefab in a pooled scene warn about entities it had not dropped, which is the alarm
+  that makes the true report unreadable.
+
+⚠️ **Create Prefab reads the world TWICE, and both reads go through `authoringEntitiesFor`.**
+`serializePrefab` writes the file; `tagEntityTreeAsInstance` then re-walks the tree and re-runs
+`planPrefabRows` to convert it into a live instance — and **refuses to tag at all** when its plan
+does not match the file (`planMatchesFile`, a bare `return`). So a selection rule applied to one
+read and not the other does not produce a wrong prefab, it produces a prefab asset with **no
+instance in the scene and nothing logged**. This is the second instance of that shape: #1278 was
+the first (a held nested instance gave the two reads different localId spaces). `planMatchesFile`
+is the backstop; the two reads agreeing at the source is the fix.
+
+⚠️ **The subtree is the load-bearing half, not the tag.** Only the ROOT of a generated subtree is
+tagged (`spawnPrefabInstance` tags the instance root; members spawned outside a system tick are not).
+A reader that filters on `has(Transient)` alone keeps the members and drops their parent — an
+orphaned half-subtree, which is worse than not filtering at all.
+
+⚠️ **This is NOT a Play-mode concern, and reading it as one is why both misses looked unreachable.**
+`runPipeline` skips a system only below `TRANSFORM` (200), and the UIEntries pool sits at 270 so a
+paused list keeps recycling: measured on `games/scroll-demo`, a **stopped** editor holds 16 pooled
+entities out of 36, including 8 live prefab-instance roots that match `collectInstanceRoots`' filter
+exactly. A scrub envelope also reports `playState: 'stopped'` (#1122/#1148), which is what lets an
+authoring mutation through in the first place. Play-mode spawns, by contrast, never survive Stop —
+`playMode.ts` reloads the snapshot and discards them.
+
+⚠️ **What actually applies the tag is the SYSTEM TICK, not the spawner — and that is load-bearing.**
+`spawnPrefabInstance` tags only when `forceTransient` is passed or the run-mode is not `stopped`
+(`loadSceneFile.ts`), and the timeline scrub is the only caller passing `forceTransient`. The
+UIEntries pool's rows and the control-track edge's spawns are tagged because `spawnEntity` tags
+**everything spawned inside a system tick** (`core/ecs/world.ts`), and `entriesSystem` spawns from
+inside its own tick deliberately. So: move the pool's growth out of the tick — to a DOM handler, a
+React effect, a deferred callback — and every reader above goes quiet with no test failing. The
+pool's docblock already says it must spawn inside the tick; this is the other half of why.
+
+⚠️ **Therefore "a runtime spawn is `Transient`" is NOT universal, and a game's own spawn is the
+gap.** A game spawning a prefab from `onSceneReady` while stopped, outside a tick, gets **no tag** —
+so `collectInstanceRoots` still fans out to it and Create Prefab still bakes it in.
+`games/sling/runtime/field/rebuildField.ts` adds the tag by hand, which is evidence the hole is
+known and nothing makes it structural. Fixing that means changing where the tag comes from, not
+adding a fifth reader-side check (found by #1301's close-out review, F8; not filed).
+
+⚠️ **The predicate lives in its own module, not on `entityUtils`.** Most editor tests mock
+`entityUtils` with an explicit object literal, so an export added there arrives `undefined` in every
+one of them — the guard would be silently absent in all 284 files while they all stayed green.

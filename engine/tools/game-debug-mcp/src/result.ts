@@ -18,12 +18,14 @@
 // The cap, `capText`, `encode` and `isFailureBody` are SHARED with the editor MCP server — one
 // implementation, because a rule implemented twice diverges (conventions §9). This file keeps only
 // what is genuinely device-specific: eval serialization, screenshots, MIME extensions.
-export { isFailureBody } from '../../shared/mcpResult.js';
+export { isFailureBody, codeFromBody, optionsFromBody, codeFromStatus } from '../../shared/mcpResult.js';
 export { ERROR_CODES, type ErrorCode, type ToolErrorDetail } from '../../shared/mcpResult.js';
 import {
   MAX_PAYLOAD_CHARS, capText as sharedCapText, encode, encodeError,
   type ToolErrorDetail,
 } from '../../shared/mcpResult.js';
+import { decodeDeviceRefusal } from '../../shared/deviceRefusal.js';
+import { codeFromBody, optionsFromBody, codeFromStatus } from '../../shared/mcpResult.js';
 
 // ── Failures: the §5 envelope, device edition ────────────────────────────────
 // `docs/mcp-tool-conventions.md` §5. Before this, every device tool ended in
@@ -42,12 +44,61 @@ export function deviceFail(detail: ToolErrorDetail): DeviceResult {
   return { content: [{ type: 'text', text: encodeError(detail) }], isError: true };
 }
 
+/** A backend call that did not return a usable answer.
+ *
+ *  ⚠️ It carries the STATUS and the BODY, and that is the whole point: without them every backend
+ *  refusal reached `caughtFailure` as bare prose and left as `NOT_AVAILABLE_HERE` — "the app may
+ *  have been backgrounded or killed; relaunch it" — including a 409 the caller could have cleared
+ *  in one call (#1211 C-4). A message alone cannot be classified; a status can. */
+export class BackendError extends Error {
+  // Plain fields, not parameter properties: the root tsconfig sets `erasableSyntaxOnly`, under
+  // which `constructor(readonly status?: number)` is a syntax error — and the per-package tsc does
+  // not set it, so that spelling typechecks locally and fails only at the gate.
+  status?: number;
+  body?: unknown;
+  constructor(message: string, status?: number, body?: unknown) {
+    super(message);
+    this.status = status;
+    this.body = body;
+  }
+}
+
+/** The backend ANSWERED 2xx, but not in a shape this MCP can read (#1313, §9-bis). The editor
+ *  backend versions independently of this process, and a host that does not serve the route can
+ *  answer 200 with an HTML page. Neither case is an empty answer, so it is reported as "could not read", never
+ *  decoded into one. Deliberately NOT a `BackendError`: it has no status to classify. */
+export class BackendShapeError extends Error {
+  path: string;
+  got: string;
+  /** The route RAN: a POST answered with JSON this build cannot read. The request may already have
+   *  changed state, so the refusal must not read as "safe to retry" (§9-bis — `/api/scene-mutate`
+   *  double-applied a write that way). A non-JSON body came from something that is not the route, so
+ *  nothing ran. */
+  mayHaveApplied: boolean;
+  constructor(path: string, got: string, mayHaveApplied: boolean) {
+    super(`the editor answered ${path} with a shape this MCP cannot read (${got})`);
+    this.path = path;
+    this.got = got;
+    this.mayHaveApplied = mayHaveApplied;
+  }
+}
+
 /** Turn a THROWN transport error into an envelope, classified by what actually went wrong.
- *  All three cases used to arrive as the same `Error: <message>` string. */
+ *  They all used to arrive as the same `Error: <message>` string. */
 export function caughtFailure(tool: string, what: string, e: unknown): DeviceResult {
   const msg = e instanceof Error ? e.message : String(e);
-  // The backend is up but holds no lease — by far the most common failure, and the only one with a
-  // precise remedy. Reported as anonymous prose it read as "the tool is broken".
+  if (e instanceof BackendShapeError) {
+    return deviceFail({
+      code: 'NOT_AVAILABLE_HERE',
+      tool, what,
+      why: `${msg} — this is NOT an empty answer; nothing could be read.`
+        + (e.mayHaveApplied ? ' The request DID reach the editor, so if this call changes state it may already have applied.' : ''),
+      options: [
+        ...(e.mayHaveApplied ? ['if this call changes state, do not retry blindly — the request reached the editor, so check whether it already applied'] : []),
+        'restart the editor — its backend and this MCP are from different builds',
+      ],
+    });
+  }
   if (/no device connected/i.test(msg)) {
     return deviceFail({
       code: 'NOT_AVAILABLE_HERE',
@@ -75,22 +126,61 @@ export function caughtFailure(tool: string, what: string, e: unknown): DeviceRes
       ],
     });
   }
+  // ⚠️ AFTER the two transport cases above, deliberately. The lease relay answers "no device
+  // connected" as an HTTP failure, so classifying by status first turned the most common failure on
+  // this surface — no lease — into REFUSED_BY_OP and dropped the three options that say how a HUMAN
+  // connects one. Status classification is for a backend that answered ABOUT THE OP.
+  // A backend that ANSWERED — 4xx/5xx with a body — is classified from what it said, exactly as the
+  // editor MCP classifies its own (`codeFromStatus` is shared between them). Only a backend that
+  // could not be reached at all falls through to the transport cases below. Before this, a 409 read
+  // as "relaunch the app" (#1211 C-4).
+  if (e instanceof BackendError && typeof e.status === 'number') {
+    // The body's own `error`, never `msg`: `backendGet` defaults an empty body's message to
+    // "HTTP 404", which `codeFromStatus` would read as a real detail and call NOT_FOUND — where the
+    // editor MCP (and the truth: nobody answered for that route) says NOT_AVAILABLE_HERE.
+    const detail = e.body && typeof e.body === 'object' && typeof (e.body as { error?: unknown }).error === 'string'
+      ? (e.body as { error: string }).error : undefined;
+    const bodyOptions = optionsFromBody(e.body);
+    // ⚠️ A 5xx is still "the request could not be completed" — the device relay answers every
+    // transport failure and timeout as 502, connect/disconnect every failure as 500 — so it keeps
+    // the transport advice unless the backend named better. Only a 4xx is the caller's to fix.
+    const serverSide = e.status >= 500;
+    return deviceFail({
+      code: codeFromBody(e.body, codeFromStatus(e.status, detail)),
+      tool, what,
+      why: serverSide
+        ? `the request to the device failed (HTTP ${e.status}): ${msg}`
+        : `the backend refused with HTTP ${e.status}: ${msg}`,
+      ...(e.body !== undefined ? { got: e.body } : {}),
+      ...(bodyOptions ? { options: bodyOptions } : serverSide ? { options: TRANSPORT_OPTIONS } : {}),
+    });
+  }
+  // The backend is up but holds no lease — by far the most common failure, and the only one with a
+  // precise remedy. Reported as anonymous prose it read as "the tool is broken".
   return deviceFail({
     code: 'NOT_AVAILABLE_HERE',
     tool, what,
     why: `the request to the device failed: ${msg}`,
-    options: ['device_status — confirm the lease is still held', 'the device app may have been backgrounded or killed; relaunch it and reconnect'],
+    options: TRANSPORT_OPTIONS,
   });
 }
+
+const TRANSPORT_OPTIONS = ['device_status — confirm the lease is still held', 'the device app may have been backgrounded or killed; relaunch it and reconnect'];
 
 /** The device answered, but its reply is an `Error: …` STRING rather than a thrown error — a
  *  selector miss, an occluded target, no canvas. A refusal by the op, not a transport failure. */
 export function deviceReplyFailure(tool: string, what: string, reply: unknown, options?: string[]): DeviceResult {
+  // The refusal's own code/options/stale when the device named them (`deviceRefusal.ts`, #1223 P3):
+  // an entity aim knows NOT_FOUND from AMBIGUOUS from OCCLUDED, and its options are the real
+  // choices (the guids), which beat this call site's generic advice. An older app build sends no
+  // tail and lands on the generic refusal, as before.
+  const r = decodeDeviceRefusal(String(reply));
   return deviceFail({
-    code: 'REFUSED_BY_OP',
+    code: r.code ?? 'REFUSED_BY_OP',
     tool, what,
-    why: `the device refused: ${String(reply)}`,
-    ...(options ? { options } : {}),
+    why: `the device refused: ${r.message}`,
+    ...(r.stale ? { got: { stale: r.stale } } : {}),
+    ...(r.options ? { options: r.options } : options ? { options } : {}),
   });
 }
 

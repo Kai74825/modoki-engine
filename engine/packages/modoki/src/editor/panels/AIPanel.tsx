@@ -7,12 +7,14 @@ import React, { useCallback, useEffect, useRef, useState } from 'react';
 import {
   type ConnectStatus,
   type ConnectResult,
+  claudeCliState,
   connectionSummary,
   portRows,
   runInstruction,
 } from './aiPanelModel';
 import DeviceConnectSection from './DeviceConnectSection';
 import AiCaptureSection from './AiCaptureSection';
+import { confirmDiscardUnsaved } from '../scene/unsavedGate';
 
 /** Access the whitelisted preload invoke bridge (null outside the Electron editor). */
 function electronInvoke<T = unknown>(channel: string, payload?: unknown): Promise<T> | null {
@@ -77,6 +79,9 @@ export default function AIPanel(): React.ReactElement {
   }, [refresh]);
 
   const toggleCdp = useCallback(async (on: boolean) => {
+    // Packaged, this RELAUNCHES the editor — ask before the page goes (#1419). (In dev main
+    // refuses the toggle, so the question costs a clean editor nothing.)
+    if (!(await confirmDiscardUnsaved('relaunch the editor to change renderer debugging', 'page-unload'))) return;
     const p = electronInvoke<{ ok: boolean; error?: string }>('modoki:set-cdp-enabled', on);
     if (!p) return;
     setBusy(true); setNote(on ? 'Enabling renderer debugging — the editor will relaunch…' : 'Disabling renderer debugging — the editor will relaunch…');
@@ -157,7 +162,7 @@ export default function AIPanel(): React.ReactElement {
         <div style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '4px 2px' }}>
           <Dot level={status.claude.found ? 'ok' : 'action'} />
           <span style={{ flex: 1, color: '#aaa' }}>claude CLI</span>
-          <span style={{ color: status.claude.found ? '#2ecc71' : '#e0a030' }}>{status.claude.found ? 'found' : 'not found'}</span>
+          <span style={{ color: status.claude.found ? '#2ecc71' : '#e0a030' }}>{claudeCliState(status.claude)}</span>
         </div>
         {/* WHICH file we actually read/write. For an in-repo game this is the REPO ROOT's
             .mcp.json, not the game folder's — claude only searches upward from its cwd, so
@@ -213,7 +218,7 @@ export default function AIPanel(): React.ReactElement {
         </div>
       )}
 
-      {!status.claude.found && (
+      {claudeCliState(status.claude) === 'not found' && (
         <a href="https://claude.com/claude-code" target="_blank" rel="noreferrer" style={{ color: '#5aa0e0', display: 'inline-block', marginBottom: 8 }}>
           Install Claude Code ↗
         </a>

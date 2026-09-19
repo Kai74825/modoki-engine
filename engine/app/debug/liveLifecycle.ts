@@ -18,49 +18,45 @@ import {
   getAllTraits,
   readTraitDataFull,
   findEntity,
-  findEntityByGuid,
+  guidOfEntityId,
   spawnEntity,
   deleteEntity,
   getCurrentWorld,
   newGuid,
+  durableGuid,
+  cloneTraitValues,
+  remapGuidValues,
+  planCopyGuids,
+  templateKeyOf,
+  setTemplateKey,
+  carryEntityIdFields,
   buildEntityCreateSpecs,
   resolveCreateEntitySpec,
+  isResourceEntity,
+  parentRefusal,
   type CreateEntitySpec,
 } from '@modoki/engine/runtime';
+import { resolveEntityAddress, guidListFields, descendantsOf, alsoDeletedFields } from './entityRef';
+import type { ErrorCode } from '../../tools/shared/mcpResult';
 
 const LIVE_ONLY = 'live world only — no project on disk here, and a relaunch is the undo. There is no undo stack.';
 
-export interface LifecycleFailure { ok: false; error: string; options?: string[] }
+export interface LifecycleFailure { ok: false; error: string; code?: ErrorCode; options?: string[]; stale?: string }
 
-/** Resolve `{guid}` (preferred) or `{id}` to a LIVE entity id.
- *
- *  A guid resolves to the RIGHT entity or fails; a recycled numeric id can silently name a
- *  DIFFERENT entity after a hot-reload, which on a DELETE is data loss reported as success. Same
- *  reasoning as the editor op's C7 fix. */
-function resolveLiveId(ref: { id?: number; guid?: string }): number | null {
-  if (ref.guid != null) {
-    const ent = findEntityByGuid(ref.guid);
-    return ent ? ent.id() : null;
-  }
-  if (ref.id != null) return findEntity(ref.id) ? ref.id : null;
-  return null;
+/** A shared-resolver refusal (`entityRef.ts`, #1223) as this op's failure: its code, options and
+ *  `stale` travel with the message, and `tail` says what was NOT done. */
+function addressFailure(r: { code?: ErrorCode; error: string; options?: string[]; stale?: string }, tail: string): LifecycleFailure {
+  return { ok: false, error: `${r.error} — ${tail}`, ...(r.code ? { code: r.code } : {}), ...(r.options ? { options: r.options } : {}), ...(r.stale ? { stale: r.stale } : {}) };
 }
 
 function attrMeta() {
   return getAllTraits().find((m) => m.name === 'EntityAttributes');
 }
 
-/** An entity's authored guid, or `null` when it has none (#1199).
- *
- *  ⚠️ NEVER `String(id)` as the fallback. That is what this used to return, and it is a live id
- *  disguised as a guid: it looks addressable, and every guid-addressed op then refuses it (a
- *  guid-less entity is not in the guid index) with a message telling the caller to use guids.
- *  `null` says "no guid yet" in the reply's own type; the row's `id` is still there beside it.
- *  Exported so the `set-traits` op reports the same way. */
+/** An entity's guid, or `null` when it has none (#1199). NEVER `String(id)` — see `guidOfEntityId`
+ *  (runtime `core/ecs/entityUtils.ts`), which this names for the ops that already import it from here. */
 export function liveGuidOf(id: number): string | null {
-  const meta = attrMeta();
-  const d = meta ? (readTraitDataFull(id, meta) as Record<string, unknown> | null) : null;
-  return (d?.guid as string) || null;
+  return guidOfEntityId(id);
 }
 
 /** Give a freshly-spawned entity a stable guid. The editor mints one via its undo-aware
@@ -70,7 +66,10 @@ function mintGuid(id: number): string | null {
   const meta = attrMeta();
   const entity = findEntity(id);
   if (!meta || !entity) return null;   // not String(id) — see liveGuidOf (#1199)
-  const existing = (readTraitDataFull(id, meta) as Record<string, unknown> | null)?.guid as string | undefined;
+  // Durable only (#1210): `spawnEntity` already gave the entity a RUNTIME guid, which dies with the
+  // world — a Play→Stop revert rebuilds it and the reply's guid would name nothing. The reply exists
+  // to hand back an address that survives that, so mint over a runtime guid like an empty one.
+  const existing = durableGuid((readTraitDataFull(id, meta) as Record<string, unknown> | null)?.guid as string | undefined);
   if (existing) return existing;
   const guid = newGuid();
   if (!entity.has(meta.trait)) entity.add(meta.trait);
@@ -104,15 +103,17 @@ export function createEntityLive(params: unknown): unknown {
   const resolved = resolveCreateEntitySpec(p.spec);
   if (!resolved.ok) return { ok: false, error: resolved.error, options: resolved.options };
 
+  // `parentId: 0` alone is the root; anything else resolves through the shared resolver, which refuses
+  // a stale parent (an ORPHAN reported as success, conventions §3), a guid beside an id (D1), and an id
+  // for a parent that has a guid (D2).
   let parentId = 0;
-  if (p.parentGuid != null) {
-    const pid = resolveLiveId({ guid: p.parentGuid });
-    if (pid == null) return { ok: false, error: `parentGuid "${p.parentGuid}" matched no live entity — nothing was created.` };
-    parentId = pid;
-  } else if (p.parentId != null && p.parentId !== 0) {
-    // A stale numeric parent id would produce an ORPHAN reported as success (conventions §3).
-    if (!findEntity(p.parentId)) return { ok: false, error: `parentId ${p.parentId} matched no live entity — nothing was created. Ids are reassigned on scene reload; prefer parentGuid.` };
-    parentId = p.parentId;
+  if (p.parentGuid || (p.parentId != null && p.parentId !== 0)) {
+    const r = resolveEntityAddress({ guid: p.parentGuid, id: p.parentId }, { label: 'create-entity parent', accept: ['guid', 'id'] });
+    if (!r.ok) return addressFailure(r, 'nothing was created.');
+    parentId = r.id;
+  }
+  if (parentRefusal(parentId)) {
+    return { ok: false, error: `parent ${parentId} is a resource (Time, Input, a config singleton) and holds no children — a child under the Transient Time/Input singleton is dropped from every save. Nothing was created; parent it elsewhere, or omit the parent for the scene root (#1248).` };
   }
 
   const { name, specs } = buildEntityCreateSpecs(resolved.spec, parentId);
@@ -131,31 +132,25 @@ export function createEntityLive(params: unknown): unknown {
  *  makes the walk terminate on any graph; `guardParentWrite` in liveMutate.ts stops the illegal
  *  state being created in the first place. Both, because either alone leaves a hole. */
 function subtreeOf(rootId: number): number[] {
-  const all = getAllEntities();
-  const out = [rootId];
-  const seen = new Set([rootId]);
-  for (let i = 0; i < out.length; i++) {
-    for (const e of all) {
-      if (e.parentId !== out[i] || seen.has(e.id)) continue;
-      seen.add(e.id);
-      out.push(e.id);
-    }
-  }
-  return out;
+  return [rootId, ...descendantsOf([rootId])];
 }
 
 /** Copy an entity AND its descendants. A shallow copy would be a false success for any parent —
  *  "duplicate this" that silently drops the children is the shape conventions §0 ranks worst. */
 export function duplicateEntityLive(params: unknown): unknown {
   const p = (params ?? {}) as { id?: number; guid?: string; count?: number };
-  const rootId = resolveLiveId(p);
-  if (rootId == null) {
-    return { ok: false, error: `duplicate-entity: ${p.guid != null ? `guid "${p.guid}"` : `id ${p.id}`} matched no live entity — nothing was duplicated.` };
-  }
+  const r = resolveEntityAddress(p, { label: 'duplicate-entity', accept: ['guid', 'id'] });
+  if (!r.ok) return addressFailure(r, 'nothing was duplicated.');
+  const rootId = r.id;
   // Refuse a malformed count rather than quietly substituting 1: `count: "5"` used to return
   // {ok:true, created:1} — the caller asked for five and nothing in the reply said the field was
   // ignored. Every other malformed input in these two files is refused loudly; this was the one
   // place that guessed.
+  if (isResourceEntity(rootId)) {
+    // Same refusal as the editor's duplicate-entity and the Hierarchy's disabled Duplicate (#1248). A copy
+    // is a second world singleton, and for Input its per-frame maps would be SHARED by reference.
+    return { ok: false, error: `duplicate-entity: entity ${rootId} is a resource (Time, Input, a config singleton) — a world holds one, so nothing was duplicated.` };
+  }
   const count = p.count === undefined ? 1 : p.count;
   if (typeof count !== 'number' || !Number.isInteger(count) || count < 1 || count > 1000) {
     return { ok: false, error: `count must be an integer between 1 and 1000 — got ${JSON.stringify(p.count)}. Nothing was duplicated.` };
@@ -171,10 +166,13 @@ export function duplicateEntityLive(params: unknown): unknown {
     for (const meta of all) {
       if (!entity?.has(meta.trait)) continue;
       const data = readTraitDataFull(id, meta) as Record<string, unknown> | null;
-      traits.push({ name: meta.name, ...(data ? { data: { ...data } } : {}) });
+      // A deep clone: readTraitDataFull hands back LIVE references, so a shallow copy would share an
+      // AoS array (UIAction.bindings) with the source (each copy is cloned again below).
+      traits.push({ name: meta.name, ...(data ? { data: cloneTraitValues(data) as Record<string, unknown> } : {}) });
     }
     const parent = getAllEntities().find((e) => e.id === id)?.parentId ?? 0;
-    return { id, parentId: parent, traits };
+    // The template key is an unregistered marker the registry walk above never sees (#1430).
+    return { id, parentId: parent, traits, key: templateKeyOf(entity) };
   });
 
   const roots: Array<{ id: number; guid: string | null }> = [];
@@ -188,21 +186,31 @@ export function duplicateEntityLive(params: unknown): unknown {
     return { ok: false as const, error: `duplicate-entity: ${why} Nothing was kept — ${spawned.length} partial copy entit${spawned.length === 1 ? 'y was' : 'ies were'} rolled back.` };
   };
 
+  type Node = (typeof snapshot)[number];
+  const childrenOf = new Map<number, Node[]>();
+  for (const src of snapshot) {
+    if (src.id !== rootId) childrenOf.set(src.parentId, [...(childrenOf.get(src.parentId) ?? []), src]);
+  }
+  const dataOf = (node: Node, name: string) => node.traits.find((t) => t.name === name)?.data ?? null;
+
   for (let n = 0; n < count; n++) {
     const idMap = new Map<number, number>();
+    // A copy must NOT inherit the original's guid — two entities answering to one address is the
+    // addressing failure every Percept tool would then inherit — and a ref INSIDE the copy must
+    // follow it, or the copy drives the source (#1338). One plan per copy: each gets its own guids.
+    const { guidOf, remap, keyed } = planCopyGuids(snapshot[0]!, (node) => childrenOf.get(node.id) ?? [], dataOf, (node) => node.id, newGuid, (node) => node.key);
     for (const src of snapshot) {
       const specs = src.traits.map((t) => {
-        if (t.name !== 'EntityAttributes' || !t.data) return t;
-        // A copy must NOT inherit the original's guid — two entities answering to one address is
-        // the addressing failure every Percept tool would then inherit. Re-parent within the copy.
+        if (!t.data) return t;
+        // Cloned PER COPY: remapGuidValues hands back the same object where nothing changed, and koota
+        // stores what it is given, so two copies would otherwise share one bindings array.
+        const data = cloneTraitValues(remapGuidValues(t.data, remap) as Record<string, unknown>) as Record<string, unknown>;
+        if (t.name !== 'EntityAttributes') return { name: t.name, data };
+        // Re-parent within the copy.
         const mappedParent = idMap.get(src.parentId);
         return {
           name: t.name,
-          data: {
-            ...t.data,
-            guid: newGuid(),
-            ...(mappedParent !== undefined ? { parentId: mappedParent } : {}),
-          },
+          data: { ...data, guid: guidOf.get(src)!, ...(mappedParent !== undefined ? { parentId: mappedParent } : {}) },
         };
       });
       // A trait factory can THROW on data it dislikes, not just return null — and an uncaught throw
@@ -216,7 +224,10 @@ export function duplicateEntityLive(params: unknown): unknown {
       if (newId == null) return rollback('a trait on the source entity is not registered in this build, so the copy would be incomplete.');
       spawned.push(newId);
       idMap.set(src.id, newId);
+      if (keyed.has(src)) setTemplateKey(findEntity(newId), src.key);
     }
+    // Numeric refs (PrefabInstance.rootInstanceId) need the new ids, so they follow once the copy exists.
+    carryEntityIdFields(snapshot.map((src) => ({ id: idMap.get(src.id)!, traits: src.traits })), idMap);
     const newRoot = idMap.get(rootId)!;
     roots.push({ id: newRoot, guid: liveGuidOf(newRoot) });
   }
@@ -244,17 +255,22 @@ export function deleteEntitiesLive(params: unknown): unknown {
 
   const targets: number[] = [];
   const missing: Array<{ id?: number; guid?: string }> = [];
-  for (const r of refs) {
-    const id = resolveLiveId(r);
-    if (id == null) missing.push(r);
-    else if (!targets.includes(id)) targets.push(id);
+  let stale: string | undefined;
+  for (const ref of refs) {
+    const r = resolveEntityAddress(ref, { label: 'delete-entities', accept: ['guid', 'id'] });
+    if (r.ok) { if (!targets.includes(r.id)) targets.push(r.id); continue; }
+    // A wrong ADDRESS (an id for an entity that has a guid, #1223 D2) refuses the call on its own terms.
+    if (r.code !== 'NOT_FOUND') return addressFailure(r, 'NOTHING was deleted.');
+    stale ??= r.stale;
+    missing.push(ref);
   }
   // Refuse the WHOLE call on any unresolvable ref rather than deleting the rest: a partial delete
   // reported alongside a miss leaves the caller unable to tell which entities are now gone.
   if (missing.length) {
     return {
-      ok: false,
+      ok: false, code: 'NOT_FOUND',
       error: `${missing.length} of ${refs.length} ref(s) matched no live entity — NOTHING was deleted. Missing: ${missing.map((m) => m.guid ?? `#${m.id}`).join(', ')}`,
+      ...(stale ? { stale } : {}),
     };
   }
 
@@ -262,7 +278,12 @@ export function deleteEntitiesLive(params: unknown): unknown {
   // parent destroys a child that is also in `targets` — and reading that child's guid afterwards
   // finds no entity, reporting `null` for an entity that had a real guid. Same
   // snapshot-before-mutating discipline duplicateEntityLive uses one function up.
-  const deleted = targets.map(liveGuidOf);
+  // Named by guid, the same shape as the editor op (#1223 P2): `deleted` lists the guids and
+  // `deletedNoGuidIds` the ids of any target that has none. It was a COUNT beside a `guids` array
+  // holding a bare `null` per guid-less target, which said one was deleted and not which.
+  const deleted = guidListFields('deleted', targets);
+  // …and the descendants the cascade takes with them, which the reply never mentioned (#1216 C-6).
+  const also = alsoDeletedFields(descendantsOf(targets));
   for (const id of targets) deleteEntity(id);   // a second delete of a cascaded child is a safe no-op
-  return { ok: true, deleted: deleted.length, guids: deleted, saved: false, savedNote: LIVE_ONLY };
+  return { ok: true, ...deleted, ...also, saved: false, savedNote: LIVE_ONLY };
 }

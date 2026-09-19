@@ -44,6 +44,9 @@ vi.mock('../../src/editor/scene/prefab', () => ({
   installPrefabSnapshot: (...a: any[]) => installPrefabSnapshot(...a),
   guidForEntityId: (id: number) => (id === 1 ? 'g-root' : ''),
   entityIdForGuid: (guid: string) => (guid === 'g-root' ? 1 : 0),
+  // #1431: undo/redo re-derive carried BASE instances; this suite's instance is primary, and its
+  // subject is the prefab + primary scene pair — pinned in engine/tests/editor/applyPrefabDirtiesBase.test.ts.
+  refreshBaseInstances: vi.fn(),
 }));
 
 let currentBaseScene: string | undefined;
@@ -118,6 +121,16 @@ describe('applyToPrefabWithUndo — Apply is undoable, restores BOTH prefab + sc
     setCurrentBaseScene.mockClear();
     await pushed!.undo();
     expect(setCurrentBaseScene).toHaveBeenCalledWith('base-guid-after-undo');
+  });
+
+  // #1258: the agent `apply` op answers with `result.warnings`, and this wrapper is the layer between it and
+  // applyToPrefabSelective, which fills them. A wrapper that rebuilt its result would empty the agent's list silently.
+  it('hands back the validation warnings applyToPrefabSelective reported, the same list', async () => {
+    const warnings = ['entity[localId=1] "Ship".UIElement.width is inert'];
+    applyResult = { ...applyResult, warnings };
+    const { applyToPrefabWithUndo } = await getModule();
+    const result = await applyToPrefabWithUndo(1, new Set(['1.Transform.x']));
+    expect(result.warnings).toBe(warnings);
   });
 
   it('does not push an undo entry for a no-op apply', async () => {

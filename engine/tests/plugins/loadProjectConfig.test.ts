@@ -589,6 +589,52 @@ describe('validateBuildConfig', () => {
     expect(validateBuildConfig(withCfg({}, { appId: 'com.x && curl evil' }), DEFAULT_PROJECT_USER_CONFIG).length).toBeGreaterThan(0);
   });
 
+  // #1441, observed live: Project Settings ▸ Browse… for JAVA_HOME on Windows, then Apply, refused
+  // its own picked folder — the allowlist had no drive letter, so NO Windows absolute path passed.
+  it('accepts a Windows SDK path spelled with a drive and / separators', () => {
+    for (const p of ['D:/Downloads', 'C:/Program Files/Eclipse Adoptium/jdk-21.0.4.7-hotspot', 'c:/Users/x/AppData/Local/Android/Sdk']) {
+      expect(validateBuildConfig(DEFAULT_PROJECT_CONFIG, withUser(undefined, { javaHome: p, androidHome: p, gcloudPath: p })), p).toEqual([]);
+    }
+  });
+
+  // #1444: `(x86)` is where the Windows Cloud SDK installs by default, and an Android SDK sits under
+  // the user's own folder — non-ASCII for a Japanese user name. `ユーザー` in NFD carries a combining
+  // mark (U+3099), the spelling macOS file APIs hand back.
+  it('accepts a Program Files (x86) path and a non-ASCII user folder', () => {
+    for (const p of [
+      'C:/Program Files (x86)/Google/Cloud SDK/google-cloud-sdk/bin',
+      'C:/Users/山田太郎/AppData/Local/Android/Sdk',
+      'C:/Users/ユーサ\u3099ー/AppData/Local/Android/Sdk',
+      // An accented folder under a placeholder user: `/Users/<name>` with a real-looking name is a
+      // blocking finding in scan-publish-safety (it read `José` as the username `Jos`).
+      '/Users/me/Développement/Android/sdk',
+    ]) {
+      expect(validateBuildConfig(DEFAULT_PROJECT_CONFIG, withUser(undefined, { javaHome: p, androidHome: p, gcloudPath: p })), p).toEqual([]);
+    }
+  });
+
+  it('widened for #1444 by inert characters only — every shell-active one is still refused', () => {
+    const errs = (javaHome: string) => validateBuildConfig(DEFAULT_PROJECT_CONFIG, withUser(undefined, { javaHome }));
+    for (const bad of ['C:/x/$(reboot)', 'C:/x/`reboot`', 'C:/x;reboot', 'C:/x && reboot', 'C:/x | reboot',
+      "C:/x'y", 'C:/x"y', 'C:/x<y', 'C:/x>y', 'C:/x\nreboot', 'C:/x$HOME', 'C:/x~', 'C:/x*']) {
+      expect(errs(bad), JSON.stringify(bad)).toHaveLength(1);
+    }
+  });
+
+  it('still refuses a colon anywhere but a leading drive, and every backslash — with a hint for the latter', () => {
+    const errs = (javaHome: string) => validateBuildConfig(DEFAULT_PROJECT_CONFIG, withUser(undefined, { javaHome }));
+    expect(errs('/jdk:/x')).toHaveLength(1);
+    expect(errs('D:/x:y')).toHaveLength(1);
+    expect(errs('DD:/x')).toHaveLength(1);
+    expect(errs('D:/jdk"; touch pwned; "')).toHaveLength(1);
+    // The backslash is refused rather than rewritten — it is the character that can swallow a
+    // closing quote — but the message says what to type instead.
+    expect(errs('D:\\Downloads')).toEqual([expect.stringContaining('use / as the separator')]);
+    // The hint is for paths, not every field that happens to hold a backslash.
+    expect(validateBuildConfig(withCfg({ webCdnUrlMap: 'a\\b' }), DEFAULT_PROJECT_USER_CONFIG))
+      .toEqual([expect.not.stringContaining('use / as the separator')]);
+  });
+
   it('does NOT sanitize the custom deploy command (it is a trusted shell command)', () => {
     expect(validateBuildConfig(withCfg({ webDeployCommand: 'rsync -a {dist}/ host:/var/www && echo done' }), DEFAULT_PROJECT_USER_CONFIG)).toEqual([]);
   });

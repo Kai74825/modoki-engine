@@ -8,7 +8,7 @@
 import { z } from 'zod';
 import type { ToolDef } from '../toolDef.js';
 import type { ToolContext } from '../context.js';
-import { type ToolResult } from '../result.js';
+import { type ToolResult, MAX_PAYLOAD_CHARS } from '../result.js';
 import { summarizeAssets, summarizeTraits, type AssetEntry, type TraitSchema } from '../summarize.js';
 import { mutateOpSchema, precisionParam, unsavedForceParam } from '../shapes.js';
 import { describeShape } from '../../../shared/mcpResult.js';
@@ -27,8 +27,8 @@ export function registerSceneTools(tool: ToolDef, ctx: ToolContext): void {
       'To get VALUES, target or enrich: trait=<Trait> | id=<n> | name=<substr> | ' +
       'where="Transform.y>3" | full=true (every field, incl. AoS/object fields the compact dump ' +
       'omits) | world/bounds/contacts. Address entities by `guid` — runtime ids are reassigned ' +
-      'on every scene hot-reload. `guid: null` means none has been minted yet (a runtime spawn, or ' +
-      'an entity never saved or edited) — address that one by id. The index applies a default limit (see `hint`/`truncated`); a ' +
+      'on every scene hot-reload. Every entity has a guid: a code-spawned one carries a runtime guid, valid ' +
+      'until the scene reloads. The index applies a default limit (see `hint`/`truncated`); a ' +
       'targeted query is never silently capped. A bad `where` returns a `warnings` array rather ' +
       'than silently ignoring the filter.',
     {
@@ -39,7 +39,7 @@ export function registerSceneTools(tool: ToolDef, ctx: ToolContext): void {
       where: z.string().optional().describe('Filter by predicate "Trait.field op value", op ∈ = != > >= < <= ~ (~=contains). E.g. "Transform.y>5". Unparseable/unknown-trait/unknown-field → a `warnings` entry, not a silent full dump.'),
       full: z.boolean().optional().describe('Include EVERY persistent trait field (AoS/object fields like animSets/materials/onClickSet), not just the curated Inspector subset. Default false (bare = a names-only index). NOTE: an UNTARGETED full=1 on a real scene exceeds the response cap and comes back as an elision envelope — combine it with trait=/id=/name=/where= or limit=.'),
       resources: z.boolean().optional().describe('Force-include resource entities (mesh/material/prefab/env holders + config singletons Time/Physics/NPRPostFX). Excluded from the DEFAULT untargeted listing only — any id/trait/name/where filter already includes them.'),
-      limit: z.number().int().nonnegative().optional().describe('Cap the number of entities returned; response sets truncated:true + totalCount when hit. The untargeted INDEX applies a default cap; an explicit limit always wins, and a targeted query is never capped unless you pass one.'),
+      limit: z.number().int().nonnegative().optional().describe('Cap the entities returned. `returnedCount` is what came back and `totalCount` every match before the cap (both always); truncated:true when it bites. The untargeted INDEX applies a default cap; an explicit limit always wins, and a targeted query is never capped unless you pass one.'),
       world: z.boolean().optional().describe('Add each entity\'s RESOLVED world transform (position/rotation/scale after parent-chain propagation) + activeInHierarchy flag. Default false (local Transform only). Saves composing the parent chain by hand.'),
       bounds: z.boolean().optional().describe('Add each entity\'s screen-space rect (screen {x,y,w,h} CSS px) + onScreen flag, plus (3D only) worldAABB {size:[x,y,z], center:[x,y,z]} — the TRUE geometric extent in world units (distinct from the authored scale). Geometry without a separate get_layout_bounds call. Default false. Needs the renderer.'),
       contacts: z.boolean().optional().describe('Add each body\'s CURRENT physics contacts as GUID arrays (rolled up to bodies; a partner with no guid appears as `id:<n>`): `contacts` (solid, load-bearing — resting on the ground) + `overlaps` (sensor/trigger — inside a zone). The STATE view ("what is it touching NOW"), vs the @contact/@sensor journal EVENTS ("when did they touch"). Present only on bodies currently touching something. Default false.'),
@@ -72,20 +72,27 @@ export function registerSceneTools(tool: ToolDef, ctx: ToolContext): void {
    *  documented `path` default was broken on every call for exactly that reason, so this lives in
    *  ONE place now rather than being re-derived per tool.
    *
+   *  While `modoki_prefab edit-open` has the prefab-edit world loaded there IS no scene file, so the
+   *  editor reports `prefabEditWorld` (`/__prefab-edit__/<guid>`) instead, and that handle is what
+   *  `/api/scene-mutate` applies live (#1254).
+   *
    *  Returns the path, or an already-formed error ToolResult to return as-is. */
   async function activeScenePath(path: string | undefined, toolName: string): Promise<string | ToolResult> {
     if (path) return path;
     let ref: string | undefined;
     try {
       const { status, body } = await call('/api/editor-state');
-      if (status < 400 && body && typeof body === 'object') ref = (body as { scenePathRef?: string }).scenePathRef;
+      if (status < 400 && body && typeof body === 'object') {
+        const st = body as { scenePathRef?: string; prefabEditWorld?: string };
+        ref = st.scenePathRef ?? st.prefabEditWorld;
+      }
     } catch (e) { return unreachable(e); }
     if (!ref) {
       return fail({
         code: 'NOT_FOUND',
         tool: toolName,
         what: 'resolve the ACTIVE scene as an editable path, because `path` was omitted',
-        why: "the editor reported no editable scene path. Either no scene is open, or the open scene lives outside the project's asset roots and so has no asset-root URL.",
+        why: "the editor reported no editable scene path. Either no scene is open, the open scene lives outside the project's asset roots and so has no asset-root URL, or a prefab-edit world is loaded with no edit session (an edit-exit whose scene reload failed), which nothing can save.",
         expected: 'an asset-root URL like /assets/scenes/main.scene.json',
         options: [
           'pass `path` explicitly — get the valid values from modoki_list_scenes',
@@ -105,21 +112,26 @@ export function registerSceneTools(tool: ToolDef, ctx: ToolContext): void {
       '"fields". Returns {ok, changed, errors, warnings, saved, mode} — deliberately NOT the scene ' +
       '(echoing the whole file on every edit cost ~10k tokens for data nobody read). An addEntity op ' +
       'also reports `created:[{op, id, guid, name}]`, so you address what you just made by GUID ' +
-      'instead of re-finding it by name (which is refused when the name is ambiguous). After ' +
+      'instead of re-finding it by name (which is refused when the name is ambiguous). A setTrait with ' +
+      'fields on a trait the entity does not have ADDS the trait, and says so in `addedTraits:[{op, id, guid, trait}]`. A removeEntity removes the whole ' +
+      'subtree, and `alsoDeleted` lists the descendants the call took with the entities it named (as modoki_delete_entities does; ' +
+      'on the file-direct path, only entities authored in the file — never a prefab instance\'s members). After ' +
       'mutating, verify with modoki_get_scene_state, which reads the running engine. ' +
       'PERSISTENCE (mcp-persistence.md): when the editor has this exact scene open, the ' +
       'whole call applies to the LIVE world as ONE undoable step (a human can Cmd-Z it) and stays ' +
       'live-only until modoki_save_all — persistence is MANUAL-only, so `saved:false` is the normal ' +
       'answer, not a failure. `setBaseScene` has no live equivalent and always goes straight to the ' +
       'FILE. With no editor connected, or targeting a scene that ISN\'T the one open ' +
-      'live, this falls back to writing the scene FILE directly (the browser-free curl-editing path).',
+      'live, this falls back to writing the scene FILE directly (the browser-free curl-editing path). ' +
+      'Exception — the prefab-edit world (`path` omitted during modoki_prefab edit-open): LIVE-only, never a file; ' +
+      'setBaseScene is refused there, and a call when that world is not loaded is refused rather than written.',
     {
       path: z.string().optional().describe(
         'Asset-root URL of the scene, e.g. /games/x/assets/scenes/main.scene.json. Defaults to the ' +
         'ACTIVE scene — omit it unless you mean a scene that is not the open one.'),
       ops: z.array(mutateOpSchema).describe(
         'Ops. setTrait: {"op":"setTrait","entity":{"name":"Title"},"trait":"UIElement","fields":{"fontSize":56}}. ' +
-        'removeTrait (remove a component; core Transform/EntityAttributes refused): {"op":"removeTrait","entity":{"id":7},"trait":"Light"}. ' +
+        'removeTrait (remove a component; core Transform/EntityAttributes refused, and PrefabInstance on every op — use modoki_prefab detach): {"op":"removeTrait","entity":{"id":7},"trait":"Light"}. ' +
         'addEntity: {"op":"addEntity","name":"Box","parentId":0,"traits":{"Transform":{...},"EntityAttributes":{"layer":"3d"}}}. ' +
         'removeEntity: {"op":"removeEntity","entity":{"id":11}}. ' +
         'setBaseScene (base-scene persistence — scene-level, no entity ref; guid of a base scene to load additively, or null to clear): ' +
@@ -134,8 +146,12 @@ export function registerSceneTools(tool: ToolDef, ctx: ToolContext): void {
       // editor-state probe PLUS a 30s live apply, so an MCP timeout of 30s could fire while the
       // edit was still succeeding — reporting "the backend did not respond in time" for a change
       // that LANDED. A client deadline must exceed the server budget it is waiting on.
+      // A partly failed call answers ok:false AND carries the receipts of the ops that applied (`created`,
+      // `alsoDeleted` — up to ~4k of guids, #1262). The default 8k `got` elided them into a shape preview,
+      // so a mistyped third op cost the agent the guid of the entity its first op made.
       return postJson('/api/scene-mutate', { path: resolved, ops }, 45_000,
-        `apply ${ops.length} scene op(s) (${[...new Set(ops.map((o) => o.op))].join(', ')}) to ${resolved}`);
+        `apply ${ops.length} scene op(s) (${[...new Set(ops.map((o) => o.op))].join(', ')}) to ${resolved}`,
+        { gotBudget: MAX_PAYLOAD_CHARS });
     },
   );
 
@@ -156,11 +172,14 @@ export function registerSceneTools(tool: ToolDef, ctx: ToolContext): void {
       'success. A default would just relocate that mistake into the caller\'s head. For a ROOT ' +
       'entity the two spaces are identical, so either value is correct and cheap to state.',
     {
+      // Strict: a nested z.object is not strict because its parent is, so a typo'd key was STRIPPED and
+      // arrived as an empty ref (§1's silent key strip one level down, #1223).
       entity: z.object({
-        id: z.number().optional(),
+        id: z.number().int().optional(),
         name: z.string().optional(),
         guid: z.string().optional(),
-      }).describe('Entity ref — one of {id} | {name} | {guid}.'),
+      }).strict('an entity ref accepts only: guid, name, id')
+        .describe('Entity ref — exactly one of {guid} | {name} | {id}. Live: {id} only for an entity with no guid; file-direct: {id} is the authored file id.'),
       // It said "World position" and wrote Transform.x/y/z, which is LOCAL. Measured on a parented
       // entity: asking for its OWN current world position moved it by the parent offset
       // (623,679 local / 823,926 world → set to 823,926 → now 1022,1173 world). A parameter whose
@@ -207,7 +226,7 @@ export function registerSceneTools(tool: ToolDef, ctx: ToolContext): void {
   // ── validate_scene ──
   tool(
     'modoki_validate_scene',
-    'Validate a scene file against the live trait schema (warn-but-load): unknown ' +
+    'Validate a scene file against the live trait schema (warn-but-load; prefabs: modoki_validate_prefab): unknown ' +
       'trait/field, type mismatch, literal-asset-path-instead-of-GUID mistakes, and ' +
       'asset refs whose GUID names nothing in the manifest (a deleted asset — the ref ' +
       'will not resolve at load). schemaAvailable:false means no editor renderer is ' +
@@ -276,7 +295,7 @@ export function registerSceneTools(tool: ToolDef, ctx: ToolContext): void {
       folder: z.string().optional().describe('Filter to assets whose path starts with this prefix, e.g. "/assets/scenes".'),
       name: z.string().optional().describe('Filter to assets whose name or path contains this substring (case-insensitive).'),
       all: z.boolean().optional().describe('Return every asset entry. Large — prefer a filter.'),
-      limit: z.number().int().positive().optional().describe('Cap the returned entries; sets truncated + totalCount. Passing limit alone also switches the response from per-type counts to entries.'),
+      limit: z.number().int().positive().optional().describe('Cap the returned entries; sets `truncated` when it bit (`returnedCount`/`totalCount` are always present). Passing limit alone also switches the response from per-type counts to entries.'),
     },
     async ({ type, folder, name, all, limit }) => {
       try {

@@ -7,7 +7,7 @@
  *  Heavy GPU siblings scene3DSync imports at module load are mocked; the renderer is
  *  a stub whose `compileAsync` captures the scene it was handed. */
 
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import * as THREE from 'three';
 
 const deactivatedEntities = new Set<number>();
@@ -52,12 +52,12 @@ function makeRigPrototype(): THREE.Object3D {
 const disposeRetiredEnvironment = vi.fn();
 const disposeRetiredMaterial = vi.fn();
 
-async function setup(opts: { primitives?: boolean; env?: unknown; pmrem?: unknown; rig?: THREE.Object3D; overrideMaterial?: THREE.Material; retiredEnvs?: Set<unknown>; retiredMats?: Set<unknown>; primitiveMaterial?: THREE.Material } = {}) {
+async function setup(opts: { meshTemplate?: { geometry: THREE.BufferGeometry; material: THREE.Material }; primitives?: boolean; env?: unknown; pmrem?: unknown; rig?: THREE.Object3D; overrideMaterial?: THREE.Material; retiredEnvs?: Set<unknown>; retiredMats?: Set<unknown>; primitiveMaterial?: THREE.Material } = {}) {
   vi.doMock('../../src/runtime/core/ecs/transformPropagationSystem', () => ({
     worldTransforms, deactivatedEntities, transformPropagationSystem: {},
   }));
   vi.doMock('../../src/runtime/loaders/meshTemplateCache', () => ({
-    resolveMeshTemplate: vi.fn(() => null), resolveMeshLodInfo: vi.fn(() => null),
+    resolveMeshTemplate: vi.fn(() => opts.meshTemplate ?? null), resolveMeshLodInfo: vi.fn(() => null),
     resolveMaterialForMesh: vi.fn(() => opts.primitiveMaterial ?? null),
     // A rig's SkinnedMeshRenderer override resolves through THIS function, so a test that
     // supplies `overrideMaterial` is the only one that can tell "override applied" from
@@ -109,8 +109,8 @@ async function setup(opts: { primitives?: boolean; env?: unknown; pmrem?: unknow
 
   const { createWorld } = await import('koota');
   const sync = await import('../../src/runtime/rendering/scene3DSync');
-  const { Renderable3DPrimitive, SkinnedModel, SkinnedMeshRenderer, EntityAttributes } = await import('../../src/runtime/traits');
-  return { world: createWorld(), sync, Renderable3DPrimitive, SkinnedModel, SkinnedMeshRenderer, EntityAttributes, createPrimitiveMesh };
+  const { Renderable3D, Renderable3DPrimitive, SkinnedModel, SkinnedMeshRenderer, EntityAttributes } = await import('../../src/runtime/traits');
+  return { world: createWorld(), sync, Renderable3D, Renderable3DPrimitive, SkinnedModel, SkinnedMeshRenderer, EntityAttributes, createPrimitiveMesh };
 }
 
 /** A renderer stub that records, AT compile time, a snapshot of the scene it was
@@ -133,7 +133,7 @@ function makeRendererStub(stubOpts: { isWebGPU?: boolean } = {}) {
   /** Per-mesh pipeline-key inputs AT compile time (#238): the world-transform determinant sign,
    *  `frustumCulled`, and the material's `side`. All three decide WHICH pipeline three builds, and
    *  all three are cleared or restored by the time the prewarm returns. */
-  const compiledMeshes: { det: number; frustumCulled: boolean; side: THREE.Side; transparent: boolean; material: THREE.Material }[][] = [];
+  const compiledMeshes: { det: number; frustumCulled: boolean; side: THREE.Side; transparent: boolean; material: THREE.Material; geometry: THREE.BufferGeometry }[][] = [];
   const renderer = {
     compileAsync: vi.fn(async (scene: THREE.Scene) => {
       compiledScenes.push(scene);
@@ -157,7 +157,7 @@ function makeRendererStub(stubOpts: { isWebGPU?: boolean } = {}) {
           .filter((o) => (o as THREE.Mesh).isMesh)
           .map((o) => {
             const m = (o as THREE.Mesh).material as THREE.Material;
-            return { det: o.matrixWorld.determinant(), frustumCulled: o.frustumCulled, side: m.side, transparent: m.transparent, material: m };
+            return { det: o.matrixWorld.determinant(), frustumCulled: o.frustumCulled, side: m.side, transparent: m.transparent, material: m, geometry: (o as THREE.Mesh).geometry };
           }),
       );
       standardMeshCounts.push(
@@ -174,6 +174,13 @@ function makeRendererStub(stubOpts: { isWebGPU?: boolean } = {}) {
 }
 
 const camera = new THREE.PerspectiveCamera();
+
+/** Resolve once `renderer`'s compile chain holds `depth` turns — i.e. the prewarm has queued. */
+async function untilQueued(renderer: object, depth: number): Promise<void> {
+  const { pendingCompileTurns } = await import('../../src/runtime/rendering/postfx/precompileSession');
+  for (let i = 0; i < 1000 && pendingCompileTurns(renderer) < depth; i++) await new Promise((res) => setTimeout(res, 1));
+  expect(pendingCompileTurns(renderer), 'the prewarm never reached the compile queue').toBe(depth);
+}
 
 describe('prewarmShadersForWorld — F4 empty-scene first-compile guarantee', () => {
   it('still compiles a plain standard mesh when the world has no Renderable3D/Primitive', async () => {
@@ -330,6 +337,30 @@ describe('prewarmShadersForWorld — one placeholder per distinct (mesh, materia
     expect(createPrimitiveMesh).toHaveBeenCalledTimes(1); // the per-entity mint is skipped too
   });
 
+  it('compiles the engine DEFAULT for a GLB mesh with an empty material — what syncMaterial binds (#1385)', async () => {
+    // The owner's choice on #1385: an empty `Renderable3D.material` renders grey, not the baked
+    // (or `.mesh.json`) material. The prewarm used to compile the baked one here — a variant the
+    // frame never draws — and left the default to compile synchronously on the first real frame.
+    const baked = new THREE.MeshStandardMaterial({ color: 0xff0000 });
+    baked.name = 'Baked';
+    const geometry = new THREE.BufferGeometry();
+    const { world, sync, Renderable3D } = await setup({ meshTemplate: { geometry, material: baked } });
+    const { renderer, compiledMeshes } = makeRendererStub();
+    world.spawn(Renderable3D({ isVisible: true, mesh: 'mesh-guid', material: '' }));
+
+    await sync.prewarmShadersForWorld(world, renderer as never, camera);
+
+    // Find THIS entity's placeholder by its geometry: with nothing else compiled, the F4 fallback
+    // mesh is also a grey standard material, so a colour check over every mesh passes even when
+    // the entity compiled nothing (close-out review).
+    const placeholder = compiledMeshes.flat().find((c) => c.geometry === geometry);
+    expect(placeholder, 'the empty-ref entity must compile SOMETHING').toBeDefined();
+    const m = placeholder!.material as THREE.MeshStandardMaterial;
+    expect(m, 'the baked material is a variant nobody draws for an empty ref').not.toBe(baked);
+    expect({ color: m.color.getHex(), roughness: m.roughness, metalness: m.metalness, transparent: m.transparent, wireframe: m.wireframe },
+      'the engine default is what the frame binds').toEqual({ color: 0xcccccc, roughness: 0.5, metalness: 0, transparent: false, wireframe: false });
+  });
+
   it('keeps one placeholder per distinct pair — a different material still compiles', async () => {
     const { world, sync, Renderable3DPrimitive } = await setup({ primitives: true });
     const { renderer, standardMeshCounts } = makeRendererStub();
@@ -392,6 +423,60 @@ describe('prewarmShadersForWorld — the environment mirror follows the TIER', (
     await sync.prewarmShadersForWorld(world, renderer as never, camera);
     expect(compiledEnvironments[0]).toBe(pmremTexture);
     expect(compiledEnvironments[0]).not.toBe(envTexture);
+  });
+
+  /** #1239 C. Deriving a PMREM draws through the renderer. Before the prewarm's queue turn, a
+   *  previous scene's cold live compile can still hold the pass target + scene MRT, and the PMREM
+   *  would build against that MRT and be cached broken. So it derives inside the turn. */
+  it('derives the PMREM only once its compile turn arrives, not while another compile holds the renderer', async () => {
+    const envTexture = { isTexture: true, name: 'fake-hdr' };
+    const pmremTexture = { isTexture: true, name: 'fake-pmrem' };
+    const { world, sync } = await setup({ env: envTexture, pmrem: pmremTexture });
+    const { Environment } = await import('../../src/three/traits/Environment');
+    const envPmrem = await import('../../src/runtime/rendering/envPmrem');
+    const { runExclusivePrecompile } = await import('../../src/runtime/rendering/postfx/precompileSession');
+    world.spawn(Environment({ hdrPath: 'hdr-guid', intensity: 0.4 }));
+    const { renderer, compiledEnvironments } = makeRendererStub();
+    const order: string[] = [];
+    vi.mocked(envPmrem.getEnvPMREMTexture).mockImplementation(() => { order.push('derive'); return pmremTexture as never; });
+
+    let release!: () => void;
+    const ahead = runExclusivePrecompile(renderer, () => new Promise<void>((res) => { release = res; }));
+    const prewarm = sync.prewarmShadersForWorld(world, renderer as never, camera);
+    // Wait until the prewarm has built its scene and QUEUED — a fixed delay would let a slow build
+    // finish after it, and the old code would then pass too.
+    await untilQueued(renderer, 2);
+    order.push('ahead ends');
+    release();
+    await ahead;
+    await prewarm;
+
+    expect(order).toEqual(['ahead ends', 'derive']);
+    expect(compiledEnvironments[0]).toBe(pmremTexture);
+  });
+
+  /** #1239 C, review finding. While the prewarm waits for its turn, the source must still have a
+   *  holder the retired-env sweep can see — a closure is not one. Otherwise a re-import during the
+   *  wait frees the source, and the turn derives (and caches for good) a PMREM of a freed texture. */
+  it('keeps the env source visible to the retired-env sweep while its turn is queued', async () => {
+    const envTexture = { isTexture: true, name: 'fake-hdr' } as unknown as THREE.Texture;
+    const { world, sync } = await setup({ env: envTexture, retiredEnvs: new Set([envTexture]) });
+    const { Environment } = await import('../../src/three/traits/Environment');
+    const { createWorld } = await import('koota');
+    const { runExclusivePrecompile } = await import('../../src/runtime/rendering/postfx/precompileSession');
+    world.spawn(Environment({ hdrPath: 'hdr-guid', intensity: 0.4 }));
+    const { renderer } = makeRendererStub();
+
+    let release!: () => void;
+    const ahead = runExclusivePrecompile(renderer, () => new Promise<void>((res) => { release = res; }));
+    const prewarm = sync.prewarmShadersForWorld(world, renderer as never, camera);
+    await untilQueued(renderer, 2);
+    // Another surface's frame sweeps while the prewarm waits; nothing else holds the retiree.
+    sync.syncEnvironment(createWorld(), new THREE.Scene());
+    expect(disposeRetiredEnvironment).not.toHaveBeenCalled();
+    release();
+    await ahead;
+    await prewarm;
   });
 
   it('does NOT mirror it on LOW, where syncEnvironment suppresses IBL', async () => {
@@ -1080,8 +1165,9 @@ describe('compileLiveScene — prepares the live scene and restores every mutati
     let releaseA!: () => void;
     const hangingRenderer = { compileAsync: vi.fn(() => new Promise<void>((res) => { releaseA = res; })) };
     const pending = sync.compileLiveScene(hangingRenderer as never, scene, camera);
-    // A's stand-ins are live children of the shared scene right now.
-    expect(scene.children.length).toBe(3);
+    // A's stand-ins are live children of the shared scene once its turn on the renderer's compile
+    // queue starts — a microtask later, not synchronously (#957).
+    await vi.waitFor(() => expect(scene.children.length).toBe(3));
 
     // Call B — the next scene's compile. It must clear A's leftovers, or a transparent object from
     // the OLD scene stands inside the NEW one until A finally settles.
@@ -1138,5 +1224,222 @@ describe('compileLiveScene — prepares the live scene and restores every mutati
     // count — so compiling against the canvas context would warm pipelines nothing draws.
     expect(viaPass).toHaveBeenCalledTimes(1);
     expect(stub.renderer.compileAsync).not.toHaveBeenCalled();
+  });
+
+  it('a compile queued behind an abandoned one on the SAME renderer still clears its stand-ins at once', async () => {
+    const { sync } = await setup();
+    const scene = new THREE.Scene();
+    const mesh = new THREE.Mesh(
+      new THREE.BufferGeometry(),
+      new THREE.MeshStandardMaterial({ transparent: true, side: THREE.DoubleSide }),
+    );
+    scene.add(mesh);
+    let releaseA!: () => void;
+    const renderer = {
+      compileAsync: vi.fn()
+        .mockImplementationOnce(() => new Promise<void>((res) => { releaseA = res; }))
+        .mockImplementation(async () => {}),
+    };
+    const pendingA = sync.compileLiveScene(renderer as never, scene, camera);
+    await vi.waitFor(() => expect(scene.children.length).toBe(3));
+    expect(renderer.compileAsync).toHaveBeenCalledTimes(1); // A is in flight and hanging
+
+    // B waits for A (#957) — but a transparent object from the OLD scene must not stand inside the
+    // new one for as long as A takes, so the clear happens before B joins the queue.
+    const pendingB = sync.compileLiveScene(renderer as never, scene, camera);
+    expect(scene.children).toEqual([mesh]);
+
+    releaseA();
+    await Promise.all([pendingA, pendingB]);
+    expect(renderer.compileAsync).toHaveBeenCalledTimes(2);
+    expect(scene.children).toEqual([mesh]);
+  });
+});
+
+/** #957 — the black first launch on iOS (#956). three's `compileAsync` fixes its render context
+ *  synchronously, then builds each object's node graph after `await`s, reading the renderer's
+ *  bound target AT THAT MOMENT. So two compiles that each bind their own target across an `await`
+ *  build against each other's. This stub reproduces exactly that read: it records the target bound
+ *  when the compile starts, yields twice, and flags a build that sees a different one. */
+describe('every async compile on a renderer is serialised (#957)', () => {
+  // A failing fake-timer test must not leave setTimeout faked (or console.warn muted) for the rest.
+  afterEach(() => { vi.useRealTimers(); vi.restoreAllMocks(); });
+
+  function bindingRenderer(onFirstCompile?: () => void) {
+    const crossed: string[] = [];
+    const renderer = {
+      target: 'canvas',
+      compileAsync: vi.fn(async (_scene: unknown) => {
+        const context = renderer.target;
+        if (renderer.compileAsync.mock.calls.length === 1) onFirstCompile?.();
+        await new Promise((r) => setTimeout(r, 0));
+        await new Promise((r) => setTimeout(r, 0));
+        if (renderer.target !== context) crossed.push(`${context} context built against ${renderer.target}`);
+      }),
+    };
+    return { renderer, crossed };
+  }
+
+  /** What `PostFXStack.compileStagesAsync` does to the renderer: bind a stage target (bloom's
+   *  blur mip), compile its quad, restore — all inside the shared lock. */
+  function stageCompile(lock: (r: unknown, fn: () => Promise<void>) => Promise<void>, renderer: ReturnType<typeof bindingRenderer>['renderer']) {
+    return lock(renderer, async () => {
+      renderer.target = 'bloom.h0';
+      await renderer.compileAsync({});
+      renderer.target = 'canvas';
+    });
+  }
+
+  it('a live scene compile through the post-FX scene pass never interleaves with a stage compile', async () => {
+    const { sync } = await setup();
+    const { runExclusivePrecompile } = await import('../../src/runtime/rendering/postfx/precompileSession');
+    const { renderer, crossed } = bindingRenderer();
+    const scene = new THREE.Scene();
+    scene.add(new THREE.Mesh(new THREE.BufferGeometry(), new THREE.MeshStandardMaterial()));
+    // `PassNode.compileAsync`: bind the pass target, compile, restore.
+    const viaPass = async () => {
+      renderer.target = 'scenePass';
+      await renderer.compileAsync(scene);
+      renderer.target = 'canvas';
+    };
+
+    // Production order: the scene compile is kicked first, and `Scene3D` reaches the stage gate
+    // once the scene gate's ceiling releases the frame — while the scene compile is still running.
+    const live = sync.compileLiveScene(renderer as never, scene, camera, viaPass);
+    const stage = stageCompile(runExclusivePrecompile, renderer);
+    await Promise.all([live, stage]);
+
+    expect(renderer.compileAsync).toHaveBeenCalledTimes(2);
+    expect(crossed).toEqual([]);
+  });
+
+  it('a stage compile already running holds off a live scene compile kicked after it', async () => {
+    const { sync } = await setup();
+    const { runExclusivePrecompile } = await import('../../src/runtime/rendering/postfx/precompileSession');
+    const { renderer, crossed } = bindingRenderer();
+    const scene = new THREE.Scene();
+    scene.add(new THREE.Mesh(new THREE.BufferGeometry(), new THREE.MeshStandardMaterial()));
+
+    const stage = stageCompile(runExclusivePrecompile, renderer);
+    const live = sync.compileLiveScene(renderer as never, scene, camera);
+    await Promise.all([stage, live]);
+
+    expect(renderer.compileAsync).toHaveBeenCalledTimes(2);
+    expect(crossed).toEqual([]);
+  });
+
+  it('the pre-swap prewarm never interleaves with a stage compile', async () => {
+    const { world, sync } = await setup();
+    const { runExclusivePrecompile } = await import('../../src/runtime/rendering/postfx/precompileSession');
+    // The prewarm awaits its own preparation before it compiles, so kicking the stage compile at a
+    // fixed point could let it finish first and pass vacuously. Kick it at the moment the prewarm's
+    // compile STARTS instead — the one moment an overlap is possible.
+    let stage: Promise<void> | undefined;
+    const { renderer, crossed } = bindingRenderer(() => { stage = stageCompile(runExclusivePrecompile, renderer); });
+
+    await sync.prewarmShadersForWorld(world, renderer as never, camera);
+    await stage;
+
+    // The prewarm compiled its F4 placeholder scene — the empty world still compiles once.
+    expect(renderer.compileAsync).toHaveBeenCalledTimes(2);
+    expect(crossed).toEqual([]);
+  });
+
+  it('the prewarm gives up waiting and SKIPS, rather than stall a scene load behind a slow compile', async () => {
+    // A scene load awaits the prewarm (a before-swap hook, no timeout of its own). Behind the
+    // previous scene's cold compile, an unbounded wait would hold the load for all of it.
+    const { world, sync } = await setup();
+    const { runExclusivePrecompile } = await import('../../src/runtime/rendering/postfx/precompileSession');
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const { renderer } = bindingRenderer();
+    let release!: () => void;
+    const ahead = runExclusivePrecompile(renderer, () => new Promise<void>((res) => { release = res; }));
+
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+    try {
+      const prewarm = sync.prewarmShadersForWorld(world, renderer as never, camera);
+      await vi.advanceTimersByTimeAsync(1_000);
+      await prewarm; // resolved with the queue still held — the load goes ahead
+    } finally {
+      vi.useRealTimers();
+    }
+    expect(renderer.compileAsync).not.toHaveBeenCalled();
+    expect(warn.mock.calls.some((c) => String(c[0]).includes('[prewarm] skipped'))).toBe(true);
+
+    release();
+    await ahead;
+    await runExclusivePrecompile(renderer, async () => {});
+    expect(renderer.compileAsync).not.toHaveBeenCalled(); // and it never runs late, for a scene already gone
+  });
+
+  it('a live compile leaves a render-target binding it did not make ALONE — an offscreen capture owns its own', async () => {
+    // A capture (`modoki_render_scene`) binds `captureRT`, awaits its readback and restores the
+    // previous target itself. A live compile whose span straddles that must not write back what it
+    // saw at its start: that re-bound `captureRT` after the capture had restored, and every later
+    // frame drew into it (review of #957's first close-out fix).
+    const { sync } = await setup();
+    const renderer = {
+      // The capture is already mid-readback when the compile's turn comes, so `captureRT` is bound…
+      target: 'captureRT' as unknown,
+      getRenderTarget() { return renderer.target; },
+      setRenderTarget(t: unknown) { renderer.target = t; },
+      getMRT() { return null; },
+      setMRT() {},
+      compileAsync: vi.fn(async () => {
+        await new Promise((r) => setTimeout(r, 0));
+        // …and the capture finishes, restoring its previous target, while the compile still runs.
+        renderer.setRenderTarget(null);
+        await new Promise((r) => setTimeout(r, 0));
+      }),
+    };
+    const scene = new THREE.Scene();
+    scene.add(new THREE.Mesh(new THREE.BufferGeometry(), new THREE.MeshStandardMaterial()));
+
+    await sync.compileLiveScene(renderer as never, scene, camera);
+    expect(renderer.target).toBe(null);
+  });
+
+  describe("liveSceneCompileAtTurn — everything is read at the compile's TURN, not its kick", () => {
+    function surface() {
+      const renderer = { compileAsync: vi.fn(async () => {}) };
+      const s1 = { compileSceneAsync: vi.fn(async () => {}) };
+      const s2 = { compileSceneAsync: vi.fn(async () => {}) };
+      const state = { stack: s1 as typeof s1 | null, camera: camera as THREE.Camera, tornDown: false };
+      return { renderer, s1, s2, state };
+    }
+
+    it("a stack REBUILT while the compile was queued: warms the new stack's scene pass, not the disposed one", async () => {
+      const { sync } = await setup();
+      const { renderer, s1, s2, state } = surface();
+      const scene = new THREE.Scene();
+      const compile = sync.liveSceneCompileAtTurn(renderer, scene, () => state); // kicked with s1
+      state.stack = s2; // a Director beat rebuilt the stack before the queue reached it
+      await compile();
+      expect(s2.compileSceneAsync).toHaveBeenCalledTimes(1);
+      expect(s1.compileSceneAsync).not.toHaveBeenCalled();
+    });
+
+    it('the stack DROPPED while queued: compiles the scene against the canvas context, with the camera of the turn', async () => {
+      const { sync } = await setup();
+      const { renderer, state } = surface();
+      const scene = new THREE.Scene();
+      const compile = sync.liveSceneCompileAtTurn(renderer, scene, () => state);
+      const later = new THREE.OrthographicCamera();
+      state.stack = null;
+      state.camera = later;
+      await compile();
+      expect(renderer.compileAsync).toHaveBeenCalledWith(scene, later);
+    });
+
+    it('the surface TORN DOWN while queued: compiles nothing on its disposed renderer', async () => {
+      const { sync } = await setup();
+      const { renderer, s1, state } = surface();
+      const compile = sync.liveSceneCompileAtTurn(renderer, new THREE.Scene(), () => state);
+      state.tornDown = true;
+      state.stack = null;
+      await compile();
+      expect(renderer.compileAsync).not.toHaveBeenCalled();
+      expect(s1.compileSceneAsync).not.toHaveBeenCalled();
+    });
   });
 });

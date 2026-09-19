@@ -216,6 +216,13 @@ export interface ProjectConfig {
      *  own fallback treatment does the same thing. Any project whose icon is a painting rather
      *  than a flat mark should author this one. */
     iconMonochromeSource: string;
+    /** PROJECT-RELATIVE path to the **Android notification small icon** silhouette (#1203): white
+     *  on transparency, emitted as `res/drawable-<density>/ic_stat_notification.png`. Empty = none,
+     *  and a previously emitted one is removed. There is no derivation, because Android draws only
+     *  the alpha, so a painting would become a solid square. The project's `capacitor.config.json`
+     *  must also name `ic_stat_notification` as `plugins.LocalNotifications.smallIcon`. Otherwise
+     *  the plugin never looks the icon up and the framework "i" still shows. */
+    notificationIconSource: string;
     /** Marketing version — what a player sees in the store listing ("1.0", "2.3.1").
      *  Synced by `healAndroidVersion` into `versionName` and by `healIosVersion` into
      *  `MARKETING_VERSION` (which `Info.plist` reads as `CFBundleShortVersionString`
@@ -242,18 +249,23 @@ export interface ProjectConfig {
      *  fresh-clone config would do to a project that has already uploaded.
      *
      *  NOT auto-incremented, on purpose: a build number that changes itself makes builds
-     *  non-reproducible and churns a committed file on every build (the #18
-     *  write-behind-your-back hazard). The owner bumps it — or flips {@link buildNumberAuto}
-     *  on and the heal derives it instead. */
+     *  non-reproducible. The owner bumps it — or flips {@link buildNumberAuto} on, and the
+     *  build derives it instead. */
     buildNumber: number;
     /** AUTO build number. When TRUE, the typed {@link buildNumber} above is IGNORED and the
      *  effective number is derived from `git rev-list --count HEAD` of the project's repo at
-     *  every open/build — no hand-bumping per store upload. The typed value still acts as a
-     *  FLOOR (`max` of the two) so a store-forced jump stays possible without turning auto off.
-     *  The native files always see ONE resolved number; how it was derived never leaks into them.
+     *  every native build — no hand-bumping per store upload. The typed value still acts as a
+     *  FLOOR (`max` of the two).
+     *
+     *  ⚠️ **It is passed to xcodebuild/gradle on the command line and NEVER written into a
+     *  committed native file** (#1226) — the count moves with nearly every commit, so writing it
+     *  rewrote `build.gradle` and `project.pbxproj` on every build and every project open. The
+     *  committed value stays as it was, and only a direct Xcode / Android Studio archive reads it.
      *
      *  Commit counts differ between clones (main vs a worker branch) and are shared by every
-     *  game in the repo; both are absorbed by the never-lower guard, since only uploads care.
+     *  game in the repo. ⚠️ The never-lower floor does NOT absorb the first any more (#1226): it
+     *  compares against the frozen committed value, so a build from a branch whose count is below
+     *  a number already uploaded from another is not caught — upload from one line of history.
      *  A project copied OUT of its repo (no git) falls back to {@link buildNumber} with a note. */
     buildNumberAuto: boolean;
   };
@@ -696,6 +708,7 @@ export const DEFAULT_PROJECT_CONFIG: ProjectConfig = {
     iconDarkSource: '',
     iconTintedSource: '',
     iconMonochromeSource: '',
+    notificationIconSource: '',
     // '1.0' / 1 are exactly what `cap add` scaffolds into versionName/versionCode and
     // MARKETING_VERSION/CURRENT_PROJECT_VERSION, so adopting these fields rewrites NOTHING
     // in any existing project (measured across all 20: every one is 1.0/1 bar iap-test,

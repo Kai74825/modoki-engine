@@ -1,5 +1,6 @@
-/** ⚠️ **A number-keyed `Map`/`Set` in engine `runtime/**` uses `EntityTable`/`PackedEntity`, or spends
- *  a ledger row saying why it may not (#868).**
+/** ⚠️ **A number-keyed `Map`/`Set` in engine `runtime/**`, the editor, `engine/app`, the starter template,
+ *  `games/` or `demos/` uses `EntityTable`/`PackedEntity`, or spends a ledger row saying why it may not
+ *  (#868, widened #1198).** Games reach both through `@modoki/engine/runtime`.
  *
  *  koota's `entity.id()` is a recycled INDEX, and a despawn+respawn reclaims it — in bulk, every
  *  one. State held across frames under that index hands a newcomer the dead entity's state. The
@@ -29,22 +30,47 @@
  *  - An UNTYPED `new Map()` whose element type is inferred from use. The parser sees no type
  *    argument, and resolving the inferred type needs a full program, not a parse.
  *  - A string key that embeds a bare id (`` `${id}` ``, `` `${id}:${clip}` ``). The type is `string`.
+ *    So is a GUID key, and **a guid is an address, not a lifetime key**: `spawnPrefabInstance`'s
+ *    `guidSeed` mints the SAME guid on every respawn by design (timeline scrub, Entries rows), and an
+ *    entity without `EntityAttributes` has none. Per-entity state keyed by guid inherits exactly as a
+ *    bare id does; read such a map by hand.
+ *  - **Component state holding an entity id (`useState<Set<number>>`) stays BY HAND** (owner,
+ *    2026-09-14, re-confirmed 2026-09-15). It is a call, not a declaration, and a check aimed at it
+ *    could not tell an entity id from any other number in state. `core/ecs/entityPin.ts` is the
+ *    shape for it. A NAMED props interface at module scope that carries such state is a declaration
+ *    and is flagged; an inline props type in the component's parameter list is inside a function and
+ *    is not (the `okLiteralParam` fixture pins that).
+ *  - Ids held as an ARRAY or a scalar, and a held `Entity` by value: not this detector's job. The second
+ *    one, `heldEntityDeclarations` (#1222, `HELD_LEDGER`), flags a declaration typed with koota's `Entity`,
+ *    a module `…Id(s)` number, and a `…EntityId(s)` field. ITS blind spots: an untyped handle
+ *    (`let puck = null`, inferred from a later assignment) or an untyped id array (`{ movedIds: [] }`); an
+ *    interface/class id field not named `…EntityId` (`parentId`,
+ *    `rootInstanceId`), which would flag every unrelated `…Id` in the corpus; a trait default inside a
+ *    `trait({…})` call (Sling's `Enemy.hpBarId` was one); and, as here, component state and closures.
+ *  - A number-keyed map reachable only through an inferred type (`{ routing: ReturnType<typeof f> }`):
+ *    no type argument appears at the declaration. SceneView's routing memo was one until #1220 moved it
+ *    to `sceneView2DGraph.ts` behind a declared `Canvas2DRoutingMaps`, which the scan now reads.
  *  - State kept alive by a CLOSURE or a component scope rather than a declaration: a function-local
  *    `new Map<number, …>()` captured by the callback it returns (`Scene3D.tsx`'s per-mount `ecsLights`
  *    is one — read by hand 2026-09-14: lights rebuild on a type change and every field is re-applied
  *    each frame, so it is mirrored state). Functions are skipped whole; an IIFE is not.
- *  - Aliases are resolved by NAME across `runtime/**` (`type PoseMap = Map<number, …>`,
- *    `type SceneId = number`), since a parse cannot follow an import; an alias declared outside the
- *    scan is invisible.
- *  - `engine/app`, the editor and `games/`/`demos/` are outside the scan — widening it is #1198 (a
- *    game's copy of the rule has to be sized against the OSS snapshot). #868's fixes there were
- *    found by hand. Component state (`useState<Set<number>>`) is a call, not a declaration, so even
- *    a widened scan does not see it; `core/ecs/entityPin.ts` is the shape used for it.
+ *  - Aliases are resolved by NAME (`type PoseMap = Map<number, …>`, `type SceneId = number`), since a
+ *    parse cannot follow an import. The scope is `runtime/**` for LEDGER; for WIDENED_LEDGER it is
+ *    runtime plus the engine side (editor, app, three, starter) or runtime plus ONE project
+ *    (`aliasScopes`). An alias declared outside its scope is invisible.
+ *  - Unscanned: `engine/electron`, `engine/plugins`, `engine/tools`, `engine/packages/capacitor-*`, which
+ *    run outside the ECS world; their number-keyed maps are request/port ids (read 2026-09-15). A
+ *  project's OWN `packages/**` (e.g. `games/3d-test/packages/app-services`) IS scanned, as project code.
+ *  - A game COPIED OUT of the repo (#29) takes no copy of this guard with it.
  *
- *  ## The ledger
+ *  ## The ledgers
  *
- *  One row per declaration, keyed `file::Owner.name`. Every reason starts with a tag, so the list
- *  can be read by kind:
+ *  `LEDGER` covers `runtime/**`, keyed `file::Owner.name` relative to runtime. `WIDENED_LEDGER` covers
+ *  the editor, `src/three`, `engine/app`, the starter template and every project `discoverProjects`
+ *  finds, keyed REPO-relative so a row names its tree. A `games/`/`demos/` row is owed only where the
+ *  checkout carries that PROJECT (`rowIsOwedInLayout`): the OSS snapshot ships no games and a curated
+ *  subset of demos.
+ *  Every reason starts with a tag, so the list can be read by kind:
  *  - `not-entity:` — the number is something else (a glyph code, a texture uid, a pointer id).
  *  - `scratch:` — cleared and refilled inside one synchronous pass before it is read.
  *  - `revalidated:` — held across frames, but every entry is re-checked against a value recomputed
@@ -57,25 +83,30 @@
  *  - `per-world-index:` — rebuilt from the live world, read only by ids taken from live entities.
  *  - `despawn-evicted:` — a frame-derived cache read by id after the pass that fills it; its entry is
  *    deleted inside `destroy()` by `core/ecs/despawnEviction.ts`, and the owner rebuilds it next pass.
- *  - `pending: #868` — a real recycled-index defect with a fix phase. These rows are the backlog,
- *    and they are meant to disappear.
+ *  - `pending: #N` — a real recycled-index defect whose fix is bigger than a key swap, tracked by the
+ *    issue it names. ⚠️ A fix that keeps the `number` key (a version stamp, a prune, a pin) still
+ *    matches the declaration, so this guard will NOT go red when it lands: **the fixer retags the row**
+ *    with the line that now makes it safe.
  *  - `uncertain:` — not yet settled, with the test that would settle it. */
 
 import { describe, it, expect } from 'vitest';
 import fs from 'node:fs';
 import path from 'node:path';
 import ts from 'typescript';
-import { parseSource } from '@modoki/engine/testing/sourceAst';
+import { parseSource, importBindings } from '@modoki/engine/testing/sourceAst';
 import { assertExemptionLedger } from '@modoki/engine/testing/exemptionLedger';
 import { repoFiles } from '../../scripts/repoCorpus.mjs';
+import { discoverProjects } from '../../scripts/projectRoots.mjs';
+import { REPO_ROOT } from '../helpers/repoLayout';
 
 const RUNTIME = 'engine/packages/modoki/src/runtime';
 const COLLECTIONS = new Set(['Map', 'Set', 'ReadonlyMap', 'ReadonlySet', 'Record']);
 
 /** Type aliases found across the scanned corpus: names that stand for a number-keyed collection
  *  (`type PoseMap = Map<number, PoseEntry>`) and names that stand for `number` (`type SceneId = number`).
- *  Resolved by NAME, corpus-wide — a parse cannot follow an import, and a same-named alias with a
- *  different meaning elsewhere would at worst add a row. */
+ *  Resolved by NAME within a scope (see `aliasScopes`) — a parse cannot follow an import. A same-named
+ *  alias with a different meaning inside ONE scope would add a false row; across projects it did, which
+ *  is why the widened scan does not pool them. */
 export interface Aliases { collections: ReadonlySet<string>; numbers: ReadonlySet<string> }
 const NO_ALIASES: Aliases = { collections: new Set(), numbers: new Set() };
 
@@ -148,8 +179,8 @@ function insideFunction(n: ts.Node): boolean {
  *  iterate to a fixed point (an alias of an alias). */
 /** Every alias the corpus declares, iterated to a fixed point so an alias of an alias declared ABOVE
  *  its target (or in a file scanned earlier) still resolves. */
-export function collectCorpusAliases(sources: ReadonlyArray<{ file: string; code: string }>): Aliases {
-  const aliases = { collections: new Set<string>(), numbers: new Set<string>() };
+export function collectCorpusAliases(sources: ReadonlyArray<{ file: string; code: string }>, base: Aliases = NO_ALIASES): Aliases {
+  const aliases = { collections: new Set(base.collections), numbers: new Set(base.numbers) };
   for (let grew = true; grew;) {
     grew = false;
     for (const s of sources) if (collectAliases(s.code, s.file, aliases)) grew = true;
@@ -204,18 +235,204 @@ export function numberKeyedDeclarations(code: string, file: string, aliases: Ali
   return { scanned, found };
 }
 
-function scanRuntime(): { scanned: number; found: Declaration[] } {
-  const files = repoFiles({
-    under: RUNTIME,
-    match: (rel: string) => /\.tsx?$/.test(rel) && !rel.endsWith('.d.ts') && !rel.includes('.test.'),
-    floor: 400,
-  });
-  const sources = files.map(({ rel, abs }) => ({ file: path.posix.relative(RUNTIME, rel), code: fs.readFileSync(abs, 'utf8') }));
-  const aliases = collectCorpusAliases(sources);
+/** The local names a file imports koota's `Entity` type under — `Entity` from any other module (a scene
+ *  file's JSON entry shape, a test's own interface) is not a handle. */
+function kootaEntityNames(sf: ts.SourceFile): Set<string> {
+  return new Set(importBindings(sf, 'koota').filter((b) => b.imported === 'Entity').map((b) => b.local));
+}
+
+/** Does `node` name koota's `Entity` outside a function signature (whose types die with the call)? */
+function mentionsEntity(node: ts.Node, names: ReadonlySet<string>): boolean {
+  let hit = false;
+  const visit = (n: ts.Node): void => {
+    if (hit || ts.isFunctionLike(n)) return;
+    if (ts.isTypeReferenceNode(n) && !n.typeArguments && names.has(n.typeName.getText())) { hit = true; return; }
+    ts.forEachChild(n, visit);
+  };
+  visit(node);
+  return hit;
+}
+
+/** A number or number array, outside a function signature: `number`, `number | null`, `number[]`,
+ *  `Array<number>`, `readonly number[]`. */
+function isNumberish(t: ts.TypeNode): boolean {
+  if (t.kind === ts.SyntaxKind.NumberKeyword) return true;
+  if (ts.isUnionTypeNode(t)) return t.types.some(isNumberish) && t.types.every((u) => isNumberish(u) || u.kind === ts.SyntaxKind.NullKeyword
+    || u.kind === ts.SyntaxKind.UndefinedKeyword || (ts.isLiteralTypeNode(u) && u.literal.kind === ts.SyntaxKind.NullKeyword));
+  if (ts.isArrayTypeNode(t)) return isNumberish(t.elementType);
+  if (ts.isTypeOperatorNode(t)) return isNumberish(t.type);
+  if (ts.isParenthesizedTypeNode(t)) return isNumberish(t.type);
+  return ts.isTypeReferenceNode(t) && (t.typeName.getText() === 'Array' || t.typeName.getText() === 'ReadonlyArray')
+    && !!t.typeArguments?.[0] && isNumberish(t.typeArguments[0]);
+}
+
+/** A declaration that HOLDS an entity across calls, by value rather than as a map key (#1222): koota's
+ *  `get`/`set` ignore the generation, so a held `Entity` whose entity was destroyed reads and writes whatever
+ *  reclaimed its index, and a held id names it outright. Flags, outside any function:
+ *  - a module variable, class field, interface/type-literal field or module object-literal property whose
+ *    type (or `as` cast) names koota's `Entity` — `Entity | null`, `Entity[]`, `Map<…, Entity>`;
+ *  - a module-scope variable, or a module object-literal property, named `…Id`/`…Ids` holding a number or
+ *    number array (typed, `as number`, or a numeric literal), except a `next…Id` counter, which mints ids
+ *    rather than holding one;
+ *  - a class or interface field named `…EntityId`/`…EntityIds` holding a number or number array.
+ *  A declaration `numberKeyedDeclarations` already flags is left to that ledger. Keys match it. */
+export function heldEntityDeclarations(code: string, file: string): { scanned: number; found: Declaration[] } {
+  const sf = parseSource(code, file);
+  const names = kootaEntityNames(sf);
+  const found: Declaration[] = [];
+  let scanned = 0;
+  const at = (n: ts.Node) => `${file}:${sf.getLineAndCharacterOfPosition(n.getStart(sf)).line + 1}`;
+  const keyedElsewhere = (n: ts.Node | undefined): boolean => !!n && holdsNumberKeyed(n);
+  const idName = /(?:^|[a-z])Ids?$/;
+  const entityIdName = /EntityIds?$/;
+  const counterName = /^_?next[A-Z]/;   // mints ids rather than holding one
+
+  const objectProps = (obj: ts.ObjectLiteralExpression, prefix: string): void => {
+    for (const p of obj.properties) {
+      if (!ts.isPropertyAssignment(p)) continue;
+      scanned++;
+      const key = `${prefix}.${p.name.getText()}`;
+      const propName = p.name.getText();
+      const init = p.initializer;
+      const idValue = idName.test(propName) && !counterName.test(propName)
+        && (ts.isNumericLiteral(init) || (ts.isAsExpression(init) && isNumberish(init.type)));
+      if (ts.isObjectLiteralExpression(init)) objectProps(init, key);
+      else if ((names.size && mentionsEntity(init, names)) || idValue) found.push({ item: `${file}::${key}`, site: at(p) });
+    }
+  };
+
+  for (const st of sf.statements) {
+    if (!ts.isVariableStatement(st)) continue;
+    const mutable = !(st.declarationList.flags & ts.NodeFlags.Const);
+    for (const d of st.declarationList.declarations) {
+      scanned++;
+      const name = d.name.getText();
+      if (keyedElsewhere(d.type) || keyedElsewhere(d.initializer)) continue;
+      const holdsEntity = names.size > 0 && (!!d.type && mentionsEntity(d.type, names));
+      const holdsId = idName.test(name) && !counterName.test(name) && (d.type ? isNumberish(d.type) && (mutable || ts.isArrayTypeNode(d.type))
+        : mutable && !!d.initializer && ts.isNumericLiteral(d.initializer));
+      if (holdsEntity || holdsId) found.push({ item: `${file}::${name}`, site: at(d) });
+      else if (d.initializer && ts.isObjectLiteralExpression(d.initializer)) objectProps(d.initializer, name);
+    }
+  }
+  const walk = (n: ts.Node): void => {
+    if ((ts.isPropertyDeclaration(n) || ts.isPropertySignature(n)) && !insideFunction(n)) {
+      scanned++;
+      const init = ts.isPropertyDeclaration(n) ? n.initializer : undefined;
+      if (!keyedElsewhere(n.type) && !keyedElsewhere(init)) {
+        const holdsEntity = names.size > 0 && ((!!n.type && mentionsEntity(n.type, names)) || (!!init && mentionsEntity(init, names)));
+        const holdsId = entityIdName.test(n.name.getText()) && !!n.type && isNumberish(n.type);
+        if (holdsEntity || holdsId) found.push({ item: `${file}::${ownerName(n.parent)}.${n.name.getText()}`, site: at(n) });
+      }
+    }
+    ts.forEachChild(n, walk);
+  };
+  walk(sf);
+  return { scanned, found };
+}
+
+const isScannedSource = (rel: string): boolean => /\.tsx?$/.test(rel) && !rel.endsWith('.d.ts') && !rel.includes('.test.');
+
+function readSources(under: string, floor: number, keyRelativeTo: string): Array<{ file: string; code: string }> {
+  return repoFiles({ under, match: isScannedSource, floor })
+    .map(({ rel, abs }) => ({ file: path.posix.relative(keyRelativeTo, rel), code: fs.readFileSync(abs, 'utf8') }));
+}
+
+function scan(sources: ReadonlyArray<{ file: string; code: string }>, aliases: Aliases): { scanned: number; found: Declaration[] } {
   let scanned = 0;
   const found: Declaration[] = [];
   for (const { file, code } of sources) {
     const r = numberKeyedDeclarations(code, file, aliases);
+    scanned += r.scanned;
+    found.push(...r.found);
+  }
+  return { scanned, found };
+}
+
+function runtimeSources(): Array<{ file: string; code: string }> {
+  return readSources(RUNTIME, 400, RUNTIME);
+}
+
+function scanRuntime(): { scanned: number; found: Declaration[] } {
+  const sources = runtimeSources();
+  return scan(sources, collectCorpusAliases(sources));
+}
+
+/** The widened corpus (#1198): everything outside `runtime/**` that holds entity state. Keys are
+ *  REPO-relative, so a row names its tree. Aliases come from runtime plus the source's own scope
+ *  (`aliasScopes`) — the editor and every game declare their maps with runtime's aliases.
+ *
+ *  ⚠️ **Projects are enumerated from the checkout, per PROJECT, not per root.** The OSS snapshot ships
+ *  no `games/` and only a curated subset of `demos/`, so a fixed `games/court` root would throw on its
+ *  floor there. `discoverProjects` is the single source of which projects this layout carries. */
+const ENGINE_ROOTS: ReadonlyArray<{ under: string; floor: number }> = [
+  { under: 'engine/packages/modoki/src/editor', floor: 200 },
+  { under: 'engine/packages/modoki/src/three', floor: 1 },
+  { under: 'engine/app', floor: 50 },
+  { under: 'engine/templates/starter', floor: 1 },
+];
+
+function widenedRoots(): Array<{ under: string; floor: number }> {
+  // `floor: 0` per project: a project directory can legitimately carry no tracked source (a gitignored
+  // leftover on one clone), and the declaration floor on the whole scan is what bounds vacuity.
+  const projects = discoverProjects(REPO_ROOT).map((pr: { root: string; name: string }) => ({ under: `${pr.root}/${pr.name}`, floor: 0 }));
+  return [...ENGINE_ROOTS, ...projects];
+}
+
+/** Does this checkout carry the project a ledger row's file lives in? A row under a project the layout
+ *  does not ship (every `games/` project and any unpublished demo in the OSS snapshot) is not owed there.
+ *
+ *  ⚠️ Keyed on the PROJECT directory, never on the file (#1140): a renamed or deleted file inside a
+ *  project that IS present must still read its row as stale. Same trade as `corpusProducerIsShared`'s
+ *  `demoProjectIsPresent`: a whole project deleted reads as absent-by-layout rather than stale. */
+export function rowIsOwedInLayout(item: string, presentProjects: ReadonlySet<string>): boolean {
+  const project = /^((?:games|demos)\/[^/]+)\//.exec(item)?.[1];
+  return !project || presentProjects.has(project);
+}
+
+const projectOf = (file: string): string | undefined => /^((?:games|demos)\/[^/]+)\//.exec(file)?.[1];
+
+/** Group sources into alias SCOPES: the engine side (editor, app, three, starter) is one scope, and each
+ *  project is its own. Every scope sees runtime's aliases, because everything imports the runtime.
+ *
+ *  ⚠️ Not one corpus-wide pool (#1198): Court's `type Placement = ReadonlyMap<number, Piece>` flagged
+ *  Sling's and Wordweave's unrelated `interface Placement` fields, because a name lookup across games
+ *  cannot tell them apart — and a game cannot import another game's types (#29), so per project is exact. */
+export function aliasScopes(sources: ReadonlyArray<{ file: string; code: string }>, runtimeAliases: Aliases):
+  Array<{ sources: Array<{ file: string; code: string }>; aliases: Aliases }> {
+  const groups = new Map<string, Array<{ file: string; code: string }>>();
+  for (const src of sources) {
+    const key = projectOf(src.file) ?? '<engine>';
+    let g = groups.get(key);
+    if (!g) { g = []; groups.set(key, g); }
+    g.push(src);
+  }
+  return [...groups.values()].map((g) => ({ sources: g, aliases: collectCorpusAliases(g, runtimeAliases) }));
+}
+
+function scanWidened(): { scanned: number; found: Declaration[] } {
+  const widened = widenedRoots().flatMap(({ under, floor }) => readSources(under, floor, ''));
+  const runtimeAliases = collectCorpusAliases(runtimeSources());
+  let scanned = 0;
+  const found: Declaration[] = [];
+  for (const scope of aliasScopes(widened, runtimeAliases)) {
+    const r = scan(scope.sources, scope.aliases);
+    scanned += r.scanned;
+    found.push(...r.found);
+  }
+  return { scanned, found };
+}
+
+/** The held-handle scan over the whole corpus — runtime and the widened roots — keyed repo-relative. */
+function scanHeld(): { scanned: number; found: Declaration[] } {
+  const sources = [
+    ...readSources(RUNTIME, 400, ''),
+    ...widenedRoots().flatMap(({ under, floor }) => readSources(under, floor, '')),
+  ];
+  let scanned = 0;
+  const found: Declaration[] = [];
+  for (const { file, code } of sources) {
+    const r = heldEntityDeclarations(code, file);
     scanned += r.scanned;
     found.push(...r.found);
   }
@@ -233,6 +450,10 @@ const LEDGER: ReadonlyArray<{ item: string; reason: string }> = [
     reason: 'per-world-index: Allocated fresh by each buildEntityIndex call from a live EntityAttributes query and used only within the calling pass; no caller keeps an index across frames; core/ecs/entityIndex.ts:38' },
   { item: 'core/ecs/entityIndex.ts::EntityIndex.childrenByParent',
     reason: 'per-world-index: Allocated fresh by each buildEntityIndex call (parentId -> name -> id) and used only within the calling pass; no caller keeps an index across frames; core/ecs/entityIndex.ts:39' },
+  { item: 'core/ecs/world.ts::RuntimeAddresses.entityOf',
+    reason: 'not-entity: Keyed by a runtime-guid ORDINAL (a per-world spawn counter that is never reused), not an entity id; the value is re-checked with isAlive() on every lookup and the row is deleted by unregisterEntity; the whole table is per-World in a WeakMap; core/ecs/world.ts' },
+  { item: 'core/ecs/world.ts::issuedGenerations',
+    reason: 'not-entity: Holds runtime-guid GENERATIONS (one per World, from a module counter that only increments), never an entity id; read only by classifyRuntimeGuidMiss to call a miss stale (#1223); core/ecs/world.ts' },
   { item: 'core/ecs/transformPropagationSystem.ts::worldTransforms',
     reason: 'despawn-evicted: onRemove(Transform), and the eviction forces the next pass past the unchanged short-circuit; cleared on world swap; pinned by tests/runtime/transformPropagationIdReuse.test.ts; core/ecs/transformPropagationSystem.ts' },
   { item: 'core/ecs/transformPropagationSystem.ts::deactivatedEntities',
@@ -394,45 +615,47 @@ const LEDGER: ReadonlyArray<{ item: string; reason: string }> = [
   { item: 'rendering/particle2DRouting.ts::Canvas2DRoute.canvasIds',
     reason: 'scratch: Cleared and refilled by buildCanvas2DRoute at the start of syncParticles and read only within that call; rendering/particle2DRouting.ts:29' },
   { item: 'rendering/scene3DSync.ts::_activeLightIds',
-    reason: 'scratch: Cleared at the top of syncLights and consumed by its removal sweep in the same call; rendering/scene3DSync.ts:1095' },
+    reason: 'scratch: Cleared at the top of syncLights and consumed by its removal sweep in the same call; rendering/scene3DSync.ts:1110' },
   { item: 'rendering/scene3DSync.ts::_activeRenderIds',
-    reason: 'scratch: Cleared at the top of syncRenderables and consumed by its removal sweep in the same call; rendering/scene3DSync.ts:2856' },
+    reason: 'scratch: Cleared at the top of syncRenderables and consumed by its removal sweep in the same call; rendering/scene3DSync.ts:2948' },
   { item: 'rendering/scene3DSync.ts::_activeSkinnedIds',
-    reason: 'scratch: Cleared at the top of syncSkinnedModels and consumed by its reap and mixer loop in the same call; rendering/scene3DSync.ts:2265' },
+    reason: 'scratch: Cleared at the top of syncSkinnedModels and consumed by its reap and mixer loop in the same call; rendering/scene3DSync.ts:2360' },
   { item: 'rendering/scene3DSync.ts::_boneParentMap',
-    reason: 'scratch: Cleared and refilled at the top of syncBones, read by the bone walks within that call; rendering/scene3DSync.ts:2731' },
+    reason: 'scratch: Cleared and refilled at the top of syncBones, read by the bone walks within that call; rendering/scene3DSync.ts:2823' },
   { item: 'rendering/scene3DSync.ts::_boneIds',
-    reason: 'scratch: Cleared and refilled in syncBones, read by isUnderBone within that call; rendering/scene3DSync.ts:2742' },
+    reason: 'scratch: Cleared and refilled in syncBones, read by isUnderBone within that call; rendering/scene3DSync.ts:2834' },
   { item: 'rendering/scene3DSync.ts::_boneAffected',
-    reason: 'scratch: Cleared then filled and consumed inside the same syncBones re-propagation block; rendering/scene3DSync.ts:2840' },
+    reason: 'scratch: Cleared then filled and consumed inside the same syncBones re-propagation block; rendering/scene3DSync.ts:2932' },
   { item: 'rendering/scene3DSync.ts::_billboardActive',
-    reason: 'scratch: Cleared at the top of syncBillboardSprites and consumed by its sweep in the same call; rendering/scene3DSync.ts:3393' },
+    reason: 'scratch: Cleared at the top of syncBillboardSprites and consumed by its sweep in the same call; rendering/scene3DSync.ts:3526' },
   { item: 'rendering/scene3DSync.ts::_activeText',
-    reason: 'scratch: Cleared at the top of syncText3D and consumed by its sweep in the same call; rendering/scene3DSync.ts:3617' },
+    reason: 'scratch: Cleared at the top of syncText3D and consumed by its sweep in the same call; rendering/scene3DSync.ts:3757' },
   { item: 'rendering/scene3DSync.ts::RenderState.ecsObjects',
-    reason: 'owner-checked: the kept THREE object is re-compared against the live entity each pass, and ownedEcsObject evicts it through removeEcsObject when RenderState.ecsOwners names a different packed entity, so userData overrides and bound clones cannot reach a newcomer (#868); rendering/scene3DSync.ts:3170' },
+    reason: 'owner-checked: the kept THREE object is re-compared against the live entity each pass, and ownedEcsObject evicts it through removeEcsObject when RenderState.ecsOwners names a different packed entity, so userData overrides and bound clones cannot reach a newcomer (#868); rendering/scene3DSync.ts:3225' },
   { item: 'rendering/scene3DSync.ts::RenderState.ecsOwners',
-    reason: 'gen-in-value: the packed entity each ecsObjects entry was built for, stamped at every ecsObjects.set and removed with it by removeEcsObject; pinned by syncSceneRenderables3D + skinnedShadowFlags tests (#868); rendering/scene3DSync.ts:1348' },
+    reason: 'gen-in-value: the packed entity each ecsObjects entry was built for, stamped at every ecsObjects.set and removed with it by removeEcsObject; pinned by syncSceneRenderables3D + skinnedShadowFlags tests (#868); rendering/scene3DSync.ts:1370' },
   { item: 'rendering/scene3DSync.ts::RenderState.ecsSprites',
-    reason: 'revalidated: Mesh-ref mirror compared against the live Renderable3D/Primitive mesh every pass, rebuilding on mismatch; rendering/scene3DSync.ts:2992' },
+    reason: 'revalidated: Mesh-ref mirror compared against the live Renderable3D/Primitive mesh every pass, rebuilding on mismatch; rendering/scene3DSync.ts:2989' },
   { item: 'rendering/scene3DSync.ts::RenderState.ecsMaterials',
-    reason: 'revalidated: Material-ref mirror compared against the live ref every pass by syncMaterial, rebinding on mismatch; rendering/scene3DSync.ts:1614' },
+    reason: 'revalidated: Material-ref mirror compared against the live ref every pass by syncMaterial, rebinding on mismatch; rendering/scene3DSync.ts:1706' },
   { item: 'rendering/scene3DSync.ts::RenderState.ecsColors',
-    reason: 'revalidated: Colour mirror compared against the live Renderable3DPrimitive.color every pass; rendering/scene3DSync.ts:3110' },
+    reason: 'revalidated: Colour mirror compared against the live Renderable3DPrimitive.color every pass; rendering/scene3DSync.ts:3182' },
   { item: 'rendering/scene3DSync.ts::RenderState.ecsSizes',
-    reason: 'revalidated: Size mirror compared against the live primitive size every pass, rebuilding the mesh on mismatch; rendering/scene3DSync.ts:2991' },
+    reason: 'revalidated: Size mirror compared against the live primitive size every pass, rebuilding the mesh on mismatch; rendering/scene3DSync.ts:3082' },
   { item: 'rendering/scene3DSync.ts::RenderState.ecsShadowFlags',
-    reason: 'revalidated: Shadow-key mirror compared against the live cast/receive fields every pass; rendering/scene3DSync.ts:2940' },
+    reason: 'revalidated: Shadow-key mirror compared against the live cast/receive fields every pass; rendering/scene3DSync.ts:3031' },
   { item: 'rendering/scene3DSync.ts::RenderState.skinnedShadowFlags',
-    reason: 'revalidated: Mirrors the flags applied to the kept skinned root, compared to live fields every pass and deleted with that entry; its hazard belongs to the skinned row; rendering/scene3DSync.ts:2368' },
+    reason: 'revalidated: Mirrors the flags applied to the kept skinned root, compared to live fields every pass and deleted with that entry; its hazard belongs to the skinned row; rendering/scene3DSync.ts:2466' },
   { item: 'rendering/scene3DSync.ts::RenderState.ownsGeometry',
-    reason: 'revalidated: Marks that the kept object\'s geometry is engine-owned; describes the object, and is deleted with it on every rebuild/sweep; rendering/scene3DSync.ts:3036' },
+    reason: 'revalidated: Marks that the kept object\'s geometry is engine-owned; describes the object, and forgetEcsObject deletes it with the object at every teardown (#1388); rendering/scene3DSync.ts:1433' },
   { item: 'rendering/scene3DSync.ts::RenderState.billboards',
-    reason: 'revalidated: Rig ref and topology sig compared against the live buffer (rebuild); tint/opacity/visibility/flip/deform version/transform rewritten every pass; rendering/scene3DSync.ts:3329' },
+    reason: 'revalidated: Rig ref and topology sig compared against the live buffer (rebuild); tint/opacity/visibility/flip/deform version/transform rewritten every pass; rendering/scene3DSync.ts:3461' },
   { item: 'rendering/scene3DSync.ts::RenderState.textMeshes',
-    reason: 'gen-in-value: the mesh is rebuilt on a layout/style signature change recomputed each pass; the one time-accumulated piece, the text-animation clock, carries its packed owner (animOwner via textAnimElapsed, #868); rendering/scene3DSync.ts:3796' },
+    reason: 'gen-in-value: the mesh is rebuilt on a layout/style signature change recomputed each pass; the one time-accumulated piece, the text-animation clock, carries its packed owner (animOwner via textAnimElapsed, #868); rendering/scene3DSync.ts:3659' },
   { item: 'rendering/scene3DSync.ts::TextMeshEntry.pages',
-    reason: 'not-entity: Font atlas page number -> page mesh; rendering/scene3DSync.ts:3756' },
+    reason: 'not-entity: Font atlas page number -> page mesh; rendering/scene3DSync.ts:3627' },
+  { item: 'rendering/scene3DSync.ts::BillboardEntry.pendingPages',
+    reason: 'not-entity: Holds rig PART indices (positions in entry.meshes) whose page load failed, never an entity id; owned by one BillboardEntry, which is disposed with its entity and rebuilt on a rig/signature change (#1397); rendering/scene3DSync.ts:1360' },
   { item: 'rendering/shadowCasterCapFrame.ts::kept',
     reason: 'scratch: Reassigned at the top of every syncLights and read only by shadowCasterAllowed in that call\'s light loop; rendering/shadowCasterCapFrame.ts:49' },
   { item: 'rendering/sprite2DMaterialBroker.ts::shaderMaps',
@@ -507,6 +730,8 @@ const LEDGER: ReadonlyArray<{ item: string; reason: string }> = [
     reason: 'not-entity: asset key → Set of owning SceneIds (`type SceneId = number`), the per-scene refcount; loaders/audioBufferCache.ts:29' },
   { item: 'loaders/fontAtlasLoader.ts::owners',
     reason: 'not-entity: asset key → Set of owning SceneIds (`type SceneId = number`), the per-scene refcount; loaders/fontAtlasLoader.ts:30' },
+  { item: 'loaders/loadSceneFile.ts::NestedStructureDelta.removedTraits',
+    reason: 'not-entity: keyed by a prefab member\'s serialized localId (the NESTED prefab file\'s own id space — the instance this delta addresses), not a runtime entity id; loaders/loadSceneFile.ts:42' },
   { item: 'loaders/loadSceneFile.ts::AddedEntity.overrides',
     reason: 'not-entity: keyed by a prefab member\'s serialized localId (the prefab file\'s own id space), not a runtime entity id; loaders/loadSceneFile.ts:46' },
   { item: 'loaders/loadSceneFile.ts::AddedEntity.removedTraits',
@@ -515,6 +740,14 @@ const LEDGER: ReadonlyArray<{ item: string; reason: string }> = [
     reason: 'not-entity: keyed by a prefab member\'s serialized localId (the prefab file\'s own id space), not a runtime entity id; loaders/loadSceneFile.ts:55' },
   { item: 'loaders/loadSceneFile.ts::SceneEntityEntry.overrides',
     reason: 'not-entity: keyed by a prefab member\'s serialized localId (the prefab file\'s own id space), not a runtime entity id; loaders/loadSceneFile.ts:69' },
+  { item: 'loaders/loadSceneFile.ts::SceneEntityEntry.moved',
+    reason: 'not-entity: keyed by a prefab member\'s row localId (the prefab file\'s own id space); the value is a guid, never a runtime entity id (#1437)' },
+  { item: 'loaders/loadSceneFile.ts::NestedStructureDelta.moved',
+    reason: 'not-entity: keyed by a prefab member\'s row localId (the prefab file\'s own id space); the value is a guid, never a runtime entity id (#1437)' },
+  { item: 'loaders/loadSceneFile.ts::AddedEntity.moved',
+    reason: 'not-entity: keyed by a prefab member\'s row localId (the prefab file\'s own id space); the value is a guid, never a runtime entity id (#1437)' },
+  { item: 'loaders/loadSceneFile.ts::InstanceStructureData.moved',
+    reason: 'not-entity: keyed by a prefab member\'s row localId (the prefab file\'s own id space); the value is a guid, never a runtime entity id (#1437)' },
   { item: 'loaders/loadSceneFile.ts::SceneEntityEntry.removedTraits',
     reason: 'not-entity: keyed by a prefab member\'s serialized localId (the prefab file\'s own id space), not a runtime entity id; loaders/loadSceneFile.ts:75' },
   { item: 'loaders/loadSceneFile.ts::SceneEntityEntry.nestedOverrides',
@@ -553,6 +786,280 @@ const LEDGER: ReadonlyArray<{ item: string; reason: string }> = [
     reason: 'not-entity: SceneId → loaded scene entry; scene/SceneManager.ts:274' },
   { item: 'scene/sceneMutate.ts::MutableEntity.overrides',
     reason: 'not-entity: keyed by a prefab member\'s serialized localId (the prefab file\'s own id space), not a runtime entity id; scene/sceneMutate.ts:23' },
+];
+
+/** Rows for the widened corpus (#1198), keyed `repo/relative/file::Owner.name`. Same tags as LEDGER. */
+const WIDENED_LEDGER: ReadonlyArray<{ item: string; reason: string }> = [
+  { item: 'engine/packages/modoki/src/editor/panels/assetViews/VideoAssetView.tsx::QUALITY_LABELS',
+    reason: 'not-entity: ffmpeg CRF value -> label; editor/panels/assetViews/VideoAssetView.tsx:48' },
+  ...['PrefabEntity.overrides', 'PrefabEntity.removedTraits', 'PrefabEntity.nestedOverrides'].map((f) => ({
+    item: `engine/packages/modoki/src/editor/scene/prefab.ts::${f}`,
+    reason: 'not-entity: keyed by a prefab member\'s serialized localId (the prefab file\'s own id space), not a runtime entity id — the editor twin of loaders/loadSceneFile.ts PrefabFileEntry{}; editor/scene/prefab.ts:42' })),
+  { item: 'engine/packages/modoki/src/editor/scene/prefab.ts::PlannedNestedRow.nestedOverrides',
+    reason: 'not-entity: path-keyed by nested-row localIds, then a nested prefab member\'s localId — the row value serializePrefab writes as PrefabEntity.nestedOverrides (#1381), never a runtime entity id; editor/scene/prefab.ts:171' },
+  ...['SerializedEntity.overrides', 'SerializedEntity.removedTraits', 'SerializedEntity.moved', 'SerializedEntity.nestedOverrides'].map((f) => ({
+    item: `engine/packages/modoki/src/editor/scene/serialize.ts::${f}`,
+    reason: 'not-entity: keyed by a prefab member\'s serialized localId, not a runtime entity id — the written twin of loaders/loadSceneFile.ts SceneEntityEntry; editor/scene/serialize.ts:41' })),
+  { item: 'engine/packages/modoki/src/editor/scene/prefab.ts::InstanceStructure.moved',
+    reason: 'not-entity: keyed by a prefab member\'s row localId (the prefab file\'s own id space); the value is a guid, never a runtime entity id (#1437)' },
+  { item: 'engine/packages/modoki/src/editor/scene/prefab.ts::InstanceReference.moved',
+    reason: 'not-entity: keyed by a prefab member\'s row localId (the prefab file\'s own id space); the value is a guid, never a runtime entity id (#1437)' },
+  { item: 'engine/packages/modoki/src/editor/scene/prefab.ts::InstanceStructure.removedTraits',
+    reason: 'not-entity: keyed by a prefab member\'s serialized localId, not a runtime entity id; editor/scene/prefab.ts:1159' },
+  { item: 'engine/packages/modoki/src/editor/scene/prefab.ts::InstanceReference.overrides',
+    reason: 'not-entity: keyed by a prefab member\'s serialized localId, not a runtime entity id; editor/scene/prefab.ts:1395' },
+  { item: 'engine/packages/modoki/src/editor/scene/prefab.ts::InstanceReference.removedTraits',
+    reason: 'not-entity: keyed by a prefab member\'s serialized localId, not a runtime entity id; editor/scene/prefab.ts:1395' },
+  { item: 'engine/packages/modoki/src/editor/scene/prefab.ts::NestedInstanceCapture.overrides',
+    reason: 'not-entity: keyed by a nested prefab member\'s localId, addressed by the parentLocalId chain precisely because runtime ids churn across the rebuild; editor/scene/prefab.ts:2047' },
+  { item: 'engine/packages/modoki/src/editor/scene/prefab.ts::RevertResult.fullOverrides',
+    reason: 'not-entity: keyed by a prefab member\'s serialized localId, not a runtime entity id; editor/scene/prefab.ts:2351' },
+  { item: 'engine/packages/modoki/src/editor/scene/prefab.ts::RevertResult.reducedOverrides',
+    reason: 'not-entity: keyed by a prefab member\'s serialized localId, not a runtime entity id; editor/scene/prefab.ts:2351' },
+  { item: 'engine/packages/modoki/src/editor/scene/prefab.ts::InstanceStructure.consumedEcsIds',
+    reason: 'scratch: built by captureInstanceStructure from a live query and read by serialize/serializePrefab in the same call; the structures kept by ApplyPrefabDialog\'s undo closures and engine/app/editor/agentEditorOps.ts:2409 never read it (rebuildInstance recomputes live members, editor/scene/prefab.ts:2186); editor/scene/prefab.ts:1159' },
+  { item: 'engine/packages/modoki/src/editor/scene/prefab.ts::InstanceStructure.ownedNested',
+    reason: 'scratch: same capture-and-consume call as InstanceStructure.consumedEcsIds — built by captureInstanceStructure from the same live query and handed straight to captureNestedChannels in the same synchronous call chain (#1369: serializeScene\'s pre-pass loop, and captureNestedRef), with no await and no spawn/destroy between build and read. The revert filter passes it through unchanged and never keys off it (editor/scene/prefab.ts:2947); editor/scene/prefab.ts:1430' },
+  { item: 'engine/packages/modoki/src/editor/scene/prefab.ts::InstanceReference.memberEcsIds',
+    reason: 'scratch: built by captureInstanceReference from a live PrefabInstance query and consumed as a skip set by the serializer that asked for it, in the same call; editor/scene/prefab.ts:1395' },
+  { item: 'engine/packages/modoki/src/editor/scene/prefab.ts::InstanceReference.consumedEcsIds',
+    reason: 'scratch: same capture-and-consume call as InstanceReference.memberEcsIds; editor/scene/prefab.ts:1395' },
+  { item: 'engine/packages/modoki/src/editor/scene/prefab.ts::InstanceReference.ownedNested',
+    reason: 'scratch: passed through from InstanceStructure.ownedNested by captureInstanceReference and read once, synchronously, by captureNestedRef\'s captureNestedChannels call (#1369); editor/scene/prefab.ts:1921' },
+  { item: 'engine/packages/modoki/src/editor/undo/undoManager.ts::_restoringSessions',
+    reason: 'not-entity: preview session ids, the same space as _previewSession; editor/undo/undoManager.ts:155' },
+  { item: 'engine/packages/modoki/src/editor/panels/SceneView.tsx::dominantBoneFieldCache',
+    reason: 'not-entity: WeakMap keyed by the ParsedRig2D object, inner key a rig part index; editor/panels/SceneView.tsx:170' },
+  { item: 'engine/packages/modoki/src/editor/animation/entityIndex.ts::AnimEntityIndex.byId',
+    reason: 'per-world-index: rebuilt from getAllEntities() whenever getStructureVersion() moved OR the current world changed. Every index reuse bumps the version (spawnEntity → registerEntity → markStructureDirty, runtime/core/ecs/world.ts:72), and the world stamp covers the global counter moving in a staging world before the swap and a swap back that registers nothing (#1198 review), pinned by animEntityIndex.test.ts; editor/animation/entityIndex.ts:33' },
+  { item: 'engine/packages/modoki/src/editor/animation/entityIndex.ts::AnimEntityIndex.childrenByParent',
+    reason: 'per-world-index: same build and invalidation as AnimEntityIndex.byId; editor/animation/entityIndex.ts:25' },
+  { item: 'engine/packages/modoki/src/editor/panels/sceneViewResources.ts::SceneViewEntityObjects.outlineMeshes',
+    reason: 'revalidated: syncOutlineFor rebuilds (and stores back) when the source geometry resolved from the live object this frame differs from the one the edges were traced from, and colour/TRS are rewritten every frame (#1198), pinned by sceneViewMath.test.ts; the owner-evicted ecsObjects also clears it through onMeshRemoved; editor/scene/sceneViewMath.ts' },
+  { item: 'engine/packages/modoki/src/editor/panels/sceneViewResources.ts::SceneViewEntityObjects.descOutlineMeshes',
+    reason: 'revalidated: same syncOutlineFor source-geometry stamp as outlineMeshes, rebuilt each frame from subtreeIds of the live selection (#1198); editor/panels/SceneView.tsx' },
+  { item: 'engine/packages/modoki/src/editor/panels/sceneViewResources.ts::SceneViewEntityObjects.colliderWires',
+    reason: 'revalidated: drawCollider resolves the id to a live Collider3D first, then rebuilds the wire when colliderOutlineSig3D (every field colliderWireframeGeometry reads, plus the mesh geometry uuid) or the colour differs; pose rewritten every frame; editor/panels/SceneView.tsx' },
+  { item: 'engine/packages/modoki/src/editor/panels/sceneViewResources.ts::SceneViewEntityObjects.colliderWireSigs',
+    reason: 'revalidated: the signature half of colliderWires, compared against the live Collider3D every frame and deleted with the wire; editor/panels/SceneView.tsx' },
+  { item: 'engine/packages/modoki/src/editor/panels/sceneViewResources.ts::SceneViewEntityObjects.ecsLights',
+    reason: 'revalidated: runtime syncLights rebuilds on a light-type mismatch and rewrites colour, intensity, shadow, range/cone, pose and layer mask from the live Light every frame; layers are identical for every light — the mirrored-state reading Scene3D\'s per-mount ecsLights already has; runtime/rendering/scene3DSync.ts:1122' },
+  { item: 'engine/packages/modoki/src/editor/panels/SceneView.tsx::_pick2DByCanvas',
+    reason: 'revalidated: canvas entity id -> pick callback; the callback holds only that id and live element/scale getters, and re-queries routing, paint order and the world on every call; editor/panels/SceneView.tsx:1436' },
+  { item: 'engine/packages/modoki/src/editor/scene/prefab.ts::expandedFrom',
+    reason: 'scratch: set and cleared (try/finally) around ONE synchronous captureNestedInstanceOverrides call — a read-only capture that spawns and destroys nothing, so no instance-root id it holds can be recycled while it is read; null outside that call (#1437); editor/scene/prefab.ts:1620' },
+  { item: 'engine/packages/modoki/src/editor/scene/sceneViewBus.ts::ecsObjectsRegistry',
+    reason: 'owner-checked: a reference to SceneView\'s live RenderState.ecsObjects, registered with its ecsOwners stamp map; the one reader, isEcsObjectVisible, refuses an entry whose packed owner is no longer alive before reading it (#1198 review), pinned by sceneViewBus.test.ts; editor/scene/sceneViewBus.ts' },
+  { item: 'engine/packages/modoki/src/editor/scene/sceneViewBus.ts::ecsOwnersRegistry',
+    reason: 'gen-in-value: SceneView\'s RenderState.ecsOwners, the packed entity each ecsObjects entry was built for (runtime LEDGER row); read only by isEcsObjectVisible, which checks it alive; editor/scene/sceneViewBus.ts:127' },
+  { item: 'engine/packages/modoki/src/editor/panels/Hierarchy.tsx::NO_COLLAPSE',
+    reason: 'not-entity: an empty sentinel substituted for the collapsed set while filtering; never written, so it holds no id; editor/panels/Hierarchy.tsx:81' },
+  { item: 'engine/packages/modoki/src/editor/panels/sceneView2DGraph.ts::_paintOrderCache',
+    reason: 'per-world-index: rebuilt from the live world whenever the structure version moves, which every registerEntity AND unregisterEntity bumps (#1220), so a recycled index is never served the dead entity\'s rank; editor/panels/sceneView2DGraph.ts:92, runtime/core/ecs/world.ts:224' },
+  { item: 'engine/packages/modoki/src/editor/panels/sceneView2DGraph.ts::_paintOrderCache{}.order',
+    reason: 'per-world-index: the id -> rank map inside _paintOrderCache, rebuilt on the same structure-version stamp (#1220); editor/panels/sceneView2DGraph.ts:92' },
+  { item: 'engine/packages/modoki/src/editor/panels/sceneView2DGraph.ts::Canvas2DRoutingMaps.parentOf',
+    reason: 'per-world-index: id -> parentId, built only by buildCanvas2DRouting from the live world and served only through getCanvas2DRouting, whose stamp includes the structure version every spawn and destroy bumps (#1220); editor/panels/sceneView2DGraph.ts:79' },
+  { item: 'engine/packages/modoki/src/editor/panels/sceneView2DGraph.ts::Canvas2DRoutingMaps.sortOrderOf',
+    reason: 'per-world-index: id -> sortOrder, built only by buildCanvas2DRouting from the live world and served only through getCanvas2DRouting, whose stamp includes the structure version every spawn and destroy bumps (#1220); editor/panels/sceneView2DGraph.ts:79' },
+  { item: 'engine/packages/modoki/src/editor/panels/sceneView2DGraph.ts::Canvas2DRoutingMaps.orderInLayerOf',
+    reason: 'per-world-index: id -> Renderable2D.orderInLayer, built only by buildCanvas2DRouting from the live world and served only through getCanvas2DRouting, whose stamp includes the structure version every spawn and destroy bumps (#1220); editor/panels/sceneView2DGraph.ts:79' },
+  { item: 'engine/packages/modoki/src/editor/panels/sceneView2DGraph.ts::Canvas2DRoutingMaps.canvasIds',
+    reason: 'per-world-index: the Canvas2D id set, built only by buildCanvas2DRouting from the live world and served only through getCanvas2DRouting, whose stamp includes the structure version every spawn and destroy bumps (#1220); editor/panels/sceneView2DGraph.ts:79' },
+  { item: 'engine/packages/modoki/src/editor/panels/gizmoBounds.ts::GizmoBoundsDeps.parentOf',
+    reason: 'per-world-index: every caller passes getCanvas2DRouting()\'s map, rebuilt from the live world on each spawn/destroy via the structure version (#1220); editor/panels/sceneView2DGraph.ts:79' },
+  { item: 'engine/packages/modoki/src/editor/panels/hierarchyCollapse.ts::CollapseHolds.held',
+    reason: 'gen-in-value: id -> HeldEntity, and every hold carries the packed entity (generation included) and its World; holdCollapsed keeps a prior hold only while findEntityById(id).valueOf() still equals it, and reconcileCollapsed resolves each through resolveHeld (#1221); editor/panels/hierarchyCollapse.ts:192' },
+  { item: 'engine/packages/modoki/src/editor/panels/Hierarchy.tsx::EntityNodeProps.collapsed',
+    reason: 'revalidated: every collapsed id is held (packed + guid + world) when collapsed and re-resolved before each tree rebuild — a replacement on the index leaves the set, a guid respawn takes its place (#1221); editor/panels/Hierarchy.tsx:726' },
+  { item: 'engine/packages/modoki/src/editor/panels/Hierarchy.tsx::EntityNodeProps.selectedIds',
+    reason: 'revalidated: a per-render memo of editorStore.selectedEntityIds, which editorRefLiveness re-resolves against the held entity synchronously on every structure change, before a spawn can reclaim the index (#1221); editor/store/editorRefLiveness.ts:125' },
+  // ── games/ (owed only where the layout carries the project — see rowIsOwedInLayout) ──
+  { item: 'games/court/runtime/knowledge.ts::EMPTY_ASSIGNED',
+    reason: 'not-entity: an empty region -> candidate map; its filled twin is keyed by region index (knowledge.ts:184); games/court/runtime/knowledge.ts:178' },
+  { item: 'games/court/runtime/rules.ts::Board.holes',
+    reason: 'not-entity: a Court board cell index, not an entity id; games/court/runtime/rules.ts:51' },
+  { item: 'games/court/runtime/rules.ts::Level.civilians',
+    reason: 'not-entity: a Court board cell index, not an entity id; games/court/runtime/rules.ts:59' },
+  { item: 'games/court/runtime/session.ts::SessionState.placements',
+    reason: 'not-entity: a Court board cell index, not an entity id; cell -> piece; games/court/runtime/session.ts:146' },
+  { item: 'games/court/runtime/session.ts::SessionState.paint',
+    reason: 'not-entity: a Court board cell index, not an entity id; cell -> painted glyphs; games/court/runtime/session.ts:148' },
+  { item: 'games/court/runtime/session.ts::SessionState.regionNotes',
+    reason: 'not-entity: keyed by a Piece letter, flagged for its Set<number> of REGION indices; games/court/runtime/session.ts:191' },
+  { item: 'games/court/runtime/session.ts::EMPTY_REGIONS',
+    reason: 'not-entity: an empty set of region indices; games/court/runtime/session.ts:265' },
+  { item: 'games/court/runtime/solver.ts::PropagateOptions.start',
+    reason: 'not-entity: region index -> assigned candidate (from assignedFromPlacements); games/court/runtime/solver.ts:479' },
+  { item: 'games/court/runtime/solver.ts::PropagateResult.placement',
+    reason: 'not-entity: Court\'s own `type Placement = ReadonlyMap<number, Piece>`, cell -> piece; games/court/runtime/rules.ts:141' },
+  { item: 'games/court/runtime/systems.ts::PaintStroke.touched',
+    reason: 'not-entity: a Court board cell index, not an entity id; cells a paint stroke already visited; games/court/runtime/systems.ts:14064' },
+  { item: 'games/court/runtime/systems.ts::pieceRevealMs',
+    reason: 'not-entity: a Court board cell index, not an entity id; cell -> reveal clock; games/court/runtime/systems.ts:12926' },
+  { item: 'games/court/runtime/systems.ts::revealedFlagCells',
+    reason: 'not-entity: a Court board cell index, not an entity id; games/court/runtime/systems.ts:12310' },
+  { item: 'games/court/runtime/systems.ts::flagInstances',
+    reason: 'not-entity: a Court board cell index, not an entity id; the VALUE is the flag\'s Entity HANDLE since #1224, which syncFlags asks entityAlive before retiring; games/court/runtime/systems.ts:2052' },
+  { item: 'games/court/runtime/systems.ts::wheelWedgeMismatchWarned',
+    reason: 'not-entity: wedge COUNTS already warned about; games/court/runtime/systems.ts:20765' },
+  { item: 'games/court/runtime/systems.ts::cellCenters',
+    reason: 'not-entity: a Court board cell index, not an entity id; games/court/runtime/systems.ts:11044' },
+  { item: 'games/court/runtime/systems.ts::cellGeometry',
+    reason: 'not-entity: a Court board cell index, not an entity id; games/court/runtime/systems.ts:10977' },
+  { item: 'games/court/tests/courtSweepPass.ts::BeatsRecord.byKind',
+    reason: 'not-entity: action kind -> (beat count -> stories); games/court/tests/courtSweepPass.ts:114' },
+  { item: 'games/court/tests/hintKit.ts::Board.placements',
+    reason: 'not-entity: a Court board cell index, not an entity id; the test kit\'s board; games/court/tests/hintKit.ts:83' },
+  { item: 'games/court/tests/hintKit.ts::Board.paint',
+    reason: 'not-entity: a Court board cell index, not an entity id; the test kit\'s board; games/court/tests/hintKit.ts:84' },
+  { item: 'games/sling/runtime/field/rebuildField.ts::registeredKeys',
+    reason: 'revalidated: field root id -> the runtime-mesh keys registered for it, and every key EMBEDS that same root id (capTopKey/dirtKey/rampShellKey), so a newcomer on the index owns exactly the key strings it would register itself; clearField unregisters them before a rebuild re-registers. Not an inheritance hazard; a root whose id CHANGES across a reload leaves its keys registered (a leak, outside this guard); games/sling/runtime/field/rebuildField.ts:253' },
+  { item: 'games/sling/runtime/fish.ts::rootInfo',
+    reason: 'scratch: cleared and refilled from the live query at the top of every frame; games/sling/runtime/fish.ts:141' },
+  { item: 'games/sling/runtime/fish.ts::parentOf',
+    reason: 'scratch: cleared and refilled from the live EntityAttributes query every frame; games/sling/runtime/fish.ts:208' },
+  { item: 'games/wordweave/runtime/systems.ts::wheelWedgeMismatchWarned',
+    reason: 'not-entity: wedge COUNTS already warned about; games/wordweave/runtime/systems.ts:2459' },
+  { item: 'games/wordweave/runtime/systems.ts::NO_CELLS',
+    reason: 'not-entity: an empty set of Wordweave board cell indices; games/wordweave/runtime/systems.ts:5645' },
+  { item: 'games/wordweave/tools/generate.ts::TierPool.byLength',
+    reason: 'not-entity: word length -> words; games/wordweave/tools/generate.ts:159' },
+];
+
+/** Rows for `heldEntityDeclarations` (#1222), keyed repo-relative like WIDENED_LEDGER. Tags as above, plus:
+ *  `alive-checked:` (every use follows an isAlive check or a per-frame prune), `brief:` (instances live
+ *  within one call or frame, the owner's "brief use is fine by id"), `rebuilt:` (reassigned from a live
+ *  query before each use) and `empty:` (a constant that never holds an entity). */
+const HELD_LEDGER: ReadonlyArray<{ item: string; reason: string }> = [
+  { item: 'engine/packages/modoki/src/runtime/core/actionRegistry.ts::UIActionContext.target',
+    reason: 'brief: built per dispatch and handed straight to the handler; runtime/core/actionRegistry.ts:185' },
+  { item: 'engine/packages/modoki/src/runtime/core/actionRegistry.ts::DispatchOptions.target',
+    reason: 'brief: the caller\'s options for one call, read once and never stored; runtime/core/actionRegistry.ts:185' },
+  { item: 'engine/packages/modoki/src/runtime/core/ecs/transformPropagationSystem.ts::_allEntityIds',
+    reason: 'scratch: cleared, then refilled from the live EntityAttributes query in the same pass that reads it; runtime/core/ecs/transformPropagationSystem.ts:204' },
+  { item: 'engine/packages/modoki/src/runtime/loaders/loadSceneFile.ts::EntityIdRef.entity',
+    reason: 'alive-checked: a record local to one loadSceneFile call (#1353), dropped when it returns; writeEntityIdRef skips a dead entity and a field that no longer holds the expected id before every write; runtime/loaders/loadSceneFile.ts:1464' },
+  { item: 'engine/packages/modoki/src/runtime/input/pointerSource.ts::activeId',
+    reason: 'not-entity: the DOM PointerEvent.pointerId being tracked; runtime/input/pointerSource.ts:204' },
+  { item: 'engine/packages/modoki/src/runtime/physics/physics2DSystem.ts::EMPTY_CHILDREN',
+    reason: 'empty: a frozen empty array, only ever a `??` fallback; runtime/physics/physics2DSystem.ts:728' },
+  { item: 'engine/packages/modoki/src/runtime/physics/physics3DSystem.ts::EMPTY_CHILDREN',
+    reason: 'empty: a frozen empty array, only ever a `??` fallback; runtime/physics/physics3DSystem.ts:147' },
+  { item: 'engine/packages/modoki/src/runtime/physics/physicsContactEvents.ts::ColliderInfo.entity',
+    reason: 'uncertain: held across frames in the per-world collider map; the reconcile before each step evicts unseen and generation-mismatched bodies (runtime/physics/physics2DSystem.ts:945), and a ref crossing to game code goes through refOf\'s isAlive (runtime/physics/physicsContactEvents.ts:78). NOT re-checked for an entity a contact handler destroys mid-routing: the @contact speed reads RigidBody2D off it (physics2DSystem.ts:1336), so a handler that destroys one body and spawns another RigidBody2D entity would report the newcomer\'s velocity. Settled by a test whose onCollisionEnter handler destroys a body and spawns a replacement before the pair\'s contact detail is emitted' },
+  { item: 'engine/packages/modoki/src/runtime/rendering/frameDriver.ts::rafId',
+    reason: 'not-entity: a requestAnimationFrame handle; runtime/rendering/frameDriver.ts:158' },
+  { item: 'engine/packages/modoki/src/runtime/timeline/timelineSystem.ts::Pending.entity',
+    reason: 'brief: pushed into a call-local array from the live Director query and consumed in the same call; runtime/timeline/timelineSystem.ts:1191' },
+  { item: 'engine/packages/modoki/src/runtime/ui/uiOverflow.ts::UIOverflowVerdict.boxEntityId',
+    reason: 'brief: a verdict built and consumed per scan; its id is copied into a finding that is only printed, never used to reach an entity; runtime/ui/uiOverflow.ts:116' },
+  { item: 'engine/packages/modoki/src/runtime/zones/zoneTriggerCore.ts::ZoneCandidate.entity',
+    reason: 'brief: built per frame from the live zone query and consumed by runZoneTriggers in the same call; runtime/zones/zone2DSystem.ts:85' },
+  { item: 'engine/packages/modoki/src/runtime/zones/zoneTriggerCore.ts::OccupantSample.entity',
+    reason: 'brief: built per frame from the live occupant query and consumed in the same call; runtime/zones/zone2DSystem.ts:93' },
+  { item: 'engine/packages/modoki/src/runtime/zones/zoneTriggerCore.ts::ZoneMember.entity',
+    reason: 'revalidated: membership is keyed by the packed entity, so a reclaimed index is a new member (a real exit and enter), and refs cross to game code through refOf\'s isAlive; runtime/zones/zoneTriggerCore.ts:72' },
+  { item: 'engine/packages/modoki/src/editor/panels/uiPreviewPick.ts::PreviewStackEntry{}.canvasEntityId',
+    reason: 'brief: parsed from the DOM for one pick and consumed by that pick; editor/panels/uiPreviewPick.ts:175' },
+  { item: 'engine/packages/modoki/src/editor/store/editorStore.ts::EditorState.selectedEntityId',
+    reason: 'revalidated: held as a HeldEntity (packed value + guid + world) and re-resolved on every structure change, synchronously, before a spawn can reclaim the index (#1221); editor/store/editorRefLiveness.ts:182' },
+  { item: 'engine/packages/modoki/src/editor/store/editorStore.ts::EditorState.selectedEntityIds',
+    reason: 'revalidated: held as a HeldEntity (packed value + guid + world) and re-resolved on every structure change, synchronously, before a spawn can reclaim the index (#1221); editor/store/editorRefLiveness.ts:182' },
+  { item: 'engine/packages/modoki/src/editor/store/editorStore.ts::EditorState.animatorRootEntityId',
+    reason: 'revalidated: held as a HeldEntity (packed value + guid + world) and re-resolved on every structure change, synchronously, before a spawn can reclaim the index (#1221); editor/store/editorRefLiveness.ts:182' },
+  { item: 'engine/packages/modoki/src/editor/store/editorStore.ts::EditorState.directorRootEntityId',
+    reason: 'revalidated: held as a HeldEntity (packed value + guid + world) and re-resolved on every structure change, synchronously, before a spawn can reclaim the index (#1221); editor/store/editorRefLiveness.ts:182' },
+  { item: 'games/court/runtime/systems.ts::trayRoot',
+    reason: 'alive-checked: boardHandlesIntact checks every board handle with isPackedAlive before any per-frame use, and rebuilds the board when one is gone (#1224); games/court/runtime/systems.ts:23748' },
+  { item: 'games/court/runtime/systems.ts::tutorialHand',
+    reason: 'alive-checked: boardHandlesIntact checks every board handle with isPackedAlive before any per-frame use, and rebuilds the board when one is gone (#1224); games/court/runtime/systems.ts:23748' },
+  { item: 'games/court/runtime/systems.ts::dragOutline',
+    reason: 'alive-checked: boardHandlesIntact checks every board handle with isPackedAlive before any per-frame use, and rebuilds the board when one is gone (#1224); games/court/runtime/systems.ts:23748' },
+  { item: 'games/court/runtime/systems.ts::dragBadge',
+    reason: 'alive-checked: boardHandlesIntact checks every board handle with isPackedAlive before any per-frame use, and rebuilds the board when one is gone (#1224); games/court/runtime/systems.ts:23748' },
+  { item: 'games/court/runtime/systems.ts::dragIcon',
+    reason: 'alive-checked: boardHandlesIntact checks every board handle with isPackedAlive before any per-frame use, and rebuilds the board when one is gone (#1224); games/court/runtime/systems.ts:23748' },
+  { item: 'games/court/runtime/systems.ts::dragShadow',
+    reason: 'alive-checked: boardHandlesIntact checks every board handle with isPackedAlive before any per-frame use, and rebuilds the board when one is gone (#1224); games/court/runtime/systems.ts:23748' },
+  { item: 'games/court/runtime/systems.ts::dropRing',
+    reason: 'alive-checked: boardHandlesIntact checks every board handle with isPackedAlive before any per-frame use, and rebuilds the board when one is gone (#1224); games/court/runtime/systems.ts:23748' },
+  { item: 'games/court/runtime/systems.ts::carryRingBars',
+    reason: 'alive-checked: boardHandlesIntact checks every board handle with isPackedAlive before any per-frame use, and rebuilds the board when one is gone (#1224); games/court/runtime/systems.ts:23748' },
+  { item: 'games/court/runtime/systems.ts::trayBanners',
+    reason: 'alive-checked: boardHandlesIntact checks every board handle with isPackedAlive before any per-frame use, and rebuilds the board when one is gone (#1224); games/court/runtime/systems.ts:23748' },
+  { item: 'games/court/runtime/systems.ts::TrayBadgeInstance.root',
+    reason: 'alive-checked: boardHandlesIntact checks every board handle with isPackedAlive before any per-frame use, and rebuilds the board when one is gone (#1224); games/court/runtime/systems.ts:23748' },
+  { item: 'games/court/runtime/systems.ts::TrayBadgeInstance.members',
+    reason: 'alive-checked: boardHandlesIntact checks every board handle with isPackedAlive before any per-frame use, and rebuilds the board when one is gone (#1224); games/court/runtime/systems.ts:23748' },
+  { item: 'games/court/runtime/systems.ts::boardRoot',
+    reason: 'alive-checked: entityAlive(boardRoot) gates the per-frame board branch (#1224); games/court/runtime/systems.ts:24610' },
+  { item: 'games/court/runtime/systems.ts::winFxRoot',
+    reason: 'alive-checked: entityAlive before reuse, and destroySubtrees skips a dead root (#1224); games/court/runtime/systems.ts:18041' },
+  { item: 'games/court/runtime/systems.ts::overlayRoot',
+    reason: 'alive-checked: a dead overlay root marks the board dirty for a rebuild (#1224); games/court/runtime/systems.ts:24703' },
+  { item: 'games/court/runtime/systems.ts::flagRoot',
+    reason: 'alive-checked: respawned when not alive, before its id is read (#1224); games/court/runtime/systems.ts:17823' },
+  { item: 'games/court/runtime/systems.ts::bonusFxRoot',
+    reason: 'alive-checked: entityAlive before reuse, and destroySubtrees skips a dead root (#1224); games/court/runtime/systems.ts:21189' },
+  { item: 'games/court/runtime/systems.ts::flagInstances{}.entity',
+    reason: 'alive-checked: syncFlags drops an instance whose entity is not alive before touching it (#1224); games/court/runtime/systems.ts:17811' },
+  { item: 'games/sling/runtime/fish.ts::zoneIds',
+    reason: 'scratch: cleared and refilled from the live Zone3D query every frame before resolveZones reads it; games/sling/runtime/fish.ts:118' },
+  { item: 'games/sling/runtime/systems.ts::puck',
+    reason: 'alive-checked: pruneDeadHandles nulls a dead handle at the top of the GAME and LATE_UPDATE ticks (#1222); games/sling/runtime/systems.ts:1065' },
+  { item: 'games/sling/runtime/systems.ts::puckVisual',
+    reason: 'alive-checked: pruneDeadHandles nulls a dead handle at the top of the GAME and LATE_UPDATE ticks (#1222); games/sling/runtime/systems.ts:1065' },
+  { item: 'games/sling/runtime/systems.ts::collectSensor',
+    reason: 'alive-checked: pruneDeadHandles nulls a dead handle at the top of the GAME and LATE_UPDATE ticks (#1222); games/sling/runtime/systems.ts:1065' },
+  { item: 'games/sling/runtime/systems.ts::pad',
+    reason: 'alive-checked: pruneDeadHandles nulls a dead handle at the top of the GAME and LATE_UPDATE ticks (#1222); games/sling/runtime/systems.ts:1065' },
+  { item: 'games/sling/runtime/systems.ts::padAnim',
+    reason: 'alive-checked: pruneDeadHandles nulls a dead handle at the top of the GAME and LATE_UPDATE ticks (#1222); games/sling/runtime/systems.ts:1065' },
+  { item: 'games/sling/runtime/systems.ts::aimLine',
+    reason: 'alive-checked: pruneDeadHandles nulls a dead handle at the top of the GAME and LATE_UPDATE ticks (#1222); games/sling/runtime/systems.ts:1065' },
+  { item: 'games/sling/runtime/systems.ts::bandL',
+    reason: 'alive-checked: pruneDeadHandles nulls a dead handle at the top of the GAME and LATE_UPDATE ticks (#1222); games/sling/runtime/systems.ts:1065' },
+  { item: 'games/sling/runtime/systems.ts::bandR',
+    reason: 'alive-checked: pruneDeadHandles nulls a dead handle at the top of the GAME and LATE_UPDATE ticks (#1222); games/sling/runtime/systems.ts:1065' },
+  { item: 'games/sling/runtime/systems.ts::camera',
+    reason: 'alive-checked: pruneDeadHandles nulls a dead handle at the top of the GAME and LATE_UPDATE ticks (#1222); games/sling/runtime/systems.ts:1065' },
+  { item: 'games/sling/runtime/systems.ts::enemies',
+    reason: 'alive-checked: pruneDeadEnemies splices dead enemies and evicts their packed-keyed state at the top of the tick and before planning (#1198); games/sling/runtime/systems.ts:1082' },
+  { item: 'games/space-invader/runtime/systems.ts::pointer.hostId',
+    reason: 'rebuilt: reassigned from resolveCanvas2DHost at the top of every frame, before handlePointer resolves a canvas with it; games/space-invader/runtime/systems.ts:231' },
+  { item: 'games/space-invader/runtime/systems.ts::State{}.player',
+    reason: 'rebuilt: reassigned from world.queryFirst(Player) every frame before any use; games/space-invader/runtime/systems.ts:238' },
+  { item: 'games/wordweave/runtime/celebrationFx.ts::LiveFx.root',
+    reason: 'alive-checked: its only use is the subtree destroy, which drops a root that fails isPackedAlive or belongs to another world; games/wordweave/runtime/celebrationFx.ts:173' },
+  { item: 'games/wordweave/runtime/systems.ts::Built.crosswordRoot',
+    reason: 'pending: #1243 — cleared only on a world swap or a board rebuild; nothing checks isAlive, so a delete during Play leaves it writing to whatever reclaims the index; games/wordweave/runtime/systems.ts:711' },
+  { item: 'games/wordweave/runtime/systems.ts::Built.crosswordClip',
+    reason: 'pending: #1243 — cleared only on a world swap or a board rebuild; nothing checks isAlive, so a delete during Play leaves it writing to whatever reclaims the index; games/wordweave/runtime/systems.ts:711' },
+  { item: 'games/wordweave/runtime/systems.ts::Built.boardCells',
+    reason: 'pending: #1243 — cleared only on a world swap or a board rebuild; nothing checks isAlive, so a delete during Play leaves it writing to whatever reclaims the index; games/wordweave/runtime/systems.ts:711' },
+  { item: 'games/wordweave/runtime/systems.ts::Built.boardCellOutlines',
+    reason: 'pending: #1243 — the cells\' outline rings, index-aligned with Built.boardCells and living exactly as long; cleared only on a world swap or a board rebuild, and nothing checks isAlive; games/wordweave/runtime/systems.ts:711' },
+  { item: 'games/wordweave/runtime/systems.ts::Built.boardGlyphs',
+    reason: 'pending: #1243 — cleared only on a world swap or a board rebuild; nothing checks isAlive, so a delete during Play leaves it writing to whatever reclaims the index; games/wordweave/runtime/systems.ts:711' },
+  { item: 'games/wordweave/runtime/systems.ts::Built.hitAreas',
+    reason: 'pending: #1243 — cleared only on a world swap or a board rebuild; nothing checks isAlive, so a delete during Play leaves it writing to whatever reclaims the index; games/wordweave/runtime/systems.ts:711' },
+  { item: 'games/wordweave/runtime/systems.ts::Built.bandOutlines',
+    reason: 'pending: #1243 — cleared only on a world swap or a board rebuild; nothing checks isAlive, so a delete during Play leaves it writing to whatever reclaims the index; games/wordweave/runtime/systems.ts:711' },
+  { item: 'games/wordweave/runtime/systems.ts::Built.crosswordCells',
+    reason: 'pending: #1243 — cleared only on a world swap or a board rebuild; nothing checks isAlive, so a delete during Play leaves it writing to whatever reclaims the index; games/wordweave/runtime/systems.ts:711' },
+  { item: 'games/wordweave/runtime/systems.ts::Built.crosswordGlyphs',
+    reason: 'pending: #1243 — cleared only on a world swap or a board rebuild; nothing checks isAlive, so a delete during Play leaves it writing to whatever reclaims the index; games/wordweave/runtime/systems.ts:711' },
+  { item: 'games/wordweave/runtime/systems.ts::Built.trail',
+    reason: 'pending: #1243 — cleared only on a world swap or a board rebuild; nothing checks isAlive, so a delete during Play leaves it writing to whatever reclaims the index; games/wordweave/runtime/systems.ts:711' },
+  { item: 'games/wordweave/runtime/systems.ts::Built.trailJoins',
+    reason: 'pending: #1243 — the bevel wedges that close Built.trail\'s corners (#1365), pooled and living exactly as long as it; cleared only on a world swap or a board rebuild, and nothing checks isAlive; games/wordweave/runtime/systems.ts:711' },
+  { item: 'games/wordweave/runtime/systems.ts::Built.currentWord',
+    reason: 'pending: #1243 — cleared only on a world swap or a board rebuild; nothing checks isAlive, so a delete during Play leaves it writing to whatever reclaims the index; games/wordweave/runtime/systems.ts:711' },
+  { item: 'games/wordweave/runtime/systems.ts::Built.wordFlightGlyphs',
+    reason: 'pending: #1243 — cleared only on a world swap or a board rebuild; nothing checks isAlive, so a delete during Play leaves it writing to whatever reclaims the index; games/wordweave/runtime/systems.ts:711' },
+  { item: 'games/wordweave/runtime/systems.ts::Built.meterCells',
+    reason: 'pending: #1243 — cleared only on a world swap or a board rebuild; nothing checks isAlive, so a delete during Play leaves it writing to whatever reclaims the index; games/wordweave/runtime/systems.ts:711' },
 ];
 
 describe('entity-keyed maps — runtime/** state keyed by a recycled index (#868)', () => {
@@ -633,5 +1140,115 @@ describe('entity-keyed maps — runtime/** state keyed by a recycled index (#868
         + '`core/ecs/entityTable.ts`, rule in docs/engine-concepts.md § Entity. Otherwise add a LEDGER '
         + 'row whose reason starts with its tag and cites the line that makes it safe.',
     });
+  });
+
+  it('aliases are scoped per project: one game\'s number-keyed alias does not flag another game\'s same-named type (#1198)', () => {
+    const runtime = collectCorpusAliases([{ file: 'core/ids.ts', code: 'export type SceneId = number;' }]);
+    const sources = [
+      { file: 'games/court/rules.ts', code: 'export type Placement = ReadonlyMap<number, string>;\ninterface R { placement: Placement | null }' },
+      { file: 'games/sling/floor.ts', code: 'export interface Placement { tx: number }\ninterface M { placements: Placement[] }' },
+      { file: 'engine/app/x.ts', code: 'interface E { owners: Map<SceneId, string> }' },
+    ];
+    const found = aliasScopes(sources, runtime)
+      .flatMap((sc) => sc.sources.flatMap((src) => numberKeyedDeclarations(src.code, src.file, sc.aliases).found.map((d) => d.item)));
+    // Reject side: court's own alias still flags court's field, and a runtime alias reaches every scope.
+    expect(found).toContain('games/court/rules.ts::R.placement');
+    expect(found).toContain('engine/app/x.ts::E.owners');
+    // Accept side: sling's unrelated Placement is not court's.
+    expect(found).not.toContain('games/sling/floor.ts::M.placements');
+  });
+
+  it('a games/ or demos/ row is owed only when this layout carries its PROJECT — never judged by the file (#1198)', () => {
+    const present = new Set(['demos/shipped', 'games/court']);
+    // Reject side: a project the layout does not ship.
+    expect(rowIsOwedInLayout('demos/unpublished/game.ts::m', present)).toBe(false);
+    expect(rowIsOwedInLayout('games/sling/runtime/fish.ts::rootInfo', present)).toBe(false);
+    // Accept side: a present project's row is owed even if its FILE is gone — that is a stale row.
+    expect(rowIsOwedInLayout('demos/shipped/renamed-away.ts::m', present)).toBe(true);
+    expect(rowIsOwedInLayout('games/court/runtime/systems.ts::x', present)).toBe(true);
+    // Engine rows are always owed; a prefix look-alike is not a project.
+    expect(rowIsOwedInLayout('engine/packages/modoki/src/editor/x.ts::m', present)).toBe(true);
+    expect(rowIsOwedInLayout('games-archive/x.ts::m', new Set())).toBe(true);
+  });
+
+  it('the editor, engine/app, the starter template, games/ and demos/: every flagged declaration uses EntityTable/PackedEntity, or spends a WIDENED_LEDGER row (#1198)', () => {
+    const { scanned, found } = scanWidened();
+    const presentProjects = new Set(discoverProjects(REPO_ROOT).map((pr: { root: string; name: string }) => `${pr.root}/${pr.name}`));
+    assertExemptionLedger({
+      label: 'WIDENED_LEDGER in entityKeyedMaps',
+      population: found,
+      exempt: WIDENED_LEDGER.filter(({ item }) => rowIsOwedInLayout(item, presentProjects)),
+      floor: 1500,
+      scanned,
+      fix: 'number-keyed Map/Set(s) outside runtime/** with no WIDENED_LEDGER row. Same rule as the runtime '
+        + 'ledger: if the number is an entity id and the state survives the frame (or the user\'s click), use '
+        + '`EntityTable` or key by `packedOf(entity)` (`core/ecs/entityTable.ts`); otherwise add a row whose '
+        + 'reason starts with its tag and cites the line that makes it safe. Keys are repo-relative.',
+    });
+  });
+});
+
+
+describe('held entity handles — a declaration holding an Entity or an entity id across calls (#1222)', () => {
+  it('flags module handles, entity-typed fields, module object properties and module id scalars; not locals, counters or other Entity types', () => {
+    const src = [
+      "import type { Entity, World } from 'koota';",
+      'let puck: Entity | null = null;',
+      'const enemies: Entity[] = [];',
+      'let boardRootId = 0;',
+      'let rootIds: number[] = [];',
+      'const pointer = { active: false, hostId: 0, dragId: null as number | null, nextSlotId: 1 };',
+      'const state = { player: null as Entity | null, score: 0, nested: { cam: null as Entity | null } };',
+      'class Owner { held: Entity | undefined; other = 1; }',
+      'interface Store { selectedEntityId: number | null; selectedEntityIds: number[]; target: Entity; }',
+      '',
+      '// Accept side: none of these may be flagged.',
+      'let _nextTraitId = 1;',
+      'const fixedId = 3;',
+      'let parentId = "x";',
+      'interface NotStore { parentId: number; onPick(e: Entity): void; cb: (e: Entity) => void }',
+      'function local() { let held: Entity | null = null; const ids: number[] = []; return [held, ids]; }',
+      'const byId = new Map<number, Entity>();',   // the number-keyed ledger owns this one
+    ].join('\n');
+    const { found, scanned } = heldEntityDeclarations(src, 'fixture.ts');
+    expect(found.map((d) => d.item)).toEqual([
+      'fixture.ts::puck',
+      'fixture.ts::enemies',
+      'fixture.ts::boardRootId',
+      'fixture.ts::rootIds',
+      'fixture.ts::pointer.hostId',
+      'fixture.ts::pointer.dragId',
+      'fixture.ts::state.player',
+      'fixture.ts::state.nested.cam',
+      'fixture.ts::Owner.held',
+      'fixture.ts::Store.selectedEntityId',
+      'fixture.ts::Store.selectedEntityIds',
+      'fixture.ts::Store.target',
+    ]);
+    expect(scanned).toBeGreaterThanOrEqual(found.length + 6);
+  });
+
+  it('every held Entity or entity id in the corpus is liveness-checked, brief, or spends a HELD_LEDGER row', () => {
+    const { scanned, found } = scanHeld();
+    const presentProjects = new Set(discoverProjects(REPO_ROOT).map((pr: { root: string; name: string }) => `${pr.root}/${pr.name}`));
+    assertExemptionLedger({
+      label: 'HELD_LEDGER in entityKeyedMaps',
+      population: found,
+      exempt: HELD_LEDGER.filter(({ item }) => rowIsOwedInLayout(item, presentProjects)),
+      floor: 3000,
+      scanned,
+      fix: 'declaration(s) holding a koota Entity, or an entity id, across calls with no HELD_LEDGER row. koota\'s '
+        + 'get/set ignore the generation, so a held handle reads and writes whatever reclaims a destroyed '
+        + 'entity\'s index. Check it with isAlive()/isPackedAlive before each use (or prune it once per frame), hold '
+        + 'a guid for a reference that should follow "the same thing", or add a row whose reason starts with its '
+        + 'tag and cites the line that makes it safe — rule in docs/engine-concepts.md § Entity.',
+    });
+  });
+
+  it('an Entity that is not koota\'s is not a handle', () => {
+    const src = "interface Entity { name: string }\nlet current: Entity | null = null;";
+    expect(heldEntityDeclarations(src, 'scene.ts').found).toEqual([]);
+    const aliased = "import type { Entity as KEntity } from 'koota';\nlet current: KEntity | null = null;";
+    expect(heldEntityDeclarations(aliased, 'aliased.ts').found.map((d) => d.item)).toEqual(['aliased.ts::current']);
   });
 });

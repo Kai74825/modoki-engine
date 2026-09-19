@@ -8,7 +8,8 @@
  *  tested both ways: nothing written → `REFUSED_BY_OP`, something written → `PARTIAL`. */
 
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
-import { createTestWorld, type TestWorld, setPlayState, registerAsset, findEntity, Transform } from '@modoki/engine/runtime';
+import { createTestWorld, type TestWorld, setPlayState, registerAsset, findEntity, Transform, EntityAttributes, sceneManager, type LoadedSceneEntry } from '@modoki/engine/runtime';
+import { markSceneDirty, clearAllSceneDirty } from '../../packages/modoki/src/editor/scene/sceneDirty';
 import { markSceneSaved, clearHistory, clearDirtyAssets, markAssetDirty, setCurrentScenePath, setPrefabCache } from '@modoki/engine/editor';
 import { registerAllTraits } from '../../app/ecs/registerTraits';
 import { registerEditorAgentOps } from '../../app/editor/agentEditorOps';
@@ -90,6 +91,29 @@ describe('REQUIRES_SAVE — the world swap would cross unsaved work (guardUnsave
   });
 });
 
+describe('REQUIRES_SAVE over a dirty BASE scene names the carry exception (#1417 review)', () => {
+  it('says a loaded base the target shares survives, and that the open scene itself is not one', async () => {
+    markSceneDirty('bbbbbbbb-0000-4000-8000-000000001417');
+    try {
+      const err = await runAgentOp('load-scene', { path: '/assets/scenes/elsewhere-1417.scene.json' })
+        .then(() => null, (e: unknown) => e as { code?: string; message?: string });
+      expect(err).toMatchObject({ code: 'REQUIRES_SAVE' });
+      expect(err?.message).toMatch(/loaded AS A BASE \(not the open scene itself\).*carried across live and stays unsaved/);
+      expect(err?.message).toMatch(/discards the LIVE-WORLD edits \(not those of a loaded base the target shares\)/);
+      // #1420: since #1417 the usual way a base is dirty here is an ordinary base edit carried
+      // through a load, so the cause names that, and no longer sends the reader after a save_all
+      // failure that never happened.
+      expect(err?.message).toMatch(/1 loaded base scene\(s\) with edits not yet saved \(guid\(s\): bbbbbbbb-0000-4000-8000-000000001417\) — usually an edit made to that base/);
+      expect(err?.message).not.toMatch(/may have failed/);
+      // #1422: the carry is not promised for a base whose file changed on disk (a pending hot
+      // reload), which the next load reloads whoever issues it.
+      expect(err?.message).toMatch(/stays unsaved, unless its FILE changed on disk since it loaded \(a pending hot reload of it\): then disk wins/);
+    } finally {
+      clearAllSceneDirty();
+    }
+  });
+});
+
 describe('save-all while PLAYING — the scene half is refused; the code follows what landed', () => {
   beforeEach(() => { setCurrentScenePath('/assets/scenes/opcodes-1012.scene.json'); });
 
@@ -119,6 +143,93 @@ describe('save-all with NO scene path (the Save-As panel needs a human) — same
     const err = await runAgentOp('save-all', {}).then(() => null, (e: unknown) => e as { code?: string; message?: string });
     expect(err).toMatchObject({ code: 'PARTIAL' });
     expect(err?.message).toMatch(/DID land/);
+  });
+});
+
+describe('save-all with an explicit path that is not a scene file name (#1413)', () => {
+  // Both scene-write routes: a path other than the open scene's is a Save As since #1414, which goes
+  // through /api/scene-save-as (the stub answers it without a guid, so it reports write-failed —
+  // these tests are about which NAMES are accepted, not about the save-as itself).
+  const writesTo = () => (fetch as unknown as { mock: { calls: unknown[][] } }).mock.calls
+    .filter(([u]) => String(u).includes('/api/write-file') || String(u).includes('/api/scene-save-as'));
+  const notANameRefusal = (e: unknown) => expect((e as { message?: string } | null)?.message ?? '').not.toMatch(/not a scene file name/);
+  beforeEach(() => { setCurrentScenePath('/assets/scenes/open-1413.scene.json'); });
+
+  it('a plain .json is REFUSED, nothing is written, and the corrected path is named', async () => {
+    const err = await runAgentOp('save-all', { path: '/assets/scenes/new-1413.json' }).then(() => null, (e: unknown) => e as { code?: string; message?: string });
+    expect(err).toMatchObject({ code: 'REFUSED_BY_OP' });
+    expect(err?.message).toContain('"/assets/scenes/new-1413.scene.json"');
+    expect(writesTo()).toEqual([]);
+  });
+
+  it('parked docs are still written first (#259) — the refusal is PARTIAL and names them', async () => {
+    markAssetDirty(PARKED, 'particle', def());
+    const err = await runAgentOp('save-all', { path: '/assets/scenes/new-1413.json' }).then(() => null, (e: unknown) => e as { code?: string; message?: string });
+    expect(err).toMatchObject({ code: 'PARTIAL' });
+    expect(err?.message).toMatch(/WERE written/);
+    // …and the scene half really was not written, under either name.
+    const bodies = (fetch as unknown as { mock: { calls: unknown[][] } }).mock.calls.map(([, init]) => String((init as { body?: string })?.body ?? ''));
+    expect(bodies.some((b) => b.includes('new-1413'))).toBe(false);
+  });
+
+  it('another kind\'s suffix is refused too — it would be registered as a scene under a prefab name', async () => {
+    await expect(runAgentOp('save-all', { path: '/assets/scenes/new-1413.prefab.json' })).rejects.toMatchObject({ code: 'REFUSED_BY_OP' });
+    expect(writesTo()).toEqual([]);
+  });
+
+  it('a legacy /scenes/*.json the manifest already types scene is still re-savable under its name', async () => {
+    registerAsset('00001413-0000-4000-8000-000000001413', '/assets/scenes/legacy-1413.json', 'scene');
+    notANameRefusal(await runAgentOp('save-all', { path: '/assets/scenes/legacy-1413.json' }).then(() => null, (e: unknown) => e));
+    expect(writesTo().length).toBeGreaterThan(0);
+  });
+
+  it('a .scene.json path saves', async () => {
+    notANameRefusal(await runAgentOp('save-all', { path: '/assets/scenes/new-1413.scene.json' }).then(() => null, (e: unknown) => e));
+    expect(writesTo().length).toBeGreaterThan(0);
+  });
+});
+
+describe('save-all Save As whose copy FAILS after a dirty base was written (#1414) — PARTIAL, naming the base', () => {
+  const OPEN = '/assets/scenes/open-1414.scene.json';
+  const BASE = '/assets/scenes/base-1414.scene.json';
+  const OPEN_ID = '00001414-0000-4000-8000-000000000001';
+  const BASE_ID = '00001414-0000-4000-8000-000000000002';
+  beforeEach(() => {
+    registerAsset(OPEN_ID, OPEN, 'scene');
+    setCurrentScenePath(OPEN);
+    markSceneSaved();
+    clearAllSceneDirty();
+    vi.spyOn(sceneManager, 'getLoadedScenes').mockReturnValue(new Map([
+      [OPEN_ID, { guid: OPEN_ID, path: OPEN, role: 'primary' } as unknown as LoadedSceneEntry],
+      [BASE_ID, { guid: BASE_ID, path: BASE, role: 'base' } as unknown as LoadedSceneEntry],
+    ]) as never);
+    markSceneDirty(BASE_ID);
+    // The base write lands; the copy is refused (a path outside the roots, say).
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL) => {
+      const url = typeof input === 'string' ? input : input.toString();
+      if (url.includes('/api/scene-save-as')) return { ok: false, status: 403, json: async () => ({}) } as unknown as Response;
+      return { ok: true, json: async () => ({ ok: true }) } as unknown as Response;
+    }));
+  });
+  afterEach(() => { vi.restoreAllMocks(); clearAllSceneDirty(); });
+
+  it('a copy that lands but is not reopened names the base too', async () => {
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL) => {
+      const url = typeof input === 'string' ? input : input.toString();
+      if (url.includes('/api/scene-save-as')) return { ok: true, status: 200, json: async () => ({ ok: true, guid: '00001414-0000-4000-8000-000000000003', path: '/assets/scenes/copy-1414.scene.json' }) } as unknown as Response;
+      if (url.includes('/api/')) return { ok: true, json: async () => ({ ok: true }) } as unknown as Response;
+      return { ok: false, status: 404, json: async () => ({}), text: async () => '' } as unknown as Response; // the reopen fails
+    }));
+    const err = await runAgentOp('save-all', { path: '/assets/scenes/copy-1414.scene.json' }).then(() => null, (e: unknown) => e as { code?: string; message?: string });
+    expect(err).toMatchObject({ code: 'PARTIAL' });
+    expect(err?.message).toContain(`scene ${BASE}`);
+  });
+
+  it('is PARTIAL and says the base landed — not "Nothing was written"', async () => {
+    const err = await runAgentOp('save-all', { path: '/assets/scenes/copy-1414.scene.json' }).then(() => null, (e: unknown) => e as { code?: string; message?: string });
+    expect(err).toMatchObject({ code: 'PARTIAL' });
+    expect(err?.message).toContain(`scene ${BASE}`);
+    expect(err?.message).not.toMatch(/Nothing was written/);
   });
 });
 
@@ -170,7 +281,7 @@ describe('prefab revert — the override keys named', () => {
 
   /** A real instance carrying ONE real override, so `available.all` is non-empty and both refusals
    *  are reached rather than the earlier "has no overrides" exit. */
-  async function instanceWithOverride(): Promise<number> {
+  async function instanceWithOverride(): Promise<string> {
     setPrefabCache(PREFAB, {
       version: 1, name: 'opcodes-1012', rootLocalId: 1,
       entities: [{ localId: 1, name: 'Root', traits: {
@@ -180,19 +291,21 @@ describe('prefab revert — the override keys named', () => {
     } as never);
     const r = await runAgentOp('prefab', { action: 'instantiate', path: PREFAB }) as { rootId: number };
     findEntity(r.rootId)!.set(Transform, { x: 5 });
-    const o = await runAgentOp('prefab', { action: 'overrides', entityId: r.rootId }) as { keys?: { all?: string[] } };
+    // By guid: the instance root has one, so an `entityId` is refused (#1223 D2).
+    const guid = (findEntity(r.rootId)!.get(EntityAttributes) as { guid: string }).guid;
+    const o = await runAgentOp('prefab', { action: 'overrides', entityGuid: guid }) as { keys?: { all?: string[] } };
     expect(o.keys?.all?.length, 'fixture must carry a real override, or the refusals below are never reached').toBeGreaterThan(0);
-    return r.rootId;
+    return guid;
   }
 
   it('an EMPTY keys array → AMBIGUOUS ("nothing" and "everything" are both readings)', async () => {
-    const id = await instanceWithOverride();
-    await expect(runAgentOp('prefab', { action: 'revert', entityId: id, keys: [] })).rejects.toMatchObject({ code: 'AMBIGUOUS' });
+    const guid = await instanceWithOverride();
+    await expect(runAgentOp('prefab', { action: 'revert', entityGuid: guid, keys: [] })).rejects.toMatchObject({ code: 'AMBIGUOUS' });
   });
 
   it('a key matching no override → NOT_FOUND, with the real keys as options', async () => {
-    const id = await instanceWithOverride();
-    const err = await runAgentOp('prefab', { action: 'revert', entityId: id, keys: ['no-such-override-1012'] })
+    const guid = await instanceWithOverride();
+    const err = await runAgentOp('prefab', { action: 'revert', entityGuid: guid, keys: ['no-such-override-1012'] })
       .then(() => null, (e: unknown) => e as { code?: string; options?: string[] });
     expect(err).toMatchObject({ code: 'NOT_FOUND' });
     expect(err?.options?.length).toBeGreaterThan(0);

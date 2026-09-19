@@ -38,11 +38,17 @@ function trackWorld<T>(w: T): T { createdWorlds.push(w); return w; }
  */
 const spriteUrlRedirects = new Map<string, string>();
 
+/** Every ref the `resolveSprite` mock was asked for, in order — read by the #1408 tests below,
+ *  which pin WHEN Scene2D routes an unknown guid through it (for its warning). A `gone:` ref
+ *  stands in for a guid the manifest no longer knows (`isUnknownAssetGuid`). Cleared per test. */
+const resolveSpriteCalls: string[] = [];
+
 beforeEach(() => {
   vi.resetModules();
 });
 afterEach(() => {
   spriteUrlRedirects.clear();
+  resolveSpriteCalls.length = 0;
   for (const w of createdWorlds) { try { w.destroy(); } catch { /* already disposed */ } }
   createdWorlds.length = 0;
   // ⚠️ **Several tests here spy `console.warn` and do not restore it** (#1110 close-out finding
@@ -211,7 +217,7 @@ function mockDeps() {
     const cacheMap = new Map<string, any>();
     const unloaded: string[] = [];
     const Assets = {
-      cache: { has: (url: string) => cacheMap.has(url), remove: (url: string) => cacheMap.delete(url) },
+      cache: { has: (url: string) => cacheMap.has(url), get: (url: string) => cacheMap.get(url), remove: (url: string) => cacheMap.delete(url) },
       get: (url: string) => cacheMap.get(url),
       load: (url: string) => {
         // Loaded textures carry a live `source` (with a `.style`) — the 2D-material path
@@ -329,8 +335,10 @@ function mockDeps() {
       if (ref.startsWith('http') || ref.startsWith('/')) return ref;
       return undefined;
     },
+    isUnknownAssetGuid: (ref: string) => typeof ref === 'string' && ref.startsWith('gone:'),
     resolveSprite: (ref: string) => {
       if (typeof ref !== 'string') return undefined;
+      resolveSpriteCalls.push(ref);
       // `sheet:<i>` → a sliced FRAME of one shared sheet (same url, different sub-rect) —
       // the sprite-sheet animation case the in-place frame-swap path targets.
       const m = /^sheet:(\d+)$/.exec(ref);
@@ -1243,8 +1251,9 @@ describe('Scene2D.renderFrame', () => {
 
     // #692 site 2: `matSig` used to include width/height/pivot, so an animated size rebuilt the
     // whole Mesh+Shader+Geometry every frame — and every Shader rebuild leaks a permanent entry
-    // into WebGPU's BindGroupSystem._hash (#699) and pixi's GCManagedHash (#707), making an
-    // animated size an unbounded grow. `matBuildSig`/`matQuadSig` split the two: a size/pivot
+    // into WebGPU's BindGroupSystem._hash (#699, filed upstream as pixijs/pixijs#12214), making an
+    // animated size an unbounded grow. (It does NOT also leak a pixi GCManagedHash key, as this
+    // comment claimed until 2026-09-18 — that cache tombstones and compacts at 10k.) `matBuildSig`/`matQuadSig` split the two: a size/pivot
     // change now resizes the existing quad's 8 position floats in place instead.
     describe('material quad resize is in-place, not a rebuild (#692)', () => {
       it('T5: a size change resizes the quad in place — same Mesh, same Shader, geometry updated', async () => {
@@ -1613,6 +1622,59 @@ describe('Scene2D.renderFrame', () => {
     });
   });
 
+  // #1408: a guid the manifest no longer knows is not an image to `isImagePath`, so it draws as the
+  // graphics fallback — and must still be routed through `resolveSprite` once, for its warning.
+  describe('an unknown sprite guid reaches resolveSprite for its warning (#1408)', () => {
+    it('a new slot resolves it once, and a static frame after does not resolve it again', async () => {
+      const { traits, pool, scene2d, world } = await setup();
+      const canvas = spawnCanvas(world, traits);
+      spawnChild(world, traits, canvas.id(), { sprite: 'gone:tex' });
+      scene2d.renderFrame();
+      expect((pool.getSlot(canvas.id())!.container.children[0] as any).kind).toBe('graphics'); // fallback still draws
+      expect(resolveSpriteCalls).toEqual(['gone:tex']);
+      scene2d.markScene2DDirty();
+      scene2d.renderFrame();
+      expect(resolveSpriteCalls).toEqual(['gone:tex']);
+    });
+
+    it('a ref change onto an unknown guid resolves it; a primitive keyword never does', async () => {
+      const { traits, scene2d, world } = await setup();
+      const canvas = spawnCanvas(world, traits);
+      const child = spawnChild(world, traits, canvas.id(), { sprite: 'square' });
+      scene2d.renderFrame();
+      expect(resolveSpriteCalls).toEqual([]);
+      child.set(traits.Renderable2D, { ...child.get(traits.Renderable2D), sprite: 'gone:tex' });
+      scene2d.renderFrame();
+      expect(resolveSpriteCalls).toEqual(['gone:tex']);
+    });
+
+    it('a texture deleted UNDER a live sprite (same ref, sprite → graphics) resolves it', async () => {
+      const { pixi, traits, pool, scene2d, world } = await setup();
+      pixi.Assets.__seed('/hero.png', { width: 64, height: 64 });
+      spriteUrlRedirects.set('gone:tex', '/hero.png');          // resolvable: an image sprite
+      const canvas = spawnCanvas(world, traits);
+      const child = spawnChild(world, traits, canvas.id(), { sprite: 'gone:tex' });
+      scene2d.renderFrame();
+      expect((pool.getSlot(canvas.id())!.container.children[0] as any).kind).toBe('sprite');
+      resolveSpriteCalls.length = 0;
+      spriteUrlRedirects.delete('gone:tex');                     // the texture is deleted
+      child.set(traits.Renderable2D, { ...child.get(traits.Renderable2D) }); // same ref, re-dirtied
+      scene2d.markScene2DDirty();
+      scene2d.renderFrame();
+      expect((pool.getSlot(canvas.id())!.container.children[0] as any).kind).toBe('graphics');
+      expect(resolveSpriteCalls).toEqual(['gone:tex']);
+    });
+
+    it('a 2D-material entity whose sprite guid is unknown resolves it on the material path', async () => {
+      const { traits, scene2d, world, matReady } = await setup();
+      matReady.add('matGuid');
+      const canvas = spawnCanvas(world, traits);
+      spawnChild(world, traits, canvas.id(), { sprite: 'gone:tex', material: 'matGuid' });
+      scene2d.renderFrame();
+      expect(resolveSpriteCalls).toContain('gone:tex');
+    });
+  });
+
   it('replaces the display object when the sprite KIND changes (primitive → image)', async () => {
     const { pixi, traits, pool, scene2d, world } = await setup();
     pixi.Assets.__seed('/a.png', { width: 64, height: 64 });
@@ -1645,6 +1707,7 @@ describe('Scene2D.renderFrame', () => {
     child.set(traits.Renderable2D, { ...child.get(traits.Renderable2D), sprite: 'http://t/b.png' });
     scene2d.renderFrame();
     await new Promise((r) => setTimeout(r, 0)); // let the deferred unload elapse
+    scene2d.renderFrame(); // the woken frame binds b (#1397: slots bind through the retrier's drain)
 
     // a.png was the last (only) user → unloaded; b.png now bound, not unloaded.
     expect(pixi.Assets.__unloaded).toContain('http://t/a.png');
@@ -1686,8 +1749,14 @@ describe('Scene2D.renderFrame', () => {
   // when an entity's sprite url changes while the old url's texture is still loading, the
   // stale resolve must NOT bind onto the (now destroyed) old sprite or onto the new one.
   it('a stale async texture load is dropped after the url changed mid-load (F12)', async () => {
-    const { pool, traits, scene2d, world } = await setup();
-    // Neither url seeded → makeSprite takes the ASYNC load branch (load left in flight).
+    const { pixi, pool, traits, scene2d, world } = await setup();
+    // Loads resolve by hand, and a texture becomes resident only when its load does — as in real
+    // Pixi. (The default fake marks a url resident synchronously, which lets a drain bind `a` onto
+    // spriteA before the swap destroys it and so cannot tell a dropped waiter from a bound one.)
+    const settle = new Map<string, () => void>();
+    pixi.Assets.load = (url: string) => new Promise((res) => {
+      settle.set(url, () => { const t = { width: 32, height: 32, source: { style: {} } }; pixi.Assets.__seed(url, t); res(t); });
+    });
     const canvas = spawnCanvas(world, traits);
     const child = spawnChild(world, traits, canvas.id(), { sprite: 'http://t/a.png' });
 
@@ -1703,11 +1772,13 @@ describe('Scene2D.renderFrame', () => {
     expect(spriteB).not.toBe(spriteA);
     expect(spriteA.destroyed).toBe(true);
 
-    // Flush both pending loads (a's stale resolve, then b's).
-    await Promise.resolve();
-    await Promise.resolve();
+    // Both loads land (a's is stale), then the frame their wake buys — slots bind in its drain (#1397).
+    settle.get('http://t/a.png')!();
+    settle.get('http://t/b.png')!();
+    await Promise.resolve(); await Promise.resolve(); await Promise.resolve();
+    scene2d.renderFrame();
 
-    expect(spriteA.texture.width).toBe(0);       // a's resolve dropped (destroyed guard) — no rebind
+    expect(spriteA.texture.width).toBe(0);       // a's waiter dropped (destroyed guard) — no rebind
     expect(spriteB.texture.width).toBe(32);      // b bound normally
     expect(pool.getSlot(canvas.id())!.container.children.length).toBe(1);
   });
@@ -1924,6 +1995,7 @@ describe('Scene2D.renderFrame', () => {
       expect(obj.texture).not.toBe(stale); // never bound the sourceless corpse
 
       await Promise.resolve(); await Promise.resolve(); // let the evict-and-reload settle (markDirty)
+      scene2d.renderFrame(); // the woken frame binds it (#1397: slots bind through the retrier's drain)
 
       expect(obj.texture).not.toBe(stale);
       expect(obj.texture.source?.style).toBeDefined();   // the RELOADED texture (Assets.load mints a live source)

@@ -44,6 +44,9 @@ vi.mock('../../src/runtime/core/ecs/world', () => ({
   spawnEntity: (world: any, ...traits: any[]) => { const e = world.spawn(...traits); index.set(e.id(), e); return e; },
   unregisterEntity: (e: any) => index.delete(e.id()),
   destroyEntity: (e: any) => { ((e: any) => index.delete(e.id()))(e); e.destroy(); },
+  // rebuildInstance ends with the derive pass (#1387), which indexes each guid it mints.
+  indexEntityGuid: () => {},
+  findEntityById: (id: number) => index.get(id),
 }));
 vi.mock('../../src/runtime/core/ecs/entityUtils', () => ({
   getAllEntities: () => getAllEntitiesImpl(),
@@ -74,7 +77,7 @@ vi.mock('../../src/runtime/core/ecs/traitRegistry', () => ({
   getTraitByName: (name: string) => TRAITS.find((t) => t.name === name),
   getAllTraits: () => TRAITS,
 }));
-vi.mock('../../src/runtime/loaders/meshTemplateCache', () => ({ invalidatePrefab: vi.fn() }));
+vi.mock('../../src/runtime/loaders/meshTemplateCache', () => ({ invalidatePrefab: vi.fn(), replaceCachedPrefab: vi.fn() }));
 
 // write-file always succeeds so apply runs to completion.
 // @ts-expect-error mock global

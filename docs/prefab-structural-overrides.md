@@ -102,7 +102,8 @@ interface AddedEntity {
    *  the instance root). An added subtree never anchors to another added entity —
    *  that case is just nesting via `children`. */
   parentLocalId: number;
-  guid: string;                                       // EntityAttributes.guid, stable identity
+  guid: string;                                       // EntityAttributes.guid, stable identity ('' in a prefab file)
+  key?: string;                                       // template-local identity, in a prefab file only (#1387)
   name: string;
   traits: Record<string, Record<string, unknown> | boolean>;  // full snapshot, like a prefab entity
   children: AddedEntity[];                            // nested adds (parentLocalId omitted/ignored)
@@ -161,10 +162,11 @@ Algorithm:
      children to fill `AddedEntity.children`, anchor with `parentLocalId = localId of
      its (member) parent`;
    - an **owned** nested instance (a self-rooted `PrefabInstance` that expanded from
-     THIS prefab's definition — its `parentLocalId` is set, or it matches a prefab
-     `prefab` row) → **skip** (it round-trips via the prefab row / `nestedOverrides`);
-   - a **user-added** nested instance (self-rooted `PrefabInstance`, `parentLocalId`
-     0, no matching prefab row) → capture as a **reference node** (`captureInstanceReference`),
+     THIS prefab's definition — it **claimed** one of the prefab's `prefab` rows, see
+     [Which instance is a row's own](#which-instance-is-a-rows-own-expansion)) →
+     **skip** (it round-trips via the prefab row / `nestedOverrides`);
+   - a **user-added** nested instance (self-rooted `PrefabInstance` that claimed no
+     row) → capture as a **reference node** (`captureInstanceReference`),
      storing its source + overrides/structure. See below.
    Don't recurse into members.
 
@@ -194,7 +196,32 @@ In `loadSceneFile.ts`, after `instantiatePrefabIntoWorld` spawns the prefab and
 
 1. **Entity removals** — for each `removed` localId, delete the corresponding
    spawned entity **and its prefab descendants** (resolve localId → ECS id from
-   the instantiation's `localToEcs`, then cascade by `parentId`).
+   the instantiation's `localToEcs`, then cascade by ECS `parentId` through
+   `collectSubtreeIds`, the walk the editor's `deleteEntities` shares). The map alone
+   is not enough: it reaches a nested row's ROOT but not that nested instance's own
+   members, which used to survive naming a dead parent (#1247).
+
+   ⚠️ **The cascade is sound only because both instantiators spawn their first pass
+   PARENTLESS** (runtime `instantiatePrefabIntoWorld`, editor `instantiatePrefab`).
+   The second pass reads each row's parent from the file entry. A nested row's own
+   `removed` is applied *during* the outer first pass. If the outer rows spawned so
+   far still held the file's parentId (a localId), a cascade would destroy any of them
+   whose raw parent number equals a removed member's ECS id. That was measured with a
+   fresh id (5) and a recycled one (1).
+   #1222 landed that cascade once and reverted it, and the runtime then fell back to
+   deleting exactly the mapped ids. So **a live `parentId` is always an ECS id or 0**,
+   the same rule scene load follows for scene entities. Don't reintroduce a raw
+   localId there. Covered by `structuralApplyParity.test.ts` § #1247.
+
+   The rule covers raw localIds only. A **dangling** `parentId` is not covered.
+   `destroyEntity` does not cascade, so a child whose parent was destroyed on its own
+   keeps the dead id. koota recycles indices last-in-first-out, so a removed member
+   can reclaim that index, and the cascade then destroys the orphan too. The editor's
+   `deleteEntities` has always done this.
+   The orphan was already mis-parented under whichever entity reclaimed the index. The
+   defect is the non-cascading destroy, not the cascade. It matters only at runtime,
+   e.g. a gameplay `spawnPrefabInstance` into a world where something was destroyed
+   without its children.
 2. **Component removals** — for each `removedTraits[localId]`, resolve localId →
    ECS id and remove each named trait from the spawned entity.
 3. **Additions** — for each `AddedEntity`, resolve `parentLocalId → ECS id`, then
@@ -276,9 +303,8 @@ rather than a flat trait snapshot. This preserves its exact parent placement acr
 save/reload (it was previously dropped, then briefly re-anchored to the scene root):
 
 - **Owned vs user-added.** `captureInstanceStructure` distinguishes the two via
-  `nestedRootKind`: a nested instance with `PrefabInstance.parentLocalId > 0` (or
-  whose `(anchor member, source)` matches one of the parent prefab's own `prefab`
-  rows) is **owned** and skipped; otherwise it's **user-added** and captured.
+  `nestedRootKind`, which reads a per-row **claim** — see
+  [Which instance is a row's own](#which-instance-is-a-rows-own-expansion).
 - **Capture.** `captureInstanceReference(nestedRoot, source, childPrefab)` yields the
   node's `overrides` + `added`/`removed`/`removedTraits`; the nested instance's whole
   live id set is folded into `consumedEcsIds` so serialize skips it.
@@ -289,19 +315,459 @@ save/reload (it was previously dropped, then briefly re-anchored to the scene ro
   prefab** as a nested instance under the anchor — `instantiatePrefab(child, anchor)`
   / `instantiatePrefabIntoWorld(world, child, anchor, …)` — replaying its
   overrides/structure. The spawned root keeps `parentLocalId 0`, so the next capture
-  re-detects it as user-added (idempotent round-trip).
+  re-detects it as user-added — idempotent, because an unstamped instance is never
+  taken for a row (#1367; see [the partition](#which-instance-is-a-rows-own-expansion)).
+- **Its own nested rows.** The node is the outermost layer for everything under it, so it
+  carries that interior's scene edits itself: `nestedOverrides` and `nestedStructure`,
+  path-keyed from the node's own prefab, written by the same `captureNestedChannels` walk a
+  top-level entry uses (#1369). Before that, an edit inside the row expansion of a dragged-in
+  prefab was captured by nothing and came back on reload. Both expansion paths forward both
+  channels (`spawnNestedInstance` in the loader and in the editor).
+- **Rebuilds.** `rebuildInstance` re-spawns the node whole from the captured structure, so its
+  live re-apply (`captureNestedInstanceOverrides`) skips every instance whose chain passes
+  through a user-added root. It used to visit them too and apply their structure a second
+  time — one Bolt became two on every rebuild.
+
+  **What the re-apply of an OWNED nested instance states (#1386, #1401, #1383).** The fresh expansion
+  already applies everything the outer prefab's row chain authors, so the capture is the live instance
+  **minus that chain**. The chain comes from the document the live tree was expanded FROM, which is
+  `rebuildInstance`'s `baseline` (a refresh passes its old file). Only the scene's own edit is left:
+  - **values** are dropped when they EQUAL the chain's value. A scene that changed a row-set field
+    keeps its change, which the key-presence rule `captureNestedSceneDelta` uses for saving would lose.
+    The chain's member tokens are first resolved by `baseTokenResolver` from the nested root: its own
+    frame, with `^` climbing to the instance whose row expanded it. The loader applies every value in
+    that frame, whichever layer authored it. A reference node's payload is in its own instance's frame
+    and is left whole, as `rebaseAddedTokens` leaves it. The live side holds
+    guids, so an unresolved `@member:` token never compared equal and froze the old target. A trait
+    the chain ADDS is captured whole, schema defaults included, so an unauthored field equal to its
+    default counts as the chain's too.
+  - **`removed` / `removedTraits`** lose the chain's own entries.
+  - **`added` nodes** are matched to the chain by **template key**: the live marker, or
+    `recoverTemplateKey` once a round trip dropped it. A key-less legacy node matches by the durable
+    guid it carried. An unchanged match is dropped: the fresh copy owns it, so a template edit
+    reaches it. An EDITED match is kept, and the re-apply deletes the fresh copy first and restores
+    the key marker on the survivor. Restating these nodes spawned every row-authored node twice.
+  - ⚠️ **A template node the scene DELETED still comes back.** With no live node there is nothing to
+    match, and "deleted here" cannot be told from "added by the refresh" without the old live key set.
+    A template node the scene MOVED below another added node also duplicates. Only nodes directly
+    under a member are matched, so its fresh copy returns at the template anchor beside the moved
+    one. A save and reload gives one, because the scene's `nestedStructure` owns the interior. Both
+    predate this subtraction.
+  - A nested instance whose `parentLocalId` climb does **not reach the outer root** (it stops at a
+    plain `added` node) gets no capture. The outer structure already carries it as a reference node.
+    Its partial chain used to address the real row's expansion and write its overrides there. This is
+    latent from the editor: reparent unpacks, and duplicating clears the stamp.
+
+  #1401 is latent the same way. Apply is the only rebuild from a CHANGED document, and it adds or
+  removes whole rows, so the `baseline` hand-off in `refreshInstances` has no editor flow to test.
+  `tests/editor/rebuildNestedReapply.test.ts` drives it at `rebuildInstance`.
 - **Resources.** `collectResourceRefsFromEntities` surfaces `added[].prefab` and
   recurses a reference node's own `added`, so `SceneManager` acquires the child
   prefab (and its transitive refs) at load.
 - **Apply to Prefab.** `insertAddedSubtree` writes a reference node as a nested
   **row** in the owner's `.prefab.json`, so promoting it matches how `serializePrefab`
-  writes nested rows. (It also raises `version` to `PREFAB_FORMAT_VERSION`, which since
+  writes nested rows, and the node's `nestedOverrides` + `nestedStructure` become the row's own
+  (#1381). (It also raises `version` to `PREFAB_FORMAT_VERSION`, which since
   #379 every writer stamps unconditionally — the bump is no longer a signal that the file
   gained nesting.)
 - **Recursion.** Because `captureInstanceReference` calls `captureInstanceStructure`,
   a user-added instance nested inside another is captured (and expanded) recursively.
   `serializePrefab`'s nested-row loop skips an instance already folded into a parent
-  reference node (`skip.has(e.id)`), so it is never double-emitted.
+  reference node (`skip.has(e.id)`), so it is never double-emitted. It equally skips every
+  **owned** nested instance inside a row, at any depth (`captureNestedChannels`'
+  `ownedMemberEcsIds`) — the row re-expands them. They once got a second reference row at the
+  prefab root, so a Create Prefab over a held instance wrote its owned INNER twice and the tagger
+  re-stamped it onto the wrong row (#1382).
+
+## The scene's structural channel into a nested instance (`nestedStructure`)
+
+A scene could always override a nested instance's **values** by row path (`nestedOverrides`), but
+until #1358 it had no channel for that instance's **structure**. `serializeScene` ran
+`captureInstanceStructure` only for TOP-LEVEL instances; a row's own expansion got a per-field value
+delta and nothing else. So a member deleted inside it came back on the next load, and a member
+dragged out of it existed at **both** places — two entities holding one guid.
+
+`nestedStructure` is the sibling slot, on a scene entry, on an added reference node (#1369) and on a
+prefab nested row (#1381) — see *Three carriers* below — keyed by the same path grammar
+(`nestedPathKey`):
+
+```ts
+nestedStructure?: Record<string /* "4", "4.7" */, {
+  added?: AddedEntity[]; removed?: number[]; removedTraits?: Record<number, string[]>;
+}>
+```
+
+- **Once the scene addresses a path it OWNS the interior** — all three lists come from the slot, and
+  an absent one reads as **empty**, not as "fall back to the row". Per-field fallback makes *"the
+  row's own list no longer applies"* unrepresentable: deleting the last member of a row-authored
+  `added` wrote `{"4": {}}`, the loader fell back to the row, and the member came back on reload
+  (with the save alternating between the two shapes forever).
+- **Skipped only when both sides are empty** — the live interior AND what the prefab chain applies.
+  That absence is what lets a member added to the inner prefab later still reach an untouched
+  instance. A row that authors its own structure is therefore always restated by the scene; that
+  asymmetry is deliberate and follows from the previous point.
+  ⚠️ The first cut instead compared the live capture against the file-authored baseline and wrote
+  only the differing fields. Those two documents are **not comparable** — `snapshotAddedTraits`
+  compacts schema-default fields (and until #1377 carried a live `parentId`), the baseline is whatever the prefab
+  file holds — so "equal" was unreachable for any row with authored structure: the slot was written
+  on a no-op save, baking a live ECS id into the scene file and freezing the instance, which is the
+  one thing the gate existed to prevent.
+- **Scene format v14.** Purely additive, so `migrateV13toV14` only stamps. The bump is still
+  required: Scene's disposition is REFUSE, so an older build must refuse a v14 document rather than
+  read it, ignore the key it does not know, and drop it on the next save — the exact loss this fixes.
+
+⚠️ **THREE resource-ref walkers must know about this slot, and they are in three files.** An
+`added[]` node inside `nestedStructure` carries `prefab` and trait asset refs exactly like a
+top-level one, so a walker that misses it produces a ref the BUILD cannot see: the asset is dropped
+from the production bundle and it fails only once shipped (#53's class). Extending one and not the
+others is invisible to a round-trip test, because the refs resolve fine from a warm editor cache.
+
+| walker | file | what it feeds |
+|---|---|---|
+| `assertNoPathRefs` + the `flag*` scanner | `editor/scene/serialize.ts` | the scene's `resources[]`, and the literal-path tripwire |
+| `collectResourceRefsFromEntities` | `runtime/loaders/loadSceneFile.ts` | `SceneManager` at load |
+| `walkCarrier` | `plugins/asset-tree-shaker.ts` | the production build |
+
+The third one is the expensive one to miss, and its own docblock asserts parity with the second: for
+a document with no `resources[]` an unqueued ref reaches `vite-asset-scanner`'s guid check and
+**fails the build** on legitimate authoring.
+
+⚠️ **Three carriers — a scene entry, a reference node, and a prefab ROW (#1381).** Each is the
+outermost layer for its own paths *within its document*, and a path steps only through nested ROWS.
+Where two meet during expansion the outer one wins **per path, whole** (`mergeNestedStructurePaths`
+— never element-wise, for the same un-delete reason as above), and `resolveEffectivePrefabStructure`
+descends the rows' slots path-keyed exactly as `resolveEffectivePrefabOverride` does, so a scene's
+baseline includes what an intermediate row already did to the interior.
+
+The row carrier is written two ways, both **with a writer**, which is the order CLAUDE.md requires
+for an authored field:
+- **Promotion** (Apply to Prefab, `insertAddedSubtree`) copies a reference node's slot into the row.
+- **A prefab-edit save / Create Prefab** (`serializePrefab` → `planPrefabRows`) **captures** each
+  row's channels from its live expansion with the same `captureNestedChannels` walk the other two
+  carriers use. Captured, not passed through: `buildPrefabEditScene` forwards both channels onto the
+  row's scene entry, so the edit world IS the expansion, and an edit made inside a row's nested row
+  in the prefab editor must replace the file's value rather than be overwritten by it.
+  ⚠️ **The row writer does NOT use the scene's "restate when the baseline is non-empty" rule**
+  (`omitUnchanged`). A path whose live interior equals what the inner prefab chain already applies
+  is omitted. Otherwise a no-op save of the outer prefab pins the inner prefab's own authored
+  structure into the outer file, and a later edit to the inner prefab stops reaching every instance
+  of the outer one. The compare that #1358 rejected for scenes is sound here, because file-authored
+  `added` nodes come from the same compacting capture, and #1377 stopped capturing the live
+  `parentId`. The compare (`sameStructure`) is over content: `added`/`removed` are sets, and a
+  file bag is run through the capture's own compaction (`compactAddedTraitData`), so hand-ordered
+  lists and legacy full bags compare equal too. A mismatch still writes the path verbatim, which is
+  the safe direction.
+  An owned nested instance whose prefab is uncached still re-expands from its owner's row, so it and
+  everything under it are skipped. Anything added inside it is dropped with a warning, following the
+  `captureNestedRef` precedent; every caller warms the cache first (#1295).
+
+⚠️ **Why the channels are not folded into the row at promotion instead.** A reference node's
+`nestedStructure` is keyed by paths inside ITS OWN prefab, so no key ever targets a row the promoted
+(outer) prefab owns — its direct lists already land in the row's `added`/`removed`. The only fold
+possible would write into the inner prefab's file, changing every instance of it.
+
+**No `PREFAB_FORMAT_VERSION` bump for the row slot, deliberately.** Unlike a scene (v14, REFUSE),
+nothing on the prefab loading path reads the version at all (see `PREFAB_FORMAT_VERSION`'s docblock),
+so a bump would protect nothing: an older build still loads the file, ignores the field and would
+drop it on its next save. That is the same exposure every optional prefab field has had since v1.
+
+History: the row slot was declared during #1358 and removed because nothing wrote it, and the
+descend in `resolveEffectivePrefabStructure` was removed as dead for the same reason. Both came back
+in #1381 with their producers; before that, promotion dropped the slot and a prefab-edit save lost a
+row's file-authored `nestedOverrides` too.
+
+**One walk, `captureNestedChannels(source, ownedNested)`** (`editor/scene/prefab.ts`), produces both
+channels for all three carriers. It descends top-down through the row partition at every level
+(`captureInstanceStructure(…).ownedNested`). It replaced a bottom-up walk in `serializeScene` that
+resolved each owned instance UP to a top-level root, which was why a chain through a reference node
+resolved to nothing. Paths are written sorted, so key order does not depend on ECS ids.
+
+⚠️ **`onInstantiatePrefab` carries it as its LAST argument**, not beside `nestedOverrides` where it
+belongs logically. Those arguments are positional and five implementors read them by position
+(`SceneManager` plus four test harnesses), so inserting would silently shift `rootGuid` and
+`rootEditorFolder` in any implementor not updated in the same change. Threading the recursion alone
+is not enough — the save looks correct while nothing applies it.
+
+## Which instance is a row's own expansion
+
+A nested-prefab row expands to **exactly one** instance, so "owned" is a property of the
+*row*, not a test you can run on a node in isolation. `captureInstanceStructure` therefore
+**partitions**: it assigns each row at most one claimant and treats every other instance at
+that anchor as independent (#1354).
+
+- **Candidates** are the self-rooted `PrefabInstance`s directly under a member of this
+  instance — the only place a row of this prefab can expand. Sorted by ecsId, so the
+  assignment is deterministic rather than dependent on world-query order.
+- **The claim** — a candidate whose `PrefabInstance.parentLocalId` names a row *at its own
+  anchor* claims that row (first by ecsId when two carry the same stamp).
+- Everything unclaimed is `'userAdded'` and rides as a reference node — **including every
+  unstamped instance.** Every path that expands a row stamps it: the loader
+  (`instantiatePrefabIntoWorld`), the editor's `instantiatePrefab`, and Create Prefab's tag.
+  So a live unstamped instance is never a row's expansion. It is one the user dragged in, a
+  duplicate, or an unlinked root. That premise is pinned by a test (#1367).
+
+Two consumers must read that one claim map rather than re-deriving it, and both did
+re-derive it before #1354:
+
+- **`nestedRowPresent`**, which decides whether a row goes into `removed[]`. Before, it
+  ran its own `(source, stamp)` scan, so a row could be reported present while the
+  classifier had already given it to someone else.
+- **`captureNestedChannels`**, which writes the nested channels for exactly the instances in
+  `ownedNested`. Until #1369 `serializeScene` found owned instances with its own
+  `parentLocalId > 0` test and needed a reconcile block to line that up with the partition.
+  Without the reconcile, an instance both of them disowned was written **nowhere**. Walking the
+  partition itself removed the second answer, and the block went with it.
+
+Present means CLAIMED: `nestedRowPresent` is strict. A row nobody claims is written into
+`removed[]` even when an unstamped instance of its prefab sits at the anchor, because that
+instance is written separately, as a reference node.
+
+**Duplicating an owned nested root produces an independent instance, saved separately**
+(owner ruling, 2026-09-18). `clearOwnedNestedStampFromSnapshot` clears the copy's row stamp
+at both duplicate seams, so the copy is independent by intent rather than because the source
+happened to claim the row first — and, because it cannot then form a same-stamp pair, the
+double-write that a non-claiming *stamped* candidate would otherwise produce stays
+unreachable.
+
+**Why there is no pass for an unstamped instance (#1367).** There used to be one, for "legacy"
+data. It let an unstamped instance claim a free row, and presence was kept lenient wherever one sat
+at a row's anchor, so that a wrong claim could not send a row into `removed[]`. Together those
+reversed the user's own edits. A user-added instance under a member whose row of the same prefab
+had been deleted was taken to BE that row. A no-op save then dropped the addition (no reference
+node) and the row's `removed` (lenient presence): the row came back and the instance was gone.
+
+The two halves only work as a pair, which is why both went in one change. Dropping the pass alone
+would write a legacy expansion as a reference node while its row ALSO still expanded, giving two
+instances. Strict presence writes the row as removed, so a legacy unstamped expansion round-trips
+as one instance with its own guid, and its deep edits ride on the reference node's channels.
+
+The issue's proposed discriminator, the derived-vs-stored root guid, adds nothing: a nested
+root's derived guid is itself computed from this stamp (`memberStepId`).
+
+## Moved members (#1437)
+
+A prefab member moved to another parent **inside its outermost instance** stays linked, and the move
+is saved (owner rulings, #1437: (a) same frame, (b) across frames — under a scene-added node, into a
+nested instance's member, out of a nested instance into its outer one). Moved OUT of the outermost
+instance, a member is unpacked, while an owned nested instance stays an instance of its own prefab
+(#1447). The rule for that case is in docs/scene-loading.md § the #1355 note. `reparentEntity` decides
+by `outermostInstanceRoot`, before the parent write (`planMoveUnlinks`, #1445).
+
+**Identity does not move.** A member's guid is derived from its row PATH (`deriveMemberGuid(anchor,
+path)`), so a moved member must keep deriving from where it was. `PrefabInstance.homeParent` holds the
+guid of the row parent it left, and `homeSteps` the steps through homes that were since deleted or
+unpacked (`runtime/core/ecs/memberHome.ts`). Every identity walk — `deriveInstanceMemberGuids`,
+`memberPathIndex`, `planCopyGuids`, `baseTokenResolver`, the template tokenizer — steps from the home
+(`identityParentId`, `homeStepsOf`). Moved back to its row parent, the stamp is cleared.
+
+**Save and load.** The save writes `moved: {rowLocalId: newParentGuid}` on the instance's entry, in a
+`nestedStructure` slot, or on a reference node (scene v15, which a v14 reader refuses). The loader
+expands the member at its row, derives every guid, and only then moves it (the per-World after-derive
+queue, drained at the end of `deriveInstanceMemberGuids`). A removed row holding a moved member stays
+until the drain, so the member derives through it first. Rebuild, delete, duplicate, revert and undo
+each keep the home pair: a member of another instance moved in is parked and put back, a moved-out
+member of a torn-down instance is torn down with it, and a delete detaches members whose instance goes.
+
+**A member's guid is never an anchor.** `deriveInstanceMemberGuids` used to anchor on the nearest
+ancestor with ANY guid. At load no member has one, so the walk reached the instance's anchor; a later
+pass did not. Rebuilding an owned nested instance found the outer members' derived guids and anchored
+there, so every member of the rebuild re-derived guids a reload does not reproduce. Measured with
+nothing moved: Slot's guid changed on a rebuild of its MidRoot. That predated #1437, and applying a
+move made it bite, because Apply rebuilds owned nested instances routinely. A member (linked to
+another root, or an owned nested root) is now always walked through.
+
+**Apply** (`applyToPrefabSelective`, key `~moved.<rowLocalId>`) writes the move where the prefab can
+say it, and always takes the member's live Transform with it (its pose relative to the new parent):
+- **The new parent is a row of the same frame**, or a plain node promoted by the same apply: the row
+  is RE-PARENTED. That changes the member's path, so its guid and every guid below it change, in every
+  instance. The references follow, in three places:
+  - live: `liveMemberGuidRemap` pairs old and new paths per live instance, the rebuild translates what
+    it looks up by guid, and `remapWorldGuidRefs` rewrites every trait value afterwards;
+  - the prefab's own `@member:` tokens (`rewritePrefabMemberTokens`, runtime/loaders/memberPaths.ts);
+  - every OTHER file: `/api/prefab-member-paths` runs `planMemberPathRepair` — scene guids through
+    `memberGuidRemap`, prefab tokens through the token rewrite — over every file naming the prefab,
+    transitively. A file an asset view holds unsaved is left and named (`ApplyResult.fileRepair`);
+    undo and redo run it back from the document the files were last repaired for.
+  Paths pair by IDENTITY (`memberPathRecords`: a localId per frame), so a row that goes from orphaned
+  (parentId 0, hung off the instance's parent) to row-parented is followed across anchors.
+- **The new parent is a member of a NESTED instance** (ruling (i): Handle → Lock/Bolt writes
+  Door.prefab only), or a nested instance's root: the prefab gets its own `moved` entry,
+  `"<member path>": "@member:<target path>"`. The row keeps its parent, so no guid changes. Hanging a
+  row under a nested root instead would give it the path of the nested prefab's own row with that
+  localId, and the two would derive one guid (review F1).
+- **The new parent was added in the scene**: skipped with that reason unless the same apply promotes it.
+- **A member of a NESTED instance moved out of it** (Lock's Bolt under Door's Frame): its own prefab cannot
+  name the parent, so applied on the nested instance it is skipped, with a pointer outward. The OUTER
+  instance offers it instead (owner, #1437 option B), as `~moved.<nested row chain>:<localId>`
+  (`nestedFrameMoves`): Apply writes the outer prefab's own `moved` entry, by path, and the member's pose as
+  an override on the nested row; the nested prefab is untouched and no guid moves. A move INSIDE the nested
+  instance is not offered outward — its own prefab records it. Revert rebuilds without it (`nestedMoves.drop`
+  on what the rebuild captures of the nested instance) and its undo sets it back. While a rebuild captures
+  nested instances, an enclosing instance's move base is read from the document it was EXPANDED from
+  (`expandedFrom`): read from the cache's newer copy during a refresh, a member not yet moved looked moved
+  back, and the capture cancelled the move being applied. The Apply dialog toasts every skip and every file left unrepaired
+  (`applyOutcomeNotice`).
+
+**A prefab's own moves** (prefab v4, `PrefabFile.moved`) are queued by `queuePrefabMoves` as BASE moves
+and resolved in the drain against the declaring instance's root. One move per member wins: an
+instance's own over any prefab's, and a prefab nesting the instance (queued later) over the nested
+prefab's. The capture compares against that base, so an instance at its prefab's target records
+nothing, and one moved back to its row records the move back. The base climbs the ENCLOSING instances'
+documents too (`prefabMoveTargets`), or a nested copy read its outer prefab's move as its own and saved it
+in every instance (review F4). The moved-Transform exemption from the override mark gate applies only away
+from the base, or every instance would pin its pose. Create Prefab / prefab-edit save (`serializePrefab` →
+`templateMoves`) writes the new prefab's own map for every nested member not under the parent the prefab
+would otherwise give it, and for a ROW sitting under a nested member: that row is written under the row it
+derives from (`rowParentsFor` — its home, the prefab-edit hint, or the nearest row ancestor), never with
+parent 0. Prefab-edit SHOWS the prefab's own moves (`applyEditWorldMoves`), and a nested row's edit-scene
+entry carries its sentinel as its stored guid so its members are found by the guids `editGuidAt` gives
+them; the nested capture never takes an edited prefab's row (`isPrefabEditRowGuid`) as its own addition.
+Applying a `-removed` row stops the cascade at a moved member and lifts its row to the nearest surviving row
+(a re-parent, so the ref repair follows), and drops a prefab move that names nothing any more. Promoting a user-added
+instance carries its interior moves the same way, and deletes its members that were moved out of its
+subtree, which the refresh respawns.
+
+A prefab's move of a nested member survives everything that rebuilds the nested instance alone (an
+apply or revert on it): `rebuildInstance` re-queues the moves of the documents around it
+(`enclosingFrames`). Once an outer prefab places a member, only the outer instance can move it again —
+back home included, which removes the entry; the nested instance's own Apply points outward. A row lifted
+past removed rows is carried through their poses, so it stays where it was in every instance.
+
+**Not covered.** An older build ignores a prefab's `moved` (the version is a writer-only stamp), so
+such a member sits at its row there. A prefab move whose member no longer exists — the nested prefab
+dropped that row — is skipped silently on load; the entry is cleaned up the next time the prefab that
+holds it is applied. A row lifted past removed rows without a `Transform` of its own gets no carried pose,
+and a carried pose under a non-uniformly scaled, rotated removed row is the nearest TRS, not exact. A ref into a node promoted by Apply still stays a guid, as
+before. Tests: `engine/tests/editor/duplicateCarriesRefs.test.ts` (the #1437 describes),
+`engine/tests/plugins/remintPrefabMemberRefs.test.ts` (memberGuidRemap, the token rewrite and
+planMemberPathRepair against the loader), `engine/tests/plugins/prefabMemberPathsRoute.test.ts`.
+
+## What each hierarchy action does
+
+Measured headlessly with the real editor functions (`reparentEntity`, `deleteEntitiesWithUndo`, `serializeScene`
+→ `loadSceneFile`, `applyToPrefabSelective`). The fixture is `Outer` (`OuterRoot → Panel → {Button, nested Inner}`)
+and `Inner` (`InnerRoot → {Leaf, Leaf2}`), with a second `Outer` instance to confirm Apply reaches it. Every
+row round-trips through save + reload.
+
+| Action | The dragged thing afterwards | Apply on the outer instance | Apply on the nested instance |
+|---|---|---|---|
+| Create / drag a plain entity under an outer member | plain, an `added` node | becomes an Outer member | — |
+| Create / drag a plain entity under a nested member | plain, in `nestedStructure` | nothing to apply | becomes an **Inner** member (every Inner) |
+| Drag an outer member out of the instance | unpacked; the instance records it `removed` | removed from Outer | — |
+| Drag a member to another parent inside the instance | stays linked, a `moved` entry | re-parents the row | — |
+| Drop a user-added instance's root under its own member | that member is unpacked (#1450); the instance stays linked under it | — | — |
+| Drag a nested member into the outer instance | stays linked | Outer records the move (`moved` map) | refused, pointing outward |
+| Drag an outer member into the nested instance | stays linked | Outer records the move | — |
+| Drag a nested member out of everything | unpacked | nothing to apply | removed from Inner |
+| **Drag a nested instance out of everything** | **stays an Inner instance** (#1447); Outer records the row `removed` | removes the row | — |
+| Drag a nested instance to another outer member | stays linked | re-parents the row | — |
+| Delete an outer member / the nested instance / a nested member | — | removes it from Outer / removes the row / nothing | — / — / removes it from Inner |
+| Drag a prefab instance into the outer instance | stays linked, a reference node | becomes a nested row | — |
+| Drag a prefab instance under a nested member | stays linked | nothing to apply | becomes a nested row of Inner |
+| Drag a member into ANOTHER instance | unpacked (#1445): the old instance records it `removed`, the new one saves it as `added` | — | — |
+| Drag an instance into an instance of the SAME prefab | allowed, a reference node (#1436) | **refused**, with a reason: a prefab cannot contain itself (#1446) | — |
+
+A linked member is written by its **frame**'s save: the first promoted root on its ownership chain, or else
+the stored root (top-level or user-added) that chain reaches. A frame is saved from its root down. So after
+EVERY reparent (`planMoveUnlinks`), a linked member is unpacked in exactly the two shapes the save cannot
+write: it sits ABOVE its frame, or the outermost instance it sits inside differs from its frame's. Written
+nowhere, both it and the instance vanished on reload. A member merely BESIDE its frame inside the same
+outermost instance is an ordinary #1437 move and stays linked.
+
+This is also the rule for a move that stays INSIDE the instance (#1450, owner ruling 2026-09-19: unpack, not
+refuse as a cycle). Drag a user-added instance's member beside its root, then drop the root under that member:
+the member unpacks into a plain entity, saved as the outer instance's `added` node, and the instance hangs
+under it. An **owned** nested root is not a frame, because its members are saved by the stored root above it.
+So an owned root dropped under its own member keeps that member linked. The same holds two levels down (a
+`Mid` dropped under a member of the `Inner` its row expanded), and both reload as moves. The frame was once
+only a PROMOTED root, and only the leave path checked it.
+
+**An owned root the save cannot write is PROMOTED, never unpacked** (#1447's rule, #1450 close-out review).
+Drop a stored `Mid` under the `Inner` its own row expanded, and that `Inner` now sits above its frame. It
+becomes a standalone instance, and it is the frame its own members are judged against after that. The first
+version put the owned root through the member path and unpacked it. `Inner`'s `Leaf`, moved beside it, then
+named a plain entity as its root, and the save dropped it.
+
+**Verdicts are settled one at a time**, re-judging everything after each. This is because one verdict can flip
+another:
+- A promotion changes the frame for everything owned below it.
+- An unpack can leave whatever hangs below it outside every instance.
+
+The second review measured three failures when the loop instead acted on the whole list in storage order:
+- A member under an unpacked member stayed linked, and the save dropped it.
+- An owned root under an unpacked member stayed owned, and it reloaded under new guids.
+- With `Inner` ahead of its `Mid` in the entity list, both were promoted, which cut `Inner` off `Mid`'s row for
+  good.
+
+Each pass acts on an entity whose verdict nothing else pending can flip: nothing unwritable sits above it in
+the tree, and nothing unwritable sits on its ownership chain. Failing that, it acts on the shallowest entity
+that has no unwritable owned root on its chain, so an owner is still settled before the roots it owns. (The
+plain shallowest pick promoted an `Inner` ahead of its `Mid`.) Promotions and unpacks only ever grow, so the
+loop ends.
+
+A third way to be unwritable (close-out review 3): the entity's identity parent is being unpacked, and the
+entity has no recorded home. A LIVE child of an unpacked member has no identity walk left, because
+`rehomeDependents` only re-points a recorded `homeParent`. Take a move inside the instance, which changes no
+outermost instance: an owned root under the unpacked member used to reload as a stored root under new guids,
+and a member there reloaded as a plain entity while the editor still showed it linked.
+
+**The loader applies moves against the tree they describe** (#1452). The `moved` entries describe the tree
+after all of them, so a member moved under a member that was its row descendant (Button up to the root, then
+Panel under Button) passes through a cycle that exists only halfway. `drainAfterDerive` lets a move whose
+target still sits inside the member wait until the others land. Only a move that is still waiting once
+nothing else can move is refused, with the "inside it; left at its row" warning. Applied in order, Panel's
+move was refused and it reloaded at its row. The drain mixes the prefab's own moves with the instance's, and
+the same shape can be split across the two: Button's move is the prefab's and Panel's is the instance's. The
+wait covers that case as well.
+
+**Ending a moved member's frame promotes or unlinks it, never re-homes it past the owner (#1451, #1453).** A delete
+re-points a surviving member whose home goes to that home's own identity parent (`rehomeDependents`). That walk
+stops at any instance ROOT, stored or owned: a home is a member of the dependent's own frame, so a root home is
+the frame's root, and the frame dies with it. `detachOrphanedMembers` then promotes an owned nested root to a
+stored one, renaming its members to the guids a reload derives (the #1447 contract), and unlinks anything else.
+It promotes when the root's OWNER dies, meaning the frame of its identity parent, and not only when its home dies. A
+nested root that rode out inside a moved member of its owner has no home, and keying on the home left it linked to
+a dead frame; its members then re-derived new guids on reload and a ref to one dangled.
+
+A frame also ends WITHOUT a delete, when a Detach Prefab or an unpack-on-leave strips `PrefabInstance` off it, and
+the same two steps apply. Every frame-ending path calls them together as **`endFrames(gone)`** (`memberHome.ts`),
+before the strip, because the owner walk reads the links being stripped. The callers are `deleteEntities`,
+`detachPrefabInstance` and `reparentEntity`'s `applyDetach`. Detach and unpack used to run only
+`rehomeDependents`, so a member moved OUT of the detached subtree kept its link to a frame that no longer
+existed. The save wrote it nowhere, and it vanished on reload (#1453). There were two shapes. One was a nested
+root moved beside its detached owner, left owned by a plain entity. The other was a plain member moved beside it,
+left linked to a plain root. Now Detach Prefab turns the first into a standalone instance, which is the #1447 rule,
+and unlinks the second where it stands. The unpack-on-leave runs `endFrames` too, so that every frame-ending
+path has one shape. Before #1450, `planLeaveInstance` could strip an owned ROOT while a member of it stayed linked.
+Since #1450, `planMoveUnlinks` sends every root to `promote`, never `strip`, so that orphan step currently has
+nothing to catch there. `detachPrefabInstance` returns `{ links, orphans }`, and `reattachPrefabInstance` relinks the orphans
+(`relinkDetachedMembers`) before it re-adds the links, because a promotion's member rename has to be reversed
+before any guid ref resolves. A redo re-detaches, and that is deterministic (the same promotions and the same
+renames), so the first snapshot still undoes it.
+
+**No generic trait edit touches `PrefabInstance` (#1454, owner chose to refuse).** It is a prefab LINK, not a
+component. It is made by instantiating a prefab and cut only by Detach Prefab, which ends the frame as above. The
+Inspector used to offer it a remove button, and the agent's `mutate_scene removeTrait` accepted it. Both cut the
+link without `endFrames`, so the members moved out of the instance vanished on reload. Removing it from one
+member also left that member's row expanding beside it on reload. So one policy, `traitEditPolicy.ts`
+(`traitRemoveRefusal` / `traitWriteRefusal`), now refuses to add, remove or write it on every generic path, and
+names Detach Prefab in the refusal. It also holds the core traits that can never be removed (Transform,
+EntityAttributes). The paths are: the Inspector remove button, the Add Component picker,
+`add`/`removeTraitFromEntitiesWithUndo` (the seam every editor caller goes through), the agent live
+`apply-scene-ops`, the file-direct `sceneMutate`, and the device `set-traits`. A per-member "unlink" command was
+considered and declined; dragging a member out of its instance already unpacks it (#1447). Not covered:
+`applyStructureCore`'s `removedTraits` at load, which the capture side never writes for `PrefabInstance`.
+Before the fix, the walk stepped through an OWNED root. A nested root moved beside its owner (Mid's `InnerRoot`
+under Panel), with the owner then deleted, was re-pointed into the grandparent frame. That frame records no move
+for it, and the one that did died with the owner, so the save wrote only `removed` and the nested root and its
+members vanished on reload.
+
+**Across scenes it is still refused.** A move to another scene file (`moveEntityToScene`) refuses anything that
+would split an instance (`instance-member`, docs/scene-loading.md), an owned nested root included, where the
+same drag inside one scene keeps it linked. Extending promotion to scene moves is not done.
+
+An edit inside a nested instance is applied to the nested prefab's own file, so every instance of it everywhere
+updates (owner, 2026-09-19). The outer instance's Apply offers nothing for it.
 
 ## Edge cases
 

@@ -4,7 +4,7 @@
  *    POST /api/reimport (Stage A bake + Stage B LODs)
  *      → browser-side importModel() (regenerate .mesh.json / .mat.json / textures)
  *      → write <glb>.prefab.json ONLY if it doesn't already exist (preserve manual edits)
- *      → refreshAssets + invalidateModel. */
+ *      → refreshAssets + invalidateModelAndRig. */
 
 import { useState, useEffect, useCallback, useMemo } from 'react';
 import { backendFetch, writeAssetFile, jsonFileBody, postWriteFile } from '../../backend/editorBackend';
@@ -16,7 +16,8 @@ import { serializePrefab, resolveExistingPrefabId, mergeRiggedPrefab, setPrefabC
 import { assetUrl } from '../../../runtime/loaders/assetUrl';
 import { DEFAULT_MODEL_SETTINGS, resolveModelSettings, type ModelImportSettings, type ModelCacheInfo, type LodCount, type ModelEncoder } from '../../../runtime/loaders/modelSettings';
 import { DEFAULT_TEXTURE_SETTINGS, TEXTURE_MAX_SIZES, DEFAULT_UASTC_LEVEL, DEFAULT_UASTC_RDO_LAMBDA, UASTC_LEVELS, resolveTextureSettings, resolveUastcRdoLambda, type TextureImportSettings, type TextureFormat } from '../../../runtime/loaders/textureSettings';
-import { invalidateModel, loadModelTemplates, getTemplatesForModel, getModelHierarchy } from '../../../runtime/loaders/meshTemplateCache';
+import { loadModelTemplates, getTemplatesForModel, getModelHierarchy } from '../../../runtime/loaders/meshTemplateCache';
+import { invalidateModelAndRig } from '../../../runtime/loaders/reimportInvalidation';
 import { registerAsset } from '../../../runtime/loaders/assetManifest';
 import { writeCollisionMeshAssets } from './collisionMeshWrite';
 import { newGuid } from '../../../runtime/core/assetRefRules';
@@ -31,6 +32,8 @@ import {
 } from '../../scene/pendingMeta';
 import { useMetaDirty } from '../useMetaDirty';
 import { UnsavedMetaBadge } from './UnsavedMetaBadge';
+import { useMissingLocalStats } from '../useMissingLocalStats';
+import { sumMeasured, MISSING_STATS_HINT } from './measuredStats';
 
 /** Cheap rigged-detection: does this GLB declare a skin? Fetches the file and reads
  *  only its glTF JSON chunk (glbDeclaresSkin), so the Model inspector shows
@@ -46,6 +49,9 @@ async function glbHasSkins(url: string): Promise<boolean> {
 export function ModelAssetView({ path, name, postprocessor }: { path: string; name: string; postprocessor: string }) {
   // #870: a parked import-settings edit was invisible in the panel that MADE it.
   const metaDirty = useMetaDirty(path);
+  // #1305: this host holds no measurement for some of the rows below — say so rather than
+  // render a blank (or, as texture and model once did, a defaulted 0 B).
+  const statsIncomplete = useMissingLocalStats(path, 'modelCache');
   const [meta, setMeta] = useState<Record<string, unknown> | null>(null);
   const [settings, setSettings] = useState<ModelImportSettings>(DEFAULT_MODEL_SETTINGS);
   // Texture-compression settings for a RIGGED model (its embedded textures are
@@ -265,16 +271,23 @@ export function ModelAssetView({ path, name, postprocessor }: { path: string; na
                 if (existing && Array.isArray(existing.entities)) prefab = mergeRiggedPrefab(prefab, existing);
               }
               if (prefab) {
-                await writeAssetFile(prefabPath, jsonFileBody(prefab));
-                // Refresh the editor cache to the just-written prefab AND evict the
-                // runtime refcounted prefab cache (meshTemplateCache) — otherwise the
-                // NEXT scene load / Play→Stop revert re-expands the STALE cached copy
-                // and a rigged re-import's freshly-added bone entities vanish. The raw
-                // /api/write-file above bypasses writePrefabFile()'s own eviction, so we
-                // mirror it here. Key by the stable GUID so both caches resolve it.
-                setPrefabCache(prefab.id ?? prefabPath, prefab);
-                const verb = !prefabExists ? 'Created' : isRigged ? 'Merged' : 'Regenerated';
-                console.log(`[Inspector] ${verb} prefab: ${prefabPath}${existingId ? ` (preserved id ${existingId})` : ''}`);
+                const wrote = await writeAssetFile(prefabPath, jsonFileBody(prefab));
+                // Refresh the editor cache to the just-written prefab AND the runtime
+                // refcounted prefab cache (meshTemplateCache) — otherwise the NEXT scene
+                // load / Play→Stop revert re-expands the STALE cached copy and a rigged
+                // re-import's freshly-added bone entities vanish. The raw /api/write-file
+                // above bypasses writePrefabFile()'s own cache update, so we mirror it
+                // here. Key by the stable GUID so both caches resolve it.
+                // ⚠️ ONLY on a successful write: the runtime entry is REPLACED now (#1308),
+                // and a scene load short-circuits on a cache hit, so seating bytes that never
+                // reached disk would keep serving them for as long as a scene owns the prefab.
+                if (wrote) {
+                  setPrefabCache(prefab.id ?? prefabPath, prefab);
+                  const verb = !prefabExists ? 'Created' : isRigged ? 'Merged' : 'Regenerated';
+                  console.log(`[Inspector] ${verb} prefab: ${prefabPath}${existingId ? ` (preserved id ${existingId})` : ''}`);
+                } else {
+                  console.error(`[Inspector] Could not write prefab: ${prefabPath}`);
+                }
               }
             }
           }
@@ -286,7 +299,10 @@ export function ModelAssetView({ path, name, postprocessor }: { path: string; na
       // 3. Refresh editor state.
       await loadMeta();
       await probePrefab();
-      invalidateModel(path);
+      // Both caches a GLB can occupy, via the one shared recipe — this panel's own Re-import
+      // button used to call `invalidateModel` alone, so re-importing a SKINNED model from its own
+      // Inspector kept the stale rigged prototype (#1366).
+      invalidateModelAndRig(path);
       refreshAssets();
       setImportStatus(false);
     } catch (e) {
@@ -529,7 +545,7 @@ export function ModelAssetView({ path, name, postprocessor }: { path: string; na
       >
         {importing ? 'Importing...' : (hasCache && hasPrefab) ? 'Re-import' : 'Import'}
       </button>
-      {hasCache && <ModelImportedStats cache={modelCache} />}
+      {hasCache && <ModelImportedStats cache={modelCache} incomplete={statsIncomplete} />}
 
       {!isSourceModel && !isRigged && (
         <GenerateCollisionMeshRow path={path} name={name} postprocessor={postprocessor} onDone={refreshAssets} />
@@ -583,7 +599,7 @@ function GenerateCollisionMeshRow({ path, name, postprocessor, onDone }: { path:
         { glbPath, glbBase64: bytesToBase64(glb), meshJsonPath, meshName, modelGuid, meshGuid },
         { post: postWriteFile, registerAsset },
         // #874: writeMetaWholesale is the write AND the forget-on-success — one shape shared with
-        // makeTexture2D and EnvironmentAssetView, so a failed write cannot drop a baseline that is
+        // makeTexture2D, so a failed write cannot drop a baseline that is
         // still accurate, and a throw from the `.mesh.json` write that FOLLOWS this cannot skip a
         // forget the meta write had already earned.
         //
@@ -633,7 +649,7 @@ function GenerateCollisionMeshRow({ path, name, postprocessor, onDone }: { path:
 }
 
 /** Post-conversion stats for the model pipeline — per-LOD tri counts + bytes. */
-function ModelImportedStats({ cache }: { cache: ModelCacheInfo | undefined }) {
+function ModelImportedStats({ cache, incomplete }: { cache: ModelCacheInfo | undefined; incomplete?: boolean }) {
   const rowStyle: React.CSSProperties = { display: 'flex', justifyContent: 'space-between', fontSize: '11px', padding: '1px 0' };
   const labelStyle: React.CSSProperties = { color: '#888' };
   const valStyle: React.CSSProperties = { color: '#ccc' };
@@ -641,7 +657,12 @@ function ModelImportedStats({ cache }: { cache: ModelCacheInfo | undefined }) {
 
   if (!cache) return null;
   const lodPaths = cache.lodPaths ?? [];
-  const total = (cache.lodBytes ?? []).reduce((a, b) => a + (b ?? 0), 0);
+  // ⚠️ `undefined` is NOT zero — see the same note in `TextureAssetView` (#1305). `lodBytes` and
+  // `triCounts` are peeled into the gitignored local sidecar, so before this machine has re-derived
+  // them these rows read "0 tri · 0 B" per LOD and a 0 B total: a measurement the Inspector does
+  // not have, stated as fact. Models are the block that usually self-heals (their peeled `hash` is
+  // the cache key), so this is rarely SEEN — which is exactly why it would have stayed.
+  const total = sumMeasured(cache.lodBytes);
   return (
     <>
       <div style={sectionStyle}>Imported</div>
@@ -649,14 +670,21 @@ function ModelImportedStats({ cache }: { cache: ModelCacheInfo | undefined }) {
         <div key={i} style={rowStyle}>
           <span style={labelStyle}>LOD{i}</span>
           <span style={valStyle}>
-            {(cache.triCounts?.[i] ?? 0).toLocaleString()} tri · {formatBytes(cache.lodBytes?.[i] ?? 0)}
+            {cache.triCounts?.[i] !== undefined ? `${cache.triCounts[i]!.toLocaleString()} tri` : '— tri'}
+            {' · '}
+            {cache.lodBytes?.[i] !== undefined ? formatBytes(cache.lodBytes[i]!) : '—'}
           </span>
         </div>
       ))}
       <div style={{ ...rowStyle, borderTop: '1px solid #333', marginTop: 2, paddingTop: 3 }}>
         <span style={{ ...labelStyle, color: '#aaa' }}>Total</span>
-        <span style={{ ...valStyle, color: '#fff' }}>{formatBytes(total)}</span>
+        <span style={{ ...valStyle, color: '#fff' }}>{total !== undefined ? formatBytes(total) : '—'}</span>
       </div>
+      {incomplete && (
+        <div style={{ color: '#8a7', fontSize: '10px', marginTop: 4 }} data-ui-id="assetView.stats.incomplete">
+          {MISSING_STATS_HINT}
+        </div>
+      )}
     </>
   );
 }

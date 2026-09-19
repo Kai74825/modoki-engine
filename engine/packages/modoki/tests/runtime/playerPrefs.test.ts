@@ -271,6 +271,35 @@ describe('PlayerPrefs — schema version protection (#630)', () => {
     expect(PlayerPrefs.get('badJson')).toBe('replaced');
   });
 
+  it('keysIncludingProtected() sees a protected key that keys() hides, and neither invents one (#1276)', async () => {
+    const backend = new InMemoryBackend();
+    await backend.set('mk:g1:fromTheFuture', JSON.stringify({ v: 2, d: 'written by a newer build' }));
+    await PlayerPrefs.init({ namespace: 'g1', backend });
+    PlayerPrefs.set('ordinary', 1);
+
+    // The split this pair exists for: `keys()` answers "what can I read" and is right to omit the
+    // protected key — every caller of it is a READER. A caller that DELETES needs the other answer,
+    // because the key is still on disk and `delete()` removes it perfectly well. Court wiped
+    // `court.session.*` by prefix through `keys()`, so a session written by a newer build survived
+    // an account delete that reported success (#1276).
+    expect(PlayerPrefs.keys()).toEqual(['ordinary']);
+    expect(PlayerPrefs.keysIncludingProtected().sort()).toEqual(['fromTheFuture', 'ordinary']);
+  });
+
+  it('keysIncludingProtected() reports a key ONCE, and drops it when it is deleted (#1276)', async () => {
+    // Two failure modes of a union, both of which would make a prefix sweep misreport: a key in
+    // both maps listed twice (Court counts DISTINCT swept sessions into `court.progress.cleared`),
+    // and a deleted protected key still listed, which would leave the wipe's own confirming
+    // read-back claiming a survivor forever and never able to report success.
+    const backend = new InMemoryBackend();
+    await backend.set('mk:g1:fromTheFuture', JSON.stringify({ v: 2, d: 'x' }));
+    await PlayerPrefs.init({ namespace: 'g1', backend });
+
+    expect(PlayerPrefs.keysIncludingProtected()).toEqual(['fromTheFuture']);
+    PlayerPrefs.delete('fromTheFuture');
+    expect(PlayerPrefs.keysIncludingProtected()).toEqual([]);
+  });
+
   it('isProtected() tells "absent" apart from "present but unreadable" — false, true, false (review finding 2)', async () => {
     const backend = new InMemoryBackend();
     await backend.set('mk:g1:protected', JSON.stringify({ v: 2, d: 'from the future' }));
@@ -360,6 +389,75 @@ describe('PlayerPrefs — unreadable.clear() sites (#630 review finding 8)', () 
     PlayerPrefs.set('k', 'fresh');
     await PlayerPrefs.flush();
     expect(PlayerPrefs.get('k')).toBe('fresh');
+  });
+});
+
+describe('PlayerPrefs — a CORRUPT entry is still something a delete reaches (#1317)', () => {
+  /** Two corrupt shapes — unparseable JSON (a truncated write) and parseable JSON with no
+   *  envelope — plus one readable key. Seeded through the backend before `init()`, so the real
+   *  hydrate classifies them. */
+  async function seed(namespace = 'g1'): Promise<InMemoryBackend> {
+    const backend = new InMemoryBackend();
+    await backend.set(`mk:${namespace}:truncated`, '{"v":1,"d":{"elapsed');
+    await backend.set(`mk:${namespace}:noEnvelope`, JSON.stringify({ hello: 'world' }));
+    await backend.set(`mk:${namespace}:ok`, JSON.stringify({ v: 1, d: 7 }));
+    await PlayerPrefs.init({ namespace, backend });
+    return backend;
+  }
+
+  it('clear() removes a corrupt entry from the backend, not only the readable ones', async () => {
+    const backend = await seed();
+    PlayerPrefs.clear();
+    await PlayerPrefs.flush();
+    // Asserted against the BACKEND: the defect is garbage surviving on disk behind a wipe that
+    // reported the namespace empty, and the cache never held these keys either way.
+    expect(Object.keys(await backend.getAll('mk:g1:'))).toEqual([]);
+    expect(PlayerPrefs.pendingKeys()).toEqual([]);
+  });
+
+  it('keysIncludingProtected() lists a corrupt key once; every reader still treats it as absent', async () => {
+    await seed();
+    expect(PlayerPrefs.keysIncludingProtected().sort()).toEqual(['noEnvelope', 'ok', 'truncated']);
+    // The reader contract is unchanged — this set exists for deletes only.
+    expect(PlayerPrefs.keys()).toEqual(['ok']);
+    expect(PlayerPrefs.has('truncated')).toBe(false);
+    expect(PlayerPrefs.get('truncated')).toBeUndefined();
+    // Corrupt is not protected: #630's overwrite rule stands.
+    expect(PlayerPrefs.isProtected('truncated')).toBe(false);
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    PlayerPrefs.set('truncated', 'replaced');
+    expect(warn).not.toHaveBeenCalled();
+    warn.mockRestore();
+    expect(PlayerPrefs.keysIncludingProtected().filter((k) => k === 'truncated')).toHaveLength(1);
+  });
+
+  it('delete() of a corrupt key removes it from disk AND from the listing', async () => {
+    // A wipe's confirming read-back re-lists after deleting (Court's `stillPresent`); a name that
+    // outlived its own delete would report a survivor forever.
+    const backend = await seed();
+    PlayerPrefs.delete('truncated');
+    expect(PlayerPrefs.keysIncludingProtected()).not.toContain('truncated');
+    await PlayerPrefs.flush();
+    expect(Object.keys(await backend.getAll('mk:g1:'))).not.toContain('mk:g1:truncated');
+  });
+
+  it('a corrupt name does not leak across a namespace swap, a failed swap, or a test reset', async () => {
+    const shared = await seed('g1');
+    await PlayerPrefs.init({ namespace: 'g2', backend: shared });
+    expect(PlayerPrefs.keysIncludingProtected()).toEqual([]);
+
+    await seed('g3');
+    const throwing: PrefsBackend = {
+      getAll: async () => { throw new Error('backend unavailable (simulated)'); },
+      set: async () => {},
+      remove: async () => {},
+    };
+    await expect(PlayerPrefs.init({ namespace: 'g4', backend: throwing })).rejects.toThrow();
+    expect(PlayerPrefs.keysIncludingProtected()).toEqual([]);
+
+    await seed('g5');
+    resetPlayerPrefsForTest();
+    expect(PlayerPrefs.keysIncludingProtected()).toEqual([]);
   });
 });
 

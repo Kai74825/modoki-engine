@@ -4,6 +4,27 @@ A scene is a single `*.scene.json` file — positively identified by that suffix
 other JSON asset kind (issue #54) — that is the **sole source of truth** for what exists in
 the world. (A plain `.json` under a `scenes/` dir is still accepted as a LEGACY fallback, for
 an externally-authored project or an already-published demo snapshot predating the suffix.)
+
+**Every entry point that names a NEW scene file writes `<name>.scene.json`** (#1413): Assets →
+Create Scene, Save Scene As / a first save, and the agent's `modoki_save_all { path }`. The first
+two spelled it `'.json'` until #1413, so they wrote files that were scenes only through the legacy
+rule above, and not scenes at all outside `/scenes/`. The suffix now comes from the classifier's
+table through `SCENE_EXT` (`editor/scene/sceneFileName.ts`). An agent's explicit path that is not
+`.scene.json` is **refused**, with the corrected path in the error, and never silently renamed
+(owner, 2026-09-18). The exceptions are the open scene and a file the manifest already types
+`scene`, so a legacy scene stays re-savable under its own name. A guard test checks that every
+built-in "Create X" kind's extension classifies as its own asset type.
+
+Two consequences, both deliberate:
+- **Choosing an existing legacy `<name>.json` in the Save/Create dialog does not replace it.** The
+  path becomes `<name>.scene.json`, a new file next to the old one, and the old file is left
+  untouched. The panel's own "Replace?" was about the `.json` name, so nothing is destroyed. Delete
+  or rename the legacy file by hand if the copy is meant to supersede it.
+- **An agent Save As now always lands on a real scene asset**, so it meets the scene-id collision
+  that the old plain-`.json` probe used to side-step (#1414, open): a save-as of the open scene
+  writes that scene's id into the copy. Start from `modoki_new_scene` for a scene that must not
+  share an identity.
+
 Scenes load asynchronously into an isolated staging world, then swap in atomically so no
 system ever observes a half-built scene.
 
@@ -34,6 +55,42 @@ During a load, `SceneManager` builds a fresh staging world with koota's
 it isn't active), then calls `setCurrentWorld()` to flip it in one statement.
 Renderers (`Scene3D`, `Scene2D`, and the `useUIEntities` selector) subscribe to
 `onWorldSwap` to flush their per-world caches the moment the swap happens.
+
+#### Module state that belongs to one world — `worldScoped(init)` (#1315)
+
+A game's module-level `let` outlives the world it describes. For a long time the only answer was a
+teardown — an `onWorldSwap` listener, Court's `enterWorld`, a game's `teardown` — that resets a
+**hand-maintained list** of such variables. That list is the defect. A variable is reset only if
+someone remembered to list it. A value written **conditionally**, or **captured once**
+(`if (x === null) x = …`), keeps the previous world's value in the next world, because the new
+world's first write sees it already set. This one mechanism produced all of these bugs:
+- Sling's field walls (#1292) and Weaveling's loaders (#1288, #1294).
+- Court's `sceneAuthoredLevelId`: after Stop and a re-authored `CourtConfig.levelId`, the bootstrap's
+  scene-default fallback still named the previous world's id. That fallback is narrow: it applies
+  when the saved level has left the manifest and its track has no next level. This was found by
+  reading the code and pinned by a headless swap test, not observed live.
+- iap-test's Status memo: a new world kept its placeholder text.
+- postfx-demo's captured lighting: a re-lit scene got the old values restored over it.
+
+`worldScoped(init)` (`runtime/core/ecs/worldScoped.ts`, exported from `@modoki/engine/runtime`)
+keys the value **by the world** instead:
+- `get(world?)`, `set(value, world?)` and `reset(world?)` all default to `getCurrentWorld()`.
+- A world that has never been written reads `init()`. So a swap needs **no reset call and no
+  listener**. There is no list to forget, and no window in which another `onWorldSwap` listener
+  reads the old value before a reset listener runs.
+- Old worlds drop their entry via GC. This is the shape `rng.ts`, `sceneLoaded.ts`,
+  `audioSystem.ts` and `canvas2DHost.ts` each hand-roll.
+- Pass `world` explicitly from bind code that runs against a world `SceneManager` has not
+  promoted yet.
+- Keep `reset()` for the resets that are *not* a swap: a game's register/unregister, and a test
+  seam that rebuilds inside one world.
+
+**What does NOT belong in it:** state that describes something other than the world. The host
+canvas's measured size (Court's and Weaveling's `hostCanvasCss`) describes a DOM element that
+survives the swap. The previous world's measurement is the best available value until the next
+frame re-measures, and scoping it per world would swap a near-correct size for 0. Games adopt the
+helper when they next touch their teardown. It is not a sweep, and a game's existing list still
+works for everything already on it.
 
 > koota caps total worlds at 16 (`WORLD_ID_BITS = 4`). `SceneManager` calls `oldWorld.destroy()`
 > after each swap to free the slot; without it the engine breaks after ~16 swaps.
@@ -682,6 +739,15 @@ re-saving an already-migrated scene is byte-identical, verified across *fresh ed
 (not merely within one session, which would not have proven the `rootInstanceId` GUID is
 persisted rather than re-minted per launch).
 
+Run again on **2026-09-16** for #1268, across 16 projects: **45 files, 34 of them gaining an
+`EntityAttributes` with a derived guid**, and the other 11 changing *only* by format convergence.
+(36 files bumped v12→v13 in total — the two counts measure different things: 36 is how many bumped,
+11 is how many had nothing else to show for the re-save.) That pass is the reason the
+convergence claim above needs one caveat — it holds for the *serializer*, but a guid that the
+serializer MINTS rather than derives never converges, because each run mints a different one. See
+"An entry with NO guid gets a DERIVED one at load" below for the mechanism, and why the reviewing
+script cannot be `check-scene-churn.mjs` for this particular class.
+
 Tooling, for the next time a serializer change makes the committed files stale:
 
 ```bash
@@ -787,7 +853,7 @@ Two gaps let it through, and both are now closed:
   canonicality check the marker guard says it cannot afford: proving a scene byte-exact needs a
   world, but proving no field on disk is one the serializer would never emit needs only the
   registry. **Its reach is engine traits only** — a game's own `runtimeOnly` field (sling's
-  `Enemy.hpBarId`) is registered by that game's runtime and is invisible to a vitest run.
+  `Enemy.hpBarGuid`) is registered by that game's runtime and is invisible to a vitest run.
 
 The rule for a trait author: `hidden` and `runtimeOnly` answer different questions — *may a human
 edit this?* vs *may this reach disk?* — and an engine-written read-back needs both
@@ -804,6 +870,32 @@ consumed with it by `clearScrollRequest`, while the authored `scrollBehavior` is
 runtime write lands on authored data, ask whether the write is a *different role* wearing the same
 field — `runtimeOnly` can only separate disk from memory, never two meanings of one value. The
 `GAINED` check above is what noticed it.
+
+**The serializer's fixed point, per trait object (#1412).** Two more slices of canonicality need only
+the registry, and they are the two that kept coming back as one-off re-saves (#268, #1177, #1410):
+a SoA trait is written in **schema key order** (`Object.keys` of the object passed to koota's
+`trait({...})`), and a **scalar at its schema default is omitted**. Hand-edited JSON, or a migration
+that appends a key, breaks the first. Both rules live in ONE place, `writtenTraitKeys` /
+`isFieldWritten` / `traitKeyOrder` in `editor/scene/traitDefault.ts`: `serializeScene` calls it for
+scene entities, prefab.ts's `compactAddedTraitData` for `added[]` children, and
+`sceneFormatCanonical.test.ts` checks every committed scene's `entities[].traits` against it. So the
+guard cannot pass a writer whose rule moved, which a restated `Object.keys(schema)` in the test
+could (mutation-checked: reversing `traitKeyOrder` turns the corpus guard red). Sharing it also
+fixed a real gap: the added-child writer claimed to mirror serialize.ts but never skipped
+`runtimeOnly` fields.
+- **Reach:** engine SoA traits only, the same limit as `runtimeOnlyFieldsOffDisk`. The 5 AoS traits
+  (`SkinnedMeshRenderer`, `AnimationLibrary`, `MaterialInstance`, `Input`, `UIAction`) have no static
+  key order, and game-registered traits are invisible to `registerAllTraits()`. `added[]` subtrees
+  are left out because older ones were written uncompacted.
+- **No ledger.** Measured 2026-09-18, the whole population was 8 hand-authored UI objects out
+  of order (Court's No Ads UI, #1410; wordweave's ad-break UI; the #1398 Player ID row) plus 2
+  default-valued scalars. They were canonicalized in the same change: keys reordered and the two
+  defaults dropped, values unchanged, the `version` line untouched. A per-object
+  `assertExemptionLedger` was tried first and dropped: other clones re-save or re-edit these scenes,
+  so its rows went stale or short at whichever merge landed second. **New drift gets a re-save,
+  never a row.**
+- **Not covered:** trait order inside `traits` (registry insertion order interleaves game traits),
+  and prefab files (a different writer, `serializePrefab`).
 
 **Prefabs needed their own route (#125), and are now swept too** — see "Re-saving legacy
 prefabs" below.
@@ -823,8 +915,8 @@ catalog: [debug-tools-mcp.md](./debug-tools-mcp.md)). `edit-open` swaps the worl
 `load-scene` does — it refuses on unsaved work and takes `discardUnsaved` — and additionally **saves the
 current scene** on the way in; that is pre-existing `prefabEdit.ts` behaviour, kept deliberately,
 because it is what makes the return trip's reload-from-disk non-destructive.
-`modoki_save_all` refuses outright while the editor is in prefab-edit mode; `edit-save` is the
-save for that world.
+In prefab-edit mode `modoki_save_all` writes any parked work and refuses only the scene half;
+`edit-save` is the save for that world.
 
 **`engine/scripts/resave-prefabs.sh`** is the prefab sibling of `resave-scenes.sh`. Per project it
 launches this clone's editor, enumerates prefabs from `/api/scan-assets`, then runs
@@ -965,6 +1057,26 @@ allowlisted case).
 > rather than just lookups. This is a **disk-form change only**; translation stays at
 > the load seam.
 
+**Gotcha — a reference to a prefab-instance entry resolves to its PLACEHOLDER (#1353).** Pass 2
+resolves every `entityId` field while prefab entries are still placeholders, and a guid resolves
+there exactly as a number does. The prefab loop then destroys each placeholder, and koota hands
+the freed id to the first row the instantiation spawns. That row is the root only when the prefab
+lists its root row first. So pass 2 records every reference it resolves, `onInstantiatePrefab`
+returns the spawned root, and the placeholder's references (and `idMap`, for a later entry's lazily
+resolved numeric parent) are re-pointed at it. They are DETACHED — zeroed — before the placeholder is
+destroyed (`detachEntityIdRefs`) and attached after (`attachEntityIdRefs`): in between, the member that
+reclaims the id may be structurally `removed`, and that removal cascades by `parentId` across the
+world, which used to delete every scene row still holding the id. A prefab that fails to instantiate
+applies each field's `onMissing` policy to them instead (a `parentId` stays 0, the scene root; a
+`PrefabInstance` whose `rootInstanceId` was detached is stripped, since at 0 it would save as an
+instance root) and drops its `idMap` entry. When an instance's parent is
+itself a placeholder a LATER entry replaces, every row the instantiation handed that parent is
+recorded the same way: the root, and each orphan or extra top-level row (#1339's shape). The
+retarget walks the record, never the world: after the destroy, a new member that reclaimed the id
+has children that legitimately hold it. Pinned by
+`packages/modoki/tests/runtime/sceneLoadInstanceParentRefs.test.ts`, whose prefab lists its root
+LAST so recycling cannot mask the bug.
+
 ### Why it mattered, and the regression gate
 
 A scene saved after a base-scene **carry** (a level swap that keeps a shared base
@@ -1077,6 +1189,47 @@ Two consumers:
 - **Editor grouping/ghosting** — `EntityInfo.sourceScene` (`runtime/core/ecs/entityUtils.ts`)
   drives the Hierarchy's scene groups and the ghost styling.
 
+⚠️ **Anything that RESPAWNS a base entity must carry the stamp, because a fresh spawn reads `''`,
+which means primary.** Losing it is silent data loss, not a cosmetic slip: the next Save All
+writes the entity into the primary and drops it from the base file, so it vanishes from every other
+level using that base. `rebuildInstance` (`editor/scene/prefab.ts`) is the case that shipped
+(#1431). Refreshing after a prefab save, Revert, and Apply to Prefab all rebuild, and all three
+brought a base's instance back primary-owned. It now reads the old ROOT's stamp before the
+teardown and writes it onto the whole new subtree (members, nested expansions, restored `added`
+nodes). The stamp comes off the root, not the parent, because a base instance usually sits at the
+scene root with no parent to inherit from (#1429 covers the parent-derived case at the reparent
+seam). The whole subtree takes it because that is where a save already puts every node under a
+base instance: the primary save drops any subtree with a base ancestor.
+
+⚠️ **The stamp is only half the chain: Save All writes a base only when the base is DIRTY.**
+Carrying the stamp keeps the instance in the base, but nothing rewrites the base's file unless an
+edit marks it. So Revert and Apply dirty it through their undo action's `affectedScenes`:
+`RevertResult.affectedScenes` for Revert (dialog and agent op), and a read before the apply in
+`applyToPrefabWithUndo`, since the apply tears the instance down. The undo manager marks those
+scenes on push, undo and redo. A plain refresh after a prefab save does not dirty the base, and
+the primary is not dirtied by one either: the instance's stored overrides are unchanged.
+
+⚠️ **Dirtying the base makes Apply's UNDO load-bearing, and its world restore does not reach a
+base.** `restoreSnapshot` rebuilds the primary from a primary-only snapshot, and a base loaded with
+it is CARRIED live. So the base's instance would keep its post-apply shape against the restored
+prefab, and the now-dirty base would be written from it. A promoted added node would then exist
+nowhere: out of the prefab, out of the base. The same carry leaves every OTHER base instance of
+that prefab built from the prefab being undone. A member the apply removed then reads as a
+`removed` nobody authored, and the dirty base's save writes it. So after each restore,
+`applyToPrefabWithUndo`'s undo and redo do two things:
+- `refreshBaseInstances` re-derives every carried base instance of the prefab against the
+  restored one. This is a prefab save's refresh, restricted to base-owned roots. It runs for a
+  PRIMARY instance's apply too, because that apply's refresh reached the base instances as well.
+  It does not dirty the base there: the base file was never stale. Primary instances are left to
+  the world restore, which rebuilt them from the snapshot.
+- The applied instance is rebuilt from a capture taken on its side of the apply. It is found
+  again by a DURABLE guid, minted with `ensureGuid` if the root held only a runtime one; a runtime
+  guid survives neither the rebuild nor the carry. The capture warms the nested cache first
+  (#1284), as Revert does.
+
+Tests: `engine/tests/editor/rebuildKeepsSourceScene.test.ts`,
+`applyPrefabDirtiesBase.test.ts`, and `agentPrefabRevertDirtiesBase.test.ts`.
+
 ### Editor authoring surface
 
 - **Set the ref** — `editor/panels/assetViews/SceneAssetView.tsx`: select a scene in
@@ -1120,12 +1273,38 @@ Two consumers:
 
 ### Two guards that keep this safe
 
-- **No cross-scene parenting.** A level entity parented under a base entity breaks save
-  provenance (filtering keys off an entity's OWN `sourceScene`, not its parent's) and
-  teardown. `reparentEntity` hard-rejects it — the one interactive path both
-  `modoki_reparent_entity` and the Hierarchy drag go through — and `SceneManager` warns
-  at load time after the staging world is fully populated. Promote/demote *changes*
-  `sourceScene`, so it satisfies the guard rather than relaxing it.
+- **No cross-scene parenting: a parent from another scene is a SCENE MOVE** (#1429, owner
+  ruling). A level entity left under a base entity breaks save provenance and teardown, because
+  filtering keys off an entity's OWN `sourceScene`, not its parent's. Under a base prefab
+  MEMBER, `captureInstanceStructure` bakes the child into that base's `added` list. Under a base
+  non-member, `serializeScene`'s foreign-subtree exclusion drops it from BOTH files. So every
+  entry point asks one question, `planReparent` (`entityActions.ts`): same scene → a plain
+  `reparentEntity`; another scene → `moveEntityToScene` under the new parent, which re-stamps
+  the whole subtree. That move is **prompted**, because every level using that base will show
+  the entity:
+
+  | Entry point | How the move is confirmed |
+  |---|---|
+  | Hierarchy row drop, cut → paste | the editor's own modal (`confirmInEditor`), text from `formatSceneMoveConfirm` |
+  | agent `reparent-entity` / `modoki_reparent_entity` | refused with that same text until re-sent with `moveToScene: true` |
+  | agent `apply-scene-ops` `setTrait parentId` | refused per op, naming `reparent-entity {moveToScene}`: a batch has no confirm step. A SAME-scene write is a full `reparentEntity` (unpack on move, world-pose compensation, folder clear), not a bare field write — the bare write left a moved member linked, and the save dropped it (#1434). A string parent is a guid; one matching no live entity is refused |
+
+  One prefab case is **refused**, because a scene move cannot carry `reparentEntity`'s
+  "unpack on move": `instance-member`, where something in the moved subtree is linked to an
+  instance that stays behind. That covers a member, an owned nested root whose outer instance is
+  not moving, and a member held under a plain added child. Moving it would split the instance
+  across two files. Move the whole instance, or unpack it first. A whole stored instance dropped
+  under a base instance's member is NOT refused: it moves and becomes that instance's user-added
+  nested instance, exactly as in a same-scene drop (#1436, below).
+
+  A subtree **created**
+  under a base entity (create, paste-copy, prefab instantiate) is stamped into the parent's
+  scene with no prompt, since nothing moves (`adoptParentScene`, owner option A).
+  `reparentEntity` still hard-rejects a cross-scene parent as the backstop for any direct
+  caller, and `SceneManager` warns at load time when a FILE already holds one.
+  Promote/demote *changes* `sourceScene`, so it satisfies the rule rather than relaxing it.
+  ⚠️ `captureInstanceStructure` deliberately has no `sourceScene` filter. A filter there
+  would turn a wrong-file save into a lost entity; the fix is to keep the state from existing.
 - **Duplicate guids across the chain.** `filterDuplicateChainGuids`
   (`SceneManager.ts`) drops a root (and its subtree) whose guid a chain scene already
   spawned, warning loudly. Chain order means the **first scene to spawn a guid keeps
@@ -1143,30 +1322,370 @@ it has already sent one sweep in the wrong direction (2026-08-18):
   and `filterDuplicateChainGuids` compare a scene against something ELSE already loaded (a carried
   entity, an earlier chain scene), so a collision *inside* one file passes straight through and
   both entities spawn. Guarded by `engine/tests/assets/sceneGuidUniqueness.test.ts`.
-- **Across scene files, sharing a guid is NORMAL and is sometimes required.** A sweep of the 54
+- **Across scene files, sharing a guid is LEGACY — and sometimes load-bearing.** A sweep of the 54
   committed scenes found ~80 shared guids and only two same-file collisions. `games/sling`'s
   `Lvl-0001`/`Lvl-0002` are variants of the same authored entities; `games/space-console`'s three
   scenes share one UI shell; and the `Persistent` carry-across-swap mechanism **depends** on both
   scene files naming the entity by the same guid — that is precisely how `filterPersistentDuplicates`
   recognises the carried entity and drops the scene's copy.
+- **Duplicating a scene FILE no longer creates new sharing (#1293).** Those shares exist because a
+  file duplicate used to copy every entity guid verbatim. `duplicateAssetFile` now remints every guid
+  the copy DEFINES — `EntityAttributes.guid`, a prefab-instance root's row-level `guid`, and each
+  `added[]` node — and rewrites every in-file string value equal to one of them (`parentId`,
+  `rootInstanceId`, every `entityRef` field, `UIAction.bindings[].target`). A ref to a guid the file
+  does not define (its base scene) is kept. Owner ruling: always remint, no "duplicate as variant"
+  opt-out — the same rule `regenerateSnapshotGuids` applies to a subtree duplicated inside a scene
+  (below). **The accepted cost:** a `Persistent` entity in the copy no longer matches its original, so
+  swapping between the two files spawns it twice. Existing files were deliberately left as they are
+  — `qa/cases/**`, `demos/postfx-demo` and Court's tests pin their guids (and postfx-demo's code
+  looks entities up by literal guid, so a DUPLICATE of one of its scenes loses those lookups).
+  **A stored ref to a prefab MEMBER follows too (#1324).** Members are not stored; they derive
+  `deriveMemberGuid(anchor, path)` (`core/assetRefRules.ts`, the one spelling of the rule) from the
+  now-reminted anchor on load. A ref holding a member's derived guid would otherwise keep the OLD
+  anchor's value and dangle in the copy. The duplicate route hands `remintSceneEntityGuids` a prefab
+  reader, and `derivedMemberPathsByAnchor` walks each instance's prefab chain, including nested rows
+  and user-added nested instances, to map `old|p` → `new|p`. The walk mirrors the LOADER's parenting,
+  not the prefab's intent. A prefab row steps by its `localId`, a user-added nested instance's root
+  by its prefab's root localId, and a plain added node by 0. **The anchor is not always the instance
+  root (#1339).** `instantiatePrefabIntoWorld` parents a row whose `parentId` is 0 or names no row to
+  the CALLER's parent. For a top-level instance that is its scene parent. For a user-added nested
+  instance it is the member the node hangs on. For a nested prefab ROW it is nothing, because the
+  row expands under 0, so those rows are unaddressable. A guid-less (pre-#1248) instance root also
+  derives, from its scene parent. So every path is tagged with the anchor it hangs off, and
+  `sceneAnchorOf` resolves the scene-side `parentId` (a guid or an entry id) to that parent. Only a
+  parent with a durable guid is followed, and refs below any other parent are left as they were. A
+  guid-less PLAIN parent's guid is seeded from the scene PATH (`deriveAuthoredEntityGuids`), which a
+  copy at another path does not share. A guid-less INSTANCE parent can only be named by number. Since
+  #1353 the loader parents the child to that instance's root, whose guid derives from its own scene
+  parent, so the walk COULD follow it; it conservatively does not, which only affects legacy files
+  that were never re-saved. **Change the loader's walk and this one together.**
+  `engine/tests/plugins/remintPrefabMemberRefs.test.ts` pins the pair by loading the original and
+  the copy through the real loader, never by hand-computing a guid. A prefab the reader cannot
+  resolve maps nothing, so a ref into it still dangles.
+  **Template-added (keyed) nodes follow too (#1430).** A keyed node steps by `'+' + key`, and the
+  walk descends every `nestedStructure` (a row's, a reference node's, an entry's) the way the loader
+  splits it: `descendPathKeyed` at each nested row, with the row's own slots under whatever was
+  forwarded. Where an outer slot REPLACES a row's `added`, both lists are walked, because
+  over-generating is harmless. A keyed node the scene EDITED is saved in scene form, with its derived
+  guid stored and its key dropped, and the load heal (#1426) re-keys it by matching that guid against
+  its derivation. So this is the one place a guid the file DEFINES takes its derived counterpart
+  instead of a random one. A random guid would leave the copy's node unkeyed for good. Such a node
+  can itself be an anchor: a keyed reference node, or a keyed plain node the scene hung a reference
+  under. Re-pointing it moves its members, so the carry repeats until nothing moves, each pass
+  against the anchors' final guids. A single pass left a member ref dangling whenever the entry's
+  own walk could not reach the anchor.
+  The heal re-keys a keyed reference-node root too (#1438). It carries `PrefabInstance`, but it is a
+  stored root that stepped by its key, so its guid derives exactly like a keyed plain node's, in the
+  original and in the copy. A member token can name the reference node itself, never a member past
+  it: a stored root is its own frame.
+  ⚠️ **The walk mirrors the loader exactly, including the shapes the loader recurses on FOREVER** (a
+  prefab whose file adds a reference leading back to it). Two structural rules for "which shapes
+  are cycles" were each wrong in review, refusing shapes that load or missing ones that do not, so
+  the walk stops on SIZE instead: past 64 instance levels or 100,000 member paths it maps nothing for
+  that anchor. Plain added levels do not count toward the depth.
+  A stale runtime guid (#1210) is not reminted (it is no identity), and a BOM-prefixed file is
+  parsed past its BOM rather than copied verbatim under the original's asset id.
+- **Duplicating or pasting a live SUBTREE carries its internal refs the same way (#1338).**
+  `regenerateSnapshotGuids` (`editor/undo/entityActions.ts`) and the device's `duplicate-entity`
+  op (`engine/app/debug/liveLifecycle.ts`, which also deep-clones its snapshot now) plan the copy's
+  guids with one shared function, `planCopyGuids` (`runtime/core/copyIdentity.ts`). They then run
+  the same `remapGuidValues` over every trait, so a `UIAction` target or an
+  `entityRef` aimed at the source's own child points at the copy's child. A ref to anything outside
+  the subtree is kept. Before the fix the copy silently drove the SOURCE, with nothing erroring.
+  Two mechanisms make this survive save + reload:
+  - **A prefab member in the copy gets the guid a reload will derive, not a random one.** A random
+    member guid would be replaced on the next load, taking every carried ref with it. Which guids a
+    save STORES is structural, so that is the classification: a `PrefabInstance` entity is derived
+    unless it is an instance root the serializer stores (its `rootInstanceId` is itself and its
+    `parentLocalId` is 0). So members and owned nested roots are derived. Top-level and user-added
+    instance roots, plain entities, and the copy's root are anchors and get `newGuid()`. An earlier
+    draft classified by "the live guid equals its derivation"; review showed that fails once a save
+    has stored a derived guid (#1349), for the entity's descendants and for a legacy root's copy.
+  - **A template-added (keyed) node keeps its key and derives through it (#1430).** It has no
+    `PrefabInstance`, so the rule above minted it a random guid, and the copy dropped its
+    `TemplateAddedKey`. A member token into it (a Panel bound to `@member:…+KEY`) then read as an
+    override live and was dead after save + reload, because neither the heal nor
+    `recoverTemplateKey` can recover a key from a random guid. Inside a copy whose root is an
+    instance root the save stores, the node steps as `'+' + key`, which is exactly the loader's rule
+    for a guid-less keyed node. Its descendants derive through it; a keyed reference-node root is
+    itself a stored root, so its own members anchor on it. `planCopyGuids` reports these nodes as
+    `keyed`, and both callers keep the key on exactly those nodes. The rule applies BELOW any
+    unkeyed instance root the save stores, inside the copy. A keyed reference-node root does not
+    count: it is a node of the OUTER template, which also writes the keys in its payload (#1369). That is either the copy root itself, or a stored
+    root under it, such as a plain group holding an instance. The review of the first cut found that
+    deciding this from the copy root alone still lost the key on that group copy. A key belongs to
+    the frame of its nearest stored root, and every stored root below the copy root is copied whole.
+    Above every stored root, the node mints a fresh guid and drops the key, because the key would
+    name a node no frame holds, or give two siblings one step. That covers three kinds of copy:
+    - a copy of a member, which the editor strips to plain added nodes;
+    - a copy of the keyed node itself;
+    - a copy of an owned nested root, which becomes an independent instance of the inner prefab
+      (#1354).
+  - **Numeric `entityId` fields follow too** (`carryEntityIdFields`, called by `respawnFromSnapshot`
+    and by the device op). `PrefabInstance.rootInstanceId` is carried from the snapshot's ids to the
+    respawned ones, within the subtree only. Before this, a copied
+    instance kept naming the SOURCE root: a copy of an instance's plain parent was folded into the
+    source instance's `added[]` on save. The old `reRootPrefabInstanceSubtree` pointed every copied
+    `PrefabInstance`, nested roots included, at the outer root. The remap replaced it, and it also
+    fixes delete + undo, whose restored instance used to name a dead id.
+  `engine/tests/editor/duplicateCarriesRefs.test.ts` round-trips loader → duplicate → `serializeScene`
+  → loader. Its guid-less variants are the #1349 block (next bullet).
+- **A guid-less instance root that a save STORES anchors its own members from the first load
+  (#1349).** Such a root is a guid-less user-added nested instance, or a guid-less (pre-#1248)
+  top-level one. The serializer writes its guid either way. Before the fix, the first load derived
+  the root's guid and derived its members *through* it, off the outer anchor. The first save then
+  stored the root's guid, and the reload anchored the members on it. So every member changed guid
+  after one save, and every ref to one dangled, with or without a duplicate.
+  `deriveInstanceMemberGuids` now resolves such a root on demand and anchors its members on the guid
+  it derives. The root's own value is unchanged, and a file that an older save already "promoted"
+  loads to the same guids as one it did not. The classification is `planCopyGuids`' structural one,
+  NOT "is this guid equal to its derivation" (see the bullet above). The file-side mirror keeps
+  pace: `derivedMemberPathsByAnchor` starts a new `|`-separated segment after such a root, and
+  `deriveMemberChain` derives the chain link by link. A committed-corpus walk (2026-09-17) found no
+  nested-prefab `added[]` node at all, so no stored ref moved.
+- **Template identity: an added node written into a PREFAB carries a key, never a guid (#1387).**
+  A template has no per-instance identity. A flat member's guid is cleared and derived per instance
+  from its localId path, but an `added` node inside a nested ROW (a row's own `added`, a row's
+  `nestedStructure[*].added`, or a reference node's `added`) has no localId. It used to keep its
+  durable guid verbatim, so every instance of the prefab spawned an entity with that one guid. Such a
+  node now carries `AddedEntity.key` (template-local, guid-shaped, stable across saves) and
+  `guid: ''`. The mechanism, in `runtime/core/templateIdentity.ts`:
+  - **Load.** `applyStructureCore` spawns the node guid-less, carrying the UNREGISTERED
+    `TemplateAddedKey` marker, and a keyed reference node's root gets the same marker.
+    `deriveInstanceMemberGuids` derives both, stepping `'+' + key` (`addedKeyStep`). The `+` keeps
+    the step disjoint from every numeric one, so no existing derived guid moves.
+  - **Load heals a lost key (#1426).** A scene save writes a keyed node as its guid and no key (see
+    "Which kind a node is" below), so a reload spawns it unkeyed. Before, a member token naming the
+    node then stayed a literal `@member:…` string in the live world, a dead reference in a shipped
+    build. `deriveInstanceMemberGuids` now ends with a heal: every node with a stored guid that could
+    have been template-added (a plain node, or a reference node's root, #1438) gets its key back
+    when one of the keys its world's expanded prefab documents declare derives that guid
+    (`runtime/loaders/templateKeyRecovery.ts`; the loader records each document's keys as it
+    expands it). It runs before member-token resolution, and a healed node was an anchor, never a
+    step, so no derived guid moves. Runtime never mints a key.
+    ⚠️ The derive pass runs on EVERY runtime prefab spawn, so the heal is bounded: only a node inside
+    a top-level instance is a candidate, its walk stops at that instance's stored root (the original
+    anchor is at or below it), and a node the world already failed to heal is skipped until its guid
+    or the world's key set or its ancestor chain changes. Unbounded, it measured ~2 s per spawn at
+    5000 entities × 20 keys. A world that expands no keyed prefab pays nothing. The prefab-edit world
+    never notes the EDITED prefab's own keys — its rows are flattened, not expanded — so those nodes
+    are not healed there; the editor's template write recovers them instead.
+  - **Write.** Every prefab-file writer captures in TEMPLATE form:
+    - `planPrefabRows` passes `{ template: true }` to `captureInstanceReference` and
+      `captureNestedChannels`;
+    - `addedNodeIdentity` reads the key back off the marker. The marker is unregistered, so any
+      scene-form round trip of the edit world drops it (Play→Stop reloads a `serializeScene`
+      snapshot; delete→undo respawns from a registry-only snapshot, though undo now carries the
+      marker — #1427). The key is then RECOVERED from the node's guid, which both round trips keep:
+      each ancestor is tried as the anchor with each key the cached prefabs declare, until
+      `deriveMemberGuid` reproduces the guid. It is the same algorithm as the load heal
+      (`recoverTemplateKey` in `runtime/loaders/templateKeyRecovery.ts`), fed the editor cache's keys,
+      which include a prefab being edited that no world expanded. Only a node that never came from a template gets a fresh key. Minting one instead
+      re-keyed the node and pinned the inner prefab's untouched interior into the outer row on a
+      no-op save (#1387 review);
+    - promotion (`toTemplateNodes` in `insertAddedSubtree`) converts a scene-form subtree the same way.
+  - **Which kind a node is follows from its fields.** A node with a `guid` is spawned with it
+    verbatim, whether or not it carries a key. A scene capture never writes a key; it writes the
+    node's live, now per-instance guid. Because a scene restates every non-empty interior (#1358),
+    a scene that stores a ref into an interior also stores that node's guid.
+  - **Rebuilds derive.** `rebuildInstance` now ends with the derive pass. Before, a respawned keyed
+    node was left guid-less.
+  - **Legacy.** A pre-key row node keeps loading exactly as before. A node with no guid loads
+    guid-less. A node with a durable guid still gives every instance that one guid, until its OWN
+    prefab is re-saved and writes the key. `sameStructure` compares node identity (`key`, `guid`)
+    only when both sides key every node, so an OUTER no-op save never pins such an interior just to
+    migrate it. **Committed corpus (2026-09-18): 0 of 105 prefabs carry a row `added` node with a
+    guid**, so nothing moved here. Games copied out of the repo can still carry that shape (#29).
+  - **The duplicate walk mirrors the step.** `derivedMemberPathsByAnchor` and `deriveMemberChain`
+    use the same keyed step, pinned by `engine/tests/plugins/remintPrefabMemberRefs.test.ts`. It
+    still does not read a ROW's `nestedStructure` (#1381), which predates this change. That gap
+    rarely matters: a scene save restates every non-empty interior with each node's guid, so a scene
+    holding a ref into one also holds the guid it points at.
+  Tests: `engine/tests/editor/prefabTemplateIdentity.test.ts`.
+- **Template identity, refs: a ref between a prefab's own members is a MEMBER TOKEN (#1352).** A
+  template kept such a ref (a `UIAction.bindings[].target`, any `entityRef`) as the SOURCE world's
+  guid. So every instance drove the one source entity, or nothing once that was gone, and nothing
+  errored. The template now stores `@member:<path>` (`runtime/core/templateRefs.ts`): the target's
+  derive-step path (localIds, a row's localId, `'+key'`) below the root of the instance the value is
+  applied to. A leading `^` climbs one enclosing instance, and `@member:` alone is that root.
+  - **Frames.** A member's own bag is in its prefab's frame. A row's `overrides`/`added` are in the
+    nested child's frame. A `nestedOverrides`/`nestedStructure` entry is in the frame of the
+    instance its path addresses. A reference node's payload is its own frame and is never rewritten.
+  - **Write.** `serializePrefab` (`templateTokenizer`) rewrites a guid to the NEAREST frame that
+    names it. That keeps the spelling canonical, which #1381's no-op comparison relies on: MID's own
+    save and OUTER's save of the same MID interior must write the same token, or OUTER pins an
+    interior it never changed. That comparison now runs AFTER tokenizing (`captureNestedChannels`
+    `baselinesOut`). Apply's value overlay tokenizes in the instance's own frame, downward only,
+    because the file is used in other contexts.
+  - **Read.** Each instantiate call (loader and editor alike) takes its path from the top call
+    (`_segments`, one per nesting level) and rebases every value it applies. So every token in one
+    tree names a path from the top call's root. A top call whose tree carried a token registers that
+    root (a token SCOPE, so a spawn of a token-free prefab pays nothing), and
+    `deriveInstanceMemberGuids` resolves the tokens to the guids just derived. ⚠️ A STORED root under
+    the frame (a scene instance parented to another instance, a user-added nested one) is a target
+    but is never REWRITTEN by the enclosing pass. Its bag is in its own frame, and rewriting it once
+    made a button placed under a panel instance drive the panel's member on every load.
+  - **Unresolved.** A token that names nothing stays as it is: visibly unresolved, never re-pointed.
+    Examples are a ref into a user-added nested instance's interior (a frame boundary) and one past
+    the top.
+  - **Compare.** `getOverrideValues` resolves a base token (`baseTokenResolver`) before comparing,
+    in the save capture, the Apply/Revert list and the Inspector highlight. Otherwise every
+    token-bearing field reads as overridden on every instance. A SCENE stores the resolved guid,
+    which is derived and so stable.
+  - **Prefab editor.** The editor flattens the prefab's own rows, so `buildPrefabEditScene` maps
+    every token that climbs to the root onto an edit-world guid: a row's sentinel, or
+    `deriveMemberGuid(sentinel, rest)` past a nested row. The save maps them back.
+  - **Not covered.**
+    - A ref OUT of the prefab dangles in other scenes, as it always did.
+    - A token left unresolved and then stored into a SCENE override by a marked edit is rebased again
+      on the next load, so its path changes. It already named nothing.
+    - A ref to a node PROMOTED by Apply is left as a guid.
+    - A ref inside a reference node's payload is left as a guid.
+  Tests: `engine/tests/editor/prefabTemplateIdentity.test.ts` § "#1352".
+- **An owned nested instance ROOT that leaves its row is saved as REMOVED from the outer instance
+  (#1355).** This is the depth-1 root case; a structural edit INSIDE an owned nested instance rides the
+  owner's `nestedStructure` slot (#1358). `captureInstanceStructure` used to skip every nested prefab row in its removal pass,
+  because reading a nested row's absence from the member map had once stripped the spaceship's
+  flames on every save. Skipping the rows meant an owned nested instance that was deleted, or moved
+  out, re-expanded on reload. Moved out, it used to unpack into plain entities that STORE the derived
+  guids (the 2026-09-17 ruling, since reversed — see below), so the reload also produced two entities
+  per guid. The row is now looked for where it expands: an instance root of
+  the row's prefab directly under the row's parent member. The check is lenient on purpose. An
+  unstamped (legacy) root counts as present, and so does a row whose prefab is not cached (it
+  expanded to nothing) or whose parent member is gone (its own removal covers it). The moved
+  entities keep their guids; with the row removed, nothing else derives those values. The
+  editor-side `applyStructureByRootInstance` maps nested rows to their roots, as the runtime map
+  already did, so a refresh or revert rebuild honours the removal. `serializeScene` preloads nested
+  row prefabs so the uncached guard does not hide a deletion.
+  Undoing an unpack re-points each entity's `rootInstanceId` at its root's live id, found through a
+  guid ref. The ids a world rebuild reassigns would otherwise leave the restored instance naming a
+  dead root, and the next save would drop it. If the owner no longer resolves, the entity is left
+  plain. That happens under an unanchored (guid-less, scene-root) instance, whose owner guid was
+  minted at move time and re-derived differently by the rebuild. Its stale id may name an unrelated
+  entity, so relinking would make the save drop it.
+  **Leaving the outermost instance cuts only the links the move SPLITS** (`planMoveUnlinks`, decided
+  before the parent write — #1445: taken after it, a member dropped into ANOTHER instance read as still
+  inside its own and stayed linked to it there). A member on the other side of the move from its
+  instance root is unpacked into a plain entity that keeps its guid. **An owned nested instance on the
+  other side from the instance whose row expanded it stays an instance of its own prefab** (#1447, owner
+  ruling 2026-09-19, reversing 2026-09-17's unpack), standalone, or a user-added nested instance when it
+  lands inside another instance; the outer instance records the row removed. That holds for a nested
+  root dragged out itself and for one inside a moved-out member. The obstacle the unpack avoided was
+  identity: an owned root's members derive their guids from the OUTER anchor, a stored root's from its
+  own guid, so left alone every ref to a member dangled after reload (#1349's shape).
+  `promoteOwnedRoots` (`core/ecs/memberHome.ts`) therefore renames each member to the guid the reload
+  derives under the root and rewrites every ref (`applyGuidRemap`), and the undo reverses the map. The
+  values the outer row set on it need nothing: every expansion marks the row overrides it applies, so
+  the save keeps them. `detachOrphanedMembers` (a delete whose home goes) promotes through the same
+  helper. A move that stays INSIDE the outermost
+  instance keeps everything linked and is saved as a move (#1437 —
+  [prefab-structural-overrides.md § Moved members](prefab-structural-overrides.md#moved-members-1437)). A user-added nested instance in the moved subtree stays linked, because
+  its root guid is already stored. A STORED instance root (top-level or user-added) moved OUTSIDE every
+  instance stays an instance, and the save writes it as a top-level entry. Before the review of
+  #1355, every root drag unpacked the whole instance, because the containment test it used then was
+  false for the root itself (linkage is now decided by `outermostInstanceRoot`, #1437). Dropped INSIDE another instance it also stays linked, and becomes that
+  instance's user-added nested instance (owner, #1436): the save writes it as an `added[]` prefab
+  reference carrying its own overrides, under a member or, inside an owned nested instance, in
+  `nestedStructure`. The same holds when the instance sits deeper in the moved subtree, under a
+  plain entity (#1433). It used to unpack there, because before #1367 (an unstamped root always
+  reads as user-added) and #1369 (nested channels on user-added nodes) the save lost it. The old
+  pin could not tell the difference, since a linked and an unpacked instance reload at the same
+  paths; the tests now assert the link itself.
+  A reparent keeps the world pose by rewriting the local Transform, and on an entity still linked to
+  an instance those values are OVERRIDES — which the save keeps only when marked. So
+  `reparentEntity` and `moveEntityToScene` mark the fields the compensation changed
+  (`markCompensatedTransform`), and undo puts the prior marks back. Unmarked, a linked root dropped
+  under a moved parent reloaded at the prefab's value, offset by the parent (#1436 review).
+  `rebuildInstance` carries an owned root's `parentLocalId` across the respawn. Without it, a
+  refresh left the root unstamped, which the save reads as a user-added instance.
 
 So a repo-wide uniqueness check would fail on the architecture rather than find a bug. The honest
 cross-file signal is "same guid, *different* entity name", which is too weak to gate a build on: an
 entity legitimately renamed in one scene is indistinguishable from a copy-paste collision. The guard
 is therefore scoped to same-file collisions deliberately, and says so in its own header.
 
+### An entry with NO guid gets a DERIVED one at load (#1268)
+
+The per-file rule above has a sibling the same guard now carries: **every committed entry must have
+a guid at all.** That was not true until 2026-09-16 — 34 entries across 34 files had none, every one
+of them the authored `Time (resource)` root.
+
+**Why a missing guid is not inert.** Since #1248 `spawnEntity` gives every entity
+`EntityAttributes`, and mints a **runtime** guid for it (#1210). `durableGuid()` reads a runtime
+guid as absent *on purpose*, so the serializer's guid pre-pass (`serialize.ts`) minted a random
+`crypto.randomUUID()` over it on the first save. Two consequences, and the second is the one people
+miss:
+
+- Each clone minted a **different** guid, so two clones saving the same untouched scene produced
+  conflicting diffs for a file neither had edited.
+- The entity also **moved**, because `compareSiblings` (`entityOrder.ts`) tiebreaks siblings on
+  `guid.localeCompare` — see "The `entities` ARRAY ORDER" above. A random guid is a random sort key.
+
+**The fix is a derivation at load**, in `deriveAuthoredEntityGuids`
+(`runtime/loaders/authoredEntityGuids.ts`), called from `loadSceneFile`'s first pass. The seed is
+`scene:<project-relative path>|path:<parent path>/<name>`, hashed through the frozen `deriveGuid()`,
+with an ordinal appended when two entries in one file would otherwise seed identically (the per-file
+uniqueness rule is exactly what that ordinal protects). It runs ahead of `deriveInstanceMemberGuids`
+so a newly-identified entry can anchor the prefab members beneath it.
+
+Three things about it that are easy to get wrong:
+
+- ⚠️ **It is derived ONCE and then STORED, not re-derived every load.** Every input to the seed is
+  authored data a human edits, so a re-derived identity would move under a rename or a reparent. The
+  engine already ships one derive-and-don't-store address space — prefab instance members — and
+  #1272/#1278/#1284 are the bugs that came out of it: a reload re-derived them and everything holding
+  a reference missed. The corpus guard in `sceneGuidUniqueness.test.ts` is what keeps the stored half
+  true; deriving alone would leave an old file arriving from a branch to reintroduce the trap.
+- ⚠️ **No `scenePath` means no derivation**, and that exemption is load-bearing. `SceneManager`'s
+  carried-snapshot respawn synthesises its `SceneData` from live entities drawn from several scenes,
+  so it has no single scene identity — and those entities already hold durable guids from their own
+  files, which is exactly what `filterPersistentDuplicates` matches them on. A base-scene chain is
+  the opposite case: one `loadSceneFile` call per file, each with its own path, so a base entity
+  derives the same guid whichever level extends it.
+- ⚠️ **The path is PROJECT-RELATIVE, so the same derived guid appears in several projects.** After
+  the migration, 11 files share `019e4c7f-…` — all of them `/assets/scenes/main.scene.json` with a
+  `Time (resource)` root. That is the section above working as designed, not a collision: uniqueness
+  is per file, the 11 are separate apps that are never loaded together, and a project-relative path
+  is the identity that survives a game being **copied out of the repo** (#29), which a repo path
+  would not. ⚠️ But "project-relative" is what callers happen to pass, **not** something the
+  derivation enforces — `App.tsx`'s OTA sub-game boot prefixes `assetBaseUrl` onto the path, so the
+  same scene seeds differently there. Latent (the runtime never saves) and tracked in #1293, which
+  also carries the alternative: seeding on the file's own `id`, which `SceneManager` already computes.
+- ⚠️ **A derived guid is checked against the guids already IN the file, not just against other
+  derived ones.** A file can legitimately hold both halves of this migration at once — a merge that
+  kept both sides, a partial revert, the pre-#1248 shape pasted into a migrated file — and the
+  guid-less copy otherwise derives *exactly* the stored guid of its migrated twin. Nothing downstream
+  catches that: `filterDuplicateChainGuids` compares on-disk guids before any derivation runs, and the
+  corpus guard only sees it after a save.
+
+The migration itself is recorded under "Re-saving legacy scenes" above: 45 files in one commit, 34
+gaining a guid and 11 converging v12→v13. Note that `check-scene-churn.mjs` cannot review this class
+on its own — it keys entities on `EntityAttributes.guid ?? 'name:'+name`, so an entity that *gains* a
+guid changes key and reports as LOST + NEW, which would bury a real defect in 34 files of noise.
+That review was done by comparing each file against `HEAD` field by field instead.
+
+**Duplicating a scene FILE remints its guids (#1293)** — see "Guid uniqueness is a PER-FILE rule"
+above. A **rename** needs nothing: a stored guid does not depend on the file name, and the path seed
+above reaches only an entry not yet migrated, of which the committed corpus now has none.
+
 ### Gotchas
 
-- **A carried prefab instance loses its EDITOR bookkeeping** (Apply-to-Prefab,
-  structural overrides) across a swap that keeps its base loaded — the carry flattens
-  the instance structure and never calls `instantiatePrefabIntoWorld`. Documented,
-  accepted; the **runtime trait data is unaffected**, and `SceneManager` warns so it is
-  never silent — but only at the moment a carry actually happens (a base already known
-  to contain a prefab instance shows up in that load's `keptBaseGuids`), not on every
-  fresh load. A base with a prefab instance loading for the first time, or reloading
-  fresh (not carried), is silent — the loss only occurs on the carry itself. (Authored
-  *override values* on carried instances DO survive — the mark set is captured off the
-  old world and re-seeded per entity through the old→new id map.)
+- **A carry keeps the unregistered markers (#1427).** The carry respawns a kept base (and every
+  `Persistent` root) from a snapshot of the trait REGISTRY, so a deliberately unregistered marker
+  was invisible to it and vanished: `Transient` (a runtime pool row under a `Persistent` root, or
+  inside a kept base's prefab member, came back savable and the next save wrote it into the scene
+  file) and `TemplateAddedKey` (a template-added node lost its name, and the Inspector showed a false
+  override on a member reference into it). `runtime/core/carriedMarkers.ts` lists the markers; the
+  carry captures them per old id beside the override marks and restores them in its
+  `onEntitySpawned`. Delete→undo does the same through `snapshotEntity` / `respawnFromSnapshot`. A
+  COPY (every duplicate and paste goes through `regenerateSnapshotGuids`) drops them: it is a new
+  identity, and two siblings sharing a template key name neither. ⚠️ That is too blunt for a keyed
+  node INSIDE a copied instance: `planCopyGuids` gives it a random guid, so no heal can recover its
+  key and a member token into it is dead after a save + reload (#1430, open). The architecture guard
+  `unregisteredTraitsCarried.test.ts` fails on a new unregistered engine trait until it is carried
+  or named with its reason. Everything else a carried prefab instance needs survived already: the
+  `PrefabInstance` trait with `rootInstanceId` remapped, and the override marks (observed live on
+  sling's `Base.scene.json`, #1421). There is no longer a carry warning.
 - **The Time/Input singleton fallback must run AFTER the carry respawn.** A level whose
   Time lives in its base has no Time of its own, so a fallback running first spawns a
   phantom fresh Time and the carried one lands on top of it — two Time entities, which
@@ -1177,9 +1696,10 @@ is therefore scoped to same-file collisions deliberately, and says so in its own
   to exist in the world (systems reading delta are no-ops without it) but it was never
   authored, so writing it back would GROW whatever scene is saved next by one entity —
   measured on `ui-focus-demo.scene.json`, 9 → 10, a direct counter-example to "a no-op save is a
-  no-op". It was not even confined to the primary: serialize's foreign-entity filter skips
-  any entity without `EntityAttributes`, and this one has none, so it landed in a shared
-  **base** just as readily.
+  no-op". Before #1248 it was not even confined to the primary: it had no `EntityAttributes`,
+  which serialize's foreign-entity filter needs, so it landed in a shared **base** just as
+  readily. Since #1248 `spawnEntity` gives every entity `EntityAttributes`, so an authored
+  base-scene Time is stamped with its `sourceScene` like any other base entity.
 
   A scene may still **author** its own Time entity — hosting the resource in a shared base
   scene is a supported setup, and it is why the `Transient` tag is needed at all. A Time
@@ -1188,8 +1708,10 @@ is therefore scoped to same-file collisions deliberately, and says so in its own
   serializes as `"Time": {}`. **Provenance is the only workable discriminator**: an
   authored Time is now byte-identical to the materialized one *at every value*, not just
   the default, so no value-based rule could ever tell them apart without deleting the
-  authored one. (`Input` needs no tag — it is simply not in the trait registry.) Gate:
-  `engine/packages/modoki/tests/editor/timeResourceProvenance.test.ts`.
+  authored one. The materialized `Input` singleton is tagged `Transient` too (#1248): it is a
+  registered resource and carries `EntityAttributes` now, so an untagged one would be saved,
+  per-frame snapshot and all. Gates: `engine/packages/modoki/tests/editor/timeResourceProvenance.test.ts`,
+  `engine/packages/modoki/tests/runtime/sceneManagerSingletonGuids.test.ts`.
 - **An entity SPAWNED BY A SYSTEM is tagged `Transient` at the spawn site, so it is never
   saved** (#124). Same provenance principle as the Time singleton, generalized: `spawnEntity`
   (`runtime/core/ecs/world.ts` — the one sanctioned `world.spawn`, enforced by an ESLint ban
@@ -1480,17 +2002,105 @@ scene currently in the chain, primary included. **Mutation is exactly one entry 
 `loadScene(path)` = "make this primary, resolve its chain, diff". There is deliberately
 no `unloadScene()` — see [Base scenes](#base-scenes-nestable-cross-scene-persistence).
 
-The editor wrapper `loadScene()` in `editor/scene/serialize.ts` delegates to
-`sceneManager.loadScene`, then tracks the scene path and swaps to **this
-scene's own** per-scene undo history (`swapHistory(scenePath)` — empty on first
-visit, restored when you return to a previously-open scene), rather than
-dropping undo globally.
 `unloadAll()` and `resetForTesting()` exist for shutdown + deterministic tests.
 `unloadAll()` is also the authoritative "unload wins" side of the #535 race
 described in step 9 above — it bumps `teardownInFlight`/`teardownGeneration` at
 its own head so any `loadScene()` racing it rejects rather than silently
 winning; `resetForTesting()` additionally resets both back to zero so a test
 run starts from a clean slate.
+
+#### Per-scene undo history
+
+The editor wrapper `loadScene()` in `editor/scene/serialize.ts` delegates to
+`sceneManager.loadScene`, then tracks the scene path and swaps to **this
+scene's own** per-scene undo history (`swapHistory(scenePath)` — empty on first
+visit, restored when you return to a previously-open scene), rather than
+dropping undo globally.
+**A parked stack is valid only if the scene was CLEAN when it was left** (#1409). The scene
+reloads from disk, so a stack recorded against unsaved edits describes a world that no longer
+exists. When the swap DISCARDED world work, the outgoing stack is **dropped** instead of parked.
+
+**But not every base reloads from disk** (#1417). `SceneManager.loadScene` KEEPS a base whose guid
+is unchanged across the swap and snapshots its entities from the live world, so a kept base's
+unsaved edits SURVIVE the load. `loadScene` resolves to `{ keptBaseGuids }` so the editor can tell
+the two apart; nothing in the world records it. A base in `forceReloadBases` is never kept. The
+editor's `loadScene` tail and the hot reload share ONE adopt rule, `adoptReplacedWorld` in
+`serialize.ts`:
+- **Only a kept base keeps its dirty flag** (`clearSceneDirtyExcept`). Before #1417 every load
+  cleared all flags, so `saveAll`, which writes a base only if it is dirty, skipped the surviving
+  edit, and the unsaved-work guard stopped asking. The edit stayed on screen, flagged clean.
+- **The stack drops iff work was discarded**: a world edit since the last save, or a dirty base
+  that was NOT kept. ⚠️ The edit version is one global counter and a base edit bumps it too, so
+  it cannot tell a primary edit from a base edit. In the common case a kept base's edit still
+  drops the stack: the edit stays saveable, not undoable. That is the lesser loss next to a stack
+  replaying discarded primary work, and filtering one mixed stack by scene would need per-entry
+  scene tags nobody records. The stack survives when only the flag is dirty, e.g. after a Save
+  All that wrote the primary and failed on the base.
+- ⚠️ **A kept flag can over-report, deliberately.** SceneManager snapshots a kept base before its
+  long resource-acquire awaits, so an edit to a CLEAN kept base made during that window is lost
+  with the outgoing world, yet the base's flag survives: the next Save All rewrites a base that
+  matches disk. The alternative, clearing the flag, would lose an edit made before the snapshot
+  silently, so the false positive is the safe side.
+- **Only an old BASE can be kept, never the old primary** (#1417 review). A primary's entities carry
+  `sourceScene: ''`, so there is nothing to carry them by. Before this, opening `/base.json` and
+  then a level whose base is that file counted it as kept, snapshotted nothing, and the base's
+  content vanished from the world next to two `role:'primary'` entries.
+- **The agent refusal says so**: `load_scene {discardUnsaved:true}` does NOT discard a scene loaded
+  AS A BASE that the target chain shares, and its refusal text names that exception rather than
+  promising "destroyed". The open scene itself is never that exception, even when the target uses
+  it as its base (see the bullet above). No agent op discards a kept base's edits today:
+  `load_scene` does not expose `forceReloadBases`.
+
+Where it applies:
+- **`loadScene`, `newScene` and prefab-edit entry** read the dirt on BOTH sides of the swap's
+  await. The outgoing world stays live and editable while the new one loads, and nothing resets
+  the dirty state until the adopt step runs after the swap, so an edit made mid-load is discarded
+  too. This covers a same-path reload as well: `swapHistory` used to no-op on an unchanged key, so
+  one undo after `modoki_load_scene {discardUnsaved:true}` replayed the discarded work onto the
+  fresh world. (`newScene` and prefab-edit entry keep no base, so they clear every flag.)
+- **A scene hot-reload** (an external write to the open scene or a prefab it uses) replaces the
+  world from disk without going through the editor's `loadScene`. Disk wins over unsaved edits
+  (owner, 2026-09-13, #1164), except in a kept base. `agentBridge.ts` hands the editor's
+  `adoptWorldReloadedFromDisk` the kept set through `setWorldReloadedFromDiskHook` once the reload
+  lands. Before #1409, `unsavedChanges` stayed true over a world that matched the file. #1409's
+  first version then did nothing at all while any base was dirty, which left stale primary
+  entries on the stack; #1417 replaced that with the rule above. A changed BASE reloads through
+  `forceReloadBases`, so it is not kept and its edits are discarded with its flag.
+  **A hot reload overtaken by another load** (#1422) splits at its swap:
+  - **Before the swap** it rejects with an AbortError and reloads nothing. The overtaking load (an
+    editor scene open, a prefab hot reload) **inherits the forced bases**, because a forced base
+    means its file changed on disk, whoever loads next. They live in `SceneManager`'s
+    `pendingForcedBases`, not on the load, and only a committed swap clears them. So they survive a
+    chain of supersedes (a base reload followed by two prefab reloads) and an inheriting load that
+    fails (a bad path, a scene format that is too new). Before that,
+    the overtaking load found the base in both chains and KEPT the stale live copy, and nothing
+    re-queued the change, so the external write was lost and a later save wrote the stale base over
+    it (reproduced in review). Now the base is not kept, so the editor's adopt treats its edits as
+    discarded: disk wins, as it does for any hot reload (#1164).
+  - **After the swap** the hot reload is not rejected: a newer load is not a teardown, so it resolves
+    and adopts. Its adopt has no supersede guard and needs none, because it always runs FIRST. The
+    tail's only yielding await is the scene managers' `init()`, and every overtaking load's own
+    `disposeActiveSceneManagers` waits for those same inits. The newer load then keeps the freshly
+    reloaded base, whose flag is already cleared. If the newer load adopted first, the late
+    hot-reload adopt would rebind the undo stack to a scene that is not open and rebaseline the
+    winner's world. If the dispose's wait ever goes, this adopt needs the `stillLive` guard the
+    editor's `loadScene` has.
+  Both halves are pinned in `sceneManagerBaseSceneChain.test.ts` § #1422. ⚠️ A token-holding editor
+  load (a scene open, a Play restore) cannot be overtaken BY a hot reload, because the reload defers
+  while the token is held (#1164). Prefab-edit entry and the prefab-undo restore take no token, so
+  a hot reload can overtake them. The ordering above still holds, since every load goes through
+  `disposeActiveSceneManagers`.
+- **Asset-document edits survive the drop.** `_isFileDirect` entries (material, clip, particle,
+  skin, timeline…) target a file the swap does not touch, so `parkSurvivors` keeps them, in order.
+- **`newScene` starts its key empty** (`freshIncoming`), apart from those asset entries, because a
+  starter world matches no stack and every untitled scene shares the `''` key. Prefab-edit entry
+  also sets a clean baseline: before, an untitled scene's dirty flag rode into the prefab world, and
+  leaving it then dropped a valid stack.
+
+"Dirty" over-reports, deliberately: undo and redo bump the edit version, so a scene undone back to
+its saved state still reads dirty and its history is dropped rather than parked. That loses
+history, never correctness. Not covered: a scene FILE that changes on disk while its CLEAN stack is
+parked under a scene that is not open (a git checkout, an agent `write_asset`).
 
 ## Persistent entities
 
@@ -1520,7 +2130,14 @@ staging world. `SceneManager`:
    guid (`filterPersistentDuplicates`) — the live persistent entity shadows the
    file copy, preventing duplicates.
 4. Respawns the snapshots into the staging world (tagged `version:
-   SCENE_FORMAT_VERSION`, currently 13, so migrations don't needlessly re-run).
+   SCENE_FORMAT_VERSION`, currently 13, so migrations don't needlessly re-run),
+   restoring each entity's override marks and unregistered markers (`Transient`,
+   `TemplateAddedKey`) against its fresh id (#1427).
+
+A `Persistent` entity can be `Transient` too, and in a shipped build it usually is: the run mode
+defaults to `playing`, and `spawnEntity` tags every spawn made inside a system tick. So the carry
+PRESERVES the tag rather than skipping tagged subtrees — skipping would delete a runtime-spawned
+`Persistent` player at every swap.
 
 Each snapshotted field is the union of the trait's koota `.schema` keys and its
 registered `meta.fields` keys (not `meta.fields` alone, which is a curated Inspector
@@ -1765,8 +2382,9 @@ Findings come from four passes:
    every instance inherits it, so reporting it from the scene side would name the wrong file
    (`main.json` for a value in `thing.prefab.json`) and then repeat it per instance — one bad
    prefab in 6 scenes at 4 instances each is 24 warnings for a single mistake. It is reported
-   instead at prefab **write** time (Apply-to-Prefab / Save-as-Prefab, via
-   `warnInertPrefabSizes`), which reaches the person who just authored it, and by a repo-wide
+   instead at prefab **write** time — every AUTHORING write: Apply-to-Prefab, Save-as-Prefab,
+   prefab edit mode's save, and the agent `modoki_prefab create` op, via `warnInertPrefabSizes`
+   — which reaches the person who just authored it, and by a repo-wide
    guard (`engine/tests/assets/prefabInertSize.test.ts`) that also covers prefabs written by hand
    or by an agent — which no editor hook can see. `GET /api/validate-prefab?path=…` exposes the
    same check so an agent editing prefab JSON can verify its own edit. All four share the one
@@ -1774,7 +2392,37 @@ Findings come from four passes:
 
    The write-time hook deliberately does NOT live in `writePrefabFile`: that is also the undo/redo
    restore path (`installPrefabSnapshot`), and warning there would fire while someone *reverts*
-   the value.
+   the value. The price is that each authoring write has to remember the call — and two did not:
+   edit mode's save predated #42 and the agent `create` op was never listed (#1251). So the guard
+   (`warnInertPrefabSizes.test.ts`) takes **two censuses** over the package's `src/editor` and the
+   app's `app/editor`, each through `assertExemptionLedger`: every `writePrefabFile` call must warn
+   first or be a named restore, and every function that calls `serializePrefab` — which reaches the
+   writers that bypass `writePrefabFile`, like Save-as-Prefab's `writeAssetFile` — must call
+   `warnInertPrefabSizes` or be a named GENERATED writer (model import, model re-import, 2D rig
+   prefab). A new writer of either shape fails by file and function instead of being skipped.
+
+   All three agent authoring writes (`modoki_prefab` `create`, `apply` and `edit-save`) also
+   return the warnings in their response as `warnings`, since the agent never reads the renderer
+   console. `create` warns inline. The other two warn one call down, so their helpers hand the
+   findings back: `ApplyResult.warnings`, and `savePrefabEditReport()`'s `{ saved, warnings }`
+   (#1258). `savePrefabEdit()` stays a boolean wrapper over that report, not an object return,
+   because an object is truthy at every existing `if (!ok)` caller and a failed save would read as
+   success. The list is everything `validatePrefabData` warns about for the written template,
+   and an inert size is only one kind.
+
+   **No test drives the op end to end.** The cover is a source guard plus behaviour tests, one
+   layer down:
+   - The source guard is in the same test file. It requires each op's own top-level `return` to
+     answer with the helper's list itself, sent under exactly `<list>.length`. An emptied or
+     sliced copy fails it, and so does an inverted or constant condition, a nested key, or a
+     return inside a callback.
+   - `applyToPrefabUndo.test.ts` pins that the undo wrapper hands `applyToPrefabSelective`'s
+     list through.
+   - `applyToPrefabPromotedAdditions.test.ts` and `prefabEditZIndexRoundTrip.test.ts` pin that
+     each helper fills it.
+
+   What the guard cannot see is a refusal branch that returns the warnings while the success
+   return drops them. The ops throw on refusal, so no such branch exists.
 
    The same check also covers a **prefab instance's overridden fields**, which
    live in the serialized entity's sibling `overrides` object (keyed by prefab
@@ -1819,6 +2467,9 @@ stability on disk" above) — they never round-trip to disk as-is.
   count as `changed`.
 - **`removeTrait`** — refuses the core traits `Transform` / `EntityAttributes`;
   removing an absent trait is a silent no-op, not an error.
+- **`PrefabInstance`** — refused by `setTrait`, `removeTrait` and `addEntity` alike: the prefab link is made by
+  instantiating a prefab and cut by Detach Prefab (`modoki_prefab` `detach`), never edited as a component (#1454,
+  `traitEditPolicy.ts`; the reason is in docs/prefab-structural-overrides.md).
 - **`addEntity`** — allocates the next free numeric id (real, not synthesized — it
   persists) and ensures `EntityAttributes` carries a stable `guid` + `name` +
   `parentId` so the entity round-trips through load/save + selection-restore.

@@ -46,6 +46,7 @@ import { rawNow } from '../core/clock';
 import { journalTick } from '../core/journal';
 import { nearestPointerBlocker, isOutsidePointerScope } from '../core/pointerBlockers';
 import { pickAt, pickableSurfaces } from '../core/screenPick';
+import { guidOfEntityId } from '../core/ecs/entityUtils';
 import type { BoundsSurface } from '../core/screenBounds';
 
 /** What a press resolved to — a discriminated union, because the three cases are genuinely
@@ -60,8 +61,8 @@ import type { BoundsSurface } from '../core/screenBounds';
  *    says so in words a reader can act on. */
 export type InputResolution =
   | { by: 'game'; kind: string; id?: string | number; label?: string }
-  | { by: 'ui'; entityId: number; label?: string }
-  | { by: 'pick'; entityId: number; surface: BoundsSurface }
+  | { by: 'ui'; entityId: number; guid: string | null; label?: string }
+  | { by: 'pick'; entityId: number; guid: string | null; surface: BoundsSurface }
   | { by: 'none'; checked: Array<'game' | 'ui' | 'pick'> }
   | { by: 'unknown'; reason: string };
 
@@ -130,7 +131,7 @@ const MAX_AWAITING = 16;
 const STALE_NOTE_MS = 1000;
 
 let open = false;
-let max = DEFAULT_MAX;
+let maxPresses = DEFAULT_MAX;
 let seqCounter = 0;
 let dropped = 0;
 const ring: InputPressRecord[] = [];
@@ -168,8 +169,10 @@ function describeNode(n: unknown): string {
   // on the live gate — Court's tutorial catcher reported as a plain "div" and had to be identified
   // by cross-referencing the resolution, which a blocker that is not also the resolved target
   // would not have offered.
+  // Named by guid (#1223 P2): a bare id is reassigned on reload and the mutating tools refuse it for
+  // an entity that has a guid. `id:<n>` only for a guid-less one, the form a contact partner takes.
   const entityId = el.getAttribute?.('data-entity-id');
-  if (entityId) s += `[entity=${entityId}]`;
+  if (entityId) s += `[entity=${guidOfEntityId(Number(entityId)) ?? `id:${entityId}`}]`;
   const testid = el.getAttribute?.('data-testid');
   if (testid) s += `[data-testid="${testid}"]`;
   else if (typeof el.className === 'string' && el.className.trim()) {
@@ -188,7 +191,7 @@ function engineResolve(target: unknown, x: number, y: number): InputResolution {
   if (uiNode) {
     const raw = uiNode.getAttribute('data-entity-id');
     const entityId = raw === null ? NaN : Number(raw);
-    if (Number.isFinite(entityId)) return { by: 'ui', entityId };
+    if (Number.isFinite(entityId)) return { by: 'ui', entityId, guid: guidOfEntityId(entityId) };
   }
   // A UI MISS is deliberately NOT recorded as an authority that looked. "This press was not on a
   // UI node" says nothing whatsoever about whether it hit something in the game — and counting it
@@ -203,7 +206,7 @@ function engineResolve(target: unknown, x: number, y: number): InputResolution {
     const hit = pickAt(surface, x, y);
     if (hit === undefined) continue;
     anyPicker = true;
-    if (hit !== null) return { by: 'pick', entityId: hit, surface };
+    if (hit !== null) return { by: 'pick', entityId: hit, guid: guidOfEntityId(hit), surface };
   }
   if (anyPicker) checked.push('pick');
 
@@ -307,7 +310,7 @@ function onCancel(e: PointerEvent): void { finish(e, 'cancel'); }
 
 function push(rec: InFlight): void {
   ring.push(rec);
-  while (ring.length > max) { ring.shift(); dropped++; }
+  while (ring.length > maxPresses) { ring.shift(); dropped++; }
 }
 
 /** The wire shape, copied field by field rather than spread-minus-deletes. Explicit is the point:
@@ -350,17 +353,17 @@ export function isUnresolvedPress(p: InputPressRecord): boolean {
  *  the journal's `@contact` gating: no history, only what follows. Re-opening an already-open
  *  window is reported rather than silently treated as a fresh start, because a caller who thinks
  *  it just cleared the ring would misread every older press as belonging to its own probe. */
-export function startInputWatch(opts?: { max?: number }): {
-  ok: true; max: number; alreadyOpen: boolean; recorded: number;
+export function startInputWatch(opts?: { maxPresses?: number }): {
+  ok: true; maxPresses: number; alreadyOpen: boolean; recorded: number;
 } {
   const wasOpen = open;
-  const requested = opts?.max;
+  const requested = opts?.maxPresses;
   if (typeof requested === 'number' && Number.isFinite(requested) && requested > 0) {
-    max = Math.min(Math.floor(requested), MAX_CEIL);
+    maxPresses = Math.min(Math.floor(requested), MAX_CEIL);
   } else if (!wasOpen) {
-    max = DEFAULT_MAX;
+    maxPresses = DEFAULT_MAX;
   }
-  while (ring.length > max) { ring.shift(); dropped++; }
+  while (ring.length > maxPresses) { ring.shift(); dropped++; }
   if (!wasOpen) {
     open = true;
     if (typeof window !== 'undefined') {
@@ -370,7 +373,7 @@ export function startInputWatch(opts?: { max?: number }): {
       window.addEventListener('pointercancel', onCancel, true);
     }
   }
-  return { ok: true, max, alreadyOpen: wasOpen, recorded: ring.length };
+  return { ok: true, maxPresses, alreadyOpen: wasOpen, recorded: ring.length };
 }
 
 /** Close the window and detach every listener — closed is free, not cheap. Recorded presses are
@@ -413,7 +416,7 @@ export function clearInputPresses(): number {
  *  evidence, and omitting it would make a stuck gesture look like no gesture at all. */
 export function readInputPresses(): {
   open: boolean;
-  max: number;
+  maxPresses: number;
   returnedCount: number;
   totalCount: number;
   dropped: number;
@@ -423,7 +426,7 @@ export function readInputPresses(): {
   const presses = [...ring.map(publish), ...held].sort((a, b) => a.seq - b.seq);
   return {
     open,
-    max,
+    maxPresses,
     returnedCount: presses.length,
     totalCount: seqCounter,
     dropped,
@@ -486,5 +489,5 @@ export function __resetInputRecorder(): void {
   ring.length = 0;
   seqCounter = 0;
   dropped = 0;
-  max = DEFAULT_MAX;
+  maxPresses = DEFAULT_MAX;
 }

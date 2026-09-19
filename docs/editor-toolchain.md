@@ -21,8 +21,8 @@ it runs identically in the Vite-plugin process, the Electron main backend, and h
 `detect(id)` / `resolve(id)` locate a tool without / with throwing. Two kinds:
 
 - **Binary tools** (`toktx`, `msdf-atlas-gen`, `npm`, `xcodebuild`, `cocoapods`, `gltf-transform-cli`, `gltfpack`, `ffmpeg`, `ffprobe`, `go-ios`) —
-  resolved from an **env override** → **extra candidates** (a userData install location) → **PATH**,
-  each validated by a `--version` probe. Results are **cached** (the probe spawn is expensive and its
+  resolved from an **env override** → **extra candidates** (a userData install location) → **PATH**
+  (never for `ffmpeg`/`ffprobe` — § "Conversion CLIs are pinned"), each validated by a `--version` probe. Results are **cached** (the probe spawn is expensive and its
   inputs are fixed at startup).
 - **Directory tools** (`android-sdk`, `java`) — resolved from **our provisioned install** →
   **env vars** → **well-known dirs**, validated by a `marker` sub-path (`platform-tools` for the SDK,
@@ -217,10 +217,105 @@ to fix it:
 
 | Tool | Gated when toggle is OFF? |
 |---|---|
-| `java`, `android-sdk`, `gltf-transform-cli`, `gltfpack`, `ffmpeg`, `ffprobe`, `go-ios` | **Yes** — installable into the toolchain dir |
-| `toktx`, `msdf-atlas-gen` | Yes, **when bundled** (their `MODOKI_*` env var is set by the packaged host); a dev checkout has no bundle, so PATH stays usable |
+| `java`, `android-sdk`, `gltf-transform-cli`, `gltfpack`, `go-ios` | **Yes** — installable into the toolchain dir |
+| `ffmpeg`, `ffprobe`, `toktx`, `msdf-atlas-gen` | **Always, toggle ON or OFF** — `pinnedOnly`, see below |
 | `npm` | Yes, **when the editor provisions Node** (packaged, or `MODOKI_PROVISION_NODE=1`); a plain dev checkout keeps its PATH npm |
 | `xcodebuild` | **No** — Apple-supplied and multi-GB; it can never be bundled, so it always resolves from the system |
+
+### Conversion CLIs are pinned (#1297, #1327)
+
+`ffmpeg`, `ffprobe`, `toktx` and `msdf-atlas-gen` carry `pinnedOnly` in the registry: `detect()` never offers them a PATH
+candidate, whatever the toggle says and whether or not `MODOKI_TOOLCHAIN_DIR` is set. Their output is
+SHIPPED (audio/video, texture/atlas and font conversion), and the conversion cache key names no binary — so a Homebrew 8.1.1
+and the provisioned `ffmpeg-static` 6.0 produced different bytes under one hash (4 of 26 wordweave
+clips), and ffprobe builds disagreed on duration for all 26. The toggle is about SDKs a build may take
+from the machine; a converter cannot.
+
+- **Where they are looked for:** `conversionToolchainDir()` — `MODOKI_TOOLCHAIN_DIR`, else the machine
+  default (`toolchainHome.mjs`, the same dir Electron provisions into). So a plain `npm run dev` /
+  `npm run build` / vitest process finds the copy the editor installed. The default is NOT written back
+  to the env: that would make a dev process bundled-only for the JDK and Android SDK too.
+- **Override:** `MODOKI_FFMPEG` / `MODOKI_FFPROBE` / `MODOKI_TOKTX` / `MODOKI_MSDF_ATLAS_GEN` still win —
+  an explicit choice, not an accident of installation. The packaged editor sets the last two to its
+  bundled copies (`resources/bin`), which the release built from the same pins.
+- **One resolver:** `plugins/pinned-cli.ts` (`pinnedConversionCli`) serves all four; `ensureFfmpeg`,
+  `ensureKtxCli` and `ensureMsdfAtlasGen` are thin names for it. The rigged-GLB path asks
+  `detect('toktx')` directly, which is the same registry entry.
+- **Stale (ffmpeg/ffprobe):** judged by the INSTALLED npm package version against `NPM_BINARY_PINS`, not by `-version`
+  output (ffmpeg-static@5.3.0 is tagged `b6.1.1` and its darwin-arm64 binary prints `6.0`; each
+  `@ffprobe-installer/<platform>` package is a different build). So the pin means the same build per
+  PLATFORM — a Mac and a Windows box still encode with different builds of the same package. It is
+  also a package pin, not a binary checksum: `ffmpeg-static`'s own install downloads its binary by
+  release tag with no checksum, and the `npm-tools` manifest records a caret range, so a re-resolved
+  tree could float to a newer 5.x — which the stale check then refuses loudly rather than using.
+  **Bumping either pin must bump `aud-*`/`vid-*` too** (the comment on `NPM_BINARY_PINS` says why).
+- **toktx / msdf-atlas-gen are not on npm** (#1327), so `engine/toolchain/conversionCliProvision.ts`
+  pins them as release assets with a hand-maintained sha256, per `<platform>-<arch>`, and installs
+  each into a VERSIONED dir (`<toolchain>/<id>/<version>[-<build>]/`, see `pinLabel`) — a pin bump points detection at a dir
+  that does not exist yet, so there is no stale check to get wrong. The assets:
+  - `toktx`: KhronosGroup's macOS `.pkg`, unpacked with `pkgutil --expand-full` (no sudo, nothing
+    installed system-wide), keeping `toktx` + `ktx` + the real `libktx.4.dylib`; its Windows NSIS installer
+    (`toktx.exe` + `ktx.exe` + `ktx.dll`),
+    unpacked with 7-Zip — which the toolchain does not provision, so Build Support installs it
+    unprompted only where a 7-Zip is found, and otherwise leaves it a button whose failure says so.
+    ⚠️ **`ktx` is kept because @gltf-transform/cli 4.4 encodes KTX2 with `ktx`, not `toktx`** (#1351).
+    It finds it on PATH, and `withToolOnPath('toktx')` puts the pinned dir first, so the pinned `ktx`
+    wins only if it is IN that dir. Before #1351 it was not. Rigged models were then encoded by
+    whatever `ktx` the machine had (on the owner's Mac, a system 4.4.2 — byte-identical, luckily),
+    and on a machine with none (the packaged editor, a fresh box) the encode failed. The failure was
+    swallowed (#1337), so raw textures shipped. Two guards now hold it:
+    - `ensureConversionCli` treats a dir missing ANY kept file as incomplete and reinstalls it. A
+      pre-#1351 install therefore repairs itself on the next `toolchain:install`, with no pin-label
+      bump (a label bump would retire every `tex-`/`atlas-` cache tag for unchanged toktx bytes).
+    - The rigged encode refuses unless `ktx` sits beside the detected toktx.
+  - `msdf-atlas-gen`: upstream publishes Windows zips only. The macOS binary is OURS, built once by
+    `engine/scripts/build-msdf-atlas-gen-macos.sh` — from sha256-pinned sources, the way upstream
+    builds its Windows zip (vcpkg, pinned to a release tag, WITH Skia), every non-system library
+    linked statically — and published as the `toolchain-msdf-atlas-gen-1.4-skia` **prerelease** on the
+    public modoki-engine repo (a prerelease so the editor's updater, which follows `/releases/latest`,
+    never sees it). Before #1327 the release job ran `brew install`, which on the macOS 14 runner
+    COMPILED it against whatever Homebrew had that day. A new version means re-running the script,
+    publishing a new prerelease, and updating the pin.
+  - **Both `msdf-atlas-gen` builds have Skia** (owner, 2026-09-17), so both preprocess overlapping
+    contours (`-preprocess`, the default in a Skia build). They even share the Skia COMMIT: upstream's
+    1.4 Windows exe names the vcpkg buildtree `skia/src/41119015ca-…`, the tail of the `REF` that
+    vcpkg 2026.02.27's skia port pins (`ee20d565…41119015ca`), so what still differs is the compiler.
+    Our first pinned Mac build did not — like
+    Homebrew's, it resolved overlaps in overlap mode, a different ALGORITHM from Windows. The pin's
+    `build: 'skia'` label is what moved the install dir to `1.4-skia/` and the font tag to `font-7`;
+    a pin whose bytes change for a build choice needs a new label, not just a new sha. ⚠️ The vcpkg
+    tag cannot simply be bumped: Skia m146 removed the `SkPath` edit methods msdfgen 1.13 calls, so
+    the script's `VCPKG_TAG` stays at the last release with Skia m144 until msdfgen moves on.
+  - A present copy that does not RUN is reinstalled rather than returned (a file that exists but
+    cannot start reads as "not provisioned" to `detect()`, so returning it would leave Build Support
+    stuck). The Windows `toktx.exe` imports the MSVC runtime, which the KTX installer payload does not
+    carry — a machine without the Visual C++ Redistributable gets that named in the error.
+  - Several editors (one per clone) install into the one machine-wide dir, so the install is
+    race-safe: it assembles in a staging dir and renames it into place FIRST; a lost rename is success
+    when the winner's copy is there, and a dir without the executable is debris, moved aside
+    atomically before the retry — nothing deletes a live dir in place (12 processes × 6 rounds: 0
+    failures, 38/72 before). Only a DEFINITE cannot-run (a non-zero exit, `ENOENT`/`EACCES`/
+    `ENOEXEC`/`EPERM`) triggers a reinstall; a transient spawn error is rethrown, never "repaired".
+  - No pin exists for Linux or Intel-Mac `msdf-atlas-gen`; there the tool is not installable and a
+    conversion needs a deliberate `MODOKI_*` override.
+  **Bumping either pin must bump `tex-*`/`atlas-*`/`font-*` too** — `conversionToolPin.test.ts` holds
+  each pin generation to its tags. The release workflows restate what a runner needs before this code
+  runs (`release-windows.yml`'s hashes; the macOS job's `toolchain:install` step), and the same test
+  holds them to the table.
+- **Missing:** `ensureFfmpeg()` throws with the install hint. A missing `ffprobe` is warned once and
+  yields no stats rather than failing the import (owner, #1300 — the reimport handlers merge).
+- **A negative detection is re-checked once** (`forgetDetection`) before failing: the install may have
+  run in the other process (the Vite server installs; the Electron main also converts).
+- **Provisioning without the editor:** `npm run toolchain:install -- ffmpeg ffprobe toktx msdf-atlas-gen`
+  (`engine/scripts/toolchain-install.mjs`) runs the same `install()` into the same default dir. A plain
+  dev editor's Build Support installs these there as well — `/api/toolchain/install` falls back to
+  `conversionToolchainDir()` for them only (`isPinnedConversionTool`), and still refuses every other tool without a toolchain dir.
+  **Removing** them from a plain dev editor is deliberately unsupported (no Remove button, and
+  `/api/toolchain/uninstall` refuses): the dir is machine-shared, so a dev editor's Remove would take
+  the converter away from every clone. Use the packaged editor's Build Support for that.
+
+What pinning changed in committed sidecars, and what it did not: [textures.md](textures.md)
+§ "Committed vs machine-local sidecar fields".
 
 ## The `/api/toolchain` surface & the Build Support dialog
 
@@ -396,9 +491,10 @@ provisions its own Android toolchain (Node + JDK 21 + sdkmanager all exist there
 but **never iOS** (`xcodebuild` is macOS-only).
 
 The two **bundled** tools (`toktx`, `msdf-atlas-gen`) ship on BOTH platforms, staged into `build/bin` by
-the `beforePack` stage hooks (`engine/scripts/stage-*.cjs`), which branch per platform and copy whatever
-the build machine has installed (macOS: relocate the Homebrew binary + its dylibs; Windows: copy the
-installed `.exe` + sibling DLL) — so a local `dist:mac` AND `dist:win` both bundle. CI additionally
+the `beforePack` stage hooks (`engine/scripts/stage-*.cjs`), which branch per platform and copy the
+PINNED build (`pinnedToolForStaging.cjs`: the `MODOKI_*` override, else `toolchain:install`, which
+provisions it if missing — never PATH) — so a local `dist:mac` AND `dist:win` both bundle what every
+machine converts with. CI additionally
 pre-stages the Windows release via a verified download in the public repo's
 `oss/.github/workflows/release-windows.yml` (there is no `.github/workflows/release-windows.yml`
 in this private repo anymore — it was deleted 2026-08-03, releases are cut from the public repo

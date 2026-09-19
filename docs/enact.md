@@ -42,13 +42,18 @@ mesh's rect on BOTH `scene-view` and `game-3d`. The reachable windows are one JS
 `uiFocusSystem`, which reads bounds inside the ECS tick before that frame's render sync) — a
 `modoki_batch` was measured to let a frame run between steps. So every source stamps the packed entity
 (`entity.valueOf()`) on each visit — `RenderState.ecsOwners`, the `skinned` `EntityTable`, an `owner`
-field on billboard/text/flame entries, SceneView's `gizmoOwners`, Scene2D's `activeIds` — and
+field on billboard/text/flame entries, SceneView's gizmo table (`editor/scene/sceneViewGizmoTable.ts`, an
+`EntityTable`), Scene2D's `activeIds` — and
 `isLiveOwner` (`runtime/rendering/entityScreenBounds.ts`) drops a missing or dead stamp. Inside the
 window the newcomer has no rect (the aim refuses) until the next pass measures it. The SceneView 3D
 picker (`pickAt`, the occlusion probe below) gathers from the same maps and applies the same check.
 ⚠️ **A new bounds source must stamp on EVERY visit, not at build**: a same-kind respawn keeps the entry,
 so a build-time stamp names the dead entity forever and the newcomer is never measurable again —
 permanently worse than the one-frame bug. `boundsSourcesOf` is typed so a source cannot omit its owner.
+A cache shared by several KINDS of object on one index needs more than a stamp: SceneView's seven gizmo
+loops each decided "is this row mine?" from the index, so a cross-kind respawn in one frame leaked the
+dead gizmo, and a Camera+Light entity threw in the frame callback every frame (#1206). Its rows carry their kind as well, and one sweep per
+pass releases what no loop kept — the module's docblock has the rules.
 
 **A COVERED aim is refused, whichever resolvable form it took** (2026-08-19). `entity` and
 `selector` are one category — both resolved server-side inside the call — so both now answer
@@ -974,13 +979,43 @@ Hierarchy drop indicator, the Assets drop overlay) is invisible from here; gatin
 cannot see those would be a false positive on legitimate flows. The warning composes with the
 `accepted ≠ committed` one above — both can fire on one drop, joined by ` ALSO: `.
 
-**Device-surface asymmetries (§9), both deliberate, neither previously written down:**
-`allowOccluded` exists only on the editor — `resolveAim` (`bridge.ts`) refuses a covered selector
-unconditionally, with no escape hatch — and the device surface has no `entity` addressing at all
-(selector or screenshot pixels only), because it has no editor to resolve a scene entity through.
-Both leave the device STRICTER than the editor, which is the safe direction; the `entity` gap is
-now stated on `device_screenshot`'s description too, which used to send callers to "aim by
-selector/entity" on tools that have no such parameter.
+### The device surface aims the same way now
+
+#1223 P3, #1216 P1-1. Both device-surface asymmetries this section used to record are closed. The premise behind the second was wrong: `resolve-entity-point` is a
+RUNTIME op that has always run on a device, so nothing about a scene entity needs an editor to
+resolve it. `bridge.ts`'s `resolveAim` simply never called it.
+- **`entity`** on `device_tap`/`hover`/`scroll`/`pointer`, and on each end of `device_drag` (nested
+  `from`/`to`, the `modoki_drag` shape; the flat `fromSelector`/`fromX`… still work, and one endpoint
+  given both ways is refused `AMBIGUOUS`). The page resolves it through the same op, and accepts or
+  refuses the answer through the same function the editor's `resolvePoint` uses
+  (`app/debug/entityAimRefusal.ts`), so one resolution is refused identically on both surfaces.
+  The trusted CDP/WDA routes resolve through `handleResolveAim`, which reads the endpoint's keys from
+  `DEVICE_AIM_KEYS` (`domPointContract.ts`).
+- **`allowOccluded`** on those tools, for `entity` and `selector` aims alike. A covered selector used to be
+  refused with no escape hatch. A held `device_pointer` move/up forces it, as the editor route does.
+- **Refusals keep their §5 fields.** The device protocol is an `Error:` string, which an older MCP
+  server must still read as a failure, so a refusal stays that string and carries `code`/`options`/
+  `stale` in ONE trailing `[modoki-refusal]{…}` line (`tools/shared/deviceRefusal.ts`). The MCP decodes
+  it into the envelope: `NOT_FOUND` with `got.stale` for a runtime guid from an earlier world,
+  `AMBIGUOUS` with the guids as `options`, `OCCLUDED`. An older app build sends no tail and still gets
+  the generic `REFUSED_BY_OP`.
+- **Deliberate differences that remain.** `surface` has no `'scene-view'` on the device (a shipped
+  game has no editor viewport). A shipped game registers no mesh picker unless it adds one, so a 3D
+  aim there is `occlusionScope:'canvas'`: DOM covering is checked, a mesh in front is not. `label`/
+  `within` aiming stays editor-only (it names editor chrome). A device refusal gets no #261 settling
+  hint: `layout-settling` samples the editor's `[data-ui-id]` dock chrome, which a game does not have.
+- ⚠️ **Version skew is made loud, not handled.** An app built before this change has no entity branch
+  and fell through to its pixel or viewport-centre default: `device_scroll {entity}` scrolled the
+  centre and answered ok (review finding). So the MCP sends a selector that matches nothing
+  (`ENTITY_AIM_SKEW_SELECTOR`) beside any entity aim without one. The new page resolves the entity
+  first and never reads it; the old one resolves it, misses, and refuses naming
+  `[data-modoki-app-predates-entity-aim]`. Rebuild the app.
+- **Found on the way:** the backend fronts a synthetic-fallback reply with a banner, a refusal
+  included, and the device MCP judged failure by `startsWith('Error:')`. So every refused synthetic tap
+  (the iPhone 8, an Android without adb) came back as `Tapped — ⚠️ SYNTHETIC INPUT … Error: …`, ok.
+  `isDeviceFailureText` now reads the line after the banner, and `synthFallbackBanner` folds newlines
+  in its reason so the banner IS one line — a WDA launch reason carries one (`withLaunchWarning`), and
+  the review reproduced the false success with it.
 ### Agent-input provenance: the actor lease (fixed 2026-07-22)
 
 `withEditorActor` can only attribute code the agent **calls**. Trusted input is the opposite
@@ -1016,6 +1051,25 @@ path but no lease → `human`.
 their click is byte-identical to the agent's. So this converts "100% of agent input is mislabeled
 human" into "agent input is labeled agent; a human action inside a short, bounded window is
 mislabeled agent" — the same race `withEditorActor` already documents, now with a deadline.
+
+**`withEditorActor` had the flag hazard itself, and its scopes are TRACKED now (#1213).** It
+saved the previous actor and restored it when the op's promise settled — a flag by another name.
+Two overlapping async ops (parallel tool calls are routine) interleaved as *A saves human, B saves
+agent, A restores human, B restores agent*, and the session stayed tagged `agent` until a reload;
+`wait-for-edit {source:'human'}` could then never wake. Measured headless by the #1213 review with
+two overlapping `open-particle-editor` calls. Each scope is its own entry now, so the actor is
+`agent` exactly while one is live, in whatever order they settle — and each carries the lease's
+**deadline** (`AGENT_SCOPE_MAX_MS`, lazy expiry), so an op that never settles cannot hold the label
+for the rest of the session. Two things this deliberately does NOT do:
+- **It does not narrow an op's scope to its synchronous part to spare a human click during a wait.**
+  That was tried for the editor openers (they park up to 3s) and reverted: the editor's REACTION to
+  the agent's open — the tab `selectTab`, the `!focus` it journals — runs in React effects after
+  the synchronous part returns, so the agent's own open was journaled as the human's. A human click
+  inside the wait being tagged `agent` is the accepted race above; the agent's action tagged
+  `human` is the defect this whole section exists to prevent.
+- **It does not make the deadline a timeout.** An op past `AGENT_SCOPE_MAX_MS` keeps running; only
+  its attribution lapses, so its late edits read as the human's. That is the lease's trade, taken
+  for the same reason.
 
 A corollary for tests: a jsdom test is necessary but **not sufficient** for an input change.
 `fireEvent.*` synthesizes straight into React and cannot reproduce the real pipeline — see the

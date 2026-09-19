@@ -50,7 +50,8 @@ PlayerPrefs.get<T>(key): T | undefined           // sync, returns a fresh copy
 PlayerPrefs.set<T>(key, value): void             // sync into cache; atomic durable write is debounced
 PlayerPrefs.has(key): boolean
 PlayerPrefs.delete(key): void                    // also: set(key, undefined)
-PlayerPrefs.keys(): string[]
+PlayerPrefs.keys(): string[]                      // readable keys — omits a protected one (see Gotchas)
+PlayerPrefs.keysIncludingProtected(): string[]    // for a sweep that DELETES — adds protected + corrupt names (see Gotchas)
 PlayerPrefs.clear(): void                         // empties THIS game's namespace
 PlayerPrefs.isHydrated(): boolean                 // true once init() has hydrated the cache
 PlayerPrefs.isSwapInFlight(): boolean             // true while an init() swap is mid-flight (see Gotchas)
@@ -77,10 +78,63 @@ if (score > best) PlayerPrefs.set('bestScore', score);
 ## How it works
 
 - **Backends.** `init()` defaults to the platform-free `InMemoryBackend`; the app passes
-  `selectDefaultBackend()`, which picks **`@capacitor/preferences`** on device
-  (NSUserDefaults / SharedPreferences), **`localStorage`** in a browser with working storage,
-  else in-memory (SSR / private-mode). Each backend maps one logical key to one atomic
-  single-entry write.
+  `selectDefaultBackend()`, which picks **`@capacitor/preferences`** on Android
+  (SharedPreferences), the **backup-excluded store** on iOS (below), **`localStorage`** in a browser
+  with working storage, else in-memory (SSR / private-mode). Each backend maps one logical key to
+  one atomic single-entry write.
+- **iOS keeps the save out of iCloud/Finder backups (#1271).** UserDefaults is part of every device
+  backup, with no way to leave single keys out, so a new iPhone restored from a backup would come
+  back holding the save as of that backup. The owner ruled iOS should match Android, where backup
+  is off for cloud-sync games (#1267): `BackupExcludedBackend` writes one file per key (SHA-256
+  name, temp-file + rename) under `Library/Application Support/modoki-prefs/`, a folder marked
+  `isExcludedFromBackup`, through `capacitor-modoki-system`'s `kv*` methods. **The accepted cost:**
+  a player who never signed in loses their save when they restore a new iPhone; the cloud account
+  is the only supported way progress crosses devices. ⚠️ The restore case was **never observed on
+  a device** — this change matches Android's ruled behaviour, not a confirmed iOS bug.
+  - **The move is one-way, and `MigratingBackend` owns it.** Its docblock lists the steps; the
+    rules they keep:
+    - **The marker alone says where the save lives.** Marker present → the new store, whatever
+      happens to UserDefaults. **A failed marker read REJECTS** (so `init()` fails loud) instead of
+      guessing: guessing UserDefaults on a migrated device showed an emptied save, and the next
+      launch then deleted that session's writes. Only a later `init()` retries, and writes in
+      between re-reject, so none lands in a store nobody read. In the shipped shell a failed
+      `init()` is the boot error screen (`App.tsx`), so in practice the retry is the next launch.
+    - ⚠️ **The native store skips a file it cannot parse** rather than failing the read, so a
+      CORRUPT marker reads as absent. That is why the mirror below never deletes anything when
+      UserDefaults is empty: on a migrated device it would have deleted the whole save.
+    - **No marker → the new store becomes an exact MIRROR of UserDefaults** (when UserDefaults
+      holds anything), then the marker, then the deletes. "Copy every key" was not enough: a failed launch leaves a half-copy, the player
+      then deletes a key in the fallback session (which runs on UserDefaults, the only whole copy),
+      and a plain re-copy brought that key back.
+    - **The old store is re-read before its keys are deleted.** Two instances can be alive across a
+      re-`init()`, and a write the outgoing one drains into UserDefaults after the snapshot is
+      carried forward instead of deleted. This NARROWS the race rather than closing it: a write
+      landing after the re-read is still deleted. It needs a failed migration first, then a
+      re-`init()` with a write inside its window (#438).
+    - All of these were found by the close-out reviews, each with a failing scenario, and each has a
+      test in `playerPrefsBackends.test.ts`.
+  - **A native build without the new methods stays on Preferences** — a JS bundle delivered by OTA
+    to an older binary keeps working instead of losing the save. The check reads the native
+    `Capacitor.PluginHeaders`, not `typeof Plugins.ModokiSystem.kvGetAll`: a game that imports the
+    plugin's JS (Weaveling) turns that entry into a `registerPlugin` proxy, which answers a function
+    for ANY name. Calls still go through `Capacitor.Plugins` (`actions/systemControls.ts` says why).
+  - ⚠️ **An OTA ROLLBACK to JavaScript from before #1271, on a binary that already migrated, reads
+    an empty UserDefaults** and shows no save. Accepted: a rollback bundle targets the binary it
+    shipped with.
+  - ⚠️ **A backup taken BEFORE the update still holds the old UserDefaults.** A phone restored from
+    it has no marker (the new store is not in the backup), so it migrates that stale copy — today's
+    behaviour. Every backup taken after the migration ran is clean.
+  - **Device-verified on Court, iPad mini 5 (iOS 26.6.2), 2026-09-17** — the update-day path, not
+    the restore. The installed build (11088, no `kv*` methods) held 7 `mk:court:*` keys in
+    UserDefaults, signed in, 30 coins, music 0.37. After installing the #1271 build over it: 0 `mk:`
+    keys left in UserDefaults, 8 entries in the store (the 7 plus the marker), `kvInfo` reported
+    `excludedFromBackup: true`, and the values were unchanged. A PlayerPrefs write then landed in the
+    store and not in UserDefaults, and a second launch (the marker path) showed the same 8 entries.
+    After the close-out fixes, the rebuilt JS on that already-migrated iPad found the kv methods in
+    `PluginHeaders` and read the save from the store (coins 30, 8 entries, 0 left in UserDefaults).
+  - A cloud-sync game must ship the plugin, or it silently stays in UserDefaults:
+    `engine/tests/architecture/androidBackupOffForCloudSync.test.ts` checks the dependency and
+    `includePlugins` for every cloud-sync project with an `ios/` app.
 - **Namespacing.** Every key is stored under `mk:<namespace>:<logical>` — the app uses the
   `gameId`, so two games on the same device/browser can't collide. **That guarantee has two parts,
   and only one is closed.** `init()` is `async`: it captures the prefix, awaits
@@ -145,6 +199,23 @@ if (score > best) PlayerPrefs.set('bestScore', score);
   clobbering*, not the player's intent — `delete()` and `clear()` still remove such a key, and
   `delete()` frees it for a subsequent `set()`. `get()`/`has()`/`keys()` all report it as absent,
   deliberately: `has(k) === true` implies `get(k) !== undefined`, and game code relies on that.
+  ⚠️ **A sweep that DELETES by prefix must use `keysIncludingProtected()`, not `keys()`** (#1276).
+  The omission above is right for every reader and wrong for a wipe: the key is still on disk, still
+  occupies its logical name, and `delete()` removes it perfectly well. Court wiped `court.session.*`
+  on account deletion by enumerating a prefix through `keys()`, so a board written by a NEWER build
+  and read back after a downgrade survived the delete loop, survived the re-sweep, AND was invisible
+  to the read-back that reports the wipe **confirmed** — a wipe returning success over a save that
+  was still there. `clear()` had always compensated for this in its own loop (it must mean *every*
+  key); a targeted sweep has to ask. Deliberately kept as a separate function rather than folded into
+  `keys()`, because every other caller is a reader.
+  ⚠️ **"Every name on disk" includes CORRUPT entries too** (#1317). A corrupt entry (a truncated write,
+  or JSON with no envelope) is not protected — `set()` overwrites it and readers see nothing — but it
+  is still on disk. Hydrate used to drop its name entirely, so `clear()` and `keysIncludingProtected()`
+  both missed it: the agent's `clear` reported the namespace wiped, and Court's / wordweave's session
+  sweeps reported confirmed, over garbage that was still there. The owner's call (2026-09-17): a wipe
+  reaches it, because a cut-off session write can still hold readable player data. Hydrate now keeps
+  those names in a delete-only set (`corrupt` in `playerPrefs.ts`); `isProtected()` stays `false` for
+  them, and the function keeps its older name.
   ⚠️ **That same asymmetry means the durability accessors can disagree with each other** (#630
   review) — `PlayerPrefs.isProtected(key)` is the way to ask "absent, or present-but-unreadable?"
   where `has()` cannot answer. A refused `set()` never touches `cache`/`dirty`/the in-flight
@@ -156,6 +227,31 @@ if (score > best) PlayerPrefs.set('bestScore', score);
   `action:'delete'` on a protected key proceeds instead of a false `NOT_FOUND` (the key reads as
   absent from `has()`, same as any other key this protects), and `action:'set'` on one reports the
   protected cause instead of misdiagnosing it as a non-serializable value.
+  ⚠️ **Which listing a DELETE loop wants is a judgement, and it has to be recorded AT the call site**
+  (#1286). `keys()` and `keysIncludingProtected()` look identical in code, so nothing but a comment
+  distinguishes "this deletes because the player asked" from "this deletes as a side effect of a
+  background sync" — and the answers are opposite. Two worked examples, deliberately disagreeing: a
+  WIPE (`clearProgress` in `games/court/runtime/systems.ts`, `clearSavedProgress` in
+  `games/wordweave/runtime/systems.ts`) uses `keysIncludingProtected()`, because a debug or account
+  wipe is the player's own instruction and a board this build cannot decode is still their data to
+  destroy; a SYNC ADOPTION (`applyProgressSyncedSave`, `writeProgressFromSync`) keeps `keys()`,
+  because a background adoption carries no user intent and #630's whole design is that a newer
+  build's save is not stomped by a build that cannot read it. The adoption sites also record the
+  **cost** that accepts: the undecodable board survives, and `set()` refuses that key until
+  something deletes it BY NAME — a wipe, or finishing that level: wordweave's clear tail deletes the
+  board (#1286 review, observed), and Court's `clearStoredSession()` does the same on solve and on a
+  level reset (#1311, by reading). Court's sync site was widened during #1276 and reverted on review;
+  wordweave's was a bare loop with no comment at all, one sweep away from the same "fix". An
+  unannotated `keys()` in a delete loop is therefore the same defect as a wrong one, wearing the
+  other sign.
+  ⚠️ **The rule covers what DESCRIBES a delete, not only the loop that performs it** (#1310).
+  `player-prefs-write action:'clear'` calls `clear()`, which reaches protected keys, but it took the
+  listing for its confirmation preview, its `cleared` count and its rejected-remove attribution
+  from `keys()`. A protected key was therefore missing from the preview the operator acknowledged,
+  and if its remove was rejected, the error called it "already pending before this clear ran"
+  beside "every key this clear enumerated was durably removed". Both now come from
+  `keysIncludingProtected()`, as does `action:'delete'`'s `NOT_FOUND` option list (a protected key
+  is a valid delete target). Readers (`player-prefs-read`, the debug tab) stay on `keys()`.
 - **Write pipeline.** The cache stores the serialized envelope string per key (so `get()`
   parses a fresh object — no caller can mutate the cache — and the JSON contract is enforced
   at `set()` time). Writes are serialized on a promise chain so `flush()` has a stable point;
@@ -564,9 +660,11 @@ is not proof of a rejection; it's the identical signature an ordinary DEBOUNCED 
   disk". `player-prefs-read` never flushes, so it can't settle which one it is; it only reports the
   ambiguity.
 - **`clear`'s `PARTIAL` separates keys this call enumerated from keys already pending beforehand.**
-  `pendingWrites` is the honest full dirty set; `failed` (keys this clear's own `flush()` retried and
-  saw rejected again) and `alsoPending` (dirty before the clear ran) are reported as separate clauses
-  so the count in the message stays consistent with `cleared`/`keys`.
+  `pendingWrites` is the honest full dirty set; `failed` (keys this clear enumerated whose durable
+  remove the backend rejected) and `alsoPending` (dirty before the clear ran, which this call's own
+  `flush()` retried and saw rejected again) are reported as separate clauses, so the count in the
+  message stays consistent with `cleared`/`keys`. The enumeration is `keysIncludingProtected()`, so a
+  protected key counts as enumerated (#1310).
 
 ## Related
 

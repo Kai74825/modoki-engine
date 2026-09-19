@@ -10,6 +10,8 @@ import { assetScannerPlugin } from './plugins/vite-asset-scanner'
 import { loadProjectConfig } from './plugins/load-project-config'
 import { resolveModules } from './plugins/detect-modules'
 import { inlinePlayablePlugin } from './plugins/inlinePlayable'
+import { ktx2LoaderAssetStripPlugin } from './plugins/ktx2LoaderAssetStrip'
+import { msdfWorkerAssetStripPlugin } from './plugins/msdfWorkerAssetStrip'
 import { subgameBuildPlugin, SUBGAME_ENTRY_VIRTUAL_ID, subgameOutDir } from './plugins/subgameBuild'
 import { bootSplashPlugin } from './plugins/bootSplash'
 import { earlyConsoleShimPlugin } from './plugins/earlyConsoleShim'
@@ -402,6 +404,10 @@ export default defineConfig(({ command }) => {
       isDebugBuild: debugBuildFlag,
     }),
     assetScannerPlugin(),
+    // three r185's KTX2Loader emits a hashed Basis transcoder pair nothing fetches (#1340).
+    ktx2LoaderAssetStripPlugin(),
+    // @zappar/msdf-generator's own worker fallback emits an unbundled worker that cannot start (#1356).
+    msdfWorkerAssetStripPlugin(),
     ...(externalProject ? [hostSharedDeps()] : []),
     // The web boot splash (#396). Build-only and opt-in: a project with no `app.splashSource`
     // emits nothing and its boot is unchanged. Skipped for the EDITOR shell, which opens projects
@@ -488,12 +494,11 @@ export default defineConfig(({ command }) => {
     // + an external MODOKI_PROJECT (C4c-2) so those imports resolve in dev.
     fs: { allow: fsAllow },
   },
-  // The runtime MSDF font generator ships its OWN module Worker + wasm and resolves
-  // them via `new URL('./worker.js', import.meta.url)` / `new URL('msdfgen_wasm.wasm',
-  // import.meta.url)`. esbuild dep-optimization bundles the lib into a single chunk,
-  // which BREAKS those relative URLs (the sibling files no longer sit next to the
-  // chunk). Excluding it keeps the lib served from node_modules as-is so the URLs
-  // resolve and Vite still transforms the worker's bare imports (comlink).
+  // The runtime MSDF font generator ships its OWN module Worker + wasm. The runtime now hands
+  // it both URLs through `?worker&url` / `?url` imports (msdfGenerate.ts, #1356), but the lib
+  // still self-resolves relative to its own file, and esbuild dep-optimization would bundle it
+  // into a chunk where those sibling files no longer sit. Excluding it keeps the lib served
+  // from node_modules as-is.
   optimizeDeps: {
     exclude: ['@zappar/msdf-generator'],
     // PACKAGED-ONLY: pre-bundle the @modoki/engine subpaths the DYNAMICALLY-loaded game
@@ -524,6 +529,14 @@ export default defineConfig(({ command }) => {
         '@modoki/engine/runtime/core/dailyCalendar',
         // #926 — Court's and wordweave's login bonus wheels import its pure decisions the same way.
         '@modoki/engine/runtime/core/loginBonus',
+        // #1312 — both games' AdMob adapters import the promoted ad lifecycle, and their pacing
+        // modules the interstitial rules, by narrow subpath.
+        '@modoki/engine/runtime/core/adLifecycle',
+        '@modoki/engine/runtime/core/adPacing',
+        // #1332 — both games' AppsFlyer wiring imports the promoted attribution lifecycle.
+        '@modoki/engine/runtime/core/attribution',
+        // #1274 — both games' auth wrappers hash login keys with the account-continuity module.
+        '@modoki/engine/runtime/sync/accountContinuity',
         '@modoki/engine/runtime/debug',
         '@modoki/engine/editor',
         '@modoki/engine/editor/rendering',
@@ -548,8 +561,8 @@ export default defineConfig(({ command }) => {
     // where the node_modules walk never reaches app.asar.unpacked/node_modules, so the import
     // fails and the whole editor renderer blanks (Vite error overlay). Pin it to an absolute
     // path so it resolves regardless of cache location. Kept as a package-DIR alias (not the
-    // entry file) so the resolver still honours the package's own `new URL('./worker.js' /
-    // 'msdfgen_wasm.wasm', import.meta.url)` self-resolution next to the real dist/.
+    // entry file) so the lib still resolves relative to the real dist/ (its own worker fallback
+    // is stripped from builds by msdfWorkerAssetStrip.ts, #1356).
     // Playable: alias @zappar/msdf-generator to a stub — the real lib emits a Worker + wasm
     // via new URL(import.meta.url) that can't be inlined into the single file (would 404 +
     // trip the inliner's single-chunk guard). Playables use pre-baked font atlases, so the
@@ -574,6 +587,11 @@ export default defineConfig(({ command }) => {
           // playable emits a few bytes instead of the real 1.5 MB wasm against its 5 MB cap;
           // it is never instantiated, since the stub generator never initializes.
           { find: /^@zappar\/msdf-generator\/msdfgen_wasm\.wasm/, replacement: path.join(engineDir, 'plugins/playable-msdf-stub.wasm') },
+          // Same trap for the worker subpath (#1356): the prefix alias below would turn
+          // `worker?worker&url` into `<stub>.ts/worker` and fail the build. Unlike the wasm entry
+          // this one SWALLOWS the query (`(?:\?.*)?$`): kept, `?worker&url` would build the stub as
+          // a worker — a separate .js chunk the single-file inliner refuses.
+          { find: /^@zappar\/msdf-generator\/worker(?:\?.*)?$/, replacement: path.join(engineDir, 'plugins/playable-msdf-worker-url-stub.ts') },
           { find: '@zappar/msdf-generator', replacement: path.join(engineDir, 'plugins/playable-msdf-stub.ts') },
           { find: /^@[^/]+\/app-services$/, replacement: path.join(engineDir, 'plugins/playable-appservices-stub.ts') },
         ] }
@@ -594,6 +612,10 @@ export default defineConfig(({ command }) => {
           alias: [
             ...(msdfGeneratorDir ? [
               { find: /^@zappar\/msdf-generator\/msdfgen_wasm\.wasm/, replacement: path.join(msdfGeneratorDir, 'dist', 'msdfgen_wasm.wasm') },
+              // #1356: the runtime imports `@zappar/msdf-generator/worker?worker&url` so Vite BUNDLES
+              // the worker (comlink inlined). The package-dir alias would rewrite it to
+              // <pkg>/worker, which does not exist — same ordering reason as the wasm entry.
+              { find: /^@zappar\/msdf-generator\/worker(?=\?|$)/, replacement: path.join(msdfGeneratorDir, 'dist', 'worker.js') },
               { find: '@zappar/msdf-generator', replacement: msdfGeneratorDir },
             ] : []),
             ...(process.env.MODOKI_VITE_CACHEDIR
@@ -647,7 +669,32 @@ export default defineConfig(({ command }) => {
         '**/index.ts',
       ],
     },
-    environment: 'jsdom',
+    // NODE by default; a file that needs a DOM says so with `// @vitest-environment jsdom` (#1285).
+    //
+    // This was `'jsdom'` for the whole suite, and the whole suite paid for it. MEASURED 2026-09-16
+    // over all 866 app-suite files, comparing vitest's own cross-worker aggregates (which, unlike
+    // wall clock, do not inflate when the box is busy — see engine/scripts/verifyLoad.mjs):
+    //
+    //     aggregate `environment`   957.87s  ->  8.59s
+    //     CPU time (user+sys)         1168s  ->   795s   (-32%)
+    //
+    // `tests/architecture` alone is 178 of 180 DOM-free — source-scanning guards that read files off
+    // disk and never render. The engine package suite already defaulted to node (it sets no
+    // `environment` at all), which is exactly why its per-file environment cost was ~8x cheaper.
+    //
+    // ⚠️ The set was derived by RUNNING the suite under node and taking the failures, not by
+    // grepping for `document` — a grep over these files is dominated by source-scanning guards that
+    // match the WORD "document" inside a string they are searching for. **That method missed twice**
+    // (an async unhandled rejection with every test line green; Court's 220 files, which
+    // `courtTouched()` hides from discovery), so treat it as a starting point, not an oracle.
+    //
+    // ⚠️ **No count is quoted here on purpose.** The first version said "108", which three later
+    // commits in the same change invalidated without touching this comment. `grep -rl
+    // '@vitest-environment jsdom'` over the include roots is the answer, and it cannot go stale.
+    //
+    // ⚠️ `environmentMatchGlobs` is NOT the mechanism: it was removed in vitest 4 (4.1.11 here).
+    // The per-file docblock is what this version supports, and 21 files already used it.
+    environment: 'node',
     setupFiles: './tests/setup.ts',
     // Reaps the claims-store fallback dirs the main process and spawned children leave (#1117).
     globalSetup: './tests/globalSetup.ts',
@@ -660,10 +707,22 @@ export default defineConfig(({ command }) => {
     // 20s was still not enough on the `win` clone: qaCaseReferences.test.ts walks the whole QA
     // corpus off disk, runs 8s unloaded, and blew past 35s under the app lane — failing 2 of 3
     // verify runs. That is a budget set on faster hardware, not a misbehaving test, so Windows
-    // gets its own ceiling and every other platform keeps the tighter one (a global raise would
-    // hide a real hang on the machines fast enough to notice it).
-    testTimeout: process.platform === 'win32' ? 60000 : 20000,
-    hookTimeout: 30000,
+    // got its own ceiling while every other platform kept the tighter one.
+    //
+    // 2026-09-16 (owner): "we should increase the timeout in general" — every ceiling here doubles,
+    // rather than one platform being patched each time the same shape reaches it. macOS was the
+    // second: wordweave's backgroundRotation.test.ts ("exactly ONE background is visible at every
+    // level of the corpus") runs ~15.7s of test time UNLOADED and hit 20302ms — a 302ms overshoot —
+    // under `verify`'s two concurrent lanes, failing the gate reproducibly while `npm test` alone
+    // stayed green. Both incidents are a budget set against lighter load than the gate really runs,
+    // so the fix is the budget, not the test.
+    //
+    // ⚠️ The cost is real, and the earlier version of this block argued the other way: a looser
+    // ceiling hides a genuine hang, and these are PER-TEST bounds, so a deadlocked test now burns
+    // twice as long before it reports. Accepted deliberately — a gate that fails on load is worse
+    // than one that reports a hang slowly, because the first teaches people to re-run it.
+    testTimeout: process.platform === 'win32' ? 120000 : 40000,
+    hookTimeout: 60000,
     include: [
       // ENGINE tests only — tests/** is the engine test surface, and it ships to the
       // public OSS repo (docs/engine-oss-publishing.md). DEMO-GAME tests live with

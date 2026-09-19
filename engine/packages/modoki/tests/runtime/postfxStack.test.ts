@@ -14,6 +14,19 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import * as THREE from 'three';
 
+/** A render target shaped like three's: `isRenderTarget` is what the disposal walk keys off, and
+ *  `textures`/`depthTexture` are the GPU textures a bare `renderTarget.dispose()` can miss (#1269).
+ *  `depthTexture` defaults to NULL because that is what the post nodes' own targets have — bloom's
+ *  pyramid and the RTT wrappers are all built `{depthBuffer: false}`; only the scene pass has one. */
+function makeFakeTarget(depthTexture: { dispose: () => void } | null = null) {
+  return {
+    isRenderTarget: true,
+    dispose: vi.fn(),
+    textures: [{ dispose: vi.fn() }],
+    depthTexture,
+  };
+}
+
 // Chainable no-op TSL node with an observable `.value` where relevant
 // (bloom()'s returned node exposes strength/radius/threshold as {value}).
 function makeBloomNode() {
@@ -23,8 +36,11 @@ function makeBloomNode() {
     threshold: { value: 0 },
     // Real BloomNode owns a MIP PYRAMID of render targets + materials and has a
     // dispose(). Modelling it here is what lets us catch the stage forgetting to
-    // call it — the leak class no other assertion can see.
+    // call it — the leak class no other assertion can see. The targets live in two
+    // ARRAYS, which is what `disposeNodeOwned` has to walk to free their textures (#1269).
     dispose: vi.fn(),
+    _renderTargetsHorizontal: [makeFakeTarget(), makeFakeTarget()],
+    _renderTargetsVertical: [makeFakeTarget(), makeFakeTarget()],
   };
 }
 
@@ -43,7 +59,14 @@ function makeScenePass() {
     // and texture type onto, and `compileAsync` stands in for three's `PassNode.compileAsync` —
     // whose only observable act here is asking the renderer for a render context the way
     // `Renderer.compile()` does: two arguments, so no call depth.
-    renderTarget: { samples: 0, texture: { type: null as unknown } },
+    renderTarget: {
+      isRenderTarget: true,
+      samples: 0,
+      texture: { type: null as unknown },
+      dispose: vi.fn(),
+      textures: [{ dispose: vi.fn() }, { dispose: vi.fn() }],
+      depthTexture: { dispose: vi.fn() },  // the scene pass DOES own one
+    },
     compileAsync: vi.fn(async (r: { _renderContexts: { get(rt: unknown, mrt: unknown, d?: number): unknown } }) => {
       r._renderContexts.get(p.renderTarget, null);
     }),
@@ -51,6 +74,10 @@ function makeScenePass() {
   };
   return p;
 }
+/** Every ParticlePassNode the NPR stage built this test, so a case can assert what its disposal
+ *  freed — the real one extends PassNode and owns a render target. */
+const particlePasses: Array<{ renderTarget: ReturnType<typeof makeFakeTarget>; dispose: ReturnType<typeof vi.fn> }> = [];
+
 /** Every pass the mocked `pass()` handed out this test, so a case can reach the one its stack
  *  holds. Declared after the factory: referencing it from inside would make its element type
  *  circular. */
@@ -58,17 +85,33 @@ const scenePasses: ReturnType<typeof makeScenePass>[] = [];
 
 // `uniform()` with an observable `.value` and a chaining `.setName()` (the NPR
 // + FXAA stages call `uniform(x).setName('...')`).
+// A TSL-shaped node for the lineColor target's math (#1416): `.mul()` chains like TSL, and it is
+// NON-enumerable so `toEqual` compares only the recorded structure, never the method.
+function tslNode<T extends object>(tag: T): T {
+  Object.defineProperty(tag, 'mul', { enumerable: false, value: (x: unknown) => tslNode({ __mul: [tag, x] }) });
+  return tag;
+}
+
 function makeUniform(initial: unknown) {
   const u: { value: unknown; setName: () => typeof u } = { value: initial, setName: () => u };
   return u;
 }
 
+// Shaped like a real RTTNode: a `renderTarget` flagged `isRenderTarget` with its own textures, and
+// the `_quadMesh` whose material three's inherited dispose() never frees (#1269). The walker in
+// `disposeNodeOwned` keys off `isRenderTarget`, so a flag-less fake would silently assert nothing.
 const rttSpy = vi.fn((node: unknown) => ({
   __rtt: node,
   isTextureNode: true,
   setPixelRatio: vi.fn(),
   dispose: vi.fn(),
-  renderTarget: { dispose: vi.fn() },
+  renderTarget: {
+    isRenderTarget: true,
+    dispose: vi.fn(),
+    textures: [{ dispose: vi.fn() }],
+    depthTexture: { dispose: vi.fn() },
+  },
+  _quadMesh: { material: { dispose: vi.fn() } },
 }));
 const buildCompositeNodeSpy = vi.fn((args: Record<string, unknown>) => ({ __composite: args }));
 const buildFXAANodeSpy = vi.fn((opts: Record<string, unknown>) => ({ __fxaa: opts }));
@@ -91,10 +134,24 @@ const bloomSpy = vi.fn((_color: unknown, strength: number, radius: number, thres
 // assertions below can read `.value` without a cast.
 type UniformNode = { value: number };
 const vignetteSpy = vi.fn((_color: unknown, intensity: UniformNode, smoothness: UniformNode) => ({ __vignette: [intensity, smoothness] }));
-const dofSpy = vi.fn((_color: unknown, viewZ: unknown, focusDistance: UniformNode, focalLength: UniformNode, bokehScale: UniformNode) => (
-  // Real DepthOfFieldNode owns 6 render targets + 5 materials and has a dispose().
-  { __dof: [viewZ, focusDistance, focalLength, bokehScale], dispose: vi.fn() }
-));
+const dofSpy = vi.fn((_color: unknown, viewZ: unknown, focusDistance: UniformNode, focalLength: UniformNode, bokehScale: UniformNode) => {
+  // Real DepthOfFieldNode owns 6 render targets + 5 materials and has a dispose() — and its
+  // setup() assigns a NEW GaussianBlurNode to `_CoCBlurredMaterial.colorNode` on every build, which
+  // that dispose() misses (#1269). `blurNodes` records each one this fake's setup() made.
+  const node = {
+    __dof: [viewZ, focusDistance, focalLength, bokehScale],
+    dispose: vi.fn(),
+    _CoCBlurredMaterial: { colorNode: null as { dispose: ReturnType<typeof vi.fn> } | null },
+    blurNodes: [] as Array<{ dispose: ReturnType<typeof vi.fn> }>,
+    setup(_builder: unknown) {
+      const blur = { dispose: vi.fn() };
+      node.blurNodes.push(blur);
+      node._CoCBlurredMaterial.colorNode = blur;
+      return {};
+    },
+  };
+  return node;
+});
 const buildViewZNodeSpy = vi.fn((depthTextureNode: unknown, isOrthographic: boolean, _near?: unknown, _far?: unknown) => ({ __viewZ: [depthTextureNode, isOrthographic] }));
 
 // Real GTAONode owns an RT + material and has a dispose(); `radius` is a live
@@ -109,6 +166,8 @@ function makeAoNode(depthNode: unknown, normalNode: unknown) {
     resolutionScale: 1,
     getTextureNode: vi.fn(() => ({ __aoTexture: true, r: { __aoTextureR: true } })),
     dispose: vi.fn(),
+    // The noise DataTexture GTAONode's constructor makes and its dispose() misses (#1269).
+    _noiseNode: { value: { dispose: vi.fn() } },
   };
 }
 const aoSpy = vi.fn((depthNode: unknown, normalNode: unknown, _camera: unknown) => makeAoNode(depthNode, normalNode));
@@ -118,6 +177,7 @@ beforeEach(() => {
   vi.clearAllMocks();
   renderPipelines.length = 0;
   scenePasses.length = 0;
+  particlePasses.length = 0;
 
   vi.doMock('three/tsl', () => ({
     pass: vi.fn(() => { const p = makeScenePass(); scenePasses.push(p); return p; }),
@@ -134,6 +194,12 @@ beforeEach(() => {
     materialReference: vi.fn((n: string) => ({ __matRef: n })),
     outputStruct: vi.fn((...a: unknown[]) => ({ __outputStruct: a })),
     vec4: vi.fn((...a: unknown[]) => ({ __vec4: a })),
+    // The lineColor MRT target's emissive terms (#1416, `nprLineColorTarget`).
+    emissive: { __emissive: true },
+    diffuseColor: { a: { __alpha: true } },
+    luminance: vi.fn((v: unknown) => tslNode({ __luminance: v })),
+    saturate: vi.fn((v: unknown) => tslNode({ __saturate: v })),
+    max: vi.fn((a: unknown, b: unknown) => ({ __max: [a, b] })),
   }));
 
   vi.doMock('three/webgpu', () => ({
@@ -154,10 +220,13 @@ beforeEach(() => {
     buildFXAANode: buildFXAANodeSpy,
   }));
   vi.doMock('../../src/runtime/rendering/npr/ParticlePassNode', () => ({
+    // Real ParticlePassNode extends PassNode, so it owns a render target whose textures its own
+    // dispose() does not free (#1269) — modelled here or the stage's routing asserts nothing.
     ParticlePassNode: class {
       getTextureNode = vi.fn(() => ({ __particleTexture: true, isTextureNode: true }));
       dispose = vi.fn();
-      constructor(..._a: unknown[]) {}
+      renderTarget = makeFakeTarget({ dispose: vi.fn() });
+      constructor(..._a: unknown[]) { particlePasses.push(this); }
     },
   }));
 
@@ -216,7 +285,7 @@ const nprCfg = (over: Record<string, unknown> = {}) => ({
   isOrthographic: false, superSampleScale: 1, fillMode: 'grayscale',
   depthThreshold: 0.005, normalThreshold: 0.4, colorThreshold: 0.15,
   lineThickness: 1, lineStrength: 1, grayscaleGamma: 0.7, grayscaleLift: 0.3,
-  clearColor: 0x000000, ...over,
+  emissivePassthrough: 1, clearColor: 0x000000, ...over,
 });
 const fxaaCfg = (over: Record<string, unknown> = {}) => ({
   edgeThreshold: 0.125, edgeThresholdMin: 0.0312, blendStrength: 4, ...over,
@@ -341,15 +410,19 @@ describe('PostFXStack — AO (GTAO) stage', () => {
 
   it('is ordered before dof/bloom/vignette (AO -> DOF -> bloom -> vignette)', async () => {
     await makeStack({ ao: aoCfg(), dof: dofCfg(), bloom: bloomCfg(), vignette: vignetteCfg() });
-    // dof's color input is AO's mul() output, not the raw scene color.
-    expect(dofSpy.mock.calls[0][0]).toEqual(expect.objectContaining({ __mul: expect.anything() }));
+    // dof's color input is AO's mul() output, not the raw scene color — resolved through an RTT
+    // the stack owns, since AO's output is not a texture node (#1269).
+    expect(dofSpy.mock.calls[0][0]).toEqual(expect.objectContaining({
+      __rtt: expect.objectContaining({ __mul: expect.anything() }),
+    }));
   });
 
-  it('dispose() frees the GTAO node (owns a render target + material)', async () => {
+  it('dispose() frees the GTAO node (owns a render target + material) AND its noise texture', async () => {
     const stack = await makeStack({ ao: aoCfg() });
     const aoNode = aoSpy.mock.results[0].value;
     stack.dispose();
     expect(aoNode.dispose).toHaveBeenCalledTimes(1);
+    expect(aoNode._noiseNode.value.dispose).toHaveBeenCalledTimes(1);
   });
 });
 
@@ -410,6 +483,34 @@ describe('PostFXStack — DOF stage', () => {
     expect(focusArg.value).toBe(20);
     expect(focalArg.value).toBe(3);
     expect(bokehArg.value).toBe(0.5);
+  });
+
+  it('hands dof() the scene colour texture directly — no RTT when the input already is one', async () => {
+    await makeStack({ dof: dofCfg() });
+    expect(dofSpy.mock.calls[0][0]).toEqual(SCENE_COLOR);
+    expect(rttSpy).not.toHaveBeenCalled();
+  });
+
+  it('dispose() frees the RTT it put in front of dof() when AO precedes it (#1269)', async () => {
+    const stack = await makeStack({ ao: aoCfg(), dof: dofCfg() });
+    const inputRtt = rttSpy.mock.results[0].value;
+    expect(dofSpy.mock.calls[0][0]).toBe(inputRtt);
+    stack.dispose();
+    expect(inputRtt.renderTarget.dispose).toHaveBeenCalledTimes(1);
+    expect(inputRtt.renderTarget.textures[0].dispose).toHaveBeenCalledTimes(1);
+    expect(inputRtt._quadMesh.material.dispose).toHaveBeenCalledTimes(1);
+  });
+
+  it('dispose() frees the DOF node and the blur node of EVERY build of it (#1269)', async () => {
+    const stack = await makeStack({ dof: dofCfg() });
+    const dofNode = dofSpy.mock.results[0].value;
+    // Two builds, as the stage precompile and the draw each build it in their own render context.
+    dofNode.setup({});
+    dofNode.setup({});
+    expect(dofNode.blurNodes).toHaveLength(2);
+    stack.dispose();
+    expect(dofNode.dispose).toHaveBeenCalledTimes(1);
+    for (const blur of dofNode.blurNodes) expect(blur.dispose).toHaveBeenCalledTimes(1);
   });
 
   it('does not force setMRT — depth is already free from pass()', async () => {
@@ -487,6 +588,29 @@ describe('PostFXStack — NPR stylize stage', () => {
     expect(scenePass.setMRT).toHaveBeenCalledTimes(1);
     const dict = scenePass.setMRT.mock.calls[0][0] as Record<string, unknown>;
     expect(Object.keys(dict).sort()).toEqual(['lineColor', 'normal', 'output']);
+  });
+
+  // #1416: small, dense emissive geometry (postfx-demo's chandelier glows) was ~all edge pixels,
+  // so the Sobel lines painted it black and the grayscale fill clamped what survived to 1.0. The
+  // lineColor target pulls BOTH its fields toward the fragment's emissive, by how strongly it
+  // glows: preserve → the composite keeps the HDR lit colour (bloom sees it), line colour → the
+  // surface's own colour (a line drawn on the glow vanishes).
+  it('pulls the lineColor target toward the fragment emissive, by glow strength (#1416)', async () => {
+    const { pass } = await import('three/tsl');
+    await makeStack({ npr: nprCfg({ emissivePassthrough: 0.5 }) });
+    const scenePass = (pass as unknown as ReturnType<typeof vi.fn>).mock.results[0].value;
+    const dict = scenePass.setMRT.mock.calls[0][0] as Record<string, unknown>;
+    // m = saturate(luminance(emissive) × gain) × alpha. The gain is the authored knob's live
+    // uniform, seeded from the request; the × alpha stops a transparent emissive draw (which
+    // OVERWRITES this unblended target) from punching a full-colour window through the image.
+    const gain = expect.objectContaining({ value: 0.5 });
+    const glow = { __mul: [{ __saturate: { __mul: [{ __luminance: { __emissive: true } }, gain] } }, { __alpha: true }] };
+    expect(dict.lineColor).toEqual({
+      __vec4: [
+        { __mix: [{ __matRef: 'lineColor' }, { __emissive: true }, glow] },
+        { __max: [{ __matRef: 'nprColorPreserve' }, glow] },
+      ],
+    });
   });
 
   it('excludes the particle layer from the geometry pass (particles are stage 2)', async () => {
@@ -587,6 +711,29 @@ describe('PostFXStack — NPR particle stage (scene-injecting, not a filter)', (
     expect(renderer.setRenderTarget).toHaveBeenCalledTimes(2);
     expect(renderer.setRenderTarget.mock.calls[1][0]).toBeNull();
   });
+
+  it('render() restores the previous render target even when the internal pass THROWS (#1298)', async () => {
+    // The throw twin of the test above, and the defect #1298 fixed here. The save/restore pair
+    // existed but was a pair of BARE STATEMENTS: `inner.render()` is the entire upstream post-FX
+    // chain, so a shader-compile failure or a lost device inside it skipped the restore and left
+    // the renderer bound to the stylized RT — every later frame then drew into that offscreen
+    // target instead of the canvas, with nothing in the log.
+    const renderer = makeRenderer();
+    const { PostFXStack } = await import('../../src/runtime/rendering/postfx/PostFXStack');
+    const stack = new PostFXStack(renderer, new THREE.Scene(), new THREE.PerspectiveCamera(), { npr: nprCfg() } as never);
+    const [internal, terminal] = renderPipelines;
+    internal.render = vi.fn(() => { throw new Error('mock compile failure in the upstream chain'); });
+
+    expect(() => stack.render()).toThrow(/mock compile failure/);
+
+    // Restored despite the throw: bound to the stylized RT, then back to null.
+    expect(renderer.setRenderTarget).toHaveBeenCalledTimes(2);
+    expect(renderer.setRenderTarget.mock.calls[0][0]).not.toBeNull();
+    expect(renderer.setRenderTarget.mock.calls[1][0]).toBeNull();
+    // And the error is not swallowed on the way out — the terminal pipeline never ran. A restore
+    // that also ate the exception would hide the lost device instead of surfacing it.
+    expect(terminal.render).not.toHaveBeenCalled();
+  });
 });
 
 describe('PostFXStack — NPR composes with the rest of the stack (the Phase 3 point)', () => {
@@ -662,6 +809,17 @@ describe('PostFXStack — NPR rebuild-vs-live contract (blocker 5)', () => {
     expect((u.clearColor.value as THREE.Color).getHex()).toBe(0xff8800);
   });
 
+  it('writes emissivePassthrough into the lineColor target\'s gain uniform LIVE (#1416)', async () => {
+    const { pass } = await import('three/tsl');
+    const stack = await makeStack({ npr: nprCfg({ emissivePassthrough: 1 }) });
+    const scenePass = (pass as unknown as ReturnType<typeof vi.fn>).mock.results[0].value;
+    const lineColor = scenePass.setMRT.mock.calls[0][0].lineColor as { __vec4: [{ __mix: unknown[] }, unknown] };
+    const gain = ((lineColor.__vec4[0].__mix[2] as any).__mul[0].__saturate.__mul[1]) as { value: number };
+    expect(gain.value).toBe(1);
+    expect(stack.setConfig({ npr: nprCfg({ emissivePassthrough: 0 }) } as never)).toBe(false);
+    expect(gain.value).toBe(0); // the SAME uniform the MRT node holds — no rebuild, no stale copy
+  });
+
   it('returns TRUE when superSampleScale changes (resizes every render target)', async () => {
     const stack = await makeStack({ npr: nprCfg({ superSampleScale: 1 }) });
     expect(stack.setConfig({ npr: nprCfg({ superSampleScale: 2 }) } as never)).toBe(true);
@@ -695,6 +853,8 @@ describe('PostFXStack — dispose frees every stage-owned render target (T3)', (
     const compositeRTT = rttSpy.mock.results[0].value;
     stack.dispose();
     expect(compositeRTT.renderTarget.dispose).toHaveBeenCalledTimes(1);
+    expect(compositeRTT.renderTarget.textures[0].dispose).toHaveBeenCalledTimes(1);
+    expect(compositeRTT._quadMesh.material.dispose).toHaveBeenCalledTimes(1);
   });
 });
 
@@ -702,11 +862,65 @@ describe('PostFXStack — stage nodes that own GPU resources are freed (leak reg
   // These nodes own render targets that `RenderPipeline.dispose()` cannot reach.
   // The stack rebuilds on ANY stage-set change, so a missing dispose leaks the
   // whole pyramid every time a sibling effect is toggled in the Inspector.
-  it('dispose() frees the bloom node (11 render targets + 8 materials upstream)', async () => {
+  it('dispose() frees the bloom node (11 render targets + 8 materials upstream) and its mip textures', async () => {
     const stack = await makeStack({ bloom: bloomCfg() });
     const bloomNode = bloomSpy.mock.results[0].value;
     stack.dispose();
     expect(bloomNode.dispose).toHaveBeenCalledTimes(1);
+    // #1269: the pyramid's targets are held in arrays, and a target rendered into by nothing keeps
+    // its texture unless the texture is disposed directly.
+    for (const rt of [...bloomNode._renderTargetsHorizontal, ...bloomNode._renderTargetsVertical]) {
+      expect(rt.textures[0].dispose).toHaveBeenCalledTimes(1);
+    }
+  });
+
+  it('a stage that THROWS mid-build frees the stages already built, and the scene pass', async () => {
+    const { PostFXStack } = await import('../../src/runtime/rendering/postfx/PostFXStack');
+    // bloom is planned AFTER ao, so ao is already built and holding its GPU resources.
+    bloomSpy.mockImplementationOnce(() => { throw new Error('boom'); });
+    expect(() => new PostFXStack(
+      makeRenderer(), new THREE.Scene(), new THREE.PerspectiveCamera(),
+      { ao: aoCfg(), bloom: bloomCfg() } as never,
+    )).toThrow('boom');
+    const aoNode = aoSpy.mock.results[0].value;
+    expect(aoNode.dispose, 'the built AO stage is unreachable once the constructor throws').toHaveBeenCalledTimes(1);
+    expect(aoNode._noiseNode.value.dispose).toHaveBeenCalledTimes(1);
+    expect(scenePasses[0].dispose).toHaveBeenCalledTimes(1);
+  });
+
+  it('dispose() frees the PARTICLE pass target\'s textures and the stylized RT\'s texture (#1269)', async () => {
+    // The stylized RT is a REAL THREE.RenderTarget the stage builds, and it names its texture, so a
+    // prototype spy can tell exactly which textures the stack freed.
+    const texSpy = vi.spyOn(THREE.Texture.prototype, 'dispose');
+    const stack = await makeStack({ npr: nprCfg() });
+    const particlePass = particlePasses[0];
+    stack.dispose();
+    const freedNames = texSpy.mock.instances.map((t) => (t as THREE.Texture).name);
+    expect(freedNames, 'the stylized RT\'s texture, which a bare renderTarget.dispose() misses').toContain('nprStylized');
+    expect(particlePass.renderTarget.textures[0].dispose).toHaveBeenCalledTimes(1);
+    texSpy.mockRestore();
+  });
+
+  it('dispose() frees every OTHER stage when one disposer throws, and rethrows after (#1269)', async () => {
+    const stack = await makeStack({ ao: aoCfg(), bloom: bloomCfg() });
+    const bloomNode = bloomSpy.mock.results[0].value;
+    const aoNode = aoSpy.mock.results[0].value;
+    bloomNode.dispose.mockImplementation(() => { throw new Error('disposer blew up'); });
+    expect(() => stack.dispose()).toThrow('disposer blew up');
+    // AO is planned BEFORE bloom, so a skipped tail would be the scene pass — the full-resolution
+    // MRT target, the most expensive thing in the stack.
+    expect(aoNode.dispose).toHaveBeenCalledTimes(1);
+    expect(scenePasses[0].dispose).toHaveBeenCalledTimes(1);
+    for (const tex of scenePasses[0].renderTarget.textures) expect(tex.dispose).toHaveBeenCalledTimes(1);
+  });
+
+  it('dispose() frees the SCENE PASS target\'s textures, not just the target (#1269)', async () => {
+    const stack = await makeStack({ bloom: bloomCfg() });
+    const scenePass = scenePasses[0];
+    stack.dispose();
+    expect(scenePass.dispose).toHaveBeenCalledTimes(1);
+    for (const tex of scenePass.renderTarget.textures) expect(tex.dispose).toHaveBeenCalledTimes(1);
+    expect(scenePass.renderTarget.depthTexture.dispose).toHaveBeenCalledTimes(1);
   });
 
   it('dispose() frees the DOF node (6 render targets + 5 materials upstream)', async () => {
@@ -757,6 +971,19 @@ describe('PostFXStack — stage nodes that own GPU resources are freed (leak reg
       expect(renderer.contextLookups).toEqual([{ rt: scenePasses[0].renderTarget, depth: 2 }]);
     });
 
+    it('the renderer target is BORROWED for the whole pass compile, and only for it (#1246, #1239 A)', async () => {
+      const { PostFXStack } = await import('../../src/runtime/rendering/postfx/PostFXStack');
+      const session = await import('../../src/runtime/rendering/postfx/precompileSession');
+      const renderer = makeRenderer();
+      const stack = new PostFXStack(renderer, new THREE.Scene(), new THREE.PerspectiveCamera(), { bloom: bloomCfg() } as never);
+      let during: boolean | undefined;
+      const inner = scenePasses[0].compileAsync.getMockImplementation()!;
+      scenePasses[0].compileAsync.mockImplementation(async (r) => { during = session.isRendererTargetBorrowed(renderer); return inner(r); });
+      await stack.compileSceneAsync();
+      expect(during).toBe(true);
+      expect(session.isRendererTargetBorrowed(renderer)).toBe(false);
+    });
+
     it('stamps the pass target sample count before compiling', async () => {
       // Not tidiness: `PassNode.setup()` normally stamps this during the first render — the very
       // frame the precompile exists to get ahead of — and a sample-count mismatch is a different
@@ -767,6 +994,205 @@ describe('PostFXStack — stage nodes that own GPU resources are freed (leak reg
       await stack.compileSceneAsync();
       expect(scenePasses[0].renderTarget.samples).toBe(4);
       expect(scenePasses[0].renderTarget.texture.type).toBe(1016);
+    });
+
+    it('a stack disposed while its compile was queued compiles nothing (#957)', async () => {
+      // The compile runs when the renderer's compile queue reaches it, which can be after a rebuild
+      // disposed this stack — compiling its pass then would warm pipelines for a dead graph.
+      const stack = await makeStack({ bloom: bloomCfg() });
+      stack.dispose();
+      await stack.compileSceneAsync();
+      expect(scenePasses[0].compileAsync).not.toHaveBeenCalled();
+    });
+
+    /** three's `PassNode.compileAsync` binds the pass target + MRT and restores them only on success. */
+    function bindingRenderer() {
+      const r = {
+        ...makeRenderer(),
+        target: 'canvas' as unknown,
+        mrt: null as unknown,
+        getRenderTarget: () => r.target,
+        setRenderTarget: (t: unknown) => { r.target = t; },
+        getMRT: () => r.mrt,
+        setMRT: (m: unknown) => { r.mrt = m; },
+      };
+      return r;
+    }
+
+    it('a scene-pass compile that REJECTS unbinds the pass target + MRT three left behind (#957)', async () => {
+      const { PostFXStack } = await import('../../src/runtime/rendering/postfx/PostFXStack');
+      const renderer = bindingRenderer();
+      const stack = new PostFXStack(renderer, new THREE.Scene(), new THREE.PerspectiveCamera(), { bloom: bloomCfg() } as never);
+      const pass = scenePasses[0];
+      pass.compileAsync.mockImplementationOnce(async () => {
+        renderer.setRenderTarget(pass.renderTarget);
+        renderer.setMRT('sceneMRT');
+        throw new Error('shader graph exploded');
+      });
+
+      await expect(stack.compileSceneAsync()).rejects.toThrow('shader graph exploded');
+      // Left bound, every later frame draws into the pass's own target: a black canvas for good.
+      expect(renderer.target).toBe('canvas');
+      expect(renderer.mrt).toBe(null);
+    });
+
+    /** #1302. The target and the MRT are independent bindings. A foreign binder such as
+     *  `PMREMGenerator` saves and restores the TARGET only, so the MRT still bound is the pass's —
+     *  nesting its restore under the target check left the scene MRT bound for good. */
+    it('…leaves a FOREIGN target alone, but still gives back the pass MRT it left bound (#1302)', async () => {
+      const { PostFXStack } = await import('../../src/runtime/rendering/postfx/PostFXStack');
+      const renderer = bindingRenderer();
+      renderer.mrt = 'prevMRT';
+      const stack = new PostFXStack(renderer, new THREE.Scene(), new THREE.PerspectiveCamera(), { bloom: bloomCfg() } as never);
+      const pass = scenePasses[0] as typeof scenePasses[0] & { getMRT?: () => unknown };
+      pass.getMRT = () => 'sceneMRT';
+      pass.compileAsync.mockImplementationOnce(async () => {
+        renderer.setRenderTarget(pass.renderTarget);
+        renderer.setMRT('sceneMRT');
+        renderer.setRenderTarget('foreignRT'); // something bound its own target mid-compile
+        throw new Error('device lost');
+      });
+      const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+
+      await expect(stack.compileSceneAsync()).rejects.toThrow('device lost');
+      expect(renderer.target).toBe('foreignRT');
+      expect(renderer.mrt).toBe('prevMRT');
+      // Unreachable by contract since #1239 — so it is said out loud when it happens.
+      expect(warn).toHaveBeenCalledWith(expect.stringContaining('foreign render target'));
+    });
+
+    it('…and leaves an MRT it did not bind alone too (#1302)', async () => {
+      const { PostFXStack } = await import('../../src/runtime/rendering/postfx/PostFXStack');
+      const renderer = bindingRenderer();
+      const stack = new PostFXStack(renderer, new THREE.Scene(), new THREE.PerspectiveCamera(), { bloom: bloomCfg() } as never);
+      const pass = scenePasses[0] as typeof scenePasses[0] & { getMRT?: () => unknown };
+      pass.getMRT = () => 'sceneMRT';
+      pass.compileAsync.mockImplementationOnce(async () => {
+        renderer.setRenderTarget(pass.renderTarget);
+        renderer.setMRT('foreignMRT');
+        throw new Error('device lost');
+      });
+
+      await expect(stack.compileSceneAsync()).rejects.toThrow('device lost');
+      expect(renderer.target).toBe('canvas');
+      expect(renderer.mrt).toBe('foreignMRT');
+    });
+
+    it('does not BIND null as the MRT through a renderer with setMRT but no getMRT, even with the pass target still bound (#1302 ②)', async () => {
+      const { PostFXStack } = await import('../../src/runtime/rendering/postfx/PostFXStack');
+      const base = bindingRenderer();
+      const setMRT = vi.fn();
+      const renderer = { ...base, getRenderTarget: () => base.target, setRenderTarget: (t: unknown) => { base.target = t; }, getMRT: undefined, setMRT };
+      const stack = new PostFXStack(renderer, new THREE.Scene(), new THREE.PerspectiveCamera(), { bloom: bloomCfg() } as never);
+      const pass = scenePasses[0];
+      pass.compileAsync.mockImplementationOnce(async () => {
+        renderer.setRenderTarget(pass.renderTarget);
+        throw new Error('device lost');
+      });
+
+      await expect(stack.compileSceneAsync()).rejects.toThrow('device lost');
+      expect(base.target, 'the target is still ours, so it is given back').toBe('canvas');
+      expect(setMRT).not.toHaveBeenCalled();
+    });
+
+    it('does not BIND null through a renderer that has no getter to capture from (#1302 ②)', async () => {
+      const { PostFXStack } = await import('../../src/runtime/rendering/postfx/PostFXStack');
+      const renderer = { ...makeRenderer(), getRenderTarget: undefined, setRenderTarget: vi.fn(), setMRT: vi.fn() };
+      const stack = new PostFXStack(renderer, new THREE.Scene(), new THREE.PerspectiveCamera(), { bloom: bloomCfg() } as never);
+      scenePasses[0].compileAsync.mockImplementationOnce(async () => { throw new Error('device lost'); });
+
+      await expect(stack.compileSceneAsync()).rejects.toThrow('device lost');
+      expect(renderer.setRenderTarget).not.toHaveBeenCalled();
+      expect(renderer.setMRT).not.toHaveBeenCalled();
+    });
+  });
+
+  /** #957. Every compile on a renderer queues on ONE chain, and the stage compile is the half that
+   *  held the lock first — so nothing else in the suite notices if it stops taking it. */
+  describe('stage precompile takes its turn on the renderer compile queue (#957)', () => {
+    afterEach(async () => {
+      const clock = await import('../../src/runtime/core/clock');
+      clock.restoreRealClock();
+    });
+
+    async function queued() {
+      const { PostFXStack } = await import('../../src/runtime/rendering/postfx/PostFXStack');
+      const session = await import('../../src/runtime/rendering/postfx/precompileSession');
+      const clock = await import('../../src/runtime/core/clock');
+      const renderer = makeRenderer();
+      const stack = new PostFXStack(renderer, new THREE.Scene(), new THREE.PerspectiveCamera(), { bloom: bloomCfg() } as never);
+      const inner = vi.spyOn(stack as unknown as { compileStagesInner(k: number): Promise<void> }, 'compileStagesInner')
+        .mockResolvedValue(undefined);
+      let release!: () => void;
+      const ahead = session.runExclusivePrecompile(renderer, () => new Promise<void>((res) => { release = res; }));
+      return { stack, inner, ahead, release: () => release(), clock };
+    }
+
+    it('does not start while another compile holds the renderer', async () => {
+      const { stack, inner, ahead, release } = await queued();
+      const kicked = stack.compileStagesAsync();
+      await new Promise((r) => setTimeout(r, 10));
+      expect(inner).not.toHaveBeenCalled();
+      release();
+      await Promise.all([ahead, kicked]);
+      expect(inner).toHaveBeenCalledTimes(1);
+    });
+
+    it('carries its KICK time into the session, so the hold ceiling still counts from the gate', async () => {
+      const { stack, inner, ahead, release, clock } = await queued();
+      clock.setManualNow(1_000);
+      const kicked = stack.compileStagesAsync();
+      const { PRECOMPILE_MAX_HOLD_MS } = await import('../../src/runtime/rendering/postfx/precompileSession');
+      clock.setManualNow(1_000 + PRECOMPILE_MAX_HOLD_MS - 1); // waited just under the budget
+      release();
+      await Promise.all([ahead, kicked]);
+      expect(inner).toHaveBeenCalledWith(1_000);
+    });
+
+    it('the session it opens ENDS at kick + PRECOMPILE_MAX_HOLD_MS, not at turn + that — #334 composes with the gate', async () => {
+      // The load-bearing half: a session deadline counted from its late start would still hold the
+      // stubbed renderer after the gate released a frame at kick + 5 s.
+      const { PostFXStack } = await import('../../src/runtime/rendering/postfx/PostFXStack');
+      const session = await import('../../src/runtime/rendering/postfx/precompileSession');
+      const clock = await import('../../src/runtime/core/clock');
+      let activeAtKickDeadline: boolean | undefined;
+      const renderer = {
+        ...makeRenderer(),
+        render: vi.fn(),
+        toneMapping: 0, outputColorSpace: 'srgb', depth: true, stencil: false,
+        compileAsync: vi.fn(async () => {
+          // Asked while the session is open, at the instant the KICK-based ceiling expires.
+          activeAtKickDeadline = session.isPrecompileActive(renderer, 1_000 + session.PRECOMPILE_MAX_HOLD_MS);
+        }),
+      };
+      const stack = new PostFXStack(renderer, new THREE.Scene(), new THREE.PerspectiveCamera(), { bloom: bloomCfg() } as never);
+      // The terminal-quad prologue `compileStagesInner` needs; the stage walk then finds nothing.
+      Object.assign((stack as unknown as { pipeline: object }).pipeline, {
+        _update: vi.fn(), _quadMesh: { camera: new THREE.OrthographicCamera(), frustumCulled: true },
+      });
+      let release!: () => void;
+      const ahead = session.runExclusivePrecompile(renderer, () => new Promise<void>((res) => { release = res; }));
+
+      clock.setManualNow(1_000);
+      const kicked = stack.compileStagesAsync();
+      clock.setManualNow(1_000 + session.PRECOMPILE_MAX_HOLD_MS - 1); // queued almost the whole budget
+      await new Promise((r) => setTimeout(r, 0)); // the holder's body starts a microtask after the call
+      release();
+      await Promise.all([ahead, kicked]);
+
+      expect(renderer.compileAsync).toHaveBeenCalled();
+      expect(activeAtKickDeadline).toBe(false);
+    });
+
+    it('skips when the queue wait alone used the hold budget — it would hold frames past the gate', async () => {
+      const { stack, inner, ahead, release, clock } = await queued();
+      const { PRECOMPILE_MAX_HOLD_MS } = await import('../../src/runtime/rendering/postfx/precompileSession');
+      clock.setManualNow(1_000);
+      const kicked = stack.compileStagesAsync();
+      clock.setManualNow(1_000 + PRECOMPILE_MAX_HOLD_MS);
+      release();
+      await Promise.all([ahead, kicked]);
+      expect(inner).not.toHaveBeenCalled();
     });
   });
 

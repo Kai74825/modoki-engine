@@ -19,7 +19,7 @@ entity's other traits**, not by a field on `VideoPlayer`:
 |---|---|
 | `Renderable3D` / `Renderable3DPrimitive` | a `THREE.VideoTexture` on the material's `map` — a screen in the world |
 | `Renderable2D` with `sprite` = the video GUID | the texture of a PixiJS sprite |
-| `RenderableUI` / `UIElement` | the element mounted **inside that UI node's box** (`UIVideoMount`), cropped by `imageMode` |
+| `RenderableUI` / `UIElement` | the element mounted **inside that UI node's box** (`UIVideoMount`), cropped by `imageMode` and aligned by `imageAlign` (`object-fit` / `object-position`) |
 | `timeMode: 'presentation'` **and no surface trait of its own** | a fullscreen DOM overlay above the game (`VideoOverlay`) |
 
 The UI row is what makes video usable as **scenery** — a full-bleed animated backdrop *behind*
@@ -219,6 +219,16 @@ wrong regardless of the gesture — so the retry is deferred to the next `timeSc
 instead. **`@video.start` announces nothing while blocked** — see "`@video.start` means observed
 playback, not a request" below for what the event does and when it fires once the gesture arrives.
 
+**Backgrounding needs no gesture to recover** (checked for #1428, whose audio half did). iOS
+pauses every media element when the app backgrounds, behind the game's back. A clip whose trait
+still says `playing` restarts on the first frame back through two redundant per-frame paths:
+the reconcile's `handle.play()` (`attemptPlay` re-plays a paused element) and `setRate` →
+`applyRate`'s resume of a started, un-blocked clip. If that `play()` is refused while the session
+wakes, only the first path retries it, on the next frame. A clip the game paused stays paused.
+The clip's SOUND rides the shared `AudioContext`, which is #1428's `audioService.resume()`.
+Pinned by `videoSystemLiveContract.test.ts` § "#1428 sibling". **Device-verified** (owner, iPhone
+Air, 2026-09-19): video resumes after a background with no tap.
+
 ## Remote delivery
 
 A `delivery: "remote"` clip lives on a CDN and never enters the build. `policy` decides what happens
@@ -355,7 +365,10 @@ adopted the dead entity's decoder, download progress and sticky failure. Fixed w
 `videoElementFor`/`seekEntityVideo` are a public addressing contract the texture surfaces,
 `UIVideoMount` and the `video.*` actions all call with a masked id. `owner` is dropped on a world
 swap but NOT on `stopWorldVideo`, so a sticky download failure still survives Stop→Play as
-intended. Background and the general rule:
+intended. Since #1397 only a PERMANENT failure is sticky: a 404/410, or a cache refusal. A
+transient one (no response, a dropped body, a 5xx) backs off per clip and is retried. That follows
+the owner ruling of 2026-09-18, and the rule is in [architecture.md](architecture.md) § "A load
+failure is classified before it is remembered". Background and the general rule:
 [engine-concepts.md](engine-concepts.md) § Entity. Regression test:
 `tests/video/videoSystemIdReuse.test.ts`.
 
@@ -617,6 +630,11 @@ Transcoding uses the toolchain's `ffmpeg`/`ffprobe`, auto-provisioned on demand 
 requirement rather than a size decision: every `ffmpeg-static` build is `--enable-gpl`, and the
 darwin-arm64 build is additionally `--enable-nonfree`, which is not redistributable under any
 licence. Compliance depends on the binary being provisioned onto the user's own machine.
+
+**And only that provisioned copy converts** (#1297) — a PATH/Homebrew `ffmpeg` is never used, even
+in a plain `npm run build`, because the cache key does not name the binary and two builds encode
+different bytes under one hash. `npm run toolchain:install -- ffmpeg ffprobe` provisions without the
+editor. Detail: [editor-toolchain.md](editor-toolchain.md) § "Conversion CLIs are pinned".
 
 ## Agent surface (cache introspection)
 

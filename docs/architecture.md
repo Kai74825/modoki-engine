@@ -122,9 +122,17 @@ writes:
   with the UI-flag setter of the same name in `uiTreeStore`.)
 - **Structure-dirty** — `markStructureDirty()` bumps a monotonic `getStructureVersion()`
   and notifies `onStructureDirty(fn)` subscribers (Hierarchy, Console) on
-  create/delete/reparent. It's wired to `registerEntity` via `setStructureCallback`, and
-  `writeTraitField`/`setTrait` also fire it for the `EntityAttributes` fields that reshape
-  the tree (`name`, `layer`, `parentId`, `sortOrder`, `editorFolder`).
+  create/delete/reparent. It's wired to BOTH `registerEntity` and `unregisterEntity` via
+  `setStructureCallback`, and `writeTraitField`/`setTrait` also fire it for the `EntityAttributes`
+  fields that reshape the tree (`name`, `layer`, `parentId`, `sortOrder`, `editorFolder`).
+  **An id-keyed memo must key on a version that BOTH lifecycle events move**, because koota recycles
+  indices. The spawn half is what stops a newcomer on a dead entity's index being served that entity's
+  row; the destroy half is what drops a dead row when nothing respawns. #1220 found both missing at
+  once. SceneView's 2D graph memos were keyed on the 2D dirty version (`canvas2DDirty.ts`), which
+  neither event bumps, so a respawn inherited the dead entity's parent and paint rank. And
+  `unregisterEntity` bumped nothing, so the Animation Editor's entity index kept a destroyed entity's
+  name-path until the next spawn. A world swap drops the old world wholesale without unregistering, so
+  it bumps nothing here; `onWorldSwap` is the signal for that.
   **`onStructureDirtyCoalesced(fn)`** collapses a burst to at most once per animation
   frame — essential for React subscribers, since firing per-entity during a synchronous
   scene load (one `markStructureDirty` per instantiated entity) blows React's
@@ -633,6 +641,235 @@ in ~50 ms, not a device stall lasting a second. Combined with the measured fact 
 time-based budget (retry while
 `now - firstFailureAt < N`, capped at K attempts) would actually cover a transient
 WASM-instantiate failure; a count-only budget against a frame-rate caller does not.
+
+### A load failure is classified before it is remembered (#1371, #1374, #1397)
+
+**A loader that remembers a failed fetch must first ask whether the same bytes would fail again.**
+The lazy def caches (`rig2dCache`, `spriteAnimCache`, `animSetCache`, `particleCache`,
+`animationClipCache`, `timelineCache`) each kept a `failed` set that remembered EVERY failure for
+the life of the process, so one dropped request on a phone disabled that asset until the app
+restarted. Weaveling's willow and susuki (`rig2dCache`) went still for the session, and the game's
+own journal still reported each ambient run as ending cleanly. Scene2D's material-sprite textures
+had the opposite bug: no failure memory, so a 404 refetched on every dirty frame. Both come from one
+missing distinction, and `runtime/core/loadFailureMemo.ts` is where it now lives:
+
+| Class | What | Memory |
+|---|---|---|
+| **permanent** | 404/410, the dev server's SPA fallback (`MissingAssetError.absent`), a parse error, a format refusal | Remembered until the cache's own `invalidate*`/`set*`/`clear*` calls `forget` — as before |
+| **transient** | no response (`AssetNetworkError`), any other non-ok status (5xx, 403, 429) | Exponential backoff: 1 s, doubling, **capped at 10 minutes, never given up** (owner ruling 2026-09-18) |
+| **unknown** | anything else | The memo's `unknownIs`: `permanent` in the JSON caches (their unknowns are normaliser throws, which the bytes reproduce), `transient` in Scene2D (Pixi reports a 404 and a dropped connection as the same opaque error) |
+
+Three decisions that are easy to undo by accident:
+
+- **The network error is marked at the fetch, not recognised afterwards.** `fetch` rejects with a
+  bare `TypeError`, and so does a bug in a normaliser. So every loader writes
+  `fetch(url).catch(rethrowFetchFailure(url))`; that `.catch` sits directly on the fetch promise and
+  sees only the fetch's own rejection. Classifying `TypeError` as network would turn every code
+  bug into an endless retry. ⚠️ **The fetch is only half of the request.** A connection that drops
+  after the headers makes `res.text()` reject, not `fetch`, so `parseAssetJson` wraps the body
+  read in `AssetNetworkError` too. The first version missed this, and a mid-body drop was still
+  permanent. The close-out review found it. **An `AbortError` passes through unwrapped**, because
+  a caller's `signal` cancelling a body is not a failure. Every caller that passes a signal
+  filters on that name, and wrapping it made a superseded scene load toast "Failed to load".
+- **No attempt budget.** #541's bounded retry (three attempts) fits a failed `import()`, which the
+  browser's module map makes unretryable anyway. It is wrong for a `fetch`, which does reach the
+  network again. And because these getters are called every frame, an attempt budget is used up
+  within a few frames of the failure. The cap bounds the cost instead: a dead asset costs one
+  request per 10 minutes.
+- **Announced once per streak, and once per WORLD.** One `console.warn` marks the first failure.
+  The silent retries after it stay silent until the key loads or is forgotten. The
+  `@asset-load-failed` journal event (level `warn`, payload `{cache, key, transient, error}`) is
+  what lets a game, or `modoki_journal`/`device_journal`, see "nothing drew" at all. ⚠️ That event
+  must reach the world that is RUNNING. `SceneManager` acquires the next scene's assets (the def
+  preloads, `acquireMesh`) BEFORE it makes that world current, and each world keeps its own journal.
+  So a failure at scene load lands in the outgoing world's journal, and the swap throws that
+  journal away. `blocked()` therefore re-announces a remembered failure into any world that has not
+  heard it yet. It is the question every consumer asks every frame, in the world it is drawing.
+  Permanent refusals that the loader reports itself (format version, unknown material type) are
+  journalled through `markPermanent`.
+
+`meshTemplateCache` records every failure in its own memo, `netRetry`, which announces it and backs off
+a transient one. It keeps its `MESH_FAILED`/`MATERIAL_FAILED` sentinels, written for the permanent
+class only, which is what its resolvers read. A load that lands calls `forget` on the path, and so
+does the last scene releasing it. That keeps a mesh's failure memory scene-scoped like its entry:
+the next scene's acquire refetches, and a later outage starts at the base delay and is announced
+again. The sentinels answer before `netRetry.blocked()` is ever asked, so the resolvers call
+`netRetry.seen()` on a sentinel hit to get the same per-world re-announcement. ⚠️ A transient failure inside
+`acquireMesh` returns before it records the mesh's transitive deps. When the render-path resolver's
+retry later loads the model, those templates have no owning scene: this is the F6 unowned-load case
+`acquireMesh` already documents. Before #1371 it could not be reached from here, because the failure
+was permanent. So "never renders" became "renders, possibly resident until that model is acquired
+again". Scene2D's
+state lives in `loaders/materialTexRetry.ts` (`MaterialTexRetry`), so its decisions can be tested
+without a Pixi app. It has no invalidation hook because it does not need one: a re-import moves the
+resolved url (`withCacheBust`). A per-load generation number stops a load that a teardown
+superseded from releasing the newer load that replaced it. What it does have is its own timer wake when a backoff expires, because an idle
+scene has nothing else to mark it dirty.
+
+#### Every loader, not just the first nine (#1397)
+
+#1371/#1374 fixed nine sites. A sweep found fourteen more with the same missing distinction.
+Some had no memory, so a 404 was requested again every frame or every tap: the rigged-model cache,
+HDR environments, font atlases, 2D skinned parts and audio. Others remembered every failure for good,
+so a blip was permanent: the Three atlas, dynamic-font glyphs, 2D sprite slots, 3D billboard pages,
+2D shader fetches, video downloads and `requestPrefab`'s give-up budget. They all use the one memo
+now. What they needed from it:
+
+- **It lives in L0.** `core/loadFailureMemo.ts` and `core/assetLoadErrors.ts` (the error types,
+  `statusIsAbsent`, `checkAssetResponse`, `readAssetBytes`). `rendering/`, `audio/` and `video/`
+  are L2 and may not import `loaders/` (docs/architecture-layers.md). `loaders/assetFetch.ts`
+  re-exports the error types. `@modoki/engine` exports the memo too, and `parseAssetJson`, so a
+  game's own loader (Court's level list, #1399; Wordweave's corpus, #1400) can use the same rule.
+  ⚠️ **Export `parseAssetJson`, not just the memo** (#1399): without it a game writes
+  `checkAssetResponse` + `res.json()`, and a connection that drops mid-body stays an untyped
+  `TypeError`, so it is misread as a permanent failure. Court's adoption (`levelLoadFailures`
+  in `games/court/runtime/systems.ts`) gates both per-frame asks on `blocked()`. The level gate
+  sits where the board despawn used to re-run on every lap of a failing load. ⚠️ A blocked level
+  still despawns ANOTHER level's board, once: returning before the despawn left the previous board
+  drawn with nothing driving its input (found in review). `enterWorld` clears the memo, so
+  Stop→Play refetches.
+- **`onRetryDue`, a wake per backing-off key.** A per-frame asker (`scene3DSync`'s model and HDR
+  acquires) comes back by itself. A render-on-demand surface, a slot built once, or an idle
+  Scene2D does not. So the memo can arm one timer per key, which `forget`/`clear` cancel. The
+  wake is the shared dirty hub (`fireDirtyListeners`) or `markTextDirty(fontId)`, never a private
+  channel (#1368). ⚠️ **Waking when the retry is due is not enough:** the woken frame starts the
+  load, and an idle 3D surface renders only about 1 s after a wake. So a load that lands must wake
+  again, which is what the Three atlas missed at first.
+- **Typing binary fetches.** `checkAssetResponse` is `parseAssetJson`'s status half for a body you
+  cannot sniff: a non-ok status, and a `text/html` content type, which for a binary asset can
+  only be the SPA fallback. `readAssetBytes` marks a body that drops mid-read. Audio's XHR
+  applies the same two checks by hand. Before, a 404 page reached `decodeAudioData` and read as a
+  decode failure.
+- **three's `HttpError`.** FileLoader (under GLTFLoader, HDRLoader, KTX2) rejects a non-ok response
+  with an `HttpError` carrying the Response, so `classifyLoadFailure` reads `e.response.status`. A
+  bare `TypeError` from the same `onError` stays unknown: FileLoader sends a dropped connection
+  and a parse error through the same callback.
+
+Loaders that cannot see a status are `unknownIs: 'transient'`: Pixi's `Assets.load` (sprites,
+skinned parts, the no-`createImageBitmap` atlas fallback), and `TextureLoader`/`<img>` (the Three
+atlas, billboard pages), whose failure is a bare `Event`. Backing off bounds a 404 to one request
+per step. Sticking would make a blip permanent.
+
+Four sites keep something the rule would otherwise erase:
+
+- **Audio: the memo covers the FETCH only.** `retryFailedAudioDecodes` re-attempts every owned
+  clip on each gesture. That is the iOS decode unlock (`decodeAudioData` rejects while the context
+  is suspended), so a decode failure is still retried per gesture.
+- **Dynamic-font glyphs: two budgets.** A network failure of the `.ttf` backs off without end.
+  While it backs off, new codepoints are parked on the armed retry instead of fetching. A generator
+  or WASM failure keeps #541/#635's `MAX_FLUSH_RETRIES`, because that one IS a broken font.
+- **Video: transient only** (owner ruling 2026-09-18, "retry, still stop on 404"). A 404/410 or
+  a cache refusal stays sticky until the clip changes, since the refusal would repeat. A
+  transient failure backs off per clip. Accepted cost: a CORS refusal has no response, looks like
+  an outage, and is retried at the 10-minute cap for the session.
+- **`requestPrefab`: the give-up budget stays, and an outage does not spend it.** The budget
+  existed because `fetchPrefab` could not tell a deleted prefab from an outage. It still gives up
+  on a prefab that is not coming (a 404, a document the caller's `isHit` rejects). An attempt that
+  ends in a transient failure is refunded (`prefabFetchRetryAt`), so a built game no longer gives
+  a prefab up for the session after about 1.5 s of dropped connection. See prefabs.md.
+
+The in-flight dedupe maps got the same **identity-checked delete** everywhere a `finally` clears
+them (fonts, HDR, prefabs), for the reason riggedModelCache spells out. A load superseded by an
+invalidation must not evict the replacement that took its key. If it does, the next frame starts a
+third load, and a failure the replacement was about to record is requested again first.
+
+**On a native build, a file the app serves ITSELF cannot have an outage (#1402).** iOS's
+`WebViewAssetHandler.swift` does not answer a missing bundled file with a 404: `Data(contentsOf:)`
+throws and the handler calls `urlSchemeTask.didFailWithError`, so `fetch` rejects exactly as it
+does offline. Measured on the iPhone 8 (iOS 16.7.16), 2026-09-18, by requesting a nonexistent
+path from inside the installed app: `fetch` rejects with `TypeError: Load failed`, XHR fires
+`onerror` with status 0, and `<img>` fires a plain `Event`. Marked as a network error, a file
+that was in the manifest but not in the bundle backed off forever. It was never remembered as
+absent, `requestPrefab` refunded every attempt so `prefab/unavailable` never fired, and
+`@asset-load-failed` said `transient: true`. Android is different by source reading (Capacitor
+8.5.0, `WebViewLocalServer.java`): a missing file with an extension gets a real **404**, which was
+already absent. Measured on the S22 the same day: `fetch` and XHR get 404, and `<img>` fires
+`error`.
+
+So a failure with **no status** is decided by the URL. `isAppBundleUrl(url)` is true on a native
+Capacitor build for a URL on the page's own scheme and host. That covers the embedded bundle, an
+OTA snapshot (the `serverBasePath` swap keeps the origin) and a sub-game's `_capacitor_file_`
+URL. `absentIfBundled(url, e)` turns such a failure into `MissingAssetError({absent: true})`.
+Three things the rule depends on:
+
+- **The URL is required at the fetch site.** A rejection carries no URL, which is why
+  `rethrowAsNetworkError(e)` became the curried `rethrowFetchFailure(url)`. Removing the old name
+  made the compiler list every site. The opaque loaders call `absentIfBundled` before `record`:
+  audio XHR, Pixi and three `TextureLoader` textures, font atlases, the rigged GLB and the env HDR.
+- **Scheme + host, not `URL.origin`.** iOS serves the page from `capacitor://localhost`, and the
+  URL standard gives a non-special scheme the opaque origin `"null"`. WebKit happens to report
+  `capacitor://localhost`, but scheme + host holds whichever way an engine answers.
+- **An error that already has a verdict is left alone.** That means a `MissingAssetError`, a
+  three `HttpError` with a status, or an `AbortError`, which is a caller's cancel. Look for the
+  abort *inside* the `AssetNetworkError` wrapper, because `rethrowFetchFailure` wraps first.
+
+- **Only a failed REQUEST is claimed.** That means a `TypeError` (from `fetch` or three's
+  `FileLoader`), a DOM `Event` (from `<img>` or XHR), an `AssetNetworkError`, or Pixi's
+  `[Loader.load] Failed to load <url>.\n<inner>` wrapper when the inner error is one of those
+  (Pixi keeps it only as text). Anything else passes through untouched: a KTX2 transcoder that
+  has not had `detectSupport` yet, a `createImageBitmap` refusal, or a parser's plain `Error`.
+  ⚠️ **The filter goes by shape, not cause**, so two failures that are not requests still get
+  claimed. An `<img>` decode failure fires the same `error` Event as a missing file. A `TypeError`
+  thrown inside a loader's own chain looks like a failed fetch: GLTFLoader runs `onLoad` inside its
+  promise, and Pixi wraps its parsers. The same bytes reproduce both, so permanent is still the
+  right verdict. Only the message overstates "missing".
+- **Hand the helper only the rejection of THIS url's own load.** A site that awaits something else
+  first in the same promise pins that failure on the url. Billboard pages did this: a failed KTX2
+  loader-module import is also a `TypeError`, and it was recorded as the page missing from the
+  build, permanently. So `loadBillboardPage` tags only `loader.loadAsync(url)`. The rigged and env
+  sites record a loader-import failure raw for the same reason.
+
+It is always false on the web, where the page's own server is as remote as a CDN. Probe-then-
+fallback sites now fall back on iOS as they do on a 404: the 2D shader variant body, the 3D
+`fileShaderBuilder` variant body, the dynamic font bake, and the processed GLB. The OTA client's
+embedded-manifest read made the same call first (#1132, `docs/ota-updates.md` § delta).
+
+**One app-origin reader keeps a rejection transient on purpose:** `engine/app/subgameLoader.ts`.
+A sub-game whose `subgame.json` is missing on iOS retries rather than being quarantined, because a
+quarantine can never be undone, while a missed one only retries at the next boot.
+
+Not handled, and measured on the S22: a Range request for a missing file returns **206 with a
+0-byte body** on Android. No classified loader sends a Range request. The `<video>` element does,
+so it matters only to video streaming. `new Audio(url)` streams and the video stream policy classify nothing.
+
+Left out on purpose: the 3D `fileShaderBuilder` fallback's lifetime (not traced), and re-downloading
+audio bytes on every decode retry.
+
+**A failure has to reach the main thread before it can be classified. On iOS 16, Pixi's worker
+path never delivers it (#1404).** Pixi 8 decodes PNG/WebP textures in a worker by default. The
+worker reports a failure as `postMessage({ error: e })`, and iOS 16 WebKit cannot structured-clone
+an `Error`, so that call throws `DataCloneError` inside the worker and no message arrives.
+`WorkerManager` both settles the job and returns the worker to its pool only from its `message`
+listener. It has no `error` listener. So the load never settles, and that worker is lost for good.
+Once `navigator.hardwareConcurrency` loads have failed, every later worker load hangs too, present
+files included. Measured on the iPhone 8 (iOS 16.7.16, `hardwareConcurrency` 4), 2026-09-18,
+against the installed Particle Demo's own Pixi `Assets`: five missing PNGs, then a present
+`favicon.png`, were all still pending after 3 s. With `preferWorkers: false`, the missing file
+rejected with `[Loader.load] Failed to load …` and the present one resolved. On the iPad (iOS 26),
+the worker posted the `Error` intact.
+
+So `loadPixiTexture` asks the browser once, before the first texture load: a tiny worker posts
+`{error: new Error()}`. If the `Error` does not arrive (the post throws, the worker errors, or it
+stays silent for 2 s), the shim sets `preferWorkers: false`, the same switch the playable `blob:`
+path already flips. A timeout on `Assets.load` would not fix this. It rejects the caller, but it
+never returns the worker, so the pool drains anyway. Neither would patching Pixi's worker, which
+would be a vendored patch to carry across Pixi upgrades.
+
+`preferWorkers` does not reach **KTX2**. Pixi transcodes KTX2 on its own single worker
+(`loadKTX2onWorker`), with no main-thread path, and that worker posts failures the same way,
+`{type: 'error', err}`. It is one worker, not a pool, so nothing drains, but a missing KTX2 still
+hangs. So where the probe said no, the shim fetches a `.ktx2` URL on the main thread first. It
+cancels the body unread and rejects through `rethrowFetchFailure` / `checkAssetResponse`, so the
+consumer gets a classified error (#1402). A live cache hit skips the check, and concurrent
+callers for one URL share a single check. So the cost is one extra request per uncached KTX2 load,
+only on affected browsers. **Still open:** a failure only the worker sees still hangs. That means
+a KTX2 that fetches fine but fails to transcode, or a transcoder (`libktx`) that fails to init.
+The init failure would hang every KTX2 load. It is unlikely because `/pixi-ktx/*` ships locally.
+
+Verified with the shim itself, 2026-09-18: a Particle Demo built from this change, running on the
+iPhone 8, called its own `loadPixiTexture`. Six missing PNGs all rejected, which is more than the
+4-worker pool could have held. A present PNG and a present KTX2 resolved. A missing KTX2 rejected
+as `MissingAssetError` with `absent: true`.
 
 ## Single source of truth — where a value lives is decided by what KIND of value it is
 

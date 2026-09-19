@@ -27,6 +27,22 @@ Layering: `Scene3D` mounts an absolutely-positioned container at `zIndex: 0`. Th
 
 Object lifetimes are tracked in a `RenderState` (`ecsObjects`, `ecsSprites`, `ecsMaterials`, …); entities that disappear from the query are removed and their owned geometry/materials disposed.
 
+The per-entity rows describing one `ecsObjects` object (`ecsOwners`, `ecsSprites`, `ecsMaterials`,
+`ecsColors`, `ecsSizes`, `ecsShadowFlags`, `ownsGeometry`) are named ONCE, in `ECS_OBJECT_ROWS`, and
+every teardown — the asset-invalidation eviction, the GLB mesh swap, the primitive rebuild, the
+end-of-pass reap and `disposeRenderState` — clears them through `forgetEcsObject` (#1388). Only the
+bookkeeping is shared by all five; disposal genuinely differs (the reap disposes inline, the
+eviction retires light-mask variants). The two MID-PASS rebuilds — the GLB mesh swap and the primitive
+rebuild — share `discardForRebuild` on top of it (dispose owned geometry, RETIRE owned materials per
+#477), because the swap used to skip that step: an id that turned from a primitive into a GLB in one
+frame leaked the primitive's geometry and default material, since `disposeRenderState` walks only
+`ecsObjects`. The failure it closes: four sites hand-listed the maps and one drifted — the GLB swap kept
+`ecsMaterials`, so an empty-ref entity swapped to another mesh drew the new mesh's baked material
+(#1385). Missing `ecsShadowFlags` does the same to shadows: a fresh object starts unshadowed and the
+stale key reads "unchanged". **A new per-entity map joins that list** — or, if another pass owns it
+(`skinnedShadowFlags`, `skinned`, `billboards`, `textMeshes`), the `OWNED_ELSEWHERE` ledger in
+`scene3DSyncRenderStateRows.test.ts`; that test fails until one of the two names it.
+
 ### `2d` — PixiJS v8
 
 `Scene2D.tsx` renders `Renderable2D` entities into their nearest `Canvas2D` ancestor's PixiJS container. A sprite is drawn either as a tinted `Graphics` primitive (driven by `Renderable2D.color`) or an image. Shared draw computations live in `render2DUtils.ts` (`drawPrimitiveShapeGfx()`, etc.) so the editor and runtime share one code path. Full detail: [2D Rendering (PixiJS)](#2d-rendering-pixijs) below.
@@ -465,7 +481,8 @@ That is safe because `dispose()` frees the scratch state but **not** the output 
 the one thing we keep. The cube half (#775) has no generator to dispose — `CubeRenderTarget`
 disposes its own scratch geometry/material internally inside `fromEquirectangularTexture` — but it
 temporarily swaps the source texture's filtering flags and the renderer's MRT state, restoring both
-before returning, so it must only ever run from this sync, same as the PMREM build.
+before returning **on the normal path only** (see the throw-safety bullet below), so it must only
+ever run from this sync, same as the PMREM build.
 
 Consequences worth knowing before touching this:
 
@@ -475,6 +492,23 @@ Consequences worth knowing before touching this:
   so it is always the `three/webgpu` one. Using the wrong one **does not throw**: three logs
   `NodeBuilder: Material "ShaderMaterial" is not compatible` and returns a target that rendered
   nothing, so a silently BLACK environment gets bound and every unit test still passes.
+- ⚠️ **THE INVARIANT: any renderer-global binding this subtree touches is restored in a `finally`,
+  because three restores only on the NORMAL-RETURN path** (#1298). `setRenderTarget`/`setMRT`/
+  `xr.enabled` are renderer-global — whatever was bound last is what the next
+  `renderer.render(scene, camera)` draws into — and three gives no unconditional restore:
+  `PMREMGenerator.dispose()` calls `_dispose()` and **never** `_cleanup()`, the method that actually
+  runs `setRenderTarget(_oldTarget, …)`, whose only call sites are the last statement of
+  `fromScene()`/`_fromTexture()`; `CubeRenderTarget.fromEquirectangularTexture` and the
+  `CubeCamera.update` it calls behave the same. So a throw on a degraded or lost context used to
+  strand the renderer on an internal offscreen target and every later frame drew into it — a black
+  screen with nothing in the log. **Borrow the renderer through `withRendererState`
+  (`runtime/rendering/rendererState.ts`) rather than hand-rolling the pair**; the repo had three
+  correct hand-rolled copies and two that restored only on the normal path before this was
+  centralised. State belonging to the SOURCE or the SCENE (`minFilter`/`generateMipmaps`,
+  `scene.background`, `camera.layers.mask`, `autoClear`) stays at the call site — only the caller
+  knows what it perturbed. ⚠️ It does **not** address state borrowed across an `await`, where
+  another consumer legitimately runs inside the window: that is a different mechanism (#1239) that
+  a `finally` cannot close and would mask.
 - ⚠️ **The "0 / 0" row is a per-surface DELTA, not a claim that ownership is free.** Engine
   ownership keys on `(renderer, source, kind)` where three's own `CubeMapNode._cache` keys on the
   source alone — that is the point (three would hand one surface a target another renderer built),
@@ -510,54 +544,76 @@ would ship the whole Three node pipeline into a `render3d:false` build (#214). I
 still dies with its source; a 2D-only build never imports the module and the registry stays empty.
 It is reclassified L3 in place for that edge — see [architecture-layers.md](./architecture-layers.md) D4.
 
-### The r185 bump — measured, REVERTED, and now capped
+### three r185 → r186 — what the bump changed, and why it stopped at r185 (#956, #957)
 
-⚠️ **WE ARE NOT ON r185 AND MUST NOT GO THERE. `three` is pinned to `0.184.0`** (#956): r185
-**black-screens EVERY iOS device on first launch after a clean install**. Everything below is a
-record of what the bump *would* buy, kept because the measurement is real and #957 will want it —
-**it is not a recommendation, and it was read as one.** This section previously ended on "a 67% cut
-in texture-memory growth for a dependency bump" with no mention of the regression, which made the
-doc a developer reads before touching three's version argue for crossing the ceiling (#966).
+`three` is pinned to **0.185.1** (exact) and `@types/three` to `^0.185.4` (#957, 2026-09-15). It sat
+at 0.184.0 for a while because r185 black-screened every iOS device on a clean-install first launch
+(#956) — that turned out to be the engine's own compile overlap, not three (§ "Gotcha: every async
+compile on a renderer is serialised"), and the bump landed once the fix did.
 
-⚠️ **No gate can catch the regression.** The repro is first-launch-on-a-cold-install only; a warm
-pipeline cache hides it, and `npm run verify`, `verify:all`, both CI legs and both signed release
-builds were all green on the affected tree. The ceiling is therefore asserted as a DECLARATION:
-`engine/tests/architecture/threeVersionCeiling.test.ts` (the installed version, plus both manifests
-that declare `three`) and a `three` ignore entry in `.github/dependabot.yml`. Raising it needs an
-on-device clean-install check — that is #957, and it is the only thing that can observe the defect.
+⚠️ **r186 is measured BAD for this engine — do not bump to it.** Its `GTAONode` reads the depth with
+`this.depthNode.gather()` (`sampleCenterDepth`, behind a `_resolutionScale.lessThan(1).select(…)`,
+so the `textureGather` is in the shader whatever the scale). WGSL has **no `textureGather` overload
+for `texture_depth_multisampled_2d`**, and our scene pass is multisampled whenever `antialias` is on
+— the high tier. So every AO pass under MSAA fails: *"no matching call to textureGather(texture_depth_multisampled_2d, sampler, vec2<f32>)"*,
+`renderPipeline_GTAO_*` invalid. Measured on `demos/postfx-demo`'s AO station, desktop Chromium, 85 s
+runs that all reached it: **0.184.0 → 0 errors, 0.185.1 → 0, 0.186.0 → 128**; and on the iPad the same
+error at the AO station on a warm relaunch, after 0.186.0 had PASSED the clean-install launch — which is
+why QA-RENDER-0008 now runs long enough to reach AO on a COLD launch (~75–80 s: the station is at
+timeline t=60 and sim time is capped per frame, so cold stalls push it later in wall time). It is a three defect (r184/r185 have no `gather()` there); the same
+multisampled-depth wall already blocks GTAO's depth-only normal reconstruction (`PostFXStack.ts`'s AO
+stage comment). Revisit at r187.
 
-three `0.184.0 → 0.185.1` closed the expensive half of the env leak with **no engine code**. Same
-fixture, same probe, same island↔empty cycle:
+⚠️ **The ceiling is "verified on a device", not "known bad".** No automated gate can see the #956
+defect class — it needs a cold pipeline cache — so `engine/tests/architecture/threeVersionCeiling.test.ts`
+(the installed version plus both manifests that declare `three`) and a `three` ignore entry in
+`.github/dependabot.yml` bound `three` below the first release that has NOT passed QA-RENDER-0008
+(`qa/cases/rendering/ios-clean-install-postfx-first-launch.md`, a clean-install first launch on the
+iPad). Raising it means running that case against the new version first.
+
+**The env-leak record is historical.** Measured before the engine took ownership of the PMREM
+(`envPmrem.ts`, #739/#775/#779), on the same island ⟷ empty cycle:
 
 | per cycle | 0.184.0 | 0.185.1 |
 |---|---|---|
-| renderTargets | +5 | **+3** |
-| textures | +9 | **+3** |
-| geometries | +17 | **+17 (unchanged — ours, not three's)** |
-| **texturesSize** | **+72.1 MB** | **+24.1 MB** |
+| renderTargets | +5 | +3 |
+| textures | +9 | +3 |
+| geometries | +17 | +17 (ours, not three's) |
+| texturesSize | +72.1 MB | +24.1 MB |
 
-A **67% cut in texture-memory growth for a dependency bump.** The geometry half is untouched exactly
-as predicted — it was the `modelOwners` ownership gap, not a three defect.
+⚠️ **Do not quote it as the cost or the benefit of any version on today's code.** The engine now
+generates and disposes the PMREM itself whatever three does, so this table no longer describes a
+three-version difference. **Re-measured on today's code, three 0.185.1** (#957, 2026-09-15): the same
+fixture (`games/3d-test`, `tropical-island` ⟷ `empty`) driven in the running editor with
+`modoki.loadScene`, reading `window.__3d.renderer.info.memory` after the counters held still for 2 s.
 
-⚠️ `"three"` is now an **exact pin** (`0.184.0`, no caret) and the engine package's peer range carries
-the matching ceiling (`>=0.183.0 <0.185.0`), so neither a plain `npm install` nor a lockfile
-regeneration can pick 0.185.x up. **0.185.0 and 0.185.1 are the only releases after 0.184.0** — so
-the cap costs nothing today beyond the env-leak win recorded above.
+| after | renderTargets | textures | texturesSize | geometries |
+|---|---|---|---|---|
+| island (priming load) | 2 | 16 | 42.3 MB | 28 |
+| empty, every cycle | 3 | 7 | 2.3 MB | 4 |
+| island, cycles 1–4 | 2 | 16 | 42.3 MB | 29 |
 
-**What r185 fixed:** `PMREMNode` now registers a dispose listener and caches the RENDER TARGET, so
-`pmrem.dispose()` disposes the target. **What it did NOT fix:** `CubeMapNode` is byte-identical to
-r184 (still caches `renderTarget.texture` and disposes the wrong object), and the `PMREMGenerator`
-ping-pong target is freed only by `PMREMNode.dispose()`, which nothing calls when the env changes —
-together the residual 24.1 MB/cycle above. It also does not touch the WebGL-fallback program leak
-(#715), which is a different layer entirely.
+**Zero growth per cycle across four cycles** — the one geometry the first reload adds does not recur.
+(The absolute totals differ from the old table's — the engine and the fixture have both changed since,
+and the cause of the difference was not attributed. Compare per-cycle deltas, not totals.) What r185 did change is
+still true of three itself: `PMREMNode` registers a dispose listener and caches the render TARGET;
+`CubeMapNode` still caches `renderTarget.texture` and disposes the wrong object; and none of it
+touches the WebGL-fallback program leak (#715).
 
-⚠️ **`@types/three` is deliberately HELD at `^0.183.1`** — owner decision, 2026-09-05, asked directly.
-Bumping it to 0.185.4 fails `verify` with ~20 errors as the TSL node generics became far more
-specific, hitting `particles/billboardTsl.ts`, `gpuComputeBackend.ts`, `spriteBillboard.ts`,
-`postfx/PostFXStack.ts`, `SceneView.tsx` and the `water.ts` shader in both `games/sling` and
-`demos/forest-camp`. Types lagging the runtime is the pre-existing arrangement, **not an open task to
-pick up.** Known cost: a REMOVED symbol still fails loudly at typecheck (the safe direction), but a
-CHANGED SIGNATURE could silently typecheck against the older types.
+**What r185 changed that no type check sees** (measured by diffing the release builds and the
+migration guide against the repo's own call sites, #957 — none observed live yet):
+- **GTAO look** — darker and wider (owner-accepted, below). `AmbientOcclusionPostFX` is off by
+  default and no committed game scene enables it; `demos/postfx-demo` shows it as a station.
+- **WebGPURenderer premultiplied alpha** was reimplemented — the NPR particle pass renders into a
+  target with a null background, the one place a blend difference could show.
+- **TransformControls world-space translation snap** now snaps the full world position under a rotated
+  or scaled parent (the SceneView gizmo).
+- **GLTFExporter** bakes a negative `normalScale` sign into the normal texture (the OBJ/FBX → GLB import
+  converter).
+- Type-only: the errors `@types/three` 0.185/0.186 raised were all stricter TSL generics
+  (`ReturnType<typeof float>` became a narrow `VarNode`), fixed with `Node<'float'>`-style aliases —
+  no three API the repo uses was removed or renamed between 0.184 and 0.186. r186 would also bake GTAO's
+  `samples` into the shader (a rebuild per change) and change its distance model.
 
 ⚠️ **GTAO is genuinely darker under r185 and the owner ACCEPTED it** (shown the side-by-side,
 2026-09-05: *"diff is fine"*). Mean luminance 42.32 → 39.86 on `demos/postfx-demo` with GTAO forced
@@ -3542,6 +3598,121 @@ a filter — see the NPR section below.
 - **FXAA runs pre-tonemap**, matching what NPR did historically. FXAA's luma heuristics assume
   gamma space, so this is a known, pre-existing compromise.
 
+### Disposal: a rebuild must free what three's OWN node `dispose()` misses (#1269)
+
+Every structural change (stage set, MRT layout, SS scale, camera object) disposes the whole
+`PostFXStack` and builds a new one, so anything a stage leaves allocated leaks **once per switch**.
+`RenderPipeline.dispose()` does not recurse into the node graph, which is why each stage handle has
+its own `dispose` (bloom's pyramid, DOF's targets, GTAO's target, the `rtt()` wrappers). That was
+not enough, because several three nodes' own `dispose()` miss things they allocate.
+
+**Every stage frees its node through `disposeNodeOwned` (`postfx/nodeOwnedResources.ts`) — one
+place, not a per-stage copy.** It calls the node's own `dispose()`, then walks the node's own
+properties for render targets (arrays too, for bloom's two mip pyramids) by three's `isRenderTarget`
+flag rather than by private field names, freeing each target's textures and depth texture, and
+finally the `_quadMesh` material an `RTTNode` never frees. The three gaps it closes:
+
+| Gap | Why three leaves it | Where it bites |
+|---|---|---|
+| A target's **textures** | freed from the target's `dispose` event only if it was ever rendered INTO — `Textures.updateRenderTarget` is what registers that listener. A target only ever **bound** as a sampled texture (which allocates the GPU texture) keeps it | every node built by a compile whose stack then never drew — reachable: `Scene3D` returns before `render()` on the precompile and live-compile paths, and disposes on tier demotion, camera swap, unmount and GPU-loss recovery |
+| `RTTNode`'s **quad material** | `RTTNode` declares no `dispose()` at all, so the inherited one only fires an event. (`RenderPipeline` frees its own quad material; `RTTNode` does not) | one compiled pipeline per `rtt()` wrapper per rebuild — DOF's input and the SS>1 NPR composite |
+| Resources made in a **constructor or `setup()`** | `GTAONode`'s 5×5 noise `DataTexture`; `DepthOfFieldNode`'s `GaussianBlurNode`, minted fresh on **every** build (once per render context — the precompile and the draw each make one) and orphaned by the next | `disposeGtaoNode`; `trackDofNode`, which wraps `setup()` to record every blur node and is called right after `dof()` |
+
+Three related rules the same file and class own:
+
+- **`ownedTextureInput`** resolves a stage input that is not already a texture node through an
+  `rtt()` the STACK owns — `dof()`'s own `convertToTexture` mints the identical RTT and keeps no
+  handle on it, and AO sits straight before DOF ending in a `mul`. ⚠️ It is deliberately **narrower
+  than three's rule**, which also passes a `SampleNode` through: this helper feeds the FXAA stage
+  too, whose `wgslFn` binds a real `texture_2d<f32>` + sampler, and a SampleNode is a vec4-valued
+  expression, not a texture binding. No stage outputs one today.
+- **The constructor frees what it already allocated if anything throws** — the scene pass included,
+  since `pass()` runs first and `ensureLineColorOnMaterials()` is a known TSL-build throw site. A
+  constructor that never returns leaves the caller no instance to dispose, and `Scene3D` builds
+  inside the frame callback, which `frameDriver` retries next frame — so it repeats per episode.
+- **`dispose()` frees every stage even if one disposer throws**, rethrowing the first error
+  afterwards; a skipped tail is a leaked mip pyramid, and the error still surfaces.
+
+⚠️ **A DOF node built AFTER its disposer ran is not covered**, and freeing it there was tried and
+removed: at that instant its targets have never been rendered into, so three's `Textures` holds no
+entry and every dispose is a guarded no-op — it would leak again the moment the node drew. No path
+reaches it today (`compileStagesInner` re-checks `disposed` before every job). The fix, if one is
+ever needed, is not building after dispose.
+
+**Measured** on `demos/postfx-demo`'s 90 s tour (every loop enters "All Composed" =
+`ao,dof,bloom,vignette`). On a Galaxy S22, before: +12 textures and ~50 MB per loop, 110 → 413 MB
+over seven loops. The editor GameView reproduces it exactly (57 → 69 → 82 textures at the same
+tour point), and a ledger on `renderer.backend.createTexture`/`destroyTexture` attributed all 12:
+8 blur-node textures, 2 for DOF's input RTT (colour + depth), 2 noise textures. After the fix three
+loops read identical texture counts and bytes at every matching point, with the gallery still
+rendering and no GPU errors.
+
+⚠️ **The helpers reach into three's PRIVATE fields** (`_CoCBlurredMaterial`, `_noiseNode`,
+`_quadMesh`), so a three bump can quietly make them free nothing. `postfxNodeOwnedResources.test.ts`
+is the tripwire: it builds the **real** three nodes, first proving each premise (the node's own
+`dispose()` leaves the resource alive), then that the helper frees it — a mocked node's `dispose()`
+frees everything by construction, which is how every one of these passed `postfxStack.test.ts`. Two
+things about that file are easy to get wrong, both measured: three's example nodes (`dof`, `ao`,
+`bloom`) live in `node_modules`, so vitest externalises them and they are real **whatever** the
+package's stub aliases say — what the `vi.mock`s actually rescue is `pass`/`rtt`, in the test and in
+the helper (delete them and 6 of the 14 cases go red). And the mocks resolve three's build directory
+with `fileURLToPath`, never `new URL(...).pathname`, which yields `/D:/…` on Windows and fails to
+import — red on the public CI matrix, invisible to the Mac gate.
+
+### The same asymmetry outside post-FX: a PMREM's output target (#1277)
+
+The rule that generalises out of the table above — **a render target and its texture are different
+owners, and freeing the texture is not freeing the target** — has a second home in the editor's two
+3D previews (`panels/previewScene.ts`, `panels/ModelPreview.tsx`).
+
+`PMREMGenerator.fromScene()` returns a **`WebGLRenderTarget`**. Both previews kept only its
+`.texture`, assigned that to `scene.environment`, and disposed the TEXTURE on teardown. Neither
+disposal reaches the target:
+
+- `generator.dispose()` frees the generator's own scratch (`_pingPongRenderTarget`, the LOD meshes,
+  the blur/GGX/cubemap materials) and **deliberately not its output** — `runtime/rendering/envPmrem.ts`
+  says the same in situ, and the runtime env path has owned its targets since #779/#775.
+- `target.texture.dispose()` is a **no-op on a render-target texture**, and this is the half that
+  reads as covered when it is not. three registers `onTextureDispose` inside `initTexture` — the
+  normal upload path — while a render target's texture is set up by `setupRenderTarget`, which
+  registers `onRenderTargetDispose` on the **target**. So the RT texture never gets `__webglInit`,
+  and `deallocateTexture` opens with `if ( textureProperties.__webglInit === undefined ) return;`.
+  (three 0.185.1, `WebGLTextures.js` — `deallocateTexture`, `initTexture`, `setupRenderTarget`.)
+
+Both previews now derive through **`panels/previewEnvironment.ts`**, which holds the target and
+registers its release onto the caller's `TeardownScope` as it is taken (#858). One helper rather
+than two patches, because the five-line block was copy-pasted — which is why one defect lived in two
+files. `previewEnvOwnership.test.ts` census-guards against a third copy by matching the bare
+`PMREMGenerator` identifier; it started as `new\s+(THREE\.)?PMREMGenerator\s*\(` and a mutation check
+walked an aliased namespace import straight past it.
+
+⚠️ **LATENT today — do not go looking for it with a memory counter.** Both previews build their own
+`WebGLRenderer` and `forceContextLoss()` it on teardown, which drops the whole context and takes the
+orphaned target with it, so `renderer.info.memory.renderTargets` shows nothing on today's path. It
+becomes a per-open leak the moment either preview re-IBLs without a teardown, or runs on a renderer
+handed back by `panels/rendererLease.ts` across remounts. The defect is established by reading
+three's source, not by a measurement.
+
+⚠️ The helper's `roomEnv`/`generator` disposals sit in a **`finally`** so a throw mid-derivation
+still frees the scratch three has already allocated by then (the ping-pong render target, the LOD
+meshes, their materials). Both panels disposed on the normal path only.
+
+⚠️ **What that `finally` does NOT buy — the obvious reading is wrong, and this doc asserted the
+wrong version first.** It does **not** restore the renderer's previous render target. That restore
+lives in `_cleanup()`, which three calls as the last statement of `fromScene()`/`_fromTexture()`,
+on the **normal path only**; `dispose()` calls `_dispose()` — materials, ping-pong target, LOD
+geometries — and never `_cleanup()`. True of **both** generators (`three/src/extras` and
+`three/src/renderers/common/extras`). So a throw mid-derivation strands the renderer on the PMREM's
+internal cube target whatever the caller does in a `finally`; only an explicit
+`setRenderTarget`/`xr.enabled` restore fixes that, which is what `envPmrem.ts`'s `'cube'` branch
+already hand-rolls and its `'pmrem'` branch does not (#1298).
+
+**To re-measure** a suspected post-FX leak: play the scene, wrap `window.__3d.renderer.backend`'s
+`createTexture`/`destroyTexture` to keep a `Map` of live textures (name, size, `new Error().stack`),
+and compare `renderer.info.memory.textures` at the SAME timeline point across loops. Grouping the
+survivors by name and stack names the owner directly; a count at different stations cannot tell a
+leak from a larger look.
+
 ## NPR Outline Post-Process
 
 The engine ships a stylized cel/outline post-process that runs **only on WebGPU**. It is off by default and toggled by the `NPRPostFX` ECS trait. It is **two stages of the post-FX stack** above, not a standalone pipeline — so it composes with bloom/vignette/DOF.
@@ -3624,6 +3795,46 @@ whenever `superSampleScale > 1` (SSAA already covers it, at scale² cost).
 
 The material property `nprColorPreserve` (0..1) lets a material keep its true hue through NPR. It's injected into the `lineColor` MRT target's **alpha**; the composite lerps the grayscale fill toward the lit scene color by that amount (`mix(fill, sceneColor, preserve)`). Outlines are still drawn on top at every preserve level.
 
+**Emissive surfaces pass through NPR** (#1416). For a standard material, the `lineColor` target
+pulls both fields toward the fragment's emissive, by
+`m = saturate(luminance(emissive) × emissivePassthrough) × alpha` — `nprLineColorTarget()` in
+`npr/NPRPostProcess.ts`. `emissivePassthrough` is an `NPRPostFX` field (default 1, a live
+uniform; **0 reproduces the pre-#1416 look exactly**, which makes it the before/after switch too). Preserve becomes `max(nprColorPreserve, m)`,
+so a glowing pixel keeps its true lit colour, **unclamped**, and bloom downstream sees its HDR
+value instead of a grayscale fill capped at 1.0. The line colour becomes
+`mix(lineColor, emissive, m)`, so a line drawn ON the glow is in its own colour and vanishes,
+while non-emissive neighbours still draw theirs, so a glow in front of geometry keeps its
+silhouette. A glow in front of empty background has no outline at all, because the composite draws
+no line where nothing was drawn (`isForeground`). `emissive`
+is three's per-fragment property (colour × intensity × map), so a non-emissive material writes
+exactly the old `vec4(lineColor, nprColorPreserve)`. A custom shader using `nprFragmentOutput`
+does not get this, because it writes the target itself. Why it matters: postfx-demo's glows are
+small, dense geometry that is nearly all Sobel edge pixels. The black line colour replaced them,
+and emissive was never actually lost. Before/after, measured on a sconce glow in the editor: the
+disc went from grey 225 with its rim eaten by the outline (1,393 bright px) to warm
+(254,248,232) at full size (1,792 px), and the bloom halo at 60px from centre went 47 → 134 luma.
+**Why the × alpha:** three gives every MRT target except `output` **no blending**
+(`MRTNode.getBlendMode`), so a transparent draw OVERWRITES `lineColor` whatever its opacity.
+Unscaled, an alpha-faded emissive halo card would cut a full-colour window through the grayscale
+image behind it. This covers fading through ALPHA only. An additive-blended card (faint through
+its rgb, alpha 1) would still cut the window, but none is reachable today: material assets expose
+no `blending`, glTF has no additive mode, and additive particles are excluded from the NPR pass
+(`PARTICLE_LAYER`). **Two things no test catches:** a three bump that renames or stops assigning the
+`EmissiveColor` property (`NodeMaterial.setupLighting`) silently makes `m ≡ 0`, and the mocked-TSL
+unit test stays green. And a non-emissive material reads an **unassigned** `EmissiveColor`. It is
+zero-initialised on WebGPU (WGSL `var<private>`, observed), and on the WebGL2 fallback it relies on
+WebGL's zero-initialisation rule, which has **not been observed** on a device. Check both with the
+following check when raising the three ceiling. (1) With NPR on, dump the renderer's fragment programs
+(`modoki_eval`: `window.__3d.renderer._pipelines.programs.fragment`, each entry's `.code`) and
+confirm the MRT's third output still mixes toward `EmissiveColor`, which is still assigned in
+the lighting setup. (2) Look up close at a postfx-demo sconce glow with `emissivePassthrough` at 0
+and then 1: the disc must go from grey and outlined to warm and full-sized. (3) Once, on the
+WebGL2 fallback (the iPhone 8), confirm that non-emissive surfaces still render grayscale and
+outlined.
+⚠️ **Measure this class close up.** At gallery distance the glows are ~4px, mostly inside their
+lamp shades, and tone-mapped to near-white. A crop there reads the same before and after the
+fix, and one session nearly concluded the fix did nothing.
+
 Both `lineColor` and `nprColorPreserve` are auto-patched onto `THREE.Material.prototype` via `Object.defineProperty` (defaulting to black / `0`), so `materialReference(...)` resolves for **all** materials — including GLB-imported ones — without patching every creation site. (The `Tint` trait sets `nprColorPreserve` on its tinted clones so the grayscale fill blends toward the team color.)
 
 ⚠️ **Both values are stored in `userData`, under one namespaced key, by `rendering/materialExtras.ts` — never in a `_`-prefixed backing field.** That is not a style choice; a `_` field survives **neither** clone route in this engine (#351). `Material.copy()` is a hand-written field list that has never heard of ours, and `cloneDerived` skips `/^(is[A-Z]|_)/` as three's own private-field convention. While they lived in `_nprColorPreserve` / `_lineColor`, a mesh that was **both tinted and light-masked** lost its `Tint.amount` and rendered at `nprColorPreserve: 0` — full grayscale fill. It failed in the confusing direction, because `.color` IS a field `Material.copy()` knows: the object looked tinted while the preserve strength was wrong, which reads as an NPR/lighting bug rather than a Tint one.
@@ -3650,6 +3861,7 @@ Two rules follow, and both are load-bearing:
 | `lineStrength` | `1` | Multiplier on the line mask before darkening the fill (0..1). |
 | `grayscaleGamma` | `0.7` | Luminance remap exponent (grayscale mode); `<1` lifts midtones. |
 | `grayscaleLift` | `0.3` | Black lift in grayscale mode (0..1). |
+| `emissivePassthrough` | `1` | Gain on emissive luminance: how strongly a glowing surface escapes the stylization (kept in HDR colour, no line on it). `0` = the pre-#1416 look. See [Color preservation](#color-preservation). |
 | `fxaa` | `true` | FXAA post-AA on the composite output. |
 | `fxaaEdgeThreshold` | `0.125` | FXAA relative-contrast threshold (typical 0.05–0.25). |
 | `fxaaEdgeThresholdMin` | `0.0312` | FXAA absolute luma floor — pixels below are flat. |
@@ -3666,7 +3878,8 @@ There is **one** post-FX code path; NPR has no branch of its own.
 - The stack is built **lazily** on the first frame `planStages(req)` is non-empty *and* the
   renderer is WebGPU (`renderer.isWebGPURenderer === true`); otherwise
   `renderer.render(scene, activeCamera)`.
-- Turning every trait off keeps the stack alive but routes around it, so toggling stays cheap.
+- When the (tier-masked) request plans no stages, the stack is disposed rather than kept, so a
+  live tier demotion frees its render targets.
 - `setConfig()` applies cheap uniform updates; a `true` return disposes and rebuilds. A
   camera-object swap (perspective ↔ ortho) also forces a rebuild.
 - The request is edge-triggered on `stackSignature`, so a static scene does no per-frame config work.
@@ -3821,6 +4034,69 @@ scene, so no HUD entities, so nothing for the window to expose (and the `!config
 replaces paints the same `#0a0a1a`). By the time the paint signal resolves, the overlay is many
 seconds past mounted. Shortening it would trade a real anti-flash benefit for nothing.
 
+**Game time waits while the overlay is up (#1246, owner 2026-09-15: "the whole game waits").**
+The world ticks from the moment it swaps in, and a fresh install's compile keeps the overlay up for
+seconds. On an iPhone Air, `demos/postfx-demo`'s tour had played its whole first look (0–15 s) before
+the overlay lifted, so the first frame anyone saw was the second station. `GameShell` now takes
+`holdTimeForLoading()` before the scene load and releases it when the overlay drops, and also on
+failure, when a mandatory OTA stops the boot, and in the effect cleanup. While any hold is active, `timeSystem` applies a time scale of 0.
+⚠️ **It zeroes TIME; it does not stop the pipeline.** Pausing through `isSimRunning()` would skip every
+system below TRANSFORM, so animation would never sample its first pose (the #1097 pre-pose flash)
+and the idle gate would stop drawing the frames that finish the load. Not frozen: media on its own
+clock and game `setTimeout`s. The editor never mounts `GameShell`, so it never holds.
+
+Measured on an iPad mini 5 at work-qa `5e2d1c2e1` (`tools-scratch/boot-stall/build-ios-1246-final.sh`):
+- **Fresh install:**
+  - The Director read `0.000` as the overlay dropped (13.07 s), and `0.978` a second later. The loading hold released at `elapsed=0.000`.
+  - GameShell's readiness wait resolved `timeout` at 10.4 s, not `painted`. The swap's live compile gate released its frame at its own 5 s ceiling. That frame then built pipelines synchronously, for a 7.7 s stretch with no frame submitted (`FRAME LOOP STALLED`).
+  - The overlay still dropped 33 ms AFTER the first submitted frame, because the two-frame wait behind the readiness wait blocks on that same stalled frame.
+  - No frame was ever held by a scene-pass borrow: at the swap there was no post-FX stack yet.
+  - No crash or throw in 95 s of the tour.
+- **Warm relaunch:**
+  - `painted` at 6.0 s, and the Director read `0.000` at the overlay drop.
+
+**The overlay waits at least as long as a render hold promises (#1246).**
+- The flat 5 s ceiling was measured from when `GameShell` began waiting. That assumed the swap's
+  compile was the only hold, but the stage gate kicks later, on a Director's first beat.
+- A cold scene-pass compile ran 6.7 s on an iPhone Air and 9.3 s on an iPad mini 5, so the overlay
+  lifted over frames still held.
+- Each gate now calls `extendScenePaintWait(itsCeiling)` as it kicks (`liveCompileGate`'s
+  `onKick`). A waiter's deadline covers every promise, including one made before it started
+  waiting, and it only ever extends.
+- A scene-pass compile's borrow (no ceiling, below) promises nothing when it starts, and outlasts a
+  gate's 5 s. (A stage precompile session does not: its ceiling counts from the gate's kick, which
+  promised it.) The review of the change caught the gap: on the iPad the overlay would still have
+  timed out 5 s after the kick, releasing game time over an undrawn canvas. So each frame the borrow
+  holds renews the promise (`heldFramePaintWait.ts`), up to `HELD_FRAME_PAINT_WAIT_MAX_MS` per
+  continuous hold (20 s, against a 9.3 s worst measured scene-pass compile). Past that it warns once
+  and the overlay times out; the 3D view stays held until the compile settles, since drawing then is
+  the crash below.
+- **A held frame does not spend the idle grace window (#1252).** A surface that is not playing draws
+  only for 60 frames after something changes (`idleFrameGrace.ts`). When every frame spent one, a
+  game paused before its first paint stopped running the frame after ~1 s of any hold. It then
+  stopped reaching `held()`, so the overlay dropped ~5 s later over a canvas still held. It also
+  stopped ticking a compile gate, so the gate's ceiling release was never seen and nothing drew
+  until the compile settled. Two changes close it:
+  - **Only a submitted frame spends grace.** It is spent next to `markScenePainted()`, the mark
+    only a drawn frame reaches.
+  - **The borrow check runs before the idle gate**, and before the whole ECS→three sync. Every other
+    hold has a ceiling, so a paused surface ticking through one is bounded. A borrow has none, and
+    up there a compile that never settles costs one check per frame. A borrowed frame also no
+    longer runs `syncEnvironment`, which closes #1239 C for frames. C's prewarm path does not go
+    through the frame loop; it is closed separately (see "The writer contract" below).
+  No game pauses during boot (GameShell boots `playing`), so it was observed with injected holds:
+  `demos/postfx-demo`, desktop Chromium on WebGPU, a temporary patch that paused play just before
+  the readiness wait and delayed the swap's live compile by 10 s (2026-09-15).
+  - **Borrow case**, with the delay run inside `borrowRendererTarget`: pre-fix `timeout` at 6.7 s
+    (the 1 s grace plus a 5 s renewal), fixed `painted` at 10.95 s, just after the borrow ended.
+  - **Gate case**, with the delay only: pre-fix, the first submitted frame came at 11.0 s, after the
+    compile settled. Fixed, it came at 5.94 s, at the gate's ceiling release.
+  - The readiness wait still reports `timeout` in the gate case, playing or paused, fixed or not.
+    The promise ends at the ceiling, and the frame the ceiling releases then builds its pipelines
+    synchronously, the iPad finding above.
+
+  Pinned by `idleFrameGrace.test.ts` and `scene3dCompileHoldWired.test.ts`.
+
 ### Precompiling the stack's own stage quads (#323)
 
 **Partially fixed 2026-08-26.** `compileSceneAsync` covers the scene pass. The stack's INTERNAL
@@ -3959,6 +4235,51 @@ optimisation can become a rendering bug, and none was visible from the node grap
   that recompiles every job after the graph stops changing was tried and did NOT fix it, which also
   eliminates compile-order staleness as the cause. Left open deliberately: three attempts did not
   converge, and it is one cheap pipeline out of ten.
+
+### Precompiling every post-FX look before the first paint was tried and reverted (#1246)
+
+**The ask.** `demos/postfx-demo` freezes at each look switch. A switch rebuilds the `PostFXStack`,
+and the rebuilt stack compiles while holding the frame: 3.5 s cold and 1.3 s warm on an iPad mini 5.
+The owner asked for that compile to happen during loading instead, with about 10 s of loading
+acceptable. It worked on desktop and was reverted on the device. The branch history holds the
+code, from `bab4dec66` to `76dc1f513` on `work-qa`, together with `tools-scratch/boot-stall/switchprobe.mjs`
+and `build-ios-1246.sh`. Do not rebuild it without reading this section.
+
+**What was built.**
+1. An engine action, `engine.postfx`, whose timeline markers named every look.
+2. A cache that kept one built stack per declared look.
+3. A queue that compiled each look's scene pass and stage quads, plus one warm draw, behind the
+   overlay.
+4. Two memory and context fixes on top:
+   - a dormant stack released its render targets;
+   - one MRT node per target layout was shared, and the scene pass was drawn at the top level (call
+     depth 0), so looks shared render contexts. Six looks needed 3 scene contexts instead of 6.
+
+**What killed it on the iPad mini 5 (3 GB, `high` tier), measured in order:**
+- **GPU memory.** Holding every look's targets killed the WebGPU device at
+  `renderer.info.memory.total` = 256 MiB, twice. The NPR look alone added about 166 MiB. Releasing
+  dormant targets fixed this.
+- **Time.** The whole list took 41 s on a fresh install and 24 s on a warm relaunch. The dominant
+  cost is a scene-pass compile per render context (12.4 s for NPR on a fresh install), and context
+  sharing did not bring the total near 10 s.
+- **WebContent memory.** Once all six looks were compiled, iOS killed the web view at the first real
+  frame, and the app reloaded in a loop. This happened with targets released and contexts shared.
+- Desktop Chrome was fine throughout, with every compile in the boot burst. So this failure class
+  is invisible without a device.
+
+**The root cause, for whoever tries next.** three caches every material's shader graph per render
+context, and a context is keyed by attachment state, the MRT node `id` and call depth. Each look is
+a new context, so it rebuilds the whole scene's shaders. Keeping N looks ready means N× the compiled
+state resident. On this device that doesn't fit in memory, and it takes longer than an acceptable
+load. Reopen only if one of these changes: a look can be served without its own scene-pass context,
+three stops keying node state by context, or the target devices have more headroom.
+
+**What stayed** (each fixes a defect that exists without the optimisation):
+- game time waits while the overlay is up;
+- the overlay waits as long as a render hold promises (both in § "The DOM overlay hides on the same
+  signal");
+- no frame draws while a scene-pass compile has the render target bound (§ "Gotcha: every async
+  compile on a renderer is serialised").
 
 ### The checklist: what actually goes into a pipeline key
 
@@ -4277,24 +4598,168 @@ TSL node builders have a racy lazy initialization on the **first** compile a ren
 
 The reload is now decided **by path on the dev server**: `isShaderGraphFile` (`engine/plugins/vite-asset-scanner.ts`) matches anything under `runtime/rendering/postfx/` or `runtime/rendering/npr/`, and `handleHotUpdate` sends `modoki:shader-code-changed` instead of letting Vite propagate an update. The renderer (`engine/app/debug/hmrStaleness.ts`) then reloads — via the same unsaved-scene countdown banner the game-code reload uses, so a shader edit can never silently discard scene work. ⚠️ **Do NOT re-add `import.meta.hot.invalidate()` to these modules** (they all used to carry it): `invalidate()` does not force a reload, it propagates to importers and stops at the first one that ACCEPTS — and the only importer is `Scene3D.tsx`, a React Fast Refresh boundary that self-accepts, so it was silently swallowed. Fast Refresh then re-ran the component but not its `[]`-deps effect, leaving the already-built `PostFXStack` (and its stale compiled graph) alive. That is exactly how one DOF `viewZ` fix was concluded "didn't work" three separate times. Since `engine/plugins/**` is not hot-reloadable, restart the editor once after changing the rule itself.
 
-## Gotcha: on three r185 an MRT pass is set up against the BLOOM pass's render target (why three is pinned)
+## Gotcha: every async compile on a renderer is serialised — two overlapping compiles build against each other's render target (#956, #957)
 
-⚠️ **`MRTNode.setup()` (three) resolves its declared output names against
-`builder.renderer.getRenderTarget()` — whatever target is bound at BUILD time.** A name that does not
-match a texture on that target resolves to index `-1`.
+⚠️ **No FRAME may draw while a scene-pass compile has the target bound, either (#1246, #1239 A).**
+Serialising compiles protects compiles from each other, but a frame is not a compile.
+- `PassNode.compileAsync` keeps the pass target and MRT bound across its awaits. A frame gate's 5 s
+  ceiling released a frame into that window on an iPad mini 5, during a cold scene-pass compile at a
+  look switch.
+- That frame drew into the bound target: `writeMask is invalid`, then `setPipeline: invalid
+  RenderPipeline`. The GPU process crashed (`gpuProcessExited reason=Crash`), and every later frame
+  threw until the render loop unregistered itself.
+- `PostFXStack.compileSceneAsync` now runs inside `borrowRendererTarget`, and `Scene3D` returns before
+  drawing while `isRendererTargetBorrowed`. That check deliberately has no ceiling: a held frame is a
+  pause, and a frame drawn in that window kills the renderer.
+- The offscreen capture (`modoki_render_scene`, `render_sequence`) draws outside the frame loop, and
+  the overlap runs both ways: a capture drawn under a bound pass target is the crash above, and a
+  compile whose turn starts during the capture's readback saves `captureRT` as its "previous" target
+  and restores it after the capture has, so every later live frame draws into `captureRT`. So the
+  capture takes a turn on `runExclusivePrecompile` like every compile that binds a target (up to
+  10 s, then refuses), and re-checks that its surface was not torn down or rebuilt while it waited.
+  The cost: a capture's turn now counts against the queue budgets of what comes after it, so a scene
+  swap landing during a capture that takes over 1 s skips the pre-swap prewarm (a warning, then a
+  first-frame stall), and a cold boot can refuse a capture outright.
+- A frame's own `syncEnvironment` is guarded too, since #1252: the borrow check runs before the idle
+  gate and the whole sync. The rest of the renderer's writers follow the contract below.
 
-**On r185 that setup also runs while `UnrealBloomPass`'s internal blur targets are bound** — observed
-four times in one run, against `h0`, `h1`, `h3`, `h4` (⚠️ **`h2` did not appear**, and that is
-unexplained: either a build did not happen for that mip or the log was short). Each carries one
-texture named `UnrealBloomPass.hN`, so **every** declared output misses, `members` is empty, and
-`OutputStructNode` emits `struct OutputType {}` — *"structures must have at least one member"* →
-`Fragment module is invalid` → pipeline creation fails → **black screen**, plus `writeMask is invalid`.
+⚠️ **`Renderer.compileAsync` (three) fixes its render context synchronously, then builds each
+object's node graph after `await`s — `await this._nodes.getForRenderAsync(renderObject)` and an
+`await yieldToMain()` per object — reading `renderer.getRenderTarget()` / `getMRT()` AT THAT
+MOMENT.** `MRTNode.setup()` resolves its outputs against the bound target, and the pipeline
+descriptor's colour targets come from the context fixed at the start. So a compile that binds a
+target and awaits is borrowing renderer-GLOBAL state for its whole duration, and any other compile
+that runs in that window builds against the wrong one.
 
-**r184 never runs the setup against those targets**, and that is the whole behavioural difference —
-the new `-1` guard alone does not explain it, because r184's `members[-1] = …` also leaves `length` at
-0 and would fail identically *if it ever ran there*. Tracked as #956; three is pinned at 0.184.0.
+**The rule: every async compile on a renderer goes through `runExclusivePrecompile`
+(`postfx/precompileSession.ts`)** — the pre-swap prewarm, `compileLiveScene` (which carries
+`PostFXStack.compileSceneAsync`) and `PostFXStack.compileStagesAsync`. A new compile path takes the
+same lock. ⚠️ It must not be taken twice on one path — the inner call waits for the outer one, which
+waits for the inner one — so `compileSceneAsync` deliberately does not lock itself.
 
-⚠️ **The r185 hunk changes THREE things, not one** — quoting only the guard misleads:
+Three consequences of queueing, each found by review and each pinned by a test:
+- **A caller whose wait has no ceiling of its own must not queue without one.** The pre-swap prewarm
+  is awaited by the scene swap, which has no timeout, so it queues through
+  `runExclusivePrecompileWithin` (`PREWARM_MAX_QUEUE_MS`, 1 s) and SKIPS its compile past that —
+  never unlocked, never late. Otherwise a cold compile of the previous scene stalls the next load.
+- **The stage compile's hold ceiling counts from its gate's KICK.** `PRECOMPILE_MAX_HOLD_MS` (4 s)
+  promises the stubbed `render` is gone before the 5 s gate releases a frame (#334); a session begun
+  after a long queue wait would break that, so `compileStagesAsync` carries its kick time into
+  `beginPrecompile` and skips when the wait alone used the budget.
+- **A compile's closure resolves when its turn comes, not when it was kicked** — and that is what
+  `Scene3D` wants (`liveSceneCompileAtTurn`): it reads the stack, camera and liveness at the turn,
+  because a rebuild while queued means the NEW stack's scene pass is what the next frame draws
+  (capturing at the kick lost that warm). A null stack falls back to a canvas compile, a torn-down
+  surface compiles nothing, and a stale disposed stack's `compileSceneAsync` returns.
+
+Also on this path: three's `PassNode.compileAsync` restores the target + MRT only on SUCCESS, so a
+rejected compile left every later frame drawing into the scene pass's own target.
+`compileSceneAsync` undoes it on rejection, and ⚠️ **each binding only while it is still the pass's
+own**. The target is restored while the pass target is bound, and the MRT while `scenePass.getMRT()`
+is bound (#1302). A pass that cannot report its MRT falls back to the target's verdict. The two used
+to share the target's check, but they are independent state: a foreign binder such as
+`PMREMGenerator` saves and restores the target only, so under it the scene MRT stayed bound. An
+unconditional write-back of "what was bound when the compile started" was tried first and is wrong,
+because it re-binds whatever a foreign binder bound in between (it re-bound a capture's `captureRT`
+before captures were queued). A renderer without the getter is left alone rather than bound to
+`null`. Under the contract below a foreign target is unreachable, so one logs a DEV warning.
+
+The stage session's give-back (`forceEnd`) has the same rule in a different shape: the target and
+MRT are restored FIRST, and **every field in its own `try`** (#1303). With one shared `try`, a throw
+from an early, cosmetic field (a setter on a dying renderer) skipped the binding. The swallow stays,
+because a restore must never throw into a frame, but a failed field leaves a DEV warning.
+
+### The writer contract — nothing writes renderer-global state inside a compile (#1239)
+
+The lock serialises compiles against each other only. Everything else that touches the renderer
+follows one rule, in one of three forms:
+- **A frame holds.** `Scene3D` returns before any sync, and before the idle gate, while
+  `isRendererTargetBorrowed` (A, and C's frame path) or `isPrecompileActive` (the stage session).
+  The stage hold used to come after the sync, so a frame could derive a PMREM through the session's
+  stubbed `render`. That draws nothing, and the empty IBL is cached per renderer and source (C's
+  other half, found in #1239's close-out; read from three's `PMREMGenerator`, not observed).
+- **An async user takes a turn.** The offscreen capture (B), and the prewarm's PMREM derivation (C),
+  which happens INSIDE its `runExclusivePrecompileWithin` turn, just before `compileAsync`. Deriving
+  it earlier, while building the throwaway scene, ran it while a previous scene's cold compile could
+  still hold the scene MRT, and the broken PMREM would be cached per renderer and source. While it
+  waits, the throwaway scene binds the RAW source, so the retired-env sweep still sees a holder. A
+  closure alone is invisible to it: a re-import during the wait would free the source, and the turn
+  would then cache a PMREM of a freed texture that nothing ever disposes. Nothing compiles against
+  the raw binding, because the turn swaps it before compiling.
+- **A synchronous write goes through `whenRendererQuiet(renderer, write)`**, which writes now when no
+  turn is queued or running (`isRendererCompiling`), and otherwise queues the write as its own turn,
+  in queue order. Past `QUIET_WRITE_MAX_WAIT_MS` (5 s, the frame gates' ceiling) it writes anyway,
+  and the late turn then does nothing. A compile that never settles must not strand a tier demotion,
+  and writing inside a compile is no worse than D was before this fix. `applyActiveTierToRuntime`'s
+  `shadowMap.enabled` flip (D) is the one user. It is
+  reached from the frame loop before the borrow check and from the before-swap hook, and every
+  compile re-reads that flag after each await, so a mid-compile flip warmed a mix of both shadow
+  variants. Whether r184+ also builds an invalid module from that mix was never measured. The
+  deferral covers both outcomes.
+
+A new writer of the bound target, MRT, `render`, tone mapping, colour space, `xr` or `shadowMap` on a
+live renderer picks one of the three. Not covered: `applyActiveTierToRuntime`'s
+`forceResizeAllSurfaces()` resizes the drawing buffer; whether a resize inside a compile matters was
+not examined.
+
+### How this became #956's black first launch
+
+Until #957 only the stage compile held the lock. The live-scene compile ran outside it, and
+`liveCompileGate` releases the FRAME at its 5 s ceiling **without cancelling the compile**; `Scene3D`
+then reaches `stackCompile.tick()` and kicks the stage compile while the scene compile is still
+building. The stage compile binds bloom's blur targets (`UnrealBloomPass.h0..h4`); the scene
+compile's remaining materials build against them; pipeline creation fails validation — *"Color
+target has no corresponding fragment stage output but writeMask … is not zero"* and
+*"`GPUColorTargetState.format`: Required member is undefined"*, on plain `MeshStandardMaterial`
+pipelines — and the scene never paints. In every broken run below, the failed pipelines were still failing 9 s later.
+
+**Why only a clean install:** the overlap needs the scene compile to outlive a 5 s ceiling, which only
+a COLD pipeline cache does. A relaunch, a redeploy over an install and an editor preview all hit a
+warm cache and finish well inside it — which is why `verify`, both CI legs and both signed release
+builds were green on the broken tree.
+
+### Measured — the overlap is the trigger, on BOTH versions
+
+`demos/postfx-demo`, `--target web`, desktop Chromium (Playwright, WebGPU), 2026-09-15. The overlap is
+forced by shortening the scene gate's ceiling to 100 ms (`?liveHold=100`, from the probe patch):
+
+| three | overlap | serialised | runs with pipeline errors |
+|---|---|---|---|
+| 0.185.1 | forced | no | **5/5** (~30 errors, lantern-only frame) |
+| 0.184.0 | forced | no | **5/5** (10 errors, empty frame) |
+| 0.185.1 | forced | yes | 0/5 |
+| 0.184.0 | forced | yes | 0/5 |
+| either | not forced | no | 0/4 each |
+
+The "yes" rows were re-run against the committed fix, not only the experiment. So **the pin to
+0.184 was never the protection it looked like** — r184 breaks identically once the compiles overlap;
+it simply did not overlap on the devices tried.
+
+**Why r184 did not black-screen on an iOS clean install — timing, measured on the device.** The
+unfixed code overlaps on BOTH versions; what differs is how long the overlap lasts. iPad mini 5,
+`demos/postfx-demo`, clean install, unfixed build, 2026-09-15 (`[PROBE-957]` timings, ms):
+
+| three | scene compile | stage compile kicked | overlap | result |
+|---|---|---|---|---|
+| 0.184.0 | 5310 → 11805 | 10322 | ~1.5 s | no pipeline error, renders |
+| 0.185.1 | 5599 → 16438 | 10618 | ~5.8 s | #956's errors, black for good |
+
+Both cross the 5 s readiness ceiling, so both kick the stage compile on top of the scene compile.
+r184's cold scene compile simply finished ~4.6 s sooner, and in that shorter window no scene material
+happened to build while a bloom target was bound. ⚠️ **That is luck, not a property** — one run, and a
+slower device or a heavier scene widens the window on r184 too. The pin was never the protection.
+
+### What the earlier diagnosis saw, re-read
+
+The `[MRT-ANOMALY]` lines from the iPad (`rtTextures=[UnrealBloomPass.hN] outputs=[output|normal|lineColor]`,
+empty `members`, `struct OutputType {}`) are one way this overlap shows up — a scene MRT built while a
+bloom target was bound — not a change in how r185 schedules `MRTNode.setup()`. The desktop forced
+overlap produced the `writeMask`/`format` pair without any `MRTNode` miss, so which symptom appears
+depends on where the two compiles interleave. The unexplained `rtTextures=[output]` row fits the same
+reading (a foreign single-`output` target bound mid-build) but was not re-measured.
+
+⚠️ **The r185 hunk in `MRTNode.setup()` changes THREE things, not one** — still worth knowing when
+reading r185's MRT code, and quoting only the guard misleads:
 
 ```diff
 -			members[ index ] = vec4( outputNodes[ name ] );
@@ -4304,46 +4769,15 @@ the new `-1` guard alone does not explain it, because r184's `members[-1] = …`
 +			members[ index ] = outputNodes[ name ].convert( type );
 ```
 
-The guard is **not gratuitous** — `getOutputType( index )` does `renderTarget.textures[ index ].type`
-and would throw on `-1`, so the guard is required by the line under it. And the member **type**
-changed from always-`vec4` to one derived from the target's format. Do not read "the guard is the
-difference" as "the guard is the bug".
-
-### ⚠️ When this can fire at all — NOT unconditionally
-
-`requiredMrtTargets` (`postfx/stackPlan.ts`) adds `normal` only for `npr || ao`, and `lineColor` only
-for `npr`; `PostFXStack.ts` calls `setMRT` **only when `targets.length > 1`**. So a project with
-neither NPR nor AO has a single `output` target, **no `MRTNode` is ever built, and this bug cannot
-fire**. AO-only gives two outputs and the same shape with two misses. A future session asking "can we
-lift the r185 ceiling for this project?" must check that gate first — the pin is not unconditional.
-
-### ⚠️ An unresolved question — do not treat the `[output]` row as settled
-
-The device log also carries one `rtTextures=[output] outputs=[output|normal|lineColor] membersLen=1`
-row, on **both** versions, which was written up as the benign "declared but unread" case (below).
-**That explanation may not hold.** `PostFXStack.ts` consumes `normal`/`lineColor` **eagerly in the
-constructor**, gated on the same condition that declares them — so for any pass whose MRT declares
-three, its own target should already hold three textures by build time and `membersLen` should be 3.
-A row showing one texture named `output` may therefore be a **fifth foreign-target build**, i.e. part
-of the bug rather than benign.
-
-**This is unresolved.** The log prints texture *names*, and two different targets whose single texture
-is named `output` are indistinguishable in it. **Next measurement: add `renderTarget.uuid` to the log
-line** (`tools-scratch/three-r185-mrt/instrumentation/`) — one field, one run, and it separates the
-two hypotheses. #1007 was closed as not-a-defect on the benign reading; if this resolves the other
-way, that closure needs revisiting.
-
-⚠️ **Also undisclosed so far, and material:** this engine runs its own precompile session that
-**stubs `renderer.render` and saves/restores `setMRT`/`setRenderTarget`**
-(`postfx/precompileSession.ts`). Any claim that the foreign-target binding is purely three's must
-account for that first — it is also a cheaper repro axis than the ones tried below.
+The guard is **required** — `getOutputType( index )` reads `renderTarget.textures[ index ].type` and
+would throw on `-1` — and the member **type** changed from always-`vec4` to one derived from the
+target's format.
 
 ### The benign case — a `-1` on its own is NOT a bug
 
 The pass allocates exactly the outputs the graph **consumes**, so an unread `normal`/`lineColor`
-legitimately has no texture and skipping it is the documented intent. Measured on both versions,
-one variable at a time (`tools-scratch/three-r185-mrt/minimal-repro.html`, which prints
-`renderTarget.textures` directly):
+legitimately has no texture and skipping it is the documented intent (#1007, retracted on this).
+Measured on both versions, one variable at a time (`tools-scratch/three-r185-mrt/minimal-repro.html`):
 
 | consumed | `renderTarget.textures` |
 |---|---|
@@ -4351,31 +4785,34 @@ one variable at a time (`tools-scratch/three-r185-mrt/minimal-repro.html`, which
 | `output` + `normal` | `[output\|normal]` |
 | `output` + `normal` + `lineColor` | `[output\|normal\|lineColor]` |
 
-What makes a `-1` real is a miss for a name a LIVE stage is reading — the bloom-target case above,
-and possibly the `[output]` row per the open question.
+`requiredMrtTargets` (`postfx/stackPlan.ts`) adds `normal` only for `npr || ao` and `lineColor` only
+for `npr`, and `PostFXStack.ts` calls `setMRT` only when `targets.length > 1` — so a project with
+neither has no `MRTNode` at all. ⚠️ That does NOT exempt it from this gotcha: the overlap corrupts the
+colour-target state of any compile, MRT or not.
 
-**Two things a future session should not re-derive** (both tested and disproved during #956):
-- It is **not** r185's reuse of a module-level `_renderPipelineDescriptor` with a `reset()` after
+**Two theories tested and disproved during #956 — do not re-derive them:**
+- **Not** r185's reuse of a module-level `_renderPipelineDescriptor` with a `reset()` after
   `createRenderPipelineAsync()`. WebKit snapshots the descriptor synchronously; verified with a
   standalone WebGPU page, no three.js involved.
-- It is **not** the F4 prewarm ordering. Building r185 with the F4 placeholder disabled changes
-  nothing.
+- **Not** the F4 prewarm ordering. Building r185 with the F4 placeholder disabled changes nothing.
 
-**Measuring it is cheap — do not reach for a device build.** It reproduces from a plain
-`--target web` build served over LAN and opened in **iPad Safari**, and intermittently (~1 in 20
-loads) in **macOS Safari**. ⚠️ Three traps: Safari caches `index.html` across builds, so serve with
-`Cache-Control: no-store` or you will silently compare the wrong bundle; the failure is
-**self-healing** in Safari — `frameDriver`'s watchdog re-arms the rAF chain and the app paints a few
-seconds later, so a screenshot taken late reads as a pass (the packaged app does not recover, because
-the readiness ceiling reveals the game first); and a `fetch`-based console collector **drops lines**
-under rapid logging, so read the page's own log for anything high-volume.
+### Reproducing it
 
-⚠️ **Reproducing the bloom-target case MINIMALLY is unsolved.** A standalone page with the same MRT
-shape plus `bloom()` does not produce it, with or without effect-graph churn, mid-sequence material
-creation, `BloomNode.setResolutionScale(2)` (note: that is bloom's own internal scale, **new in
-r185** — not the engine's NPR `superSampleScale`, which scales the scene pass), a `setLayers` split,
-or a GTAO stage. So far it needs the full app. That gap, and the un-identified r185 change behind it,
-are what stand between us and an upstream report — `tools-scratch/three-r185-mrt/`.
+**Desktop, deterministic — use this first.** `tools-scratch/three-r185-mrt/overlap/`: apply
+`scene3d-probe.patch` (compile START/END timings + the `?liveHold=` override), run `build-both.sh`
+(builds the installed three and 0.185.1, each with the `[MRT-SETUP]` probe, and restores
+`node_modules`), serve each with `serve.mjs` (`Cache-Control: no-store`), and `repeat.sh <port>
+"?liveHold=100" 5`. To see the unfixed behaviour, build from a tree before the #957 fix. Revert the
+patch before committing anything.
+
+**iOS.** iPad Safari over LAN reproduced #956 reliably from a plain web build, and macOS Safari about
+1 load in 20. Three traps: Safari caches `index.html` across builds, so serve with `no-store` or you
+compare the wrong bundle; the failure can look **self-healing** — `frameDriver`'s watchdog re-arms the
+rAF chain, so a late screenshot reads as a pass; and a `fetch`-based console collector **drops lines**
+under rapid logging. The gate for a three upgrade is a clean-install first launch on the **iPad** (WebGPU —
+the iPhone 8's WebGL2 path does not reproduce it): QA-RENDER-0008,
+`qa/cases/rendering/ios-clean-install-postfx-first-launch.md`, measured red on 0.185.1 without the
+fix and rendering (after ~15 s of black, #1239) with it.
 
 ## Bloom Post-Process
 
@@ -4466,6 +4903,29 @@ The pass is ~85% of the GPU frame at full resolution; halving the resolution tak
 to its 60 fps cap. The same perturbation in the desktop editor (1600×909) moved the GPU frame 8.2 →
 3.9 ms, and `samples` 16 → 4 at full resolution moved it 8.2 → ~4.0 ms — so both knobs reach
 GTAONode live. Not measured: the look at 0.5 on a phone, which is the owner's call.
+
+**Over time the S22 slows down from heat, not from the engine (#1209).** Measured 2026-09-15:
+- **Setup:** `demos/postfx-demo` at `resolutionScale: 0.5`, full tour, 11 minutes (7 loops) in one
+  run, with a synthetic tap every 2 s. Without the taps, Samsung's own governor throttles an
+  untouched phone.
+- **The heavy stations fall loop after loop.** All Composed went 42 → 25 → 23 → 21 → 21 → 19 fps,
+  GTAO 60 → 40 → 32 → 29, DOF 60 → 49 → 34 → 31.
+- **The light stations stay at 60 the whole run**, at the same point in every loop (Bloom on the
+  HorseHead, Vignette).
+- **The GPU ceiling falls in step.** The phone's GPU frequency ceiling (`max_gpuclk`) went
+  818 → 599 → 350 → 285 → 220 MHz, thermal status reached 3 (severe) inside loop 3, and the GPU
+  sat at 99% busy on the heavy stations.
+- **Not the CPU:** CPU time per frame is 5–10 ms, and the big cores' frequency limit went back to
+  full after loop 2.
+- **Not the tier:** it stayed `high` with no tier events. Calibration demotes on CPU cost only, so
+  it cannot see this.
+
+**The decisive control:** a fresh launch on the still-hot phone reproduced loop-7 fps from its
+first loop (All Composed 19.8, GTAO 25.9, DOF 31.9). So the drop is GPU thermal throttling and
+nothing that accumulates in the app.
+
+That run also exposed a separate problem: **look switches leak ~50 MB of GPU textures per loop**
+(#1269). It does not cost fps: the light stations hold 60 while it climbs.
 
 ⚠️ **Always passes a REAL normal buffer — the "nullable normalNode" cheap path is broken here.**
 `ao()`'s `normalNode` argument is documented as nullable (GTAO reconstructs normals from depth
@@ -4649,10 +5109,10 @@ Shared placement knobs: `width`/`height` (half-extents), `pivotX`/`pivotY` (0 = 
 
 - **Asset shape.** A `.shader.json` with `space:'2d'` + a `params` block, plus sibling `<name>.wgsl` / `<name>.glsl` bodies (Pixi v8 is WebGPU-preferred, so both backends ship). The body is a fragment MAIN snippet that writes `outColor` (a premultiplied vec4; the base high-shader multiplies it by `vColor` = the mesh tint/alpha). Available in the body: `vUV` (the texture-space UV — 0..1 for a whole-image sprite, the atlas sub-rect for a slice), `uTexture`/`uSampler` (the sampled texture), and the params as a uniform block — WGSL `matUniforms.<param>`, GLSL loose `<param>`. One configured shader = one material (v1); multiple looks = multiple assets.
 - **Builder** — `pixiShaderBuilder.ts` generalizes the MTSDF text shader (`mtsdfPixiShader.ts`): it composes Pixi's own high-shader bits (`localUniformBit` transform, `textureBit` sampler, `roundPixelsBit`) + ONE generated custom bit that declares the uniform block (a WGSL `struct MatUniforms` at `@group(3)`, or GLSL loose uniforms) and splices the authored body — so the engine owns only the fragment maths. It compiles **only the active backend's** program (resolved by the shared `canvas2DPool.resolvePixiBackend`, honoring the `pixi.backend` override so the program always matches the live renderer), once per asset; each entity mints its OWN `Shader` (its own `UniformGroup`) so uniforms are per-entity. **Reserved-name guard:** a param keyed like a Pixi built-in (`uColor`/`uTexture`/`uResolution`/…) is rejected at build + validation (it would break the WebGL fallback where uniforms are loose globals).
-- **Cache** — `spriteMaterialCache.ts` resolves a material GUID → compiled program, lazily and deduped (a failed compile is marked so it isn't retried every frame). World-lifecycle: cleared **unconditionally** on world swap / teardown (a compiled program holds no GPU memory of its own — Pixi caches the underlying programs by source and each live per-entity `Shader` holds its own reference — so a clear strands no GPU memory, and clearing on swap is what makes an edited `.shader.json` recompile on hot-reload). ⚠️ **The clear is not just a map wipe** (#523): it bumps a `generation` that an in-flight compile captures beforehand and re-checks on resolve, so a compile superseded by a clear writes nothing back. That guard has to run *before* the `.then` touches any map — a new compile for the same GUID may already own the `loading`/`waiters` entries, and deleting those orphans it. Because a superseded resolve fires no `onReady`, the clear itself wakes the pending waiters: `Scene2DRenderer.stop()` clears this **shared** cache while a sibling viewport is still drawing and re-dirties only the instance going away, so without that wake the survivor sits on a fallback sprite until an unrelated dirty. The GUID is a scene resource (`type:'shader'`, no-op acquire — tree-shaker keep; the `.wgsl`/`.glsl` siblings are kept by the shader-manifest sweep).
-- **Rendering** — Scene2D draws a material entity in a SEPARATE pass (like the skinned/text passes, so it can't destabilize the sprite change-detection) as a `Mesh`: a pivot quad (`buildMaterialQuad`, sized like a primitive) + the per-entity `Shader`, with `blendMode`/tint/alpha/transform/paint applied. The sprite pass skips a material entity once its program is ready and falls back to the default sprite/tint while it loads (an `onReady` wake re-renders when the async compile lands, even while the sim is stopped). Each entity's `Shader` is registered in a Scene2D-owned `entityShaders` map (published via `sprite2DMaterialBroker` for the driver) and disposed with its slot. Each entry carries the entity's koota **generation**, and every broker read checks it (#848): the key is the masked index, which a despawn+respawn reclaims LIFO, and the driver reads the broker at ECS priority 0 — *before* the purge below runs at render priority. ⚠️ **The stamp must be re-written on the slot-REUSE path, not only when a Mesh is built** — a respawn resolving the same material and texture passes the rebuild gate, so the renderer draws the newcomer with the dead entity's Shader, and the purge keeps that entry because the newcomer *is* rendering. A read-side check with no re-stamp therefore refuses the driver the very Shader on screen, permanently: the entity renders frozen at the dead one's last uniforms with no redraw ever armed. Storing the generation is half the shape `engine-concepts.md` § Entity prescribes; *rebuilding on a mismatch* is the other half. ⚠️ The re-stamp restores the driver's **access** to the reused Shader; it does **not** reset that Shader's uniform values, which are seeded only on a build. That second half is **#873**, closed by a SEPARATE block just above the re-stamp: the slot carries its own `matGen` (the generation its Shader's uniform state belongs to), and on a mismatch the pass re-seeds `matUniforms` from `buildUniformValues(program, undefined)` — the program defaults, which for a 2D material ARE the authored values (`Renderable2D.material` resolves straight to the `.shader.json`; the build itself passes `values: undefined`) — and marks the entity built so the canvas redraws. **The invariant: a respawn renders identically whether or not it reclaimed a dead entity's index.** ⚠️ **`matGen` is on the SLOT, not read out of `entityShaders`, and that distinction is load-bearing** — the map's lifetime is strictly SHORTER than the slot's, because the per-frame purge drops the stamp on any frame this pass skips the entity while the sweep keeps the slot (the sprite pass adds the id to `activeIds` and can then early-return without replacing it — a material still compiling plus a sprite ref with no 2D variant does it). #873's first cut keyed the reset off the map and therefore skipped exactly the case it exists for; its own close-out review caught that, and `tests/runtime/Scene2D.test.ts` pins it. The general rule: **key a reset off the thing being reset**, which is the same reason `geomSig` lives on the slot rather than on a `lastRender` snapshot. ⚠️ **Reset in place, deliberately NOT a rebuild** — see `engine-concepts.md` § Entity: rebuilding the Shader here would trade the bug for #699's `BindGroupSystem._hash` growth (two permanent entries per `new Shader`, cleared only at renderer teardown) on precisely the pooled-respawn path, which is what the #692 `matBuildSig`/`matQuadSig` split and the #698 frame swap exist to keep off. What licenses the in-place reset is that `matUniforms` is provably the WHOLE per-entity payload a surviving slot carries: the Mesh's placement/appearance is rewritten unconditionally every frame, the quad by `matQuadSig`, the sampled texture by `matBuildSig` + `builtEpoch`, `uTextureMatrix` by the frame swap, and the extra samplers by `extraSig` (which folds in this entity's own `kind:'texture'` overrides). Add per-entity state to a material slot and that enumeration is what you must extend. ⚠️ **Every in-place uniform write in the 2D layer writes into the group's `uniforms` bare, with no `update()`/`_dirtyId` bump, and that is correct ONLY because these `UniformGroup`s take Pixi's default `isStatic: false`.** There are **five**, and they share the one dependency: this reset; `applyOverrides2D` (the `MaterialInstance` driver); `updateMtsdfPixiMetrics` (#690's `uScreenPxRange`); `updateMtsdfPixiStyle` (eleven text style uniforms); and the #698 frame swap's `uTextureMatrix`. Count them from the code rather than from this list if you are about to rely on it — an earlier version of this paragraph said "three" and omitted the last two, which is exactly the shape of audit that would then set `isStatic: true` on the groups it had not looked at. Verified against pixi.js 8.20.1: `UboSystem.updateUniformGroup` (WebGPU/UBO) and `GlUniformGroupSystem.updateUniformGroup` both short-circuit their `_dirtyId` early-out when `isStatic` is false, and both sync functions read `uniforms[name]` at sync time — so replacing a value, including swapping in a fresh `Float32Array` for a vec/color, is picked up on either backend. Constructing one with `isStatic: true` (an obvious-looking optimisation) would silently strand all three writes.
+- **Cache** — `spriteMaterialCache.ts` resolves a material GUID → compiled program, lazily and deduped (a failed compile is marked so it isn't retried every frame). World-lifecycle: cleared **unconditionally** on world swap / teardown (a compiled program holds no GPU memory of its own — Pixi caches the underlying programs by source and each live per-entity `Shader` holds its own reference — so a clear strands no GPU memory, and clearing on swap is what makes an edited `.shader.json` recompile on hot-reload). ⚠️ **The clear is not just a map wipe** (#523): it bumps a `generation` that an in-flight compile captures beforehand and re-checks on resolve, so a compile superseded by a clear writes nothing back. That guard has to run *before* the `.then` touches any map — a new compile for the same GUID may already own the `loading` entry, and deleting it orphans that compile. Because a superseded resolve fires no wake, a clear that superseded a compile fires the shared `fireDirtyListeners()` itself (#1368 — it used to fire a per-caller `onReady` set): `Scene2DRenderer.stop()` clears this **shared** cache while a sibling viewport is still drawing and re-dirties only the instance going away, so without that wake the survivor sits on a fallback sprite until an unrelated dirty. The GUID is a scene resource (`type:'shader'`, no-op acquire — tree-shaker keep; the `.wgsl`/`.glsl` siblings are kept by the shader-manifest sweep).
+- **Rendering** — Scene2D draws a material entity in a SEPARATE pass (like the skinned/text passes, so it can't destabilize the sprite change-detection) as a `Mesh`: a pivot quad (`buildMaterialQuad`, sized like a primitive) + the per-entity `Shader`, with `blendMode`/tint/alpha/transform/paint applied. The sprite pass skips a material entity once its program is ready and falls back to the default sprite/tint while it loads (the cache's store fires the shared dirty wake when the async compile lands, so it re-renders even while the sim is stopped — #1368). Each entity's `Shader` is registered in a Scene2D-owned `entityShaders` map (published via `sprite2DMaterialBroker` for the driver) and disposed with its slot. Each entry carries the entity's koota **generation**, and every broker read checks it (#848): the key is the masked index, which a despawn+respawn reclaims LIFO, and the driver reads the broker at ECS priority 0 — *before* the purge below runs at render priority. ⚠️ **The stamp must be re-written on the slot-REUSE path, not only when a Mesh is built** — a respawn resolving the same material and texture passes the rebuild gate, so the renderer draws the newcomer with the dead entity's Shader, and the purge keeps that entry because the newcomer *is* rendering. A read-side check with no re-stamp therefore refuses the driver the very Shader on screen, permanently: the entity renders frozen at the dead one's last uniforms with no redraw ever armed. Storing the generation is half the shape `engine-concepts.md` § Entity prescribes; *rebuilding on a mismatch* is the other half. ⚠️ The re-stamp restores the driver's **access** to the reused Shader; it does **not** reset that Shader's uniform values, which are seeded only on a build. That second half is **#873**, closed by a SEPARATE block just above the re-stamp: the slot carries its own `matGen` (the generation its Shader's uniform state belongs to), and on a mismatch the pass re-seeds `matUniforms` from `buildUniformValues(program, undefined)` — the program defaults, which for a 2D material ARE the authored values (`Renderable2D.material` resolves straight to the `.shader.json`; the build itself passes `values: undefined`) — and marks the entity built so the canvas redraws. **The invariant: a respawn renders identically whether or not it reclaimed a dead entity's index.** ⚠️ **`matGen` is on the SLOT, not read out of `entityShaders`, and that distinction is load-bearing** — the map's lifetime is strictly SHORTER than the slot's, because the per-frame purge drops the stamp on any frame this pass skips the entity while the sweep keeps the slot (the sprite pass adds the id to `activeIds` and can then early-return without replacing it — a material still compiling plus a sprite ref with no 2D variant does it). #873's first cut keyed the reset off the map and therefore skipped exactly the case it exists for; its own close-out review caught that, and `tests/runtime/Scene2D.test.ts` pins it. The general rule: **key a reset off the thing being reset**, which is the same reason `geomSig` lives on the slot rather than on a `lastRender` snapshot. ⚠️ **Reset in place, deliberately NOT a rebuild** — see `engine-concepts.md` § Entity: rebuilding the Shader here would trade the bug for #699's `BindGroupSystem._hash` growth (two permanent entries per `new Shader`, cleared only at renderer teardown) on precisely the pooled-respawn path, which is what the #692 `matBuildSig`/`matQuadSig` split and the #698 frame swap exist to keep off. What licenses the in-place reset is that `matUniforms` is provably the WHOLE per-entity payload a surviving slot carries: the Mesh's placement/appearance is rewritten unconditionally every frame, the quad by `matQuadSig`, the sampled texture by `matBuildSig` + `builtEpoch`, `uTextureMatrix` by the frame swap, and the extra samplers by `extraSig` (which folds in this entity's own `kind:'texture'` overrides). Add per-entity state to a material slot and that enumeration is what you must extend. ⚠️ **Every in-place uniform write in the 2D layer writes into the group's `uniforms` bare, with no `update()`/`_dirtyId` bump, and that is correct ONLY because these `UniformGroup`s take Pixi's default `isStatic: false`.** There are **five**, and they share the one dependency: this reset; `applyOverrides2D` (the `MaterialInstance` driver); `updateMtsdfPixiMetrics` (#690's `uScreenPxRange`); `updateMtsdfPixiStyle` (eleven text style uniforms); and the #698 frame swap's `uTextureMatrix`. Count them from the code rather than from this list if you are about to rely on it — an earlier version of this paragraph said "three" and omitted the last two, which is exactly the shape of audit that would then set `isStatic: true` on the groups it had not looked at. Verified against pixi.js 8.20.1: `UboSystem.updateUniformGroup` (WebGPU/UBO) and `GlUniformGroupSystem.updateUniformGroup` both short-circuit their `_dirtyId` early-out when `isStatic` is false, and both sync functions read `uniforms[name]` at sync time — so replacing a value, including swapping in a fresh `Float32Array` for a vec/color, is picked up on either backend. Constructing one with `isStatic: true` (an obvious-looking optimisation) would silently strand all three writes.
 - **Redraw gate (`MaterialSnap`)** — a material's uniforms are usually the only thing that moves per frame, and the driver writes them straight into the `UniformGroup` with no render-visible signal, so the pass can't tell a changed frame from a static one on its own. Rather than force a GPU pass every running frame, the material pass dirties its canvas only when (a) the `Mesh` was just (re)built, (b) an external edit/load/swap forced it, (c) the placement/appearance moved vs a per-entity `MaterialSnap`, or (d) a driver wrote a NEW uniform value this frame: `materialInstanceSystem` compares-before-write and, on an actual change, flags the entity through `sprite2DMaterialBroker` (a per-frame map of id → generation that it clears at the top of its pass, at ECS priority — before the render passes read it; the generation is there because the mark and the read straddle the same recycled-index window as the Shader lookup, #848). So an animating material still redraws each frame, but a static-uniform one (no driver, a constant curve, or a stopped clock) costs zero redraws once settled.
-- **Sampling the sprite bitmap.** The material Mesh samples the entity's OWN `Renderable2D.sprite` as `uTexture` (`resolveMaterialTexture` resolves the GUID and loads it through the shared `spriteTextureRefs` refcount, exactly like the sprite pass — retained on build, released in `disposeSlot`). While the texture loads — or when the entity has no image sprite (a purely procedural shader like `gradient-scroll`) — it falls back to `Texture.WHITE`; the resolved url is part of the slot's REBUILD signature (`matBuildSig`), so the Mesh re-mints with the real bitmap the frame it becomes resident. The quad's size/pivot is deliberately NOT in it (#692): those live in `matQuadSig` and are applied by rewriting the geometry's 8 position floats in place, because a `Shader` rebuild adds two PERMANENT entries to WebGPU's `BindGroupSystem._hash` (#699) and a never-deleted key to pixi's `GCManagedHash` (#707) — so an animated size in the build signature was unbounded growth, not just wasted work. A texture is only bound once its `source` is live (a cached-but-mid-decode/stale texture would otherwise crash the shader on `source.style`). Example: `games/3d-test/.../shaders/dissolve.{shader.json,wgsl,glsl}` (samples `uTexture`, burns it away by a hashed-noise `uThreshold`), driven by a MaterialInstance `time` curve — demo scene `games/3d-test/.../scenes/2d-material-demo.scene.json`. An **atlas slice** (a `resolved.frame`) binds a per-slot framed WRAPPER Texture whose uv matrix (`uTextureMatrix` = the texture's `mapCoord`) maps the quad's 0..1 UVs into the sub-rect, so the shader samples the right pixels (a whole image borrows the base texture, identity matrix); the wrapper is `destroy(false)`d in `disposeSlot` (source kept for the refcount). `matBuildSig` deliberately does NOT carry the sprite ref (#698): two slices of one sheet share a url and a texture SOURCE, so an atlas frame swap is one `uTextureMatrix` write in place — the ref lives in `slot.matSpriteRef`, and "sig equal, ref moved" IS the frame-swap case. If the shader's uniform group is not reachable the fast path REFUSES itself and falls through to a full rebuild, rather than swapping the texture and leaving the matrix stale (which would animate the ECS while rendering frame 0 forever, with every test green). `vUV` is therefore texture-space (0..1 whole, sub-rect for a slice).
+- **Sampling the sprite bitmap.** The material Mesh samples the entity's OWN `Renderable2D.sprite` as `uTexture` (`resolveMaterialTexture` resolves the GUID and loads it through the shared `spriteTextureRefs` refcount, exactly like the sprite pass — retained on build, released in `disposeSlot`). While the texture loads — or when the entity has no image sprite (a purely procedural shader like `gradient-scroll`) — it falls back to `Texture.WHITE`; the resolved url is part of the slot's REBUILD signature (`matBuildSig`), so the Mesh re-mints with the real bitmap the frame it becomes resident. The quad's size/pivot is deliberately NOT in it (#692): those live in `matQuadSig` and are applied by rewriting the geometry's 8 position floats in place, because a `Shader` rebuild adds two PERMANENT entries to WebGPU's `BindGroupSystem._hash` (#699, filed upstream as [pixijs#12214](https://github.com/pixijs/pixijs/issues/12214)) — so an animated size in the build signature was unbounded growth, not just wasted work. (This once also cited a never-deleted `GCManagedHash` key, #707; that half was disproved 2026-09-18 — see the two-tier gate section.) A texture is only bound once its `source` is live (a cached-but-mid-decode/stale texture would otherwise crash the shader on `source.style`). Example: `games/3d-test/.../shaders/dissolve.{shader.json,wgsl,glsl}` (samples `uTexture`, burns it away by a hashed-noise `uThreshold`), driven by a MaterialInstance `time` curve — demo scene `games/3d-test/.../scenes/2d-material-demo.scene.json`. An **atlas slice** (a `resolved.frame`) binds a per-slot framed WRAPPER Texture whose uv matrix (`uTextureMatrix` = the texture's `mapCoord`) maps the quad's 0..1 UVs into the sub-rect, so the shader samples the right pixels (a whole image borrows the base texture, identity matrix); the wrapper is `destroy(false)`d in `disposeSlot` (source kept for the refcount). `matBuildSig` deliberately does NOT carry the sprite ref (#698): two slices of one sheet share a url and a texture SOURCE, so an atlas frame swap is one `uTextureMatrix` write in place — the ref lives in `slot.matSpriteRef`, and "sig equal, ref moved" IS the frame-swap case. If the shader's uniform group is not reachable the fast path REFUSES itself and falls through to a full rebuild, rather than swapping the texture and leaving the matrix stale (which would animate the ECS while rendering frame 0 forever, with every test green). `vUV` is therefore texture-space (0..1 whole, sub-rect for a slice).
 - **Extra samplers (`texture` params).** A shader can declare `texture`-typed params — each becomes an ADDITIONAL sampler beyond the entity's own `uTexture`. A texture param's VALUE is its manifest `default` (a sprite GUID) OR a per-instance `MaterialInstance` override with `kind:'texture'` + a `ref` on that target (a STATIC swap — MaterialInstance *sources* drive only scalar uniforms, so a texture ref isn't animated; `readTextureOverrides` collects them, the override wins over the default, and the resolved url is in `matBuildSig` so an inspector edit rebuilds the Mesh with the new texture). Scene2D resolves each WHOLE-image through the same `spriteTextureRefs` refcount + KTX2/WebP variant seam as the sprite (`resolveMaterialTexture(ref, wholeOnly)`), retains each url on build (stored in `slot.materialTexUrls`), releases them in `disposeSlot`, and binds them in `makePixiShaderInstance`. An unresolved extra texture binds `Texture.WHITE` (WebGPU needs every declared group-3 binding present) and `matBuildSig`'s `extraSig` forces exactly one rebuild when it lands. **WGSL binding:** the custom bit declares extra textures in `@group(3)` at binding `1+2i` (texture) / `2+2i` (`<key>Smp` sampler) — binding 0 stays reserved for `matUniforms` — so a texture param `uFoo` is sampled `textureSample(uFoo, uFooSmp, vUV)` (WGSL) or `texture(uFoo, vUV)` (GLSL). Extra textures are whole-image (no atlas sub-rect) and sampled at the sprite-space `vUV`. **Authoring footgun:** never write `@group(N)`/`@binding(N)` in a WGSL body COMMENT — Pixi's `extractStructAndGroups` regex only skips a decorator when the char before `@` is `/`, so `// @group(3) … ;` (space after `//`) is parsed as a real binding and silently fails the whole material. Example: `games/3d-test/.../shaders/reveal.{shader.json,wgsl,glsl}` (cross-fades the sprite with a Metal texture bound to `uReveal`, mix driven by a MaterialInstance) in `2d-material-demo.scene.json`. **Build:** the asset tree-shaker keeps extra-sampler textures in prod — `processShader` follows a 2D shader's `texture`-param `default` GUIDs and `probeTraitRefs` follows `MaterialInstance` `kind:'texture'` override refs (both were previously shaken out → a 404 in prod). **Runtime gap:** like every 2D texture, an extra sampler loads LAZILY (one-frame pop-in) — not scene-pre-acquired; the scene `resources` manifest lists override refs (via `collectResourceRefsFromEntities`) but not the async shader-manifest defaults. Scalar-VALUE overrides remain **uniform-only** and **scalar-only** (see the MaterialInstance section); a `kind:'texture'` override is the only non-scalar override kind, and it's 2D-only.
 
 ### Editing a shader: what invalidates what
@@ -4715,7 +5175,55 @@ Found via Court's memo pen marks, which rendered nothing while being perfectly c
 `renderFrame` used to re-tessellate + GPU-render every Canvas2D every frame; a two-tier gate fixes that:
 1. **Idle whole-frame skip** — while the sim is stopped / paused, 2D only changes via paths that set `_externalDirty` (editor edits, async texture loads, canvas resizes, world swaps, play-state changes), so idle + clean ⇒ no ECS scan, no render. One more signal is read BEFORE the skip rather than setting the flag: `hasAny2DMaterialDirty()`, the material driver's "a uniform changed this frame" mark, whose per-entity read otherwise sits inside the scan the skip returns before.
 
-   ⚠️ **Anything a stopped 2D renderer reads that is NOT an ECS trait write must wake it itself — and the wake belongs in the WRITER, not the call site** (#1141). Found live, five times in one pass, each looking like "the edit did nothing" until an unrelated trait write redrew it: a Skin-editor weight paint (the rig cache), a particle def edit (the particle cache), a SceneView 2D gizmo / group / collider-point drag and its undo (direct `entity.set`, which bypasses `writeTraitField`'s broadcast), and a material uniform the driver re-wrote after a Shader rebuild. The rule the fixes follow: a cache's ONE store function calls `fireDirtyListeners()` (`rig2dCache`'s `storeRig`, `particleCache`'s `storeEffect`, as `registerAsset` already did), so every writer — editor panel, undo closure, agent op, a load that resolves while stopped — is covered at once; a direct `entity.set` fires it after the write, as the 3D gizmo drag always did. `mark2DDirty` is NOT a substitute: it reaches only the SceneView's chrome overlay. Not every cache needs it — `spriteAnimCache`, `animationClipCache` and `timelineCache` feed systems that do not run while stopped, and the editor's previews wake the loop on their own.
+   ⚠️ **Anything a stopped 2D renderer reads that is NOT an ECS trait write must wake it itself — and the wake belongs in the WRITER, not the call site** (#1141). Found live, five times in one pass, each looking like "the edit did nothing" until an unrelated trait write redrew it: a Skin-editor weight paint (the rig cache), a particle def edit (the particle cache), a SceneView 2D gizmo / group / collider-point drag and its undo (direct `entity.set`, which bypasses `writeTraitField`'s broadcast), and a material uniform the driver re-wrote after a Shader rebuild. The rule the fixes follow: a cache's ONE store function calls `fireDirtyListeners()` (`rig2dCache`'s `storeRig`, `particleCache`'s `storeEffect`, as `registerAsset` already did), so every writer — editor panel, undo closure, agent op, a load that resolves while stopped — is covered at once; a direct `entity.set` fires it after the write, as the 3D gizmo drag always did. `mark2DDirty` is NOT a substitute: it reaches only the SceneView's chrome overlay. Not every cache needs it — `spriteAnimCache`, `animationClipCache`, `timelineCache` and `animSetCache` feed systems that do not run while stopped, and the editor's previews wake the loop on their own. (`animSetCache` was missing from this list until #1363's sweep; it is the one of the four that `scene3DSync` also reads, via `resolveAnimSetParams`/`getAnimSet`, but only to resolve skeletal-animation params — which are frozen when stopped, so the exemption holds for the same reason. An unlisted cache leaves the next reader re-deriving a verdict, which is why it is named rather than left to inference.)
+
+⚠️ **The rule is not 2D-only, and the 3D model caches were the last exception to it (#1363).** Exactly
+the same shape, one layer over: `meshTemplateCache` and `riggedModelCache` announced their load edge
+on a PRIVATE channel (`modelLoadNotify.ts`), whose only subscriber in the repo was the editor's
+`SceneView` — so the stopped **GameView** (`Scene3D`, idle-gated on the same two-tier logic) never
+learned a re-imported GLB had finished parsing. The evict edge emptied it, the ~1 s grace expired,
+and the model was gone until something unrelated dirtied the surface. Both caches call
+`fireDirtyListeners()` now and the channel is deleted, so the rule above reads the same for every
+cache and every surface: **the wake belongs in the writer, and the writer calls the SHARED signal.**
+A private per-cache channel is the anti-pattern — it serves whoever happened to subscribe, and
+silently omits every surface added later. `runtime/core/renderDirty.ts`'s header carries the
+measurement; `docs/editor.md` § the SceneView dirty-gate list carries the QA-ASSET-0008 history.
+
+**The texture and asset stores follow it too (#1368), and so do the two channels that were still
+private.** The writers that wake, each in its ONE store: `loadTexture3D` (every 3D texture —
+material maps, both 3D particle backends), `loadPixiTexture` (every Pixi texture), `fetchMeshAsset`
+(a `.mesh.json` that lands after its GLB was already parsed by someone else, so neither the parse
+nor `registerAsset` fired), and the billboard page job in `scene3DSync`. `spriteMaterialCache` and
+`fontTexturePixi` used to announce on per-caller `onReady` sets that only callbacks-passing Scene2D
+renderers heard; both are deleted. The material cache now calls `fireDirtyListeners()`, and the
+font atlas calls `markTextDirty(fontId)`. That is a SHARED hub too, which Scene2D, Scene3D and
+SceneView all subscribe to, and it also bumps that font's text version. Three rules came out of it:
+- **Never wake on a cache HIT.** Scene2D and the particle backends call these stores from the draw
+  path, and a hit that woke would keep the idle gate awake forever. Each store decides "miss"
+  before it loads (`loadPixiTexture` asks after evicting a sourceless corpse, so a corpse counts
+  as a miss). And a miss must be SINGLE-FLIGHT: Pixi publishes to its cache only on resolve, so
+  every call during an in-flight load also reads as a miss, and Scene2D's skinned-part path calls
+  once per frame until the texture is live — `loadPixiTexture` lets one call per url own the wake,
+  so a 2 s load lands one wake, not ~120.
+- **Wake on a REJECT only if no caller retries per frame.** `loadTexture3D` wakes on a reject,
+  because the particle backends reveal their radial fallback on it and every caller loads once per
+  build. `loadPixiTexture` does NOT: Scene2D's material-sprite path retries a failed url on every
+  dirty frame (#1374), so a reject wake would turn a 404 into a render loop. A consumer that
+  reveals something on failure wakes for itself (`pixiParticleBackend`).
+- **The consumer's reaction must land before the woken frame.** A wake is just flags, and the
+  frame is a later rAF. So a particle emitter that reveals in its own `.then` on the store's
+  promise is covered without a wake of its own. `particleTextureWaitReveal`/`gpuParticleTextureWait`
+  pin exactly that against the real resolver.
+
+Where this is reachable: every render-on-demand surface — a stopped/paused Scene3D (the GameView),
+a stopped Scene2D, and SceneView without +FX (it subscribes to both hubs) for the texture, mesh and
+font refills. The PARTICLE half is narrower: only a stopped/paused GameView, since the Particle
+Editor's preview renders every rAF with no gate and SceneView syncs particles only with +FX, which
+keeps it live. Confirmed as needing NO wake, so the next sweep can skip
+them: `fontLoader` (it feeds DOM UI text only, which the browser repaints itself; canvas text is
+MTSDF) and the prefab cache (every `acquirePrefab` caller is inside a SceneManager load, which is
+dirty throughout). Out of this family: a `.mesh.json`-only EDIT reaches no invalidator at all
+(#1380). That refill never starts, so no wake can help it.
 
    ⚠️ **A wake that is now honoured turns a harmless per-frame "change" into a per-frame render.** Two surfaced in the same review: a `time` source with `wrap: 0` yields NaN, and `NaN !== NaN` marked its entity dirty every frame (the driver now never writes a non-finite value); and a rig whose sprite never resolves rebuilt its skin buffer every frame (the retry now waits for the unresolved count to drop). Before adding a wake, ask what else already writes that signal every frame.
 2. **Per-entity change detection** — a `RenderSnap` / `MeshSnap` / `TextSnap` per entity captures the exact inputs that determine its output; only Canvas2D hosts with a CHANGED entity are GPU-rendered (`dirtyCanvases` → `pool.renderAll(dirtyIds)`). `preserveDrawingBuffer: true` keeps a skipped canvas's last frame on screen across a browser recomposite (scroll, ancestor transform, tab refocus) — but that is belt-and-braces, NOT the property the skip rests on: retention was measured to hold on WebGPU too, which has no such flag. Reading this line as a WebGL-only guarantee is exactly what produced #455's falsified first diagnosis.
@@ -4740,10 +5248,23 @@ separate lists there (`childrenToUpdate` vs `childrenRenderablesToUpdate`), so a
 MOVES never enters the view list at all — unless we clear it.
 
 The same reasoning is why a size edit must not rebuild a `Shader`: every rebuild adds two permanent
-entries to WebGPU's `BindGroupSystem._hash` (#699) and a never-deleted key to pixi's `GCManagedHash`
-(#707), so an animated width was unbounded growth. **Both text paths now rebuild geometry only** —
+entries to WebGPU's `BindGroupSystem._hash`, so an animated width was unbounded growth. **Both text
+paths now rebuild geometry only** —
 the 2D one reclaims its `Shader` (#690), the 3D one reclaims its per-page TSL material (#692), each
 gated on an atlas-identity check that REFUSES the reuse rather than proceeding half-applied.
+
+⚠️ **That justification used to name a second cache, and half of it was wrong** (corrected
+2026-09-18). It read *"…and a never-deleted key to pixi's `GCManagedHash` (#707)"*. The
+`BindGroupSystem._hash` half is real and is now measured — 1 permanent entry per `Shader`, linear to
+4,204 over 4,000 create/destroy cycles, surviving a real browser GC and an explicit
+`renderer.gc.run()` — and is filed upstream as **pixijs/pixijs#12214**. The `GCManagedHash` half is
+**not** unbounded: `remove()` does leave the key, but the null value is a **tombstone** that
+`GCSystem.runOnHash` counts and compacts at 10,000 via `_createHashClone`, so the growth is bounded
+at ~10k keys per hash. Measured: 12,000 add/unload cycles leave 12,000 keys, and one `runOnHash`
+pass takes it to 1 (`tools-scratch/webkit-gpu-leak/repro/gcmanagedhash-compaction.mjs`).
+**#707's title asserts "grows unboundedly on the JS heap" and is wrong**; it is closed NOT_PLANNED
+and carries a correction comment. The design decision here is unaffected — the `_hash` half alone
+makes an animated size unbounded growth, so the `matBuildSig`/`matQuadSig` split stands on its own.
 
 **Two invariants the dirty gate depends on (#455), both measured on a wordweave level advance that rebuilds the crossword clip mask and disposes the old one in the same frame:** (1) a `Mask2D` slot's outgoing display object + owned ramp texture are DESTROYED one frame LATER than the pass that disposes the slot — destroying them mid-pass leaves PixiJS's `AlphaMaskPipe` holding a bind group whose resource just went null, and the `renderAll` at the end of that same pass throws. (2) a render that throws sets `slot.redrawOwed`, which overrides the dirty set on the NEXT `renderAll` regardless of `dirtyCanvases` — the aborted render already cleared the surface, so the frame it presented was blank, and `Scene2D` rebuilds `dirtyCanvases` from scratch every frame so the failed attempt consumed the only flag that would have redrawn it. Without (2), one swallowed throw left a canvas blank INDEFINITELY — the session ran to its end still blank, with no frame count recorded — until an unrelated edit (a tap, an MCP call, a resize) happened to dirty it. ⚠️ **The same aborted render LOOKS different per platform, which is why this arrived as two separate reports.** Chromium/Electron presented the cleared frame, so the panel went BLANK; iOS Safari's WebGPU never presented that frame at all, so the OLD board stayed on screen until a tap. Identical cause, opposite-looking symptom — so a stale 2D canvas and a blank one are worth suspecting together. Confirmed fixed on both surfaces (editor, and an iPhone Air on iOS 26.6 running a build with the fix).
 
@@ -5038,7 +5559,7 @@ consequences the pool now handles explicitly, each with a mutation-verified test
 - **The default font is ENGINE-provided** — `DEFAULT_FONT_GUID` (`runtime/assets/builtinAssets.ts`, exported from `@modoki/engine/runtime`) is the engine's Arimo, baked mtsdf/ascii. A game does NOT need a font in its own assets to render `Text2D`; point `Text2D.font` at that GUID. It exists because fonts are otherwise referenced by CSS **family name** and stay guid-less — the asset scanner deliberately skips GUID healing for them — while a `Text2D` ref must be a GUID, so before it, getting MSDF text meant copying a font into the project (Court shipped a byte-identical 500 KB duplicate for exactly this reason, #52). It is the one engine font with a committed `.meta.json`; the other bundled families stay family-name-only, and the tree-shaker keeps a font only if something names it (measured: Court's build keeps **1 of 9** engine font files). A code-only reference still needs an `asset-keep.json` entry — the path is under `/modoki/assets/`, which is keep-listable like any project path.
 - **⚠️ The GLSL program declares `OES_standard_derivatives`, and WHERE it declares it is load-bearing.** Pixi's high-shader assembly emits **version-less (GLSL ES 1.00)** source — it only takes the ES 3.00 path when the source literally contains `#version 300 es` (`GlProgram`: `indexOf('#version 300 es')`). In ES 1.00 the `screenPxRange` line's `fwidth` is illegal without the extension declared, so every MTSDF program failed to compile on iOS 15 (`ERROR: 'GL_OES_standard_derivatives' : extension is disabled`) and **every glyph silently vanished**. Not a capability gap — WebGL2 and the extension are both present; desktop and Android drivers simply accept `fwidth` in ES 1.00 source anyway, so only Apple's stricter compiler rejects it, which is why it hid on every machine we test on. The directive **must precede `precision`**: measured on-device, a pragma placed in this file's `fragment.header` bit (where Pixi injects it, i.e. *after* the precision line) fails just as loudly with `extension directive must occur before any non-preprocessor tokens`. Hence `withDerivativesExtension` rewrites the ASSEMBLED source instead. `enable`, not `require`, so a device lacking it degrades to a warning; not switched to `#version 300 es`, which would hard-fail a genuinely WebGL1-only device.
 - **⚠️ The atlas must be decoded UNPREMULTIPLIED, and `alphaMode` CANNOT enforce that (#1045).** An MTSDF atlas carries the 3-channel distance field in **RGB** and the true SDF in **alpha**, so premultiplying scales the field by alpha and drags `median(rgb)` below the shader's 0.5 edge threshold — `fill = clamp((sd - 0.5) * spr + 0.5, 0, 1)` is then 0 for every pixel and **every 2D glyph in the game renders fully transparent**. `fontTexturePixi` sets `source.alphaMode = 'no-premultiply-alpha'` and that is not enough: per the WebGL spec `UNPACK_PREMULTIPLY_ALPHA_WEBGL` is **ignored for `ImageBitmap` uploads**, so the only lever is the `createImageBitmap` option — and `Assets.load` does not expose it (`loadTextures.mjs` passes `{premultiplyAlpha:'none'}` ONLY when `data.alphaMode === 'premultiplied-alpha'`, and otherwise calls `createImageBitmap(blob)` bare, leaving it to the UA). Hence `loadMtsdfAtlasTexture` (`pixiTextureLoad.ts`) fetches and decodes the atlas itself. ⚠️ **Do not "simplify" it back to `Assets.load({data:{alphaMode:'premultiplied-alpha'}})`** — that yields the right bitmap only by exploiting an inverted condition inside Pixi's loader while mislabelling the source, and would break silently on a Pixi bump. Since Pixi's `Assets` no longer owns the texture, its disposer **destroys** it; `Assets.unload` there would be a silent no-op leaking the whole 8 MB page.
-  - **Why it hid:** the UA default differs by WebKit version. Measured on an iPhone 8 / iOS 16.7.16, `createImageBitmap(blob)` is byte-identical to `{premultiplyAlpha:'premultiply'}`; iOS 26, Android and desktop do not premultiply, so the identical bundle is correct there. Like the `OES_standard_derivatives` trap above, this is **not a capability gap** — and the repro needs a real iOS 16 device, so `verify` and both CI legs are green on the affected tree (the same blind-spot class as the r185 ceiling, § "The r185 bump").
+  - **Why it hid:** the UA default differs by WebKit version. Measured on an iPhone 8 / iOS 16.7.16, `createImageBitmap(blob)` is byte-identical to `{premultiplyAlpha:'premultiply'}`; iOS 26, Android and desktop do not premultiply, so the identical bundle is correct there. Like the `OES_standard_derivatives` trap above, this is **not a capability gap** — and the repro needs a real iOS 16 device, so `verify` and both CI legs are green on the affected tree (the same blind-spot class as the three ceiling, § "three r185 → r186").
   - **The measurement that identified it, and the one worth repeating.** Data-correct is not pixels-correct: the glyph entities, geometry, UVs, uniforms, VAO bindings, texture binding, texture completeness, scissor/stencil/blend and viewport ALL checked out on the device. What isolated it was reading the same texel two ways — `ctx.drawImage(bitmap)` on a 2D canvas (the file: `125,194,125 a=126`) versus `gl.readPixels` through an FBO attached to the live GL texture (as uploaded: `62,96,62 a=126`, i.e. `125 x 126/255`). Over one glyph cell, texels with `median(rgb) > 0.5` were **1775 in the file and 0 on the GPU**. ⚠️ **A shader-level bisect nearly sent this the wrong way:** patching the fragment shader to a solid opaque red and relinking showed *nothing*, which reads as "the draw never lands" — but `gl.linkProgram` **resets every uniform to zero**, so the vertex stage was writing a degenerate `gl_Position` and no variant could have drawn. Patch Pixi's shader SOURCE and drop its cached program instead, so Pixi recompiles and re-syncs uniforms.
 - **A baked font's SOURCE file is not always shipped.** `Text2D` needs only `~atlas.png` + `~metrics.json`; the `.ttf` ships only when a DOM consumer names the family. See [build.md](./build.md) § "Converted assets" — including the blind spot where a CSS-named family needs `shipSource: 'always'`.
 - **Per-page meshes + dynamic packing** — one Pixi `Mesh` per atlas PAGE the text touches (a dynamic CJK provider spills glyphs across pages; a baked / single-page font is one mesh), all children of the slot `Container` so the anchor pivot + transform apply to the whole block. Geometry rebuilds only when the layout hash changes (text/font/size/wrap/spacing/`atlasVersion`); the shader updates only on a style-hash change; placement writes only when the transform moves. Atlas textures are FONT-owned (freed on scene teardown), never disposed by the slot. Per-glyph animation recomputes page positions from the base quads each frame while the sim runs (frozen when stopped, like skeletal animation).
@@ -5076,6 +5597,8 @@ one.** The chain, verified in the vendored source rather than inferred:
    program is compiled and linked.
 4. `gl.deleteProgram` has **ZERO call sites in the whole library** (checked in 8.19.0 and 8.20.1),
    and `GlProgramData.destroy()` only nulls JS fields — so it is never freed, not even at teardown.
+   Filed upstream 2026-09-18 as [pixijs#12213](https://github.com/pixijs/pixijs/issues/12213),
+   together with (3).
 
 At ~2,700 text rebuilds/min that was ~2,700 leaked programs/min, bracketing the measured 38.57 MB/min
 residual. **Fixed on our side by hoisting the two program compiles to module constants
@@ -5459,7 +5982,11 @@ not re-run either probe unless an Android GL device turns up a wrong frame.
   `renderer.uid` comes from a monotonic `uid('renderer')` counter and `resetUids()` is called nowhere
   in this repo, so a renderer uid is never reused. That is what lets the shipped purge be scoped to
   provably-dead uids instead of needing live-set reasoning.
-- **#715's GL program/shader leak was real, is closed in-repo, and is NOT fully fixed.** three's
+- **#715's GL program/shader leak was real, is closed in-repo, and is NOT fully fixed.** Filed
+  upstream 2026-09-18 as [three.js#34597](https://github.com/mrdoob/three.js/issues/34597), with a
+  standalone reproduction that instruments only the public `WebGL2RenderingContext.prototype` (the
+  figures below came from monkey-patching three's internals in our own app; the upstream report does
+  not rely on that). three's
   `webgl-fallback` backend compiles programs and never issues a GL delete: measured over repeated
   scene swaps, `Pipelines._releaseProgram` fired 12 times while `gl.deleteProgram`,
   `gl.deleteShader` and `gl.deleteVertexArray` were called **zero** times (`gl.deleteBuffer` fired

@@ -346,15 +346,15 @@ one.
   something that does. Following calls to a fixpoint turned every variable holding a log's TEXT in
   `fileLogWarnings.test.ts` into a "probe": the further a value is from its `existsSync`, the more
   likely it is content rather than presence.
-- **JSX.** The literal blanker is a heuristic, and a closing tag's `/` or an apostrophe in JSX text
-  can make it drop a closing bracket, which shifts nesting for the rest of a `.tsx` file and can
-  hide a gate below it. No `.tsx` test probes the filesystem or imports `repoLayout` today; a real
-  tokenizer measured ~10 s over the corpus against the scan's ~0.2 s, so it is a stated limit.
+- **One alias level.** `const HAS = hasSkills()` is followed; an alias of that alias is not.
 
-The scan reads literal-blanked source (string, template and regex contents replaced by spaces,
-positions kept). #1071's close-out found a bracket inside a string making one declaration's
-"initializer" run on for ~200 lines in three real test files, which is what blanking fixed; an
-earlier version of this paragraph called that a harmless limit because no verdict had changed yet.
+The scan reads the TypeScript parse (#1242), resolving names by the file's own scopes. It used to read
+literal-blanked text, which fixed #1071's case — a bracket inside a string ran one declaration's
+"initializer" on for ~200 lines in three real test files — but left JSX text, a braceless consequent
+holding a brace, and a shadowed name as stated limits. The parse was held off as ~10 s over the
+corpus; measured on 2026-09-17 it is ~0.9 s for all ~2,000 test files, and the scan parses only the
+~230 that a bare-word pre-filter keeps (a superset by construction: a row needs a `repoLayout` import
+or a probe call, and both spell a word the filter matches).
 
 It closes the silence, not the coverage.
 
@@ -386,6 +386,463 @@ It closes the silence, not the coverage.
   sequential would now be ~154s against ~84s concurrent. ⚠️ The three-lane instability no longer
   reproduces (re-measured 2026-08-18 — the pinned worker cap is why), so chaining is now kept
   because splitting is wall-clock-NEUTRAL and therefore pointless, not because it is harmful.
+
+## What made it faster (2026-09-16, #1285) — and why the 2026-08 numbers above are unquotable
+
+The section above is still correct about **mechanism** and wrong about **magnitude**, because it was
+measured on a box that no longer exists in practice.
+
+### ⚠️ Wall clock stopped being a measurement on this machine
+
+Six clones run concurrent sessions (CLAUDE.md § Clones), and a session runs the gate whenever it is
+finishing work — so the gate is routinely measured against other clones' gates. Measured on the hub
+while `modoki-qa` ran its own:
+
+```
+load average: 149.47 / 177.23 / 147.48     on a 12P+4E box
+38 live node processes under ~/Projects/modoki-qa · 3 under ~/Projects/modoki
+```
+
+That is ~9x oversubscription of the twelve performance cores. **Two runs of the same tree measured
+118.4s and 191.7s on the same afternoon**, differing only in what else was on the box.
+
+**The damage is not only slowness — it turns the gate RED.** `engine/testWorkers.ts` already records
+the shape: oversubscription's first casualties are the tests nearest `testTimeout`, and they fail as
+*timeouts*, which reads exactly like a regression in the diff under test. It cost a session on
+2026-09-16 (wordweave `backgroundRotation` overshooting a 20s ceiling by 302ms while `npm test`
+alone stayed green).
+
+⚠️ **A casualty does not have to wear a timeout's shape — under load it also fails as an ASSERTION**
+(`modoki-ai3`, 2026-09-16, load 123.41/132.11/129.54 with another clone's gate running, on a tree
+*without* any of this section's changes). Two files failed that run, neither a timeout, neither in
+the diff: `tests/architecture/projectPresencePredicate.test.ts` (*"no test computes project presence
+inline"*) and `games/wordweave/tests/backgroundRotation.test.ts`. **So "it failed as an assertion,
+not a timeout" is not evidence that the load hypothesis is out** — an earlier version of this
+paragraph implied it was, and reasoning from it would start a regression hunt on a saturation
+artifact. Both of those files enumerate a corpus off disk, which is the suspected reason they are
+load-sensitive; that has not been diagnosed.
+
+⚠️ **The discriminator is re-running the SAME file alone, REPEATEDLY — one isolated pass is not an
+answer.** Same afternoon, same sha, no edit between runs, `backgroundRotation` in isolation:
+pass, pass, **fail** (1 failed / 5 passed, 20.7s), pass (6 passed, 32.2s). A single clean isolated
+run is what got this written off as an unreproducible flake earlier in the day; it took three to see
+it alternate.
+
+**The ceilings were then doubled (40s, 120s on Windows), and that was the RIGHT call, not a
+symptomatic patch** — this paragraph said the opposite twice. `work-qa`'s three reds the same day
+measured 20846ms, 34491ms and 22601ms; all three pass at 40s and none of them is a regression. Do
+not lower them. The contention work below is what addresses the cause; the ceilings are what stops
+the cause from being mistaken for a diff.
+
+So: **`npm run verify` now prints a `context:` line on every run** — load average, how many verify
+runs share the box, and the worker split — plus each lane's vitest aggregates. Those aggregates are
+summed across workers and so inflate **less** than wall clock. **A timing quoted without its context
+line is not a measurement.**
+
+⚠️ **They inflate too — this section first claimed they were "the only figures two runs on a busy
+machine can be compared by", and that overstates it.** Measured 2026-09-16, the same tree (identical
+`868` files / `26996` passed, differing only in doc and memory commits) run twice:
+
+| app lane | busy | quiet | inflation |
+|---|---|---|---|
+| `context:` | `load 109.5 · 2 run(s) · app=6` | `load 74.6 · 1 run · app=12` | |
+| wall clock | 291.2s | **88.7s** | **3.28x** |
+| aggregate `tests` | 742.60s | 481.71s | 1.54x |
+| aggregate `import` | 621.61s | 365.07s | 1.70x |
+| aggregate `environment` | 116.77s | 60.11s | 1.94x |
+| aggregate `setup` | 87.67s | 39.61s | 2.21x |
+
+So the aggregates are roughly **twice as stable** as wall clock, which is the real claim, and a 54%
+swing on the steadiest of them is still far too large to read a code change through. ⚠️ **Two
+variables move between these columns, not one** — the worker split changed with them (`app=6` against
+`app=12`), because `verifyLoad.mjs` budgets down when it sees a peer. A clean single-variable A/B
+would need `MODOKI_VERIFY_NO_BUDGET=1` on the busy run, and has not been taken.
+
+`engine/scripts/verifyLoad.mjs` registers each run in `~/.modoki/verify-runs.json` and divides the
+performance-core pool by the number of live runs. **Since #1285's second phase EVERY vitest pool
+registers**, not just `verify.mjs`: `perfCoreWorkers()` in `engine/testWorkers.ts` is the chokepoint
+both vitest configs call, so a scoped `npx vitest run`, a bare `npm test` and a mutation check are
+all counted. `peers` counts DISTINCT GROUPS, not processes — `verify.mjs` stamps a group id into
+both lanes' env, so one gate with two vitest lanes still counts once.
+
+⚠️ **The registry deliberately does NOT use `claimsDir()`, and the first version of this did.**
+`claimsDir()` redirects to `modoki-claims-vitest-<pid>/` whenever `VITEST` is set, so every pool
+registered into a temp dir named after its own pid — visible to nobody, and it re-created the
+per-pid dir *after* `globalSetup` reaped it, re-opening the #1117 tmpdir leak at one dir per vitest
+process. The whole mechanism was **inert while looking healthy**: a plausible budget returned, a
+green gate, a correct-looking `context:` line, and 34 passing tests that all injected `dir` and so
+never touched the real resolution. `verifyRegistryDir()` honours `MODOKI_HOME` and nothing else. It intervenes **only when `peers > 1`**, so a solo
+gate is byte-identical to before — `testWorkers.ts` keeps deciding, which matters because it returns
+`{}` on a homogeneous CPU and halves on Windows. `MODOKI_VERIFY_NO_BUDGET=1` opts out;
+`MODOKI_TEST_MAX_WORKERS` still beats everything. It is advisory, not a mutex: serializing would make
+one clone wait on another's gate, and the goal is to stop the thrash, not the work.
+
+⚠️ **"Only when `peers > 1`" is the APP lane. The engine lane is sized on EVERY run** by
+`engineLaneWorkers()` in `verifyLoad.mjs`, which is also what the `context:` line prints (#1443). The
+engine lane has no per-platform fallback to fall through to: it used to be pinned to a Mac-sized
+`6`, which on the `win` box (12 logical → 6 perf cores) is the whole cap, so a solo gate overlapped
+6 + 6 = 12 workers on 6 cores while the line printed `engine=3`. Now it takes half of the app lane's
+pool everywhere: still 6 on a 12-P-core Mac, 3 on the `win` box. `MODOKI_VERIFY_ENGINE_WORKERS`, then
+`MODOKI_TEST_MAX_WORKERS`, override it; `MODOKI_VERIFY_NO_BUDGET=1` stops the cross-clone division
+and takes the solo share (half the box) — deliberately NOT the old pin of 6, which on the `win` box
+would re-create the oversubscription.
+
+Measured on the `win` box (i5-11400) 2026-09-19, solo, the same tree, interleaved 3/6/3 (a fourth
+run was killed for memory pressure; all three green):
+
+| engine | app lane | engine lane | engine agg `tests` / `import` | app agg `tests` |
+|---|---|---|---|---|
+| 3 | 573.2s | 492.0s | 308.6s / 258.4s | 1673.9s |
+| 6 | 577.1s | 333.5s | 399.9s / 339.6s | 1905.1s |
+| 3 | 567.9s | 459.3s | 310.3s / 252.9s | 1703.7s |
+
+The app lane is the pole either way, so wall clock is unchanged; at 3 the engine lane still finishes
+~80-110s before it, and both lanes do less contended work (app aggregate `tests` ~11% lower). Unlike
+the Mac, where 3 made the engine suite the pole, here 3 costs nothing. n=3: a trend, not a law.
+
+⚠️ **It divides by the PEER COUNT and never looks at the load — so it charges you for a peer that
+is not costing you anything.** Three runs of the hub gate on 2026-09-16, same tree modulo doc
+commits, show the peer count setting the wall clock more than the load does:
+
+| `context:` | wall clock |
+|---|---|
+| `load 109.5 · 2 run(s) · app=6` | 291.2s |
+| `load 74.6 · 1 run · app=12` | **88.7s** |
+| `load 39.5 · 2 run(s) · app=6` | 217.8s |
+
+The third row is the one to read: the **lowest** load of the three, and 2.5x slower than the second,
+because a registered peer halved the pool on a box that was not saturated. A peer whose run is
+nearly finished, or which is in its single-threaded typecheck leg, costs you half your workers
+exactly as a peer hammering twelve cores does. That is the mechanism doing what it says — 2 runs ×
+6 workers = the 12 performance cores — and it is still the wrong trade at load 39.5. **Load-aware
+budgeting is the obvious next move and is not implemented**; it is the second known gap in this
+fix, alongside the peer count seeing only `verify.mjs` runs (#1285).
+
+#### Does the budgeting actually earn its keep? Measured — and the answer depends on what you measure
+
+Controlled A/B on a box the owner cleared of all clone activity, 2026-09-16, `7f288dd5d`. Full app
+suite per run, concurrency GENERATED rather than waited for, so the conditions are comparable.
+(`repoCorpus.test.ts` excluded from the four-way, per #1291.)
+
+| | workers each | total on 12 perf cores | wall | extra contention reds |
+|---|---|---|---|---|
+| solo baseline | 12 | 12 | 113s | — |
+| **two** concurrent, budgeted | 6 | 12 | 210s | none |
+| **two** concurrent, unbudgeted | 12 | 24 | **202s** | none |
+| **four** concurrent, budgeted | 3 | 12 | 425s | **0 in 4/4 runs** |
+| **four** concurrent, unbudgeted | 12 | 48 | **401s** | **1–2 in 4/4 runs** |
+
+**Unbudgeted is ~5% FASTER in both pairs, and at four concurrent it is reliably REDDER** — every
+unbudgeted run also failed `accountScreen`, half of them `deviceSyslog` (#1099's load-sensitive
+capture window) as well, at a load that reached **94.66**. Budgeted runs lost nothing beyond the
+shared-tree artifact both conditions carry.
+
+⚠️ **So the mechanism costs ~5–6% wall clock and buys the casualties, not the speed** — which is the
+whole point: this repo's complaint was never that the gate is slow, it is that contention turns it
+RED and the red reads like your diff. **An early version of this section recommended deleting the
+budgeting** on the two-way throughput result alone. That was benchmarking the quantity a benchmark
+happens to produce rather than the one the problem is about, and the four-way case reversed it.
+
+⚠️ **Two concurrent runs produce no casualties in either condition.** The effect appears at FOUR —
+which is the configuration this repo actually runs. A concurrency experiment stopped at two would
+have concluded, twice over, that none of this matters.
+
+### The app suite paid for jsdom on every file and needed it on about an eighth of them
+
+`engine/vite.config.ts` set `environment: 'jsdom'` for the whole app suite. The engine package suite
+sets no `environment` at all and so defaulted to `node` — which is the entire reason its per-file
+environment cost was ~8x cheaper.
+
+⚠️ **The table below was measured over the 866-file, Court-EXCLUDED population** (`courtTouched()`
+was false on that branch). The gate runs **1086** files when Court is in. The ratio holds; the
+absolute figures are for the smaller set, and quoting them as "the current gate" overstates nothing
+but describes a different population than a reader will see.
+
+| (866 files, Court excluded) | jsdom everywhere | node by default |
+|---|---|---|
+| aggregate `environment` | 957.87s | **8.59s** |
+| CPU time (user+sys) | 1168s | **791s (−32%)** |
+| tests passing | 26,964 | 26,964 (identical) |
+
+⚠️ **Those are QUIET-BOX figures, and the aggregates inflate under load like everything else.** A
+green run on the merged tree on 2026-09-16 at `load 109.5/81.6 · 2 verify run(s)` reported aggregate
+`environment` **116.77s** over 868 files — 13x the 8.59s above, and still an eighth of the 957.87s
+the flip removed. So the table measures the FLIP, not a budget: a loaded run showing three figures
+of environment time is not a regression against it. Compare a loaded run only against another loaded
+run, and read the `context:` line of both.
+
+⚠️ **No file count is quoted anywhere in this section on purpose.** The first draft said "108", and
+three commits in the same change added ten more without updating it. The live answer is
+`grep -rl '@vitest-environment jsdom'` over the include roots — a number that cannot go stale.
+
+`tests/architecture` alone is **178 of 180 files DOM-free** — source-scanning guards that read files
+off disk and never render. A file that needs a DOM now says so with `// @vitest-environment jsdom`.
+
+⚠️ **`environmentMatchGlobs` is not the mechanism** — it was removed in vitest 4 (4.1.11 here). The
+per-file docblock is what this version supports.
+
+⚠️ **The list was derived by RUNNING the suite under node and taking the failures, not by grepping
+for `document`.** A grep over these files is dominated by source-scanning guards that match the word
+"document" inside a string they are searching for.
+
+### ⚠️ Two files failed as UNHANDLED REJECTIONS, and a passing test count hid them
+
+`@capacitor/app` touches `document` at import time, so under node
+`tests/framework/bridgeJournalGate.test.ts` and `bridgeRequestRejection.test.ts` threw
+`ReferenceError` *asynchronously*. Vitest printed `865 passed`, then `Errors 6 errors`, and **exited
+non-zero** — the suite was red while every test line read green.
+
+This was missed on the first pass because the check was `grep 'Test Files'` on a run whose exit code
+was never read. **A passing test count is not a passing suite**: read the exit code, and read the
+`Errors` line. This is the same class as the timeout above — a real failure wearing the costume of
+something else.
+
+### ⚠️ `void <async>` at a test seam: a failure that blames an unrelated file
+
+The general form of the trap above, and worth knowing on its own because the symptom points
+somewhere the bug is not. Found by `work-ai2` on 2026-09-16, diagnosed to a fix:
+
+A test called `void shutdownRealmThenReload(...)`. The `void` let the whole registered-task chain run
+asynchronously and **outlive the test file**. Vitest attributes late async work to *whatever file is
+running when it settles* — so the failure surfaced in **a different game's suite entirely**, and was
+unreproducible in isolation. Capturing and awaiting the promise fixed it.
+
+- **The shape:** `void <async call>` (or any un-awaited promise) at a test seam.
+- **The tell:** *fails only in the full run, passes alone, and blames an unrelated file.*
+- ⚠️ **Per-file isolation does NOT contain it.** A fresh module registry per file still shares the
+  process, so an escaped promise crosses files regardless. Do not reason "each file is isolated,
+  therefore this cannot be cross-file".
+
+Three clones hit `games/wordweave/tests/backgroundRotation.test.ts` three different ways on three
+different trees the same afternoon — a timeout, a non-reproducing assertion, and this escaped
+promise. When one test keeps absorbing unrelated failures, suspect the victim's own isolation, not
+three coincidences. The wordweave case is #1288: that test is correct only if its stub wins a
+module-hydration race, and per-file isolation is its only defence.
+
+⚠️ **The canary set is THREE tests, not one.** `work-qa`'s reds were `backgroundRotation` (20846ms),
+`releaseBuild` (34491ms) and `projectPresencePredicate` (22601ms) — in the same run — and `ai3`'s
+non-timeout casualties were two of those three.
+
+⚠️ **All three are SECONDS-long tests on a quiet box.** Measured 2026-09-16 at `loadavg` 5.2 with
+every clone idle: `backgroundRotation` **6.4s** (ten consecutive isolated runs — 6.39, 6.54, 6.45,
+6.54, 6.52, 6.57, 6.86, 6.49, 6.44, 6.84; 10/10 green, 7% spread) and `projectPresencePredicate`
+**3.34s**. So the reds above are a **~3-7x contention multiplier**, not tests that grew into their
+ceiling. ⚠️ `ai3`'s runs of `backgroundRotation` "in isolation" measured 20.7s and 32.2s — isolated
+from other test FILES but not from the BOX, which is the distinction that made a load artifact look
+like an intrinsic flake. **"In isolation" must mean a quiet machine, or it means nothing.**
+
+⚠️ **A quiet 10/10 does NOT clear #1288's hydration race.** A race needs a perturbation to lose, and
+a quiet box supplies none — ten green runs are exactly what a real-but-unperturbed race looks like.
+What the repeat establishes is that contention is the TRIGGER, so the failure rate is a property of
+the box rather than of the test. Any fix for that test must therefore be validated **under load**;
+a quiet pass cannot distinguish "fixed" from "unperturbed".
+
+⚠️ **What they share is NOT a mechanism, and the first version of this paragraph said it was.** It
+claimed all three "walk the repo corpus off disk". Checked against the files, that is one of three:
+`projectPresencePredicate` calls `repoFiles()`; `backgroundRotation` steps **7,200 frames** over an
+in-memory stubbed level corpus and reads nothing off disk; `releaseBuild` is pure decision functions
+plus `spawnSync`. What the three actually share is being **long-running**, which
+`engine/testWorkers.ts` already gives as the reason a test goes first under oversubscription. Do not
+instrument the other two looking for a corpus.
+
+The population is real and countable: `grep -rl` over `repoCorpus|repoFiles(` across
+`engine/tests games demos` finds **125 test files**, of which **2** state a timeout. ⚠️ **That was
+filed as #1290 and #1290 is now CLOSED** — the count describes exposure correctly and the *cost*
+model behind it did not survive measurement (see the measured table below). Kept here because the
+counting method, and the three separate ways two clones got it wrong, are worth more than the
+conclusion was.
+⚠️ **A count carries its SCOPE before it carries its sha.** Counted on `b85b1ddbf` over
+`engine/tests games demos`. `work-qa` first reported 122/1 on `55203d6f2`, and both of us explained
+the gap as a tree difference — main's #1285 commits landing in between. **That explanation was
+wrong twice over.** Re-run at the stated scope, `work-qa`'s tree gives 125 consumers, identical; its
+122 was `engine/tests` alone, and the corpus tests also live under `games/`. The timeout side is not
+a tree difference either: both files that state one (`vendorPluginsIntegration`,
+`cliNativeBuildHeals`) carry it at *both* shas and neither was touched between them.
+
+⚠️ **Re-run it with BOTH the root and the pattern below, or you will read drift that is not there.**
+Every timeout in this set is written with a numeric separator — `130_000`, `30_000` ×3, `60_000` —
+so the obvious `\}, *[0-9]{4,}\)` matches **none of them**: it consumes `60`, hits the `_`, and dies
+two digits short. `work-qa` reported 1 with that pattern where the honest answer for it is 0, and a
+reader re-deriving the figure that way sees more corpus walks riding the default than there are.
+
+```
+grep -rl --include='*.ts' -E 'repoCorpus|repoFiles\(' engine/tests games demos   # 125
+  | xargs grep -lE '\}, *[0-9_]{4,}\)'                                          # 2
+```
+
+⚠️ **Note which way that error points.** A blinded timeout-counter inflates *"how many corpus walks
+ride the unit-test default"* — the very claim the count is offered as evidence for. **A counting
+instrument that errs toward your thesis produces no friction at any step**, which is why two clones
+each explained the gap twice without either one re-running the other's command.
+
+⚠️ **And the reported command was not the command run.** `work-qa`'s figure came from an
+alternation — `timeout: *[0-9]+|\}, *[0-9_]{4,}\)` — reported as the second branch alone. Split over
+the identical file list: the budget branch matches 0, and the `timeout:` branch matches exactly one
+line — the `timeout: 120_000` option on `vendorPluginsIntegration.test.ts`'s `spawnSync` of the
+vendor script, **a child-process kill option, not a vitest budget.** The same `_` broke both branches in opposite
+directions, a false negative plus a false positive summing to a plausible 1. **The regex was an
+honest bug that one re-run would have caught; the paraphrase is what cost three rounds**, because it
+moved the disagreement from *"what does this command return"*, answerable in seconds, to *"why do
+our trees differ"*, which neither side can falsify. Quote the command you ran, not the command you
+meant.
+
+The trap generalises, and it is the reason this paragraph exists: **two counts taken at different
+scopes — or with different patterns — on the same tree diverge exactly like two counts taken on
+different trees** — so labelling
+the figure with a sha would have made the wrong explanation look confirmed. *"It's a tree
+difference"* is the plausible reading that stops you looking for the real one. The ratio does drift
+upward as corpus tests are added, which is the argument #1290 makes; it just did not drift here.
+
+⚠️ **125 counts tests EXPOSED to the default, not walks PERFORMED.** `repoFiles()` does not walk the
+disk per call: `engine/scripts/repoCorpus.mjs` shells out once to `git ls-files -z`, `statSync`s
+every listed path, memoises by mode in `cachedRawFilesByMode`, and applies each caller's
+`under`/`match`/`exclude` as an in-memory filter.
+
+### ⚠️ Two queued `vi.doMock`s of one path: the factory that wins depends on load (#1357)
+
+`vi.doMock` only QUEUES. vitest (4.1.x) resolves the queue at the next dynamic `import()`, and
+`resolveMocks()` runs consecutive `mock` entries through `Promise.all`. Each entry is applied when
+its own async `resolveId` finishes. So when one path is `doMock`ed twice with no import in between,
+the factory that wins is whichever resolves **last**, and that is decided by machine load.
+`vi.resetModules()` does not clear the queue.
+
+- **The shape:** `beforeEach` mocks `./src/config`, then a test body mocks it again before its
+  `await import(...)`. Also a helper that mocks a path, followed by a caller that mocks it again.
+- **The tell:** red only under a loaded full `verify`, green alone, and the assertion shows the
+  **other** factory's values. Court's `services.test.ts` failed 2 of 3 runs in exactly this way.
+- **The fix:** mock each path once per import. A test that needs a different value writes a holder
+  that the single factory reads when the import runs it. ⚠️ A nested `describe` does **not** fix
+  this, because the outer `beforeEach` still queues its factory first.
+- **Not guarded.** A text scan cannot follow a helper call. The one other site
+  (`scene3DSync.test.ts`'s `loadHelper`) was found by reading 13 files, which is every test file
+  that mocks a path more than once.
+
+### The corpus cost model — MEASURED, and it closed #1290
+
+Taken 2026-09-16 on `7f288dd5d` with every clone idle (`loadavg` 3.4–5.3), because a loaded box
+cannot answer any of this. Method for the spawn count: a transparent `git` shim first on `PATH`
+logging every `ls-files` argv, then one full app-suite run.
+
+| what | measured |
+|---|---|
+| cold `repoFiles()` | **99.1ms** (one git spawn + a `statSync` per path, 9,994 files) |
+| warm, same options | 4.4ms |
+| warm, different filter | 2.5ms (710 files) |
+| cold enumerations per app-suite run | **138** (118 `--cached --others --exclude-standard -z` + 20 `--cached -z`) |
+| `projectPresencePredicate` alone | **3.34s** test time, of which ~0.1s is enumeration |
+| app suite solo, 12 workers | 113s (1091 files, 30765 passed) |
+
+Three things follow, and the third is why #1290 closed:
+
+1. **The memo does not amortise across test files.** 138 cold enumerations against 125
+   corpus-consuming files — several call both `includeUntracked` modes. So the module-level cache is
+   reset roughly per test FILE, which is direct positive evidence that **vitest's per-file module
+   registry really is fresh** (neither config sets `isolate`). Useful well beyond this section: any
+   design leaning on module state surviving between test files is leaning on nothing.
+2. **The enumeration is nonetheless cheap.** 138 × ~99ms ≈ 13.7s across the whole suite, spread over
+   12 workers — about **0.25%** of a single 40s ceiling.
+3. **So a corpus test is not slow because it enumerates.** It is ~3% enumeration and ~97% reading and
+   parsing the matched files' CONTENTS. A budget attached to `repoCorpus.mjs` — the obvious fix,
+   since it is the one chokepoint all 125 go through — **would bound the wrong 3%.**
+
+⚠️ **Which is why the "corpus-walk budget" idea was retired rather than built.** #1290 argued these
+tests need their own stated budget because they scale with repo size. Measured, the canary is a
+**3.34s** test that a loaded box stretched to the **22601ms** red that prompted the issue — a ~6.7x
+contention multiplier, which is #1285's subject, not a second budget concept. Adding one would have
+put two overlapping mechanisms in the repo where one does. **#1046 remains the precedent worth
+knowing** (docCitations' scan at 17s against a 20s budget, handed 60s on Windows) — but as an
+instance of the contention class, not of a corpus-cost class.
+
+⚠️ **The general lesson is the one to carry off**: *a test that got slow under load is not evidence
+about what the test spends its time on.* Every quantity in the table above was guessed at least once
+during the investigation, by two clones, and the guesses were wrong in both directions — "order
+tens, amortised" and "123 expensive walks" were both stated confidently before anyone counted.
+
+### ⚠️ Your own mutation check racing your own backgrounded gate — a failure naming data no commit contains
+
+The same "the symptom points somewhere the bug is not" shape, from the other direction, and it is
+self-inflicted. Observed on `work-ai` on 2026-09-16 while closing out #1280.
+
+A `verify` was running in the background. In the same working tree, a mutation check was doing what
+CLAUDE.md requires of every new test — break the mechanism, confirm the test reds, restore. One of
+those mutations wrote a deliberately-dangling GUID into a scene file for a few seconds. The gate
+read the tree mid-mutation and reported:
+
+```
+/games/wordweave/assets/scenes/main.scene.json: MISSING font-family:deadbeef-0000-4000-8000-000000000000
+/games/wordweave/assets/scenes/main.scene.json: STALE font-family:651fcb15-…
+```
+
+Two findings in a guard that has nothing to do with fonts-as-such, in a commit that did not contain
+either state. It reads exactly like a real defect in the change under test.
+
+- **The shape:** any tree-mutating check — a mutation test, a `git checkout` A/B, a temporary
+  fixture edit — overlapping a backgrounded `verify`/`vitest` **in the same clone**.
+- **The tell, and it is a sharp one:** *the failure names data no committed file contains.* Grep the
+  reported value against `HEAD`; if it is not there, the gate read a transient tree, and the run is
+  not evidence about anything. Re-run it before believing a word.
+- ⚠️ **`/close-out` § 2b covers the neighbouring case and not this one.** That rule isolates an
+  `opus-reviewer` in a worktree because a REVIEWER mutates your tree. The gate reading a tree *you*
+  are mutating is the mirror image, and isolating the reviewer does nothing for it — the session
+  that hit this had correctly worktree-isolated its reviewer minutes earlier.
+- **The rule:** mutation-check or run the gate, never both at once in one clone. A backgrounded gate
+  makes the tree read-only until it returns.
+
+⚠️ It also generates load that `verifyLoad.mjs` cannot see: registration happens in `verify.mjs`
+alone, so mutation checks, scoped `npx vitest run`s, `npm test`, `typecheck` and `lint` are all
+invisible to the peer count. Four clones mid-close-out can saturate the box while every one of them
+reads `peers == 1` and claims the full worker pool — measured on the hub at load **154.86** with
+**106** node processes across four clones and zero registered runs (#1285). ⚠️ **`work-qa`
+independently confirmed the same gap from the other side**: ~8 mutation checks in one session, each
+a scoped vitest run, none of them visible to the peer count. Mutation checks are the worst case
+structurally — by design they run the same suite repeatedly, back to back. The fix shape is to move
+registration into `engine/testWorkers.ts`, the chokepoint both vitest configs already call.
+**Implemented 2026-09-16** — see the registry note above, including the two ways it can be built so
+that it silently does nothing.
+
+⚠️ **It leaves an ASYMMETRY that is now live, and it was not designed on purpose.** A registering
+pool COUNTS as a peer but does not YIELD: `perfCoreWorkers()` discards the budget it gets back, by
+design, because sizing pools from the peer count was a separate deferred decision. So a two-minute
+mutation check registers, keeps all 12 workers, and the concurrent `verify` that now sees it halves
+itself to `app=6 engine=3`. Total oversubscription does fall (18 rather than 24 on 12 cores, and the
+four-way measurement says total is what drives casualties), but **the run that yields is the GATE —
+the one whose redness is expensive — and the run that keeps its cores is the throwaway.**
+
+✅ **LEAVE IT AS IS (owner, 2026-09-16).** Put to the owner as three readings — leave it, make
+everything shrink, or give the gate priority and let ad-hoc runs shrink around it — and the ruling
+was the first. **So this asymmetry is a DECISION, not an oversight**, and a later session must not
+"complete" it by making scoped runs yield: that is the option that was declined. What justifies it
+is that the measured win is in TOTAL oversubscription (24 → 18 workers on 12 cores) and the four-way
+A/B says total is what produces the casualties; the gate paying wall clock for that is the accepted
+cost. Reopen only with a measurement showing the gate's slowdown costs more than the reds it avoids.
+
+### What the environment flip does NOT risk, and how that was checked
+
+The obvious worry is a test that still passes under node because its subject silently no-ops without
+a DOM. Checked rather than assumed: 46 engine modules carry a `typeof window === 'undefined'`
+fallback, and 43 node-environment test files import one. Of those, the guards actually reached are
+DEV debug-console hooks (`window.__ecsWorld`, `__editorStore`, `__prefabEdit`) that no test asserts
+on. The one genuinely behavioural guard — `readViewport()` in `engine/app/editor/agentEditorOps.ts`,
+which returns `null` with no `window` — is asserted by no node-environment test.
+
+**To regenerate the classification** after adding tests: run `npm test -- --environment node`, take
+the `FAIL` files *and* any file named by an `Errors` block, and add the docblock to each.
+
+⚠️ **A classification derived from "run it and take the failures" is only as complete as what that
+run DISCOVERED — and this suite's file set is conditional.** `engine/vite.config.ts` excludes
+`games/court/tests/**` unless `courtTouched()` says the branch touched Court, so the original sweep
+never saw Court's 220 files and silently did not cover them. It surfaced two commits later, when
+editing comments in `games/court/tests/*.ts` flipped that gate and pulled in 6 failures plus 2
+unhandled-rejection files, every one DOM-dependent. **Before trusting a regenerated list, check that
+the run actually discovered the files you think it did** — compare the `Test Files` count against
+`1086` (866 without Court).
+
+The residual gap is **narrower than "51 unclassified files"**, which an earlier draft of this
+section claimed. Court's sweep-tier files are ordinary `*.test.ts` and ARE discovered in a normal
+run — `MODOKI_COURT_SWEEPS` gates the `describe` BODIES, and vitest runs a describe callback to
+collect its tasks (`engine/vite.config.ts` records this), so their imports and collection already
+ran under node and would have thrown. What is genuinely unexercised is a DOM need inside a skipped
+`it` body. The nightly sweep on `main` is where that would surface.
 
 ## Typecheck traps that have bitten CI
 
@@ -1622,6 +2079,369 @@ recurred:
   running `main`'s version of the guard against the mutated tree. The same merge showed the payoff the
   other way: the parser ledger immediately found two playable gates (#926, #1184) `main`'s line scan had
   never counted.
+
+**#1193 — the import-SYNTAX readers (~40 sites, outside #1179's census).** Each guard had
+its own regex for which spellings of an import exist, and each one missed a different subset: a
+side-effect `import '…'`, `import x = require()`, `export … from`, a statement that does not start its
+line, a clause longer than the regex's window, double quotes, or an import in a string it mistook
+for a real one. They all read `importsIn` now. The helper gained two things. `importBindings(sf, spec)`
+is the one reader for "F imports N from M": one row per binding, however the import is wrapped or aliased.
+`importsIn`'s `typePositions` option returns the import types the compiler resolves (`import('x').T`)
+without counting them as runtime edges. What recurred:
+
+- **Measure the population old against new BEFORE switching, per reader.** Six readers came out
+  identical: the vite config, publish exclusions, Court's sweep scope, account literals, repoLayout
+  importers and the F11 closure (453 files). The runtime graph kept its 2,016 edges. The measurement found
+  every real miss. `barrelImportOrder` entered 240 modules and the barrel names 250. Ten modules, `./traits`
+  and `./iap` among them, had never been imported first, because their export clauses ran past a
+  `[\s\S]{0,400}?` window. `worldSwapTeardownFalsifiable` never saw 24 side-effect imports of a producer.
+  It also counted 145 `typeof import('…')` and fixture-string "imports". Its verdicts were identical
+  anyway, which the probe had to show, since the specifier lists could not. A partial mock does run its
+  producer, though: `vi.mock('../producer', (importOriginal) => … importOriginal() …)`. The text form
+  credited it only by accident, through `importOriginal`'s `typeof import('…')` type argument. Review
+  caught the first parse dropping it. It is now read from what LOADS: the mock target whose factory
+  calls its loader, and `vi.importActual`'s argument. The type argument does not count.
+- **Under `verbatimModuleSyntax`, `import { type A } from './x'` is NOT erased.** It emits
+  `import {} from './x'`, which still runs `./x`. Only `import type` / `export type` statements are
+  erased. `moduleGraph` counted the inline form as type-only. Two runtime edges moved to value, and no
+  cycle changed.
+- **"Which modules does this file run" and "which modules must resolve" are different questions.** A
+  type-position import runs nothing, so walkers and attribution skip it. It still fails a standalone typecheck, so `gamePortability`, `publishExclusions` and
+  `mainBundleExternals` read it on purpose. None of these reads `declare module '…'` or
+  `/// <reference path>`.
+- **A binding pin requires a VALUE binding, and a re-export is not an import.** `export { N } from 'M'`
+  binds no local name. An `import type { N }` does not construct or call anything.
+- **The migration found a latent defect beyond the guard.** `playableAppServicesStub` read dynamic uses as
+  `m.<name>` within 120 characters, so `games/3d-test`'s `.then(({ analytics }) => analytics.logEvent(…))`
+  was invisible. The playable stub had no `analytics`, and a playable build would have rejected that
+  promise at runtime. Rollup does not check dynamic imports. The stub gained the namespace. The guard now
+  THROWS on a use shape it cannot read, where it used to pass it unread: a non-`.then` use, a rest or
+  nested destructure, a callback parameter used other than as a call of its member, `m.<name>(…)`
+  (a chained or held member hides its own members from the namespace scan). A mock's original is credited
+  only for `vi.mock`/`vi.doMock` whose factory calls its loader, by symbol, in its own body. Each reader has its own
+  positive pin (`track` static, `register` dynamic, `analytics` destructured), because the review emptied
+  the destructured branch with the suite still green.
+- **A narrowing hides in "the regex caught it by accident", again.** The review found two more.
+  `mainBundleExternals`' regex took `` import(`@modoki/engine/${n}`) ``, a template the parse names no
+  module for; that arm is read again, by its head. `mainDialog`'s ban keyed on `'electron'` never saw
+  `'electron/main'`, which predates this change. The whole-module arms also had no fixture while the
+  real tree held no offender, so a typo in any arm would have stayed green.
+- **Stays out, and why.** Where a code UNIT ends, measured by bracket counting or the next column-0
+  declaration, is #1195. `findInstallCalls` and `requiredNamespaceMembers` are call scans, not import
+  readers. `crashSinkOrder`'s bundle case reads a built artifact. `sourceScanner.test.ts` counts
+  `/^import /` to measure the stripper itself.
+
+**#1195 — where a code UNIT ends (~117 sites, in five phases; P3–P5 are #1240–#1242).** These guards
+took the extent of a unit from its text shape: a hand-counted bracket depth, a slice to the next column-0
+`function`, or a fixed-indent closer such as `'\n}'` or `\n {2}\}\);`. A bracket inside a string, a
+neighbour, or one more level of nesting moved that edge. The anchor was observed before the move:
+`keymapHmrEpochGuard`'s paren count ran through `console.log(':-(')`, swallowed the next effect, and read
+its `[hmrEpoch]` as the deps of an effect with `[]`. **P1 landed** the helpers and the 12 guards that read
+a declaration's shape. `sourceAst` gained four helpers. `propertyValue` returns a key's value, and the
+last duplicate wins. `variablesNamed` finds a binding in any scope. `typesNamed`/`typeMembers` return an
+interface or type literal's OWN members, and refuse a union rather than read it as empty. `functionsNamed`
+returns every function known by a name, methods included. What recurred:
+
+- **A text reader fails open by OVER-counting as well as by missing.** `playableAppServicesStub`'s member
+  regex credited the stub with 10 members it does not have. They were parameter names (`_value`, `_doc`),
+  `return`, and the keys of nested return literals (`ok`, `user`, `scheduled`), so a game calling
+  `auth.user(…)` passed. `handleProviderOwner`'s brace walk counted 21 handle literals where there are 16
+  string-kinded ones (17 in all, below).
+  Five were spans anchored on a `kind:` that is not a handle, such as a TYPE `{ kind: 'color' | 'alpha' }`
+  or a `setSel({ kind: 'color' })`. They ran wide enough to match `id:`, `x:` and `owner:` elsewhere in
+  the component. A phantom member vouches for a missing one. Measuring old against new is what separates
+  a real miss from a phantom. A count that DROPS is not a regression until each dropped row has been read.
+- **Every hazard was probed on the real subject, and the old guard passed all six.** They were: a TS
+  method whose name wraps before its `(`; a nested literal closing at the fixed indent, ahead of a
+  `catch`; `markDirty` moved OUT of `install` (the anchor-to-anchor window still held it); an `owner`
+  moved into a nested `meta` literal; `_isFileDirect: true` nested the same way; and the anchor's
+  paren in a string.
+- **"The function named X" has more than one answer.** `install: (r) => install(r)` in a deps literal is a
+  function known by `install`, beside `const install = async …`. `functionsNamed` returns both on purpose,
+  and a caller asking about the declaration filters out a property-assigned one and asserts the count.
+- **Compare a wired value WHOLE.** `viewportBringUpWired` anchored each needle on the delimiter ending it,
+  so that `() => disposed && false` would not pass as `() => disposed`. `printedText(propertyValue(…))`
+  equal to the expected code does the same without a delimiter, and without the brace count that found
+  the call.
+- **The P1 review found the migration opening two holes the text had kept shut, and both have the same
+  shape: one reader widened while the reader it pairs with did not.**
+  - `stubExports` learned the `export { auth }` list form, but `stubNamespaceMembers` still read only
+    `export const auth = {`. A namespace exported through a list counted as exported, and its members were
+    never checked. One export table now feeds both.
+  - `typeMembers` returned an extending interface's own members. The `interface NAME {` text it replaced
+    could not find `interface NAME extends B {` at all, so it failed. The new reader instead read a field
+    moved into the base as missing from the interface, and `manifestBlockPlumbing` passed with `hash`
+    moved and dropped from the writer. `typeMembers` now refuses `extends`.
+
+  So when a migration makes one reader see MORE, ask what pairs with it: the other half of a
+  cross-check, or a failure the old text produced by seeing less.
+- **A population restricted to dodge a false positive is also a hole.** The stub's member scan ran only
+  over namespace OBJECTS, "so an unrelated local called `auth` can't false-positive". So a namespace
+  written as `export class serverTime {}` went unchecked. When the scan was widened to every export, its
+  name regex immediately credited Court's `track: string` parameter's `track.slice(…)` to the imported
+  `track`. The fix is to read by symbol, and that loses a binding HANDED ON: `cloudSyncWiring.ts` calls
+  through `services.auth` and a `cloudSave` parameter, and the symbol scan alone dropped those 4 calls.
+  So a binding whose every read is a member call, a direct call or a `typeof` is read by symbol, and a
+  handed-on binding is followed by name. The third review showed that name-following errs toward
+  requiring a member ONLY when the receiver is spelled like the import. Wordweave calls through
+  `accountAuth()`, which RETURNS `c ? { ...auth, …o } : auth`. Neither form saw those calls, so wordweave
+  required no `auth` member at all, and only Court calling the same four members kept the stub whole.
+  Following the return fixed that, and the fourth review found `const a = accountAuth(); a.signInWithApple()`
+  dropped the same way. **Every round had found one more path the value takes, and each was silent**,
+  because an unmodelled path yielded no members and no report. So there is now one classifier. A value
+  is a member call (required), a direct call or `typeof` (nothing), bound by `const` (follow its reads),
+  or returned from a named function (follow its calls), up to three hops. Anything else is COUNTED on a
+  hand-on ledger. That is `dynamicMembers`' rule: a use the guard cannot read must not pass as no use.
+  **The lesson is the loud default, not the extra hops.** A dataflow follower that returns "nothing" for
+  a shape it does not model has the same defect as the text slice it replaced. A pardoned hand-on is
+  UNCHECKED: the name fallback reads it only while the receiver keeps the import's spelling, and a
+  renamed parameter stayed green in review, so each row's reason has to say so.
+- **A fixture has to call the guard's own classifier.** Three #1195 fixtures re-implemented the check
+  inline (`lits.filter(… 'owner')`, `propertyValue(…)?.kind`, `typeMembers(…)` in place of
+  `versionType`). A mutation back to the text rule left them green. The classifier is now a named
+  function (`isOwned`, `isFlagged`, `versionTypeIn`), and the fixture calls that function.
+- **The docblock's own example was outside the population.** `handleProviderOwner` names `chromeHandles`
+  as the provider it exists to see. That literal's `kind` is computed (`el.getAttribute(…) ?? …`), and
+  both the text reader and the first parse required a string, so deleting its `owner` passed. A computed
+  `kind` now counts, and the ledger key prints it in parentheses.
+- **No parser is still a recorded decision.** `pluginMethodParity`'s Swift `pluginMethods` array keeps
+  its bracket count, and the reason is written on `bracketBody`. A moved edge shows up as a method-set
+  mismatch against the TS and Android sides, so it fails loud.
+
+**P2 landed** the 19 guards that read a function body, a branch, a table or a call by its text extent.
+It added no `sourceAst` helper: each guard's reader is a named function in its own file, over the P1
+helpers plus `precedingStatements`, `readsOf` and `declarationOf`. What recurred:
+
+- **A text reader over a TEST corpus reads the tests' own fixture strings as code.** `liveReloadKinds`
+  enumerated watcher files by comment-blanked text, so the new fixture strings (`server.watcher.on(`,
+  `const onChange = (`) made it list its own test file as a watcher and fail. `posixPathGuard`'s binding
+  regex counted 23 POSIX bindings where there are 14; all 9 extra were `const p = '/Users/…'` inside
+  fixture source strings. `jsonSafeIsShared` counted a `JSON.stringify(...)` written in a message string
+  (the DEV error in `writeMaterialExtra`, `materialExtras.ts`). Comment blanking does not make a text scan safe; strings are the other half.
+- **The extent was not the only window.** "Runs before", "inside the install's try", "the error path"
+  and "the claim is released before this exit" were also offsets: the first `indexOf` of each call, the
+  400 characters after one, the text between a log line and the next `} catch`. The node form is an
+  earlier statement of an enclosing list (`precedingStatements`) in the SAME function. The first draft
+  of that dropped the same-function half and credited a closure merely DEFINED before the install.
+  Offsets on nodes are still offsets: "exits after `buildClaim = …`" by position included the
+  acquisition's own `catch`, which runs while no claim is held. The unit there is the top-level
+  statement.
+- **Where names repeat, resolve by symbol.** SceneView's 2D and 3D pickers are both
+  `pickEntityAtViewportPoint`; only the slice each regex ran over told them apart. A handler that
+  shadows `path` passes `activeScenePath(path` as text. `posixPathGuard`'s indent window was a guess at
+  scope, and missed a module-level binding used two `it`s down.
+- **A reader that sees the whole unit finds what the slice never covered.** `createPrefabFromEntity`
+  writes the prefab twice: the `redo` closure rewrites it and must stay quiet, and that is now pinned.
+  "No tool spreads an `action`-bearing arg object" checked one tool; it now checks the 11 that declare
+  `action`. `classifySceneChange` branches must now RETURN the kind they test, not merely compare it.
+- **A fixture written as a fragment cannot be parsed.** `jsonSafeIsShared`'s detector fixtures were
+  `': JSON.stringify(…) ?? …'` and an unclosed `function isThenable(…) {`. They are statements of the same
+  shapes now, plus the two the paren scan documented as blind spots (a `)` in a regex literal, a
+  backtick nested in `${…}`).
+- **The review confirmed 16 more (plus one plausible and a nit, all fixed), and the largest class was a
+  node reader NARROWER than the text it replaced.** Three reviewers, one per file group, each ran the old
+  guard beside the new one on a perturbed subject. The old window was often wide by ACCIDENT, and that width was load-bearing.
+  - `bootstrapGameDepsVendorOrder`'s `'\n  }'` closer never matched the file's indent, so it scanned
+    from the vendor call to the install. A catch-only reader passed an `if (!vendorResult) continue;`
+    between them.
+  - The icon guard's text ban covered the whole function; `iconSpawns` covered one array literal. A
+    second spawn with `--icon`, or a flag held in a variable, passed.
+  - `objectReads` read array literals and missed `gcloudRun('storage', 'cat', …)`.
+  - The install port only had to CALL `runScaffoldShell`, where the concise-arrow regex had pinned its
+    RETURN. `return true` after it builds on while npm is still running.
+  - `warnInertPrefabSizes` compared the path argument, and the regex had pinned the prefab too.
+  - `posixPathGuard` needed the literal to be the whole argument, and `'/tmp/' + name` is not.
+  - `constructsTeardownToken` took a declaration or `=`, and a `??=` module left the population with
+    both checks on it.
+
+  So "the same population on today's tree" is necessary and not sufficient. Measure the old guard's
+  REACH as well: what else could its window have contained?
+- **A check that lives only in a comment or a failure message is not a check.** `dirtyWake`'s message
+  said the wake ran "before its return", and it compared top-level indices, so a conditional
+  `{ …; return; }` above the wake passed. `viteCacheBust`'s docblock said a clear "on every boot" is not
+  the fix, and nothing read the `if (prev !== buildSig)` gate. The stub scan's commit said nothing
+  unreadable yields "no members" without a row. A returner with no in-file call, or a `return` inside
+  an anonymous callback, did exactly that. A commit message's mutation list is a claim too: "no
+  dedupe: red" was green, because no fixture held a node in both sets.
+- **Each fix to a guard reader gets its own review, and two rounds of it still found defects.** The
+  first re-review of the review fixes found one that stopped counting a `break` the text reader had
+  counted. The second found a release credited because it sat below module scope, though it ran before
+  the build it was meant to cover. It also found a gate reader built from a list of what CAN skip
+  (`guardsOf`: `if`, `? :`, `&&`, `||`), which `??`, `||=` and a `switch` walked past. That reader is now
+  a list of what CANNOT skip. And it found three new rules that no mutation turned red. A list of the
+  ways to escape a check is never complete. Allow the known-safe shapes and flag everything else.
+
+  A third round still found seven, two of them false greens against the real script. Two lessons are new:
+  - **Stop locating the work, and pin a checkable condition instead.** Each claim-release reader tried to
+    say where "the build" was: module scope, then after the `try` block. Each moved the hole
+    (`release(); try { build } catch { failed = true } if (failed) exit` passed). The rule now is that
+    nothing but `console.*` or an exit runs between the release and the exit. It is strict, and red on a
+    nested report, but it cannot be walked around.
+  - **An allowlist needs its own accept cases, or it turns into false reds.** The install allowlist red-flagged
+    `if (npmRun(…).status !== 0)`. The "prior value" check red-flagged `JSON.parse(prev).buildSig !==
+    buildSig`, because a property NAME matched. And a depth budget that returns "clean" when exhausted
+    fails open. Fail loudly instead.
+
+**P3 landed** the ~43 sites in 14 GAME test files — Court (11), sling, forest-camp and wordweave (3) —
+that took a code unit out of a game's `runtime/systems.ts` by text shape. It added no `sourceAst`
+helper: each file's reader is a named function over P1's. Populations were measured old against new
+for every member, and **most were identical, which is the point** — these guards were correct on
+today's tree and blind to the next edit. Three were not identical, and the deltas say what the text
+could not see:
+
+- **A scan can enumerate NOTHING and still look busy.** `worldSwap`'s `__testing` partition has three
+  member scans, all keyed on a two-space indent. The INLINE-ARROW arm — the one its own comment calls
+  "the one shape this partition could not see" — matched 0 members where there are 85; every one of
+  them was in no population at all, under a rule whose claim is that it is TOTAL. The verdict does not
+  move (none takes a world first), so nothing but the count could have reported this.
+- **A body-by-name slice over-reads, and how far is not visible at the call site.** `winSequence` cut
+  to the next `'\nfunction '`: `lockedRefusal`'s body is 316 characters and it read 1,235;
+  `commitUndo`'s is 1,873 and it read 4,848. wordweave's 14 `update*Visuals` passes are 61,015
+  characters together and the slices returned 151,714. Every one of those checks asks whether a body
+  MENTIONS something, so the answer was partly a neighbour's.
+- **A `[^}]*` body is a fail-OPEN miss.** wordweave's backgroundColor guard read a `patchUI` body with
+  `\{([^}]*)\}`, which ends at the first `}` — so a call nesting an object before its
+  `backgroundColor` read as not pushing one. 36 sites found against 37 (`CoinShortfallBuy`).
+
+What else recurred:
+
+- **`function name(` cannot see a GENERIC signature, and a parameter's TEXT cannot see an optional
+  one.** Court's `systems.ts` has three generic declarations (`nestEntryMap`, `withDeadline`,
+  `trackedCloudSync`) that were in no population, and `saveSession(world?: World)` read as world-free
+  because `world?: World` fails `startsWith('world: World')`.
+- **A slice to EOF is a window over the whole rest of the file, and two of these were.**
+  `cellMapDiscipline` anchored at `layoutBoard` and ran to the end; `sweepGate` sliced its skip banner
+  the same way, and the file declares a THIRD banner below it that also writes to stderr and calls no
+  `console.*`. Narrowing the second to its `if` statement was NOT enough on its own: mutation-checked,
+  aiming the selector at the other banner left both assertions green, because the two blocks are
+  indistinguishable by what they assert. It now pins which banner it read.
+- **Fixture-testing a reader usually means SPLITTING it from the file it reads.** Half of these readers
+  took a path, so their hazards could not be staged: `palette`'s mirror reader, `layoutInputSignature`'s
+  runtime-write reader and the three `configFields` span readers all became `(source, label)` functions
+  with a thin file wrapper, and the fixture calls the reader rather than a copy of it.
+- **A fixture expectation is a claim too.** Three of these were wrong on the first run — a nested
+  literal's HOLDER is a field of the interface (its inner key is not), a top-level `nested: {…}` key IS
+  a written field, and `objectLiteralKeys` spells a spread `'...'`, which the hand-rolled reader had
+  skipped silently. Each was a case the new reader answered correctly and the fixture had guessed at.
+- **The migration's OWN review found the one regression, and it was a node reader that asked for MORE
+  than the text did.** The bare-entity-id BAN in `worldSwap` went from `/^let (\w*RootId) = /gm` — a
+  name — to a name PLUS a `number` annotation or a numeric-literal initializer. Three of its four
+  spellings went silent: `= -1` (a `PrefixUnaryExpression`, not a numeric literal), `= NONE`, and
+  `= boardRoot.id()`, which is the shape the ban exists to forbid. Proven both ways: with that
+  declaration inserted into `systems.ts`, the migrated file was 22/22 green while the pre-migration
+  guard was RED. **A node predicate is not automatically wider than the text it replaces — every
+  conjunct you add to "what the node must look like" is reach you are giving up**, and the fixture
+  will not tell you, because a fixture written alongside the new reader exercises the spellings that
+  still work. The same shape, smaller: `p0.type?.getText() === 'World'` refuses `World | null`, which
+  `startsWith('world: World')` accepted.
+- **A partition that enumerates by SHAPE has to enumerate every shape.** The `__testing` seam rule
+  calls itself total; 27 of that literal's 321 properties are METHOD syntax (`name(world, dt) { … }`),
+  which neither the three `^ {2}` regexes nor the first node cut put in any population. Asking "is
+  this a `PropertyAssignment` whose initializer is an arrow" is a question about spelling, and a
+  partition's members do not owe you one spelling. Related, and empty today: a reader enumerating
+  only `function` declarations cannot see a member naming a `const f = (world: World) => …`.
+
+**P4 landed** (#1241) the seven engine guards that kept a private scope or dataflow simulator:
+`geometryRelease`, `notifyIsShared`, `metaMergeNotClobber`, `worldSwapTeardownFalsifiable`,
+`appManagerDisposeReachable`, `chromeTagging` and the eleven #723 derivers in `qaCaseReferences`. The
+close-out sweep (`depth(\+\+|--)` over every test root) found two more that no census had listed,
+`gameToolFirstSentence` and `modalShellCoverage`, and moved them too. It added no `sourceAst` helper.
+`qaCaseReferences` keeps one parse per source text, TSX first and then TS, because a `<T>x` cast does
+not parse as TSX. Populations were measured old against new. Seven were identical, among them 1352 ids
+and 116 patterns over the editor corpus, per deriver and per file. (`chromeTagging`'s exemption keys now
+hold the whole first prop, but no element changed.) One was not, and one differed only in the guard's own
+file:
+
+- **`notifyIsShared` found four fan-outs the regex never matched.** Two call the element inside a spread
+  (`...p(set)`), which the regex refused because it rejects a call preceded by `.`. Both are COLLECT
+  queries, so they are exempt as `query`. Court's and Wordweave's cloud-sync teardowns start their
+  callback body with `try`, and the regex needed the call first. Both are now `notifyListeners(…, () =>
+  {})`.
+- **`worldSwapTeardownFalsifiable`'s text reader counted its own fixture STRINGS as mocks.** That is P2's
+  lesson again, from inside the guard.
+
+What recurred:
+
+- **"The nearest declaration above" is a scope guess, and three guards made it.** They were
+  `metaMergeNotClobber`'s nearest `const`, `chromeTagging`'s last `function`/`const` before the prop,
+  and `geometryRelease`'s 200-line brace-frame stack, which a `'}'` in a string closed early. They are
+  now `declarationOf` and `enclosingNamedFunction`. **Removing the guess removes the checks that
+  existed to catch it:** "two calls resolved to the same declaration" was only there to catch the
+  scope-blind binding, so it went too.
+- **A nested literal answering for its parent was the commonest miss.** A first-match regex read an
+  inner `name`, `type`, `hidden`, `key` or `id` as the outer literal's own: a trait's `showIf`, a
+  settings field's guard, `generated: { id }` and `FREE_PRESET`'s `meta`. `ownString`/`propertyValue`
+  read own members only.
+- **A text window pairs neighbours, and each one here paired silently.** `MATRIX_GROUPS` gave a row
+  without a `defaultPath` the next row's. The write-meta reader took the next `JSON.stringify(`
+  anywhere in the file. `unregisterManagers`' 500-character window stood in for "an element of this
+  array". The view-mode reader took the file's FIRST `(… as const).map`, where it should take the
+  one whose callback builds the id.
+- **A guard can ship with no cover for its own reader.** `appManagerDisposeReachable` had none, so six
+  wrong readings passed unnoticed until someone ran the old regexes on hazards. Among them:
+  `implements Disposable, ManagerDef` was not a manager, a `nickname = '…'` field read as the name, and
+  `Array<ManagerDef>` was not in the census.
+- **A mutation has to break the thing you think it breaks.** Three first attempts stayed green for a
+  reason unrelated to the guard. `findNodes` is root-inclusive and in source order, so an "any depth"
+  mutation still found the literal's own member first. The old semantic is "first in TEXT order". A
+  probe named `geo2` never matched `/geo$/`, so "exemption removed: green" proved nothing. And one
+  fixture line held two ways to satisfy the rule (`fn?.()` beside `(fn as F)()`), so removing either
+  one stayed green. Give each expectation one path to satisfy it.
+- **A redundant conjunct is a finding, not a harmless extra.** The producer scan's "does not
+  DEFINE `onWorldSwap`" test was unreachable once producers were read as CALLS. A definer that never
+  calls the function is already out. Mutation found it, and it was deleted rather than kept "just in
+  case".
+
+- **The review still found three node readers NARROWER than their text — P1–P3's lesson, a fourth
+  time.** Each one passed a spelling the old guard had failed, and each fixture had been written
+  beside the new reader:
+  - `worldSwapTeardownFalsifiable` widened "loads the original" to `vi.importActual` and any
+    loader name, and then skipped the whole literal. So `{ ...(await vi.importActual(world)),
+    onWorldSwap: vi.fn() }` passed as a partial mock, though the key after the spread IS the
+    export. The pre-migration fixture already pinned the `importOriginal` spelling of that swallow as
+    clean. A partial mock now answers for an override written after its last spread. Two more
+    re-review rounds tightened that the P2 way, with an allowlist and not a list of escapes: a spread
+    or an `x.onWorldSwap` hand-on counts only when `x` resolves to `await <loader>()` or
+    `vi.importActual(…)`. Otherwise a hoisted `mocks.onWorldSwap` spy and a `...stubs` spread each
+    passed as "the original survives". The repo's `vi.fn(actual.onWorldSwap)` spy idiom stays clean.
+  - `geometryRelease`'s `.geometry` test needed the whole initializer to BE the read. The regex had
+    matched a prefix, so `mesh.geometry ?? fallback` and `mesh.geometry.clone()` had counted.
+  - `modalShellCoverage` did not unwrap `inset: 0 as const`.
+
+  The fix is the one P3 named: before you trust an equal population, list what the old REACH
+  admitted and probe each spelling against both readers.
+
+**P5 landed** `layoutConditionalScan.ts` on the parse and recorded the three readers that stay text or
+move. The scanner's population was **identical** old against new (86 rows, every predicate sign and
+gate string), so the change is the REACH, and five fixtures pin it: four the text scanner got wrong
+(a braceless `run({ fast }); else ctx.skip()`, a probe below JSX text, `!(ci && hasX())` read with its
+De Morgan sense, and a test-local that shadows a probing name) and one it got right by accident (an
+unconditional `ctx.skip()` in a test a probing `if` registers — kept flagged on purpose). Two lessons:
+
+- **A stated limit is priced by a measurement, and the measurement ages.** The "a real tokenizer costs
+  ~10 s" line kept a heuristic literal-blanker in place; the parse measured ~0.9 s over the whole corpus
+  when it was finally re-run. A cost that justifies a limit belongs next to the date it was measured.
+- **A text reader's recorded decision needs a check that makes the moved edge LOUD in both
+  directions.** `iapParkedCallRelease`'s Java brace cut failed loudly when a `"}"` cut it short (exact
+  `toBe(1)` counts), but a `"{"` made it run long into the next method and every assertion stayed
+  green. It now refuses a body that contains a member declaration. `glProgramRelease` parses the 2.2 MB
+  three bundle (~150 ms) and takes the ONE `class Pipelines` node — the old slice to the next
+  `\nclass ` could run long, and nothing checked that it had not. The Java refusal matches only a
+  member at the signature's own indent, since an anonymous class's `public void run()` is legal inside a body. `pluginMethodParity`'s Swift half
+  already carried its recorded decision (#1195).
+- **A migration can strand an exemption row in ANOTHER file.** `cellMapDiscipline`'s two `indexOf`
+  ordering comparisons were on `indexOrderingAssertions`' in-flight ledger (#1181). Converting them to
+  node positions left that row blessing occurrences that no longer exist, and the ledger's
+  over-blessing check caught it in `verify` — which is that rule working, and worth knowing before the
+  next phase moves a file another guard counts.
+- **Three smaller ones, all fail-closed, all from the same cause — a node reader answers a slightly
+  different question than the text did, and the difference is invisible until the input changes.**
+  Excising a literal by its own span left `cfg`/`fields`/the trait `name` in the identifier corpus (a
+  config field spelled `name` would have counted as read by its own declaration); `objectLiteralKeys`
+  spells a spread `'...'`, which a guard checking keys against scene entities would have reported as
+  "no entity named '...' is authored"; and `findNodes(…, isStringLiteralLike)` descends INTO a
+  template's `${…}`, so `` `${n === 1 ? 'minute' : 'minutes'}` `` contributes two arms the function
+  cannot return alone. Read what the helper returns for the shapes your subject does NOT have yet.
 
 
 Progress: **seventeen guards are on the ledger** — `determinismGuard`, `docCitations` and

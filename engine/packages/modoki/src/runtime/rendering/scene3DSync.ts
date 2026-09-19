@@ -2,6 +2,9 @@
 
 import * as THREE from 'three';
 import { decomposeTrs } from '../core/ecs/decomposeTrs';
+import { fireDirtyListeners } from '../core/renderDirty';
+import { createLoadFailureMemo } from '../core/loadFailureMemo';
+import { absentIfBundled } from '../core/assetLoadErrors';
 import { beginBootSpan, endBootSpan, bootSpanAsync } from '../core/bootTimeline';
 import { noteGpuContextCreated } from '../core/gpuContextTracking';
 import { installGlProgramReleaseHatch } from './glProgramRelease';
@@ -63,6 +66,7 @@ import { clampPixelRatio, basePixelRatio } from './webCanvasSizing';
 import { resolveAnimSetParams, ANIMSET_DEFAULTS, getAnimSet } from '../loaders/animSetCache';
 import { clone as cloneSkeleton, retargetClip } from 'three/examples/jsm/utils/SkeletonUtils.js';
 import { resolveRef } from '../loaders/assetManifest';
+import { onAssetInvalidated } from '../core/assetInvalidation';
 import { onWorldSwap, findEntityByGuid, peekCurrentWorld } from '../core/ecs/world';
 import { EntityTable } from '../core/ecs/entityTable';
 import { emit, entityRef } from '../core/journal';
@@ -79,6 +83,14 @@ import { cloneDerived, collectDerivedChain, retireDerivedMaterial, retiredDerive
 import { getActiveRenderer } from '../core/activeRenderer';
 import { setActiveRenderer } from '../loaders/textureResolver';
 import { PARTICLE_LAYER } from './layers';
+import { runExclusivePrecompile, runExclusivePrecompileWithin } from './postfx/precompileSession';
+
+/** How long the pre-swap prewarm waits for its turn on the renderer's compile queue before
+ *  skipping (#957). A mechanism ceiling, not a feel knob: it bounds how much a scene load can be
+ *  delayed by the PREVIOUS scene's compile still running (a cold pipeline cache), and the skip is
+ *  safe because the post-swap live compile warms the placed scene anyway. Roughly three times the
+ *  prewarm's own main-thread cost on an A23 (~300-360 ms, #324). */
+const PREWARM_MAX_QUEUE_MS = 1_000;
 
 // Reused across frames to avoid per-frame allocations
 const _activeLightIds = new Set<number>();
@@ -119,8 +131,9 @@ function warnUnknownPrimitiveOnce(id: number, meshName: string): void {
 // Materials created inline for specific entities (not from caches) are tracked PER RENDER STATE,
 // as `RenderState.ownedMaterials` — only those are safe to dispose when reassigned or at teardown;
 // shared cache materials and the primitive placeholder sentinel must not be. `_defaultMaterial`
-// itself is never bound directly either (#480) — `syncMaterial` clones it per entity and owns
-// the clone, so the module-level instance stays untouched and is safe only as a clone SOURCE.
+// is never OWNED: a PRIMITIVE with an empty ref gets a per-entity clone it owns (#480), while a GLB
+// (`Renderable3D`) mesh with an empty ref binds the shared instance directly (#1385), so it must
+// never be disposed through a render state.
 //
 // ⚠️ Per-state, not module-global, because THE EDITOR RUNS TWO OF THESE on one world (SceneView +
 // the Game panel's Scene3D) and each mints its OWN inline materials. A shared set let one loop's
@@ -444,12 +457,14 @@ export function setActiveCameraFrame(world: World, ref: { name?: string; guid?: 
   // Pass 1: resolve the target entity id. A no-match is a NO-OP — a typo'd ref
   // must NOT deactivate every frame and silently kill framing.
   const target = { id: -1 };
+  // A guid resolves through findEntityByGuid, which also follows a re-minted RUNTIME guid (#1210).
+  const byGuidId = ref.guid != null ? findEntityByGuid(ref.guid, world)?.id() : undefined;
   world.query(CameraFrame, EntityAttributes).updateEach(([, attrs], entity) => {
     if (target.id >= 0) return;
     if (deactivatedEntities.has(entity.id())) return; // can't become the active frame (selectActiveFrame skips it)
     const match =
       (ref.id != null && entity.id() === ref.id) ||
-      (ref.guid != null && attrs.guid === ref.guid) ||
+      (byGuidId != null && entity.id() === byGuidId) ||
       (ref.name != null && attrs.name === ref.name);
     if (match) target.id = entity.id();
   });
@@ -1340,6 +1355,10 @@ export interface BillboardEntry {
   /** Set true by `disposeBillboardEntry`. An in-flight page-load resolving after this
    *  disposes its own texture instead of writing to the dead entry (leak guard). */
   disposed: boolean;
+  /** Parts whose page failed to load, or was backing off when the entry was built (#1397). The
+   *  entry is rebuilt only on a `billboardSig` change, so without this a failed page stayed
+   *  missing for the entry's whole life; `syncSkinnedSprite3D` re-asks these each frame. */
+  pendingPages: Set<number>;
 }
 
 export interface RenderState {
@@ -1387,6 +1406,54 @@ export interface RenderState {
    *  per-world — so only the PRIMARY surface (runtime/GameView Scene3D) emits, else
    *  every event would double-fire. In a shipped game there's one surface (primary).*/
   emitLifecycle: boolean;
+}
+
+/** A field `forgetEcsObject` can clear by bare id. The members are FUNCTION PROPERTIES, not method
+ *  signatures, on purpose: a method is compared bivariantly, which let `EntityTable` (whose `delete`
+ *  takes a packed `Entity` and calls `.id()` on it) satisfy this and then throw on first teardown. */
+type EntityRowKey = {
+  [K in keyof RenderState]: RenderState[K] extends { delete: (id: number) => boolean; clear: () => void } ? K : never;
+}[keyof RenderState];
+
+/** Every per-entity row describing the ONE `ecsObjects` object at an id — the single list each
+ *  teardown clears through `forgetEcsObject` (#1388). Four sites used to restate it by hand and one
+ *  drifted (#1385: the GLB mesh swap kept `ecsMaterials`). A map added to `RenderState` must be
+ *  listed here or in `scene3DSyncRenderStateRows.test.ts`'s `OWNED_ELSEWHERE` ledger, or that test fails.
+ *  Deliberately NOT here: `skinnedShadowFlags`/`skinned`/`billboards`/`textMeshes` — other passes
+ *  own them, and an entity may carry a SkinnedModel beside a Renderable3D under the same id. */
+export const ECS_OBJECT_ROWS = [
+  'ecsObjects', 'ecsOwners', 'ecsSprites', 'ecsMaterials',
+  'ecsColors', 'ecsSizes', 'ecsShadowFlags', 'ownsGeometry',
+] as const satisfies readonly EntityRowKey[];
+
+/** Drop every `ECS_OBJECT_ROWS` row for `id`. Bookkeeping ONLY — removing the object from the scene
+ *  and disposing/retiring what it owns differ per site and stay with the caller. Clearing
+ *  `ecsSizes`/`ecsColors` for a GLB is harmless (only the primitive pass reads them); clearing
+ *  `ecsMaterials` and `ecsShadowFlags` is load-bearing (a rebuilt object must re-run `syncMaterial`
+ *  and `applyShadowFlags`, or it keeps a baked material / starts unshadowed). */
+export function forgetEcsObject(state: RenderState, id: number): void {
+  for (const key of ECS_OBJECT_ROWS) state[key].delete(id);
+}
+
+/** Drop the object at `id` MID-PASS so the caller can build its replacement: out of the scene, owned
+ *  geometry disposed, owned materials RETIRED rather than disposed (#477 — this runs in the frame
+ *  callback that also renders), then every row forgotten. The GLB mesh swap and the primitive
+ *  rebuild share it: the swap used to skip the dispose, so an id that turned from a primitive into
+ *  a GLB in one frame leaked the primitive's geometry and default material — `disposeRenderState`
+ *  walks only `ecsObjects`, which no longer held it (#1388 close-out). */
+function discardForRebuild(state: RenderState, scene: THREE.Scene, id: number, obj: THREE.Object3D): void {
+  scene.remove(obj);
+  if (state.ownsGeometry.has(id) && (obj as THREE.Mesh).geometry) {
+    (obj as THREE.Mesh).geometry.dispose();
+  }
+  for (const target of materialTargetsOf(obj)) {
+    const mat = target.material as THREE.Material;
+    if (mat && state.ownedMaterials.has(mat)) {
+      state.ownedMaterials.delete(mat);
+      retireDerivedMaterial(mat, () => mat.dispose());
+    }
+  }
+  forgetEcsObject(state, id);
 }
 
 /** Create a fresh RenderState with empty maps/sets. Pass emitLifecycle=true for the
@@ -1438,9 +1505,60 @@ function disposeSkinnedEntry(entry: SkinnedEntry): void {
  *  that model — *before* the underlying geometry is disposed. Without this,
  *  the next render frame trips WebGPU's "setIndexBuffer parameter is not a
  *  GPUBuffer" because the in-scene mesh still points at the freed buffer.
+ *  Also evicts on a `'mesh'` event — a `.mesh.json` edited with its GLB untouched (#1380) —
+ *  because the built object is cached by ref string and nothing else would rebuild it.
  *  Returns the unsubscribe function; callers should invoke it on teardown. */
 export function attachInvalidationListener(state: RenderState, scene: THREE.Scene): () => void {
-  return onModelInvalidated((_modelPath, targets) => {
+  /** Tear down one entity's built object so the next sync rebuilds it from the cache. The model
+   *  and mesh branches below share it, so a new row in the per-entity maps is cleared by both. */
+  const evictEntity = (id: number, disposedMats: ReadonlySet<THREE.Material>): void => {
+    const obj = state.ecsObjects.get(id);
+    if (obj) {
+      // #719: retire any light-mask variant derived from a material `invalidateModel` is about
+      // to dispose, BEFORE it disposes it.
+      //
+      // ⚠️ This is what makes disposing GLB template materials safe on the RE-IMPORT path.
+      // `Material.clone()` copies texture REFERENCES (see `derivedMaterials.ts`), and a
+      // light-mask variant is such a clone. On a scene swap the variant caches are already
+      // drained — `SceneManager` fires `onWorldSwap` before `releaseAllForScene` — but a
+      // re-import of a live model swaps no world at all, so without this a variant would sit in
+      // `owned` sampling textures that are about to be freed.
+      //
+      // ⚠️ **Narrowed to `disposedMats` on purpose — retiring by evicted OBJECT over-reaches.**
+      // A mesh with a material override binds the shared cached `.mat.json`
+      // (`resolveMaterialForMesh(...) || template.material`), which `invalidateModel` never
+      // disposes. Retiring on that base would delete variants belonging to other, still-live
+      // entities sharing the override; each then re-mints a clone + pipeline and renders UNLIT
+      // until it compiles (see `lightMaskVariants.ts`'s header). So retire only what is actually
+      // about to be freed.
+      //
+      // Runs on this side because this listener is what knows WHICH objects are being evicted —
+      // not for layering reasons: `loaders/` and this file are both L3-unrestricted
+      // (`engine/eslint.config.js` `L3_FOLDERS` / `L3_RECLASSIFIED_FILES`), so either direction
+      // would have been legal. The ordering holds because `invalidateModel` fires
+      // `emitAssetInvalidated` synchronously BEFORE it disposes anything.
+      for (const mat of materialsOf(obj)) {
+        const base = baseOf(mat);
+        if (disposedMats.has(base)) retireVariantsOf(base);
+      }
+      scene.remove(obj);
+    }
+    forgetEcsObject(state, id);
+  };
+
+  // A `.mesh.json` EDIT (#1380): the entity's ref string is unchanged, so without this the sync
+  // never rebuilds and the old binding keeps drawing. Nothing is disposed on this path — the GLB
+  // was not touched, so its templates and their materials stay cached — hence no variant retires.
+  const offMesh = onAssetInvalidated((kind, meshPath) => {
+    if (kind !== 'mesh') return;
+    const toEvict: number[] = [];
+    for (const [id, meshRef] of state.ecsSprites) {
+      if (resolveRef(meshRef) === meshPath) toEvict.push(id);
+    }
+    for (const id of toEvict) evictEntity(id, NO_MATERIALS);
+  });
+
+  const offModel = onModelInvalidated((_modelPath, targets) => {
     const toEvict: number[] = [];
     for (const [id, meshRef] of state.ecsSprites) {
       const asset = getMeshAsset(meshRef);
@@ -1462,45 +1580,7 @@ export function attachInvalidationListener(state: RenderState, scene: THREE.Scen
       }
     }
 
-    for (const id of toEvict) {
-      const obj = state.ecsObjects.get(id);
-      if (obj) {
-        // #719: retire any light-mask variant derived from a material `invalidateModel` is about
-        // to dispose, BEFORE it disposes it.
-        //
-        // ⚠️ This is what makes disposing GLB template materials safe on the RE-IMPORT path.
-        // `Material.clone()` copies texture REFERENCES (see `derivedMaterials.ts`), and a
-        // light-mask variant is such a clone. On a scene swap the variant caches are already
-        // drained — `SceneManager` fires `onWorldSwap` before `releaseAllForScene` — but a
-        // re-import of a live model swaps no world at all, so without this a variant would sit in
-        // `owned` sampling textures that are about to be freed.
-        //
-        // ⚠️ **Narrowed to `disposedMats` on purpose — retiring by evicted OBJECT over-reaches.**
-        // A mesh with a material override binds the shared cached `.mat.json`
-        // (`resolveMaterialForMesh(...) || template.material`), which `invalidateModel` never
-        // disposes. Retiring on that base would delete variants belonging to other, still-live
-        // entities sharing the override; each then re-mints a clone + pipeline and renders UNLIT
-        // until it compiles (see `lightMaskVariants.ts`'s header). So retire only what is actually
-        // about to be freed.
-        //
-        // Runs on this side because this listener is what knows WHICH objects are being evicted —
-        // not for layering reasons: `loaders/` and this file are both L3-unrestricted
-        // (`engine/eslint.config.js` `L3_FOLDERS` / `L3_RECLASSIFIED_FILES`), so either direction
-        // would have been legal. The ordering holds because `invalidateModel` fires
-        // `emitAssetInvalidated` synchronously BEFORE it disposes anything.
-        for (const mat of materialsOf(obj)) {
-          const base = baseOf(mat);
-          if (disposedMats.has(base)) retireVariantsOf(base);
-        }
-        scene.remove(obj);
-      }
-      state.ecsObjects.delete(id);
-      state.ecsOwners.delete(id);
-      state.ecsSprites.delete(id);
-      state.ecsMaterials.delete(id);
-      state.ecsShadowFlags.delete(id);
-      state.ownsGeometry.delete(id);
-    }
+    for (const id of toEvict) evictEntity(id, disposedMats);
 
     // Skinned (rigged) entries: evict any whose GLB was invalidated so the next
     // syncSkinnedModels rebuilds the clone from the freshly-reloaded prototype.
@@ -1513,7 +1593,10 @@ export function attachInvalidationListener(state: RenderState, scene: THREE.Scen
     }
     for (const id of skinnedToEvict) state.skinned.deleteId(id); // disposes, and drops its shadow-flags row
   });
+  return () => { offModel(); offMesh(); };
 }
+
+const NO_MATERIALS: ReadonlySet<THREE.Material> = new Set();
 
 /** Dispose all tracked objects, remove from scene, and clear collections.
  *
@@ -1529,8 +1612,9 @@ export function attachInvalidationListener(state: RenderState, scene: THREE.Scen
  *    - **`primitives._placeholderMaterial`**, the module-level sentinel a primitive holds while its
  *      authored material is still loading (or forever, if the ref does not resolve) — documented
  *      at its definition as "must never be disposed";
- *    - **`_defaultMaterial`**, the module-level fallback for an empty ref — `syncMaterial` never
- *      binds it directly (#480), only a per-entity CLONE that IS owned and disposed normally.
+ *    - **`_defaultMaterial`**, the module-level fallback for an empty ref — bound DIRECTLY to every
+ *      empty-ref GLB mesh (#1385); only a primitive gets a per-entity clone, owned and disposed
+ *      normally (#480).
  *  All but the last are process-wide singletons or cache entries, so one panel unmounting broke
  *  them for every panel. Ownership is the only safe discriminator, and it is already tracked. */
 export function disposeRenderState(state: RenderState, scene: THREE.Scene) {
@@ -1554,15 +1638,8 @@ export function disposeRenderState(state: RenderState, scene: THREE.Scene) {
   state.billboards.clear();
   for (const [, entry] of state.textMeshes) disposeTextMeshEntry(entry, scene);
   state.textMeshes.clear();
-  state.ecsObjects.clear();
-  state.ecsOwners.clear();
-  state.ecsSprites.clear();
-  state.ecsMaterials.clear();
-  state.ecsColors.clear();
-  state.ecsSizes.clear();
-  state.ecsShadowFlags.clear();
+  for (const key of ECS_OBJECT_ROWS) state[key].clear();
   state.skinnedShadowFlags.clear();
-  state.ownsGeometry.clear();
   state.ownedMaterials.clear();
 }
 
@@ -2911,14 +2988,10 @@ export function syncRenderables(world: World, scene: THREE.Scene, state: RenderS
     let obj = ownedEcsObject(state, scene, entity, callbacks);
 
     if (obj && ecsSprites.get(id) !== rend.mesh) {
-      scene.remove(obj);
-      ecsObjects.delete(id);
-      state.ecsOwners.delete(id);
-      ecsSprites.delete(id);
-      ownsGeometry.delete(id);
-      // A fresh THREE object is about to be built below, defaulting to no shadow — force the
-      // next applyShadowFlags check to re-apply rather than reading a stale "unchanged" key.
-      ecsShadowFlags.delete(id);
+      // Every row, not a hand-picked few: this site once kept `ecsMaterials`, so an EMPTY-ref
+      // entity swapped to another mesh read `'' === ''`, never re-ran `syncMaterial`, and drew the
+      // new mesh's BAKED material instead of the engine default (#1385).
+      discardForRebuild(state, scene, id, obj);
       obj = undefined;
     }
 
@@ -3030,30 +3103,10 @@ export function syncRenderables(world: World, scene: THREE.Scene, state: RenderS
     // nothing left to warn about (`warnUnknownPrimitiveOnce` had already fired for that name on
     // the frame the kind changed). Gating the ENTIRE condition on `meshKnown` closes every route.
     if (obj && meshKnown && (sizeChanged || kindChanged)) {
-      scene.remove(obj);
-      // Dispose owned geometry from the previous mesh so size churn doesn't leak.
-      if (ownsGeometry.has(id) && (obj as THREE.Mesh).geometry) {
-        (obj as THREE.Mesh).geometry.dispose();
-      }
-      // The owned MATERIAL needs the same care as the geometry above, and for the #477 reason:
-      // nothing binds it once this mesh is dropped, and no later pass would come back for it —
-      // `disposeRenderState` only walks `ecsObjects`, which no longer holds this mesh. Retire it
-      // rather than disposing inline; this runs mid-pass, in the frame callback that also renders.
-      const discardedMat = (obj as THREE.Mesh).material as THREE.Material;
-      if (discardedMat && state.ownedMaterials.has(discardedMat)) {
-        state.ownedMaterials.delete(discardedMat);
-        retireDerivedMaterial(discardedMat, () => discardedMat.dispose());
-      }
-      ecsObjects.delete(id);
-      state.ecsOwners.delete(id);
-      ecsSprites.delete(id);
-      ecsColors.delete(id);
-      ecsMaterials.delete(id);
-      ecsSizes.delete(id);
-      // A fresh mesh is about to be built below, defaulting to no shadow — force the next
-      // applyShadowFlags check to re-apply rather than reading a stale "unchanged" key.
-      ecsShadowFlags.delete(id);
-      ownsGeometry.delete(id);
+      // Owned geometry is disposed so size churn doesn't leak; the owned MATERIAL is retired, not
+      // disposed inline, for the #477 reason — nothing binds it once this mesh is dropped, and
+      // `disposeRenderState` only walks `ecsObjects`, which no longer holds this mesh.
+      discardForRebuild(state, scene, id, obj);
       obj = undefined;
     }
 
@@ -3163,13 +3216,7 @@ function removeEcsObject(state: RenderState, scene: THREE.Scene, id: number, obj
       mat.dispose();
     }
   }
-  state.ecsObjects.delete(id);
-  state.ecsOwners.delete(id);
-  state.ecsSprites.delete(id);
-  state.ecsColors.delete(id);
-  state.ecsMaterials.delete(id);
-  state.ecsShadowFlags.delete(id);
-  state.ownsGeometry.delete(id);
+  forgetEcsObject(state, id);
 }
 
 /** The kept object at `entity`'s index, or `undefined` after evicting one built for a DIFFERENT
@@ -3288,11 +3335,62 @@ async function loadBillboardPage(url: string): Promise<THREE.Texture> {
   if (isKtx) await ensureKtx2Caps();
   // The KTX2 loader module is imported on demand (#254) — hence the await.
   const loader = isKtx ? await getKTX2Loader() : new THREE.TextureLoader();
-  return (loader.loadAsync(url) as Promise<THREE.Texture>).then((tex) => {
+  // Only the page's OWN load is asked whether the file is missing from a native bundle (#1402). A
+  // failed loader-module import or KTX2 caps race above says nothing about this url, and rejects raw.
+  return (loader.loadAsync(url) as Promise<THREE.Texture>).catch((e: unknown) => { throw absentIfBundled(url, e); }).then((tex) => {
     tex.colorSpace = THREE.SRGBColorSpace;
     if (!isKtx) { tex.flipY = false; tex.needsUpdate = true; }
     return tex;
   });
+}
+
+/** What a FAILED billboard page load left behind (#1397), by url. The url carries the content
+ *  hash, so a re-import arrives under a fresh key. `unknownIs: 'transient'`: `TextureLoader` goes
+ *  through an `<img>`, whose failure is a bare Event (a 404 from the KTX2 loader is three's
+ *  classified `HttpError`). `onRetryDue` wakes a stopped Scene3D so the retry actually runs. */
+const billboardPageFailures = createLoadFailureMemo({ label: 'billboard', unknownIs: 'transient', onRetryDue: () => fireDirtyListeners() });
+
+/** Load `url` into part `idx` of `entry`, sharing one load per url per `jobs` map (a build, or one
+ *  frame's retries). A page that is backing off, or whose load fails, goes to
+ *  `entry.pendingPages` for {@link retryBillboardPages}. */
+function loadBillboardPart(
+  entry: BillboardEntry, idx: number, mat: THREE.MeshBasicMaterial, url: string,
+  jobs: Map<string, Promise<THREE.Texture>>,
+): void {
+  if (billboardPageFailures.blocked(url)) { entry.pendingPages.add(idx); return; }
+  let job = jobs.get(url);
+  if (!job) {
+    // Wake on the SHARED job, not per part (#1368 G2): a page landing after the idle gate's
+    // grace redraws nothing on a stopped Scene3D. Once per page per `jobs` map — a build's, or
+    // one frame's retries — so it is bounded by rebuilds and by the failure memo's backoff,
+    // never a plain frame. This `.then` runs before any part's below, all ahead of the woken
+    // frame. The failure is recorded here, once per load, not once per part.
+    job = loadBillboardPage(url).then(
+      (tex) => { billboardPageFailures.forget(url); fireDirtyListeners(); return tex; },
+      (e: unknown) => { billboardPageFailures.record(url, e); throw e; },
+    );
+    jobs.set(url, job);
+  }
+  job.then((tex) => {
+    // Disposed/rebuilt mid-load: the entry is dead and its texture-dispose loop
+    // already ran (saw null here), so free this late arrival ourselves — else it leaks.
+    if (entry.disposed) { tex.dispose(); return; }
+    mat.map = tex; mat.needsUpdate = true;
+    entry.textures[idx] = tex;
+  }, () => { if (!entry.disposed) entry.pendingPages.add(idx); })
+    .catch((e: unknown) => console.warn(`[billboard] binding page ${url} failed:`, e));
+}
+
+/** Re-ask every part whose page failed, once its backoff has expired (#1397). Per frame, but a
+ *  no-op for an entry with nothing pending and for a url still backing off. */
+function retryBillboardPages(entry: BillboardEntry, parts: Skin2DPartBuffer[]): void {
+  const jobs = new Map<string, Promise<THREE.Texture>>();
+  for (const idx of [...entry.pendingPages]) {
+    const url = parts[idx]?.url;
+    entry.pendingPages.delete(idx);
+    // Still backing off → `loadBillboardPart` puts it straight back.
+    if (url) loadBillboardPart(entry, idx, entry.meshes[idx].material as THREE.MeshBasicMaterial, url, jobs);
+  }
 }
 
 /** Create the THREE objects for one billboarded rig and kick off texture loads. */
@@ -3308,7 +3406,7 @@ function buildBillboardEntry(
   group.add(flip);
   const entry: BillboardEntry = {
     owner, rigRef: ss.rig, sig: billboardSig(buf.parts), mode: opt.mode, group, flip,
-    meshes: [], orders: [], textures: [], deformVersion: -1, disposed: false,
+    meshes: [], orders: [], textures: [], deformVersion: -1, disposed: false, pendingPages: new Set(),
   };
   // Load each distinct page URL once and share across the parts that use it.
   const pageCache = new Map<string, Promise<THREE.Texture>>();
@@ -3331,17 +3429,7 @@ function buildBillboardEntry(
     entry.meshes.push(mesh);
     entry.orders.push(part.order);
     entry.textures.push(null);
-    if (part.url) {
-      let job = pageCache.get(part.url);
-      if (!job) { job = loadBillboardPage(part.url); pageCache.set(part.url, job); }
-      job.then((tex) => {
-        // Disposed/rebuilt mid-load: the entry is dead and its texture-dispose loop
-        // already ran (saw null here), so free this late arrival ourselves — else it leaks.
-        if (entry.disposed) { tex.dispose(); return; }
-        mat.map = tex; mat.needsUpdate = true;
-        entry.textures[idx] = tex;
-      }).catch((e) => console.warn(`[billboard] texture load failed: ${part.url}`, e));
-    }
+    if (part.url) loadBillboardPart(entry, idx, mat, part.url, pageCache);
   });
   scene.add(group);
   return entry;
@@ -3376,6 +3464,7 @@ function syncSkinnedSprite3D(
     disposeBillboardEntry(entry, scene); billboards.delete(id); entry = undefined;
   }
   if (!entry) { entry = buildBillboardEntry(entity.valueOf(), ss, opt, buf, scene); billboards.set(id, entry); }
+  else if (entry.pendingPages.size) retryBillboardPages(entry, buf.parts);
   entry.owner = entity.valueOf();
   entry.mode = opt.mode;
 
@@ -4255,6 +4344,10 @@ async function prewarmShadersForWorldInner(
   // NON-env variant synchronously, which is precisely the cold-compile stutter this mirror is
   // here to prevent (measured at 3926 ms on the Y6, P4a). The prewarm must model the scene the
   // tier will actually draw, not the scene as authored.
+  let prewarmEnvSource: THREE.DataTexture | null = null;
+  const bindPrewarmEnv = () => {
+    if (prewarmEnvSource) prewarmScene.environment = getEnvPMREMTexture(renderer, prewarmEnvSource) ?? prewarmEnvSource;
+  };
   if (tierAllowsIBL(getActiveTierOverrides())) {
     world.query(Environment).readEach(([env]: [{ hdrPath: string; intensity: number }]) => {
       if (!env.hdrPath) return;
@@ -4266,7 +4359,18 @@ async function prewarmShadersForWorldInner(
         // `registerBeforeSwap`, so it runs on EVERY scene swap — handing three a raw equirect here
         // makes `PMREMNode` build its own generator, which is precisely the per-swap leak #739
         // fixes, re-entering through the prewarm door and defeating the fix.
-        prewarmScene.environment = getEnvPMREMTexture(renderer, cached) ?? cached;
+        //
+        // ⚠️ Only the SOURCE is recorded here; the PMREM is derived inside the compile's queue turn
+        // below (#1239 C). Deriving draws PMREM quads through this renderer, and out here a previous
+        // scene's cold live compile can still hold the pass target + scene MRT bound — the quads
+        // would build against that MRT, and the broken texture is cached per renderer and source.
+        //
+        // The raw source is bound meanwhile, so the retired-env sweep still sees a holder while the
+        // prewarm waits in the queue: with only a closure holding it, a re-import could retire and
+        // free it there, and the turn would then derive — and cache for good — a PMREM of a freed
+        // source. Nothing compiles against the raw binding; the turn swaps it before compiling.
+        prewarmEnvSource = cached;
+        prewarmScene.environment = cached;
         prewarmScene.environmentIntensity = env.intensity;
         // Deliberately NO `prewarmScene.background` mirror (#775/#779): three only derives a
         // background conversion from a `scene.background` that is actually SET, so there is no
@@ -4376,10 +4480,13 @@ async function prewarmShadersForWorldInner(
     const template = resolveMeshTemplate(rend.mesh);
     if (!template) { unresolvedMesh++; return; }
     const authored = resolveMaterialForMesh(rend.material, rend.mesh);
-    // An empty `material` is a legitimate "use the mesh's baked material" — only a ref that was
-    // AUTHORED and did not resolve is a miss.
+    // Only a ref that was AUTHORED and did not resolve is a miss. An EMPTY ref draws the engine
+    // default — `syncMaterial` binds `_defaultMaterial` over whatever the build picked (#1385, the
+    // owner's choice: a GLB mesh with no material is grey, not its baked or `.mesh.json` material)
+    // — so that is the variant to compile. This used to compile the baked material for it, a
+    // variant nobody draws, and left the default to `compileLiveScene` after the swap.
     if (rend.material && !authored) unresolvedMaterial++;
-    const material = authored || template.material;
+    const material = rend.material ? (authored || template.material) : _defaultMaterial;
     count += place(template.geometry, material, mirrored, (o) => applyShadowFlags(o, rend.castShadow, rend.receiveShadow));
   });
 
@@ -4550,9 +4657,27 @@ async function prewarmShadersForWorldInner(
   const compileSpan = beginBootSpan('shader-compile', `${count} placeholders${rigCount ? ` + ${rigCount} rigs` : ''}${unresolvedDetail}`);
   try {
     if (typeof compile === 'function') {
-      await (renderer as THREE.WebGLRenderer).compileAsync(prewarmScene, camera);
+      // Queued with every other compile on this renderer — the canvas context this compiles for is
+      // "whatever is bound", and a stage compile running alongside would bind a bloom target under
+      // it (#957, see `runExclusivePrecompile`). Queued with a CEILING, because a scene load awaits
+      // this hook and has none of its own: behind a cold previous-scene compile it would otherwise
+      // wait for all of it. Skipping costs only the warm — `compileLiveScene` compiles what the
+      // swap actually placed.
+      const queued = await runExclusivePrecompileWithin(
+        renderer, PREWARM_MAX_QUEUE_MS, () => {
+          bindPrewarmEnv();
+          return (renderer as THREE.WebGLRenderer).compileAsync(prewarmScene, camera);
+        },
+      );
+      if (!queued.ran) {
+        console.warn(
+          `[prewarm] skipped: another compile held this renderer for over ${PREWARM_MAX_QUEUE_MS} ms — `
+          + 'the post-swap live compile covers the scene instead (#957).',
+        );
+      }
     } else {
       // Fallback: synchronous compile (still better than first-frame-stutter)
+      bindPrewarmEnv();
       (renderer as THREE.WebGLRenderer).compile?.(prewarmScene, camera);
     }
   } finally { endBootSpan(compileSpan); }
@@ -4630,15 +4755,41 @@ function clearPreviousLiveStandIns(): void {
   _liveRetained.length = 0;
 }
 
+/** The `compile` a surface hands `compileLiveScene` when it may draw through a post-FX stack.
+ *
+ *  ⚠️ Everything it needs is read when the compile's TURN on the renderer's queue comes, not at
+ *  the kick (#957) — the queue can hold it for seconds, and in between a frame may:
+ *   - REBUILD the stack (a Director beat, an SS settle): the new stack's scene pass is what the
+ *     next frame draws, so it is the one to warm. Capturing at the kick warmed a disposed one.
+ *   - drop the stack (tier demotion): the scene now draws into the canvas context — compile that.
+ *   - tear the surface down: its renderer is disposed, so compile nothing. */
+export function liveSceneCompileAtTurn(
+  renderer: { compileAsync?(scene: THREE.Scene, camera: THREE.Camera): Promise<unknown> },
+  scene: THREE.Scene,
+  atTurn: () => { stack: { compileSceneAsync(): Promise<void> } | null; camera: THREE.Camera; tornDown: boolean },
+): () => Promise<void> {
+  return async () => {
+    const { stack, camera, tornDown } = atTurn();
+    if (tornDown) return;
+    if (stack) await stack.compileSceneAsync();
+    else await renderer.compileAsync?.(scene, camera);
+  };
+}
+
 export async function compileLiveScene(
   renderer: WebGPURenderer | THREE.WebGLRenderer,
   scene: THREE.Scene,
   camera: THREE.Camera,
   compile?: () => Promise<void>,
 ): Promise<void> {
-  return bootSpanAsync('live-scene-compile', async () => {
-    // Whatever the previous compile left behind, before adding more.
-    clearPreviousLiveStandIns();
+  // Whatever the previous compile left behind, before adding more — and BEFORE queueing, so a
+  // compile abandoned by a swap has its stand-ins out of the new scene now, not once it settles.
+  clearPreviousLiveStandIns();
+  // ⚠️ Queued behind every other compile on this renderer (#957). `compile` binds the post-FX
+  // scene pass's target + MRT across its `await`, and three reads that bound state lazily between
+  // yields — so a stage compile allowed to run alongside built this scene's materials against
+  // bloom's targets: invalid pipelines, a black first launch. See `runExclusivePrecompile`.
+  return runExclusivePrecompile(renderer, () => bootSpanAsync('live-scene-compile', async () => {
     // three reads `matrixWorld` for the pipeline key (the mirrored-entity variant) and for
     // culling, and `compileAsync` updates neither.
     scene.updateMatrixWorld(true);
@@ -4714,7 +4865,7 @@ export async function compileLiveScene(
       // `_prewarmRetained`). They are held until the next prewarm frees them.
       for (const stand of standIns) scene.remove(stand);
     }
-  });
+  }));
 }
 
 // ── Renderer creation ───────────────────────────────────

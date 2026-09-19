@@ -2,9 +2,19 @@
  *  dev server + build).
  *
  *  Extracted from audio-convert.ts when the video converter landed: both need the
- *  same "env override → provisioned toolchain → PATH" lookup and the same cached
- *  availability probe, and a second copy would be a constant shadowing another (the
+ *  same lookup, and a second copy would be a constant shadowing another (the
  *  failure mode the single-source-of-truth rule exists to prevent).
+ *
+ *  ⚠️ **PINNED, never PATH (#1297).** A conversion runs the editor's provisioned,
+ *  version-pinned copy (`install('ffmpeg')` → `<toolchain>/npm-tools`) or an explicit
+ *  `MODOKI_FFMPEG`/`MODOKI_FFPROBE` override — and otherwise FAILS. It used to fall back
+ *  to whatever `ffmpeg` was on PATH, and two builds of it produced different bytes under
+ *  one cache hash (4 of 26 wordweave clips between Homebrew 8.1.1 and ffmpeg-static 6.0;
+ *  ffprobe durations differed on all 26), so what a build shipped depended on which laptop
+ *  converted it. The cache key does not name the binary, so the binary has to be the same
+ *  everywhere instead. The env override stays: setting it is a deliberate act, not an
+ *  accident of what happens to be installed. The resolution itself is shared with
+ *  toktx/msdf-atlas-gen in `pinned-cli.ts`.
  *
  *  ⚠️ The ffmpeg binary must NEVER be bundled into the packaged editor. Every
  *  `ffmpeg-static` build is `--enable-gpl` (redistributable only under the GPL,
@@ -13,51 +23,42 @@
  *  licence. We are compliant precisely because the user's own machine provisions it
  *  on demand — see engine/scripts/before-pack.cjs and docs/video.md. */
 
-import { execFileSync } from 'child_process';
-import { detect } from '../toolchain';
+import { pinnedConversionCli } from './pinned-cli';
 
-const FFMPEG_MISSING_MSG = 'ffmpeg not found. Install it from the Build Support dialog (the editor provisions its own), set MODOKI_FFMPEG to a binary path, or install it on PATH (dev: `brew install ffmpeg`).';
-
-let ffmpegCheck: { ok: boolean; cli: string } | null = null;
-
-/** Resolve a native CLI: an explicit env override wins (bundled/hand-set), else the
- *  editor's provisioned toolchain copy (`install('ffmpeg')` → userData npm-tools),
- *  else the bare name on PATH (dev). detect() re-probes the current filesystem, so an
- *  on-demand install is picked up without restarting. */
-function resolveTool(envVar: string, id: 'ffmpeg' | 'ffprobe', fallback: string): string {
-  const override = process.env[envVar];
-  if (override) return override;
-  try {
-    const d = detect(id);
-    if (d.present && d.command) return d.command;
-  } catch { /* toolchain module unavailable → PATH fallback */ }
-  return fallback;
-}
-
-export function ffmpegBinary(): string {
-  return resolveTool('MODOKI_FFMPEG', 'ffmpeg', 'ffmpeg');
-}
-
-export function ffprobeBinary(): string {
-  return resolveTool('MODOKI_FFPROBE', 'ffprobe', 'ffprobe');
-}
-
-/** For tests — forget the cached CLI-availability probe. */
-export function __resetFfmpegCheck(): void { ffmpegCheck = null; }
-
-/** Ensure `ffmpeg` is callable; returns the CLI path/name or throws with an install hint. */
+/** The pinned `ffmpeg`, or throws with an install hint. */
 export function ensureFfmpeg(): string {
-  const cli = ffmpegBinary();
-  if (ffmpegCheck && ffmpegCheck.cli === cli) {
-    if (!ffmpegCheck.ok) throw new Error(FFMPEG_MISSING_MSG);
-    return ffmpegCheck.cli;
+  return pinnedConversionCli('ffmpeg');
+}
+
+/** The pinned `ffprobe`, or throws with an install hint. */
+export function ensureFfprobe(): string {
+  return pinnedConversionCli('ffprobe');
+}
+
+const warnedProbe = new Set<string>();
+
+/** Run `probe` with the pinned ffprobe; `{}` when there is none or it fails on this file.
+ *
+ *  ⚠️ A MISSING probe is tolerated, not thrown — the owner chose that on 2026-09-16 (#1300:
+ *  the reimport handlers MERGE, so an absent reading keeps the committed value instead of
+ *  breaking the import). Pinning (#1297) does not reverse it: what it removes is the PATH
+ *  fallback, so a missing pinned probe now yields no reading rather than a different build's
+ *  reading. It is said once per process, so the gap is not silent. */
+export function withFfprobe<T extends object>(probe: (cli: string) => T): T | Record<string, never> {
+  let cli: string;
+  try {
+    cli = ensureFfprobe();
+  } catch (e) {
+    const msg = (e as Error).message;
+    if (!warnedProbe.has(msg)) {
+      warnedProbe.add(msg);
+      console.warn(`[asset-convert] no stats probe — converted-file stats are left as they were. ${msg}`);
+    }
+    return {};
   }
   try {
-    execFileSync(cli, ['-version'], { stdio: 'pipe' });
-    ffmpegCheck = { ok: true, cli };
-    return cli;
+    return probe(cli);
   } catch {
-    ffmpegCheck = { ok: false, cli };
-    throw new Error(FFMPEG_MISSING_MSG);
+    return {};
   }
 }

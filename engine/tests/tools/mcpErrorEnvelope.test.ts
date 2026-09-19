@@ -237,6 +237,20 @@ describe('§5 — classification: the code must match what actually went wrong',
     expect(e.why).not.toContain('no explanation');
   });
 
+  // #1223 close-out review: `dispatch-action` refuses a stale targetGuid as `{ok:false, code:'NOT_FOUND',
+  // reason}`; the code makes the route answer 400, and a reader of only error/errors said "no explanation".
+  // Mutation: drop the `reason` fallback from httpFailure's detail reader.
+  it('reads the cause from `reason` too — a coded op refusal relayed on its 4xx', async () => {
+    const s = (surface = loadSurface((req) =>
+      req.path.startsWith('/api/editor-action')
+        ? { status: 400, body: { ok: false, dispatched: false, code: 'NOT_FOUND', stale: 'world-swapped', reason: "targetGuid 'g' matched no entity in the live world" } }
+        : undefined));
+    const e = envelope(s, await s.call('modoki_dispatch_action', { name: 'my.real', targetGuid: 'g' }));
+    expect(e.code).toBe('NOT_FOUND');
+    expect(e.why).toContain('matched no entity in the live world');
+    expect(e.why).not.toContain('no explanation');
+  });
+
   it('a 403 is the wrong-editor refusal, and says to check identity', async () => {
     const s = (surface = loadSurface(() => ({ status: 403, body: { error: 'token mismatch' } })));
     const e = envelope(s, await s.call('modoki_get_editor_state'));
@@ -552,6 +566,26 @@ describe('S2 batch 5 — filters that were silently accepted or silently dropped
     }
   });
 
+  // #1262 close-out: a partly failed mutate is ok:false AND the receipt of what applied. Past the envelope's
+  // 8k `got` it became a shape preview, and the agent lost the guid its own addEntity minted.
+  // Mutation: drop the `gotBudget` option from modoki_mutate_scene, or its spread in postJson.
+  it('a partly failed mutate_scene keeps its receipts past the default 8k got budget', async () => {
+    const alsoDeleted = Array.from({ length: 100 }, (_, i) => `00000000-0000-4000-8000-${String(i).padStart(12, '0')}`);
+    const s = (surface = loadSurface((req) => req.path === '/api/scene-mutate'
+      ? { status: 200, body: { ok: false, changed: 2, errors: ["op[2] (setTrait): no entity named 'Typo'"],
+        warnings: Array.from({ length: 60 }, (_, i) => `schema warning ${i}: ${'x'.repeat(80)}`),
+        created: [{ op: 0, id: 9, guid: 'g-new-box', name: 'Box' }], alsoDeleted, alsoDeletedTotal: 140 } }
+      : undefined));
+    const e = envelope(s, await s.call('modoki_mutate_scene', { ops: [
+      { op: 'addEntity', name: 'Box' }, { op: 'removeEntity', entity: { name: 'P' } },
+      { op: 'setTrait', entity: { name: 'Typo' }, trait: 'Light', fields: { intensity: 1 } },
+    ] })) as { got?: { created?: Array<{ guid: string }>; alsoDeleted?: string[]; elided?: boolean } };
+    expect(JSON.stringify(e.got).length, 'the fixture must exceed the default budget').toBeGreaterThan(8_000);
+    expect(e.got?.elided).toBeUndefined();
+    expect(e.got?.created?.[0].guid).toBe('g-new-box');
+    expect(e.got?.alsoDeleted).toHaveLength(100);
+  });
+
   it('an unknown OP NAME is refused with the vocabulary, not passed through', async () => {
     const s = (surface = loadSurface());
     await expect(s.call('modoki_mutate_scene', { ops: [{ op: 'setTrai', entity: { name: 'X' }, trait: 'Light' }] }))
@@ -628,7 +662,7 @@ describe('review follow-ups — defects the adversarial pass found in this audit
     // every entity — so asking about ONE entity and receiving 200 rects read as "here it is, among
     // others". Same silent-widening class as a dropped filter.
     const s = (surface = loadSurface((req) =>
-      req.path.startsWith('/api/layout-bounds') ? { body: { count: 0, entityCount: 0, entities: [], unresolved: ['stale-guid'] } } : undefined));
+      req.path.startsWith('/api/layout-bounds') ? { body: { totalCount: 0, returnedCount: 0, entityTotal: 0, entities: [], unresolved: ['stale-guid'] } } : undefined));
     await s.call('modoki_get_layout_bounds', { guids: ['stale-guid'] });
     expect(s.last()!.path).toContain('guids=stale-guid');
   });
@@ -841,5 +875,46 @@ describe('Phase 6 — a MUTATING GET\'s ok:false is a failure, a plain read\'s i
     const r = await s.call('modoki_diagnose');
     expect(r.isError).toBeFalsy();
     expect(s.json(r)).toMatchObject({ ok: false, summary: '2 dangling refs' });
+  });
+});
+
+/** #1212: a 200 `{ok:false}` kept its code but DROPPED its options — the ≥400 path always relayed
+ *  them. A CODED refusal is re-statused by its route now, so the shape that still arrives as 200 is
+ *  an UNCODED `{ok:false, options}` — which is what these fixtures send. */
+describe('a 200 refusal relays the op\'s options', () => {
+  it('POST (postJson)', async () => {
+    const s = (surface = loadSurface((req) => req.path === '/api/scene-query'
+      ? { body: { ok: false, error: 'unknown kind', options: ['raycast', 'overlap'] } } : undefined));
+    const e = envelope(s, await s.call('modoki_scene_query', { kind: 'raycast', dim: '3d', origin: [0, 0, 0], direction: [0, 0, -1] }));
+    expect(e.code).toBe('REFUSED_BY_OP');
+    expect(e.options).toEqual(['raycast', 'overlap']);
+  });
+
+  // ⚠️ A DRIFT guard: the real journal op answers its refusal with `captures`, not `options`, so no
+  // current GET reply reaches this shape. It pins that the two 200 paths relay options alike.
+  it('GET with checkFailure (modoki_journal action:start)', async () => {
+    const s = (surface = loadSurface((req) => req.path.startsWith('/api/journal')
+      ? { body: { ok: false, reason: 'type is not watch-gated', options: ['@contact', '@trigger'] } } : undefined));
+    const e = envelope(s, await s.call('modoki_journal', { action: 'start', type: '@nope' }));
+    expect(e.options).toEqual(['@contact', '@trigger']);
+  });
+});
+
+/** PARTIAL is not a refusal — part of the work landed — and the envelope must not call it one. */
+describe('a PARTIAL reply is not described as refused', () => {
+  it('points at what landed instead', async () => {
+    const s = (surface = loadSurface((req) => req.path === '/api/player-prefs'
+      ? { status: 400, body: { ok: false, code: 'PARTIAL', error: 'the cache write landed; the disk write did not' } } : undefined));
+    const e = envelope(s, await s.call('modoki_write_player_prefs', { action: 'set', key: 'k', value: 1 }));
+    expect(e.code).toBe('PARTIAL');
+    expect(e.why).toMatch(/PARTIAL result .*read got for what did and did not land/);
+    expect(e.why).not.toMatch(/refused/);
+  });
+
+  it('a real refusal still says refused — the accept side', async () => {
+    const s = (surface = loadSurface((req) => req.path === '/api/player-prefs'
+      ? { status: 400, body: { ok: false, code: 'REFUSED_BY_OP', error: 'unknown action' } } : undefined));
+    const e = envelope(s, await s.call('modoki_write_player_prefs', { action: 'set', key: 'k', value: 1 }));
+    expect(e.why).toMatch(/refused with HTTP 400/);
   });
 });

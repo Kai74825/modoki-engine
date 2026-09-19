@@ -47,8 +47,47 @@ export const crashlytics = {
   setEnabled(_enabled: boolean): void {},
 };
 
+/** Firebase Analytics — a no-op namespace, mirroring `export * as analytics from './analytics'` in
+ *  3d-test's package, whose `sceneSetup` reads it as `import('@3d-test/app-services').then(({ analytics })
+ *  => analytics.logEvent(…))`. A dynamic import is not checked by Rollup, so without this a playable build
+ *  would reject that promise at runtime rather than fail the build. The guard could not see the use until it
+ *  read the destructured callback from the parse (#1193). Same reason as `track` for doing nothing. */
+export const analytics = {
+  async logEvent(_name: string, _params?: Record<string, string | number>): Promise<void> {},
+  async setUserProperty(_key: string, _value: string): Promise<void> {},
+  async setCurrentScreen(_screenName: string): Promise<void> {},
+  async setEnabled(_enabled: boolean): Promise<void> {},
+  /** #1398 — the real wrapper's off-native answer: no app-instance ID, so the Player ID row says so. */
+  async getAppInstanceId(): Promise<string | undefined> { return undefined; },
+};
+
 /**
- * Ads — a no-op namespace, mirroring `export * as ads from './ads'` in Court's package (#342).
+ * Local notifications — a no-op namespace, mirroring `export * as notifications from './notifications'`
+ * in Weaveling's package (#940). A creative has no OS notification centre to reach, so it answers the
+ * real wrapper's off-native values: `unavailable` (the reminder row shows the stored choice) and nothing scheduled.
+ */
+export const notifications = {
+  async permission(): Promise<'unavailable'> { return 'unavailable'; },
+  async requestPermission(): Promise<'unavailable'> { return 'unavailable'; },
+  async replaceDailyReminders(_reminders: unknown, _isOurs: unknown): Promise<{ scheduled: number; permission: 'unavailable' }> {
+    return { scheduled: 0, permission: 'unavailable' };
+  },
+  async openSettings(): Promise<boolean> { return false; },
+  onForeground(_onActive: () => void): () => void { return () => {}; },
+};
+
+/**
+ * The store review prompt (#939) — a no-op namespace, for the same reason as the others: a playable
+ * ad runs inside an ad SDK's webview with no app to review, and reaching a Capacitor plugin from
+ * there would pull the whole native bridge into a build with a 5 MB ceiling.
+ */
+export const review = {
+  async request(): Promise<boolean> { return false; },
+};
+
+/**
+ * Ads — a no-op namespace, mirroring `export * as ads from './ads'` in Court's package (#342) and
+ * Weaveling's (#1309).
  *
  * ⚠️ The no-op here is not merely a size saving, it is REQUIRED. A playable ad already runs inside
  * somebody else's ad slot: an interstitial launched from within a creative would be an ad inside
@@ -59,6 +98,17 @@ export const crashlytics = {
  */
 export const ads = {
   async initAds(): Promise<void> {},
+  // The AdMob surface both games export (#1309, #1312): the banner as per-frame desired state, a synchronous readiness
+  // read for the "watch a video" button, and UMP's privacy-options row — all "nothing here".
+  setBannerVisible(_visible: boolean): void {},
+  rewardedReady(): boolean { return false; },
+  // #1330 — the break before an ad asks whether one is loaded; a playable has none, so no card shows.
+  interstitialReady(): boolean { return false; },
+  // #1379 — the purchase card waits while an ad is up; a playable never shows one.
+  fullscreenAdShowing(): boolean { return false; },
+  bannerHeightPx(): number { return 0; },
+  privacyOptionsRequired(): boolean { return false; },
+  async showPrivacyOptions(): Promise<void> {},
   cleanupAds(): void {},
   onRewardEarned(_handler: unknown): void {},
   async restoreAdsAfterRealmSurvived(): Promise<void> {},
@@ -67,12 +117,11 @@ export const ads = {
   async showInterstitial(_placement: string): Promise<boolean> { return false; },
   async showRewardedAd(_placement: string): Promise<boolean> { return false; },
   async isRewardedReady(): Promise<boolean> { return false; },
-  async showAdDebugger(): Promise<void> {},
 };
 
 /**
  * Auth — a no-op namespace, mirroring `export * as auth from './auth'` in Court's package
- * (#359/#360).
+ * (#359/#360) and Wordweave's port of it (#927).
  *
  * ⚠️ Like `ads` above, the no-op is REQUIRED rather than merely a size saving, and for a sharper
  * reason. A playable ad is a few seconds inside somebody else's ad slot: it has no Firebase app, no
@@ -108,6 +157,12 @@ export const auth = {
   async currentUserResult() { return { ok: true as const, user: null }; },
   async signOut(): Promise<void> {},
   async onAuthChanged(_cb: unknown): Promise<() => void> { return () => {}; },
+  // Weaveling's cloud-sync deletion check (#679). A playable has no account to ask about; `'unknown'` is the
+  // real function's own off-device answer, and it creates and wipes nothing.
+  async accountStatus(_uid: string) { return 'unknown' as const; },
+  // The account-continuity check (#1274). `[]` is the real function's off-device answer: the check stays off.
+  async loginKeys(_uid: string): Promise<string[]> { return []; },
+  isUserNotFound(_e: unknown) { return false; },
   classifyAuthError(_e: unknown) { return 'not-configured' as const; },
   toCourtUser(_raw: unknown) { return null; },
   __resetAuthForTest(): void {},

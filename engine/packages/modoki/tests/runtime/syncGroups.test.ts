@@ -6,12 +6,19 @@
  * `fakeServer()`.
  */
 
-import { describe, it, expect, beforeEach } from 'vitest';
+import { describe, it, expect, beforeEach, vi } from 'vitest';
+
+const { journalWarn } = vi.hoisted(() => ({ journalWarn: vi.fn() }));
+vi.mock('../../src/runtime/core/gameJournal', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../../src/runtime/core/gameJournal')>()),
+  journalWarn,
+}));
 import {
   decideGroup, hasLocalWrites, scopeMarksToAccount, emptyMarks, neverSynced,
   defineSyncGroup, runGroupSync, runCloudSync, resolveGroupFork,
   type AnySyncGroup, type CloudGroup, type ForkPolicy, type GroupMarks, type GroupStore,
   type GroupTransport, type LocalGroup,
+  loginKey, parseLoginRecord, type AccountContinuity, type LoginRecord,
 } from '../../src/runtime/sync';
 
 // ── Fakes ──────────────────────────────────────────────────────────────────────
@@ -303,6 +310,55 @@ describe('runGroupSync', () => {
     expect(outcome.kind).toBe('fork');
     expect(s.writes.length).toBe(0);
     expect(t.pushes.length).toBe(0);
+  });
+
+  // #1253 — two phones opened on the same day each raise a date floor to the same date: both sides
+  // moved, so `decideGroup` says fork, and both hold identical content. Asking would show two
+  // identical rows.
+  it("onFork: 'ask' does NOT ask when both sides hold the same content — it adopts at the server's version", async () => {
+    const s = makeStore({
+      content: { value: 'same' }, version: 5, updatedAt: 100,
+      marks: marks({ uid: 'u1', lastSyncedVersion: 5, lastSyncedFingerprint: 'before' }),
+    });
+    const g = group({ store: s.store, onFork: 'ask' });
+    const t = fakeTransport({ g: { content: { value: 'same' }, version: 9, updatedAt: 200 } });
+    const outcome = await runGroupSync(g, t.transport, OPTS);
+    expect(outcome).toEqual({ kind: 'adopted', version: 9 });
+    expect(t.pushes.length).toBe(0);
+    expect(s.state.version).toBe(9);
+    expect(s.state.updatedAt).toBe(200);
+    expect(s.state.marks).toEqual({ lastSyncedVersion: 9, lastSyncedFingerprint: 'same', uid: 'u1', lastSyncedAt: 1000 });
+    // Settled: the next pass has nothing to do.
+    expect(await runGroupSync(g, t.transport, OPTS)).toEqual({ kind: 'idle' });
+  });
+
+  // #1253 — the equal-content fork is still a FORK, so what a group unions only on the fork path (a
+  // field its fingerprint does not see, like a transaction marker) must survive it. Resolving it
+  // through `adopt`, or writing the server's content back whole, drops it.
+  // The choice is the SERVER's, whatever the clocks say: the resolved document is the server's at the
+  // server's version, so a winner-takes field the fingerprint cannot see comes from the server too.
+  it("onFork: 'ask' with equal content resolves through merge with the server chosen, keeping what only merge unions", async () => {
+    type Noted = Content & { note: string[]; pick: string };
+    const s = makeStore({
+      content: { value: 'same', note: ['local-only'], pick: 'local' } as Noted, version: 5,
+      // NEWER than the server, so a clock-based choice would pick this side.
+      updatedAt: 300,
+      marks: marks({ uid: 'u1', lastSyncedVersion: 5, lastSyncedFingerprint: 'before' }),
+    });
+    const g = group({
+      store: s.store, onFork: 'ask',
+      merge: (local, server, choice) => ({
+        value: (server.content as Noted).value,
+        note: [...(server.content as Noted).note, ...(local.content as Noted).note],
+        pick: ((choice === 'local' ? local.content : server.content) as Noted).pick,
+      }) as Noted,
+      adopt: (_local, server) => ({ content: server.content as Content, upload: false }),
+    });
+    const t = fakeTransport({ g: { content: { value: 'same', note: ['server-only'], pick: 'server' }, version: 9, updatedAt: 200 } });
+    const outcome = await runGroupSync(g, t.transport, OPTS);
+    expect(outcome).toEqual({ kind: 'adopted', version: 9 });
+    expect((s.state.content as Noted).note).toEqual(['server-only', 'local-only']);
+    expect((s.state.content as Noted).pick).toBe('server');
   });
 
   it("onFork: 'take-server' adopts silently on a fork", async () => {
@@ -680,6 +736,251 @@ describe('runCloudSync', () => {
   });
 });
 
+// ── confirmAccount — an account deleted on another device (#679) ────────────────
+
+describe('confirmAccount', () => {
+  type Status = 'exists' | 'gone' | 'unknown';
+  /** A group this device HAS synced (v2 for `u1`) whose document is gone from the server. */
+  function syncedButMissing() {
+    const s = makeStore({
+      content: { value: 'mine' }, version: 2, updatedAt: 0,
+      marks: marks({ uid: 'u1', lastSyncedVersion: 2, lastSyncedFingerprint: 'mine' }),
+    });
+    return { s, g: group({ store: s.store }) };
+  }
+  /** `answer()` decides each ask; every ask and every load is recorded. */
+  function transportWith(answer: () => Promise<Status> | Status) {
+    const t = fakeTransport();
+    const asks: string[] = [];
+    let loads = 0;
+    const transport: GroupTransport = {
+      ...t.transport,
+      load: async (id) => { loads++; return t.transport.load(id); },
+      confirmAccount: async (uid) => { asks.push(uid); return answer(); },
+    };
+    return { t, transport, asks, loads: () => loads };
+  }
+
+  it('gone: account-gone, nothing pushed, and it asked once, about THIS sync\'s uid', async () => {
+    const { s, g } = syncedButMissing();
+    const x = transportWith(() => 'gone');
+    expect(await runGroupSync(g, x.transport, OPTS)).toEqual({ kind: 'account-gone', uid: OPTS.uid });
+    expect(x.t.pushes).toHaveLength(0);
+    expect(s.writes).toHaveLength(0);
+    expect(x.asks).toEqual(['u1']);
+  });
+
+  it('⚠️ a throw, or an answer outside the contract, is unknown — never gone: fails, creates nothing', async () => {
+    for (const answer of [() => { throw new Error('bridge'); }, () => 'maybe' as Status]) {
+      const { s, g } = syncedButMissing();
+      const x = transportWith(answer);
+      expect((await runGroupSync(g, x.transport, OPTS)).kind).toBe('failed');
+      expect(x.t.pushes).toHaveLength(0);
+      expect(s.writes).toHaveLength(0);
+    }
+  });
+
+  it('⚠️ is not asked while the document is still there — "gone" never wipes a save the server still holds', async () => {
+    // Dirty against a document that exists, so the pass uploads — the case an over-eager ask would turn into a wipe.
+    const s = makeStore({
+      content: { value: 'played since' }, version: 2, updatedAt: 0,
+      marks: marks({ uid: 'u1', lastSyncedVersion: 2, lastSyncedFingerprint: 'mine' }),
+    });
+    const x = transportWith(() => 'gone');
+    x.t.set('g', { content: { value: 'mine' }, version: 2, updatedAt: 0 });
+    expect(await runGroupSync(group({ store: s.store }), x.transport, OPTS)).toEqual({ kind: 'uploaded', version: 3 });
+    expect(x.asks).toEqual([]);
+  });
+
+  it('exists: recreates at version 1, as without the check', async () => {
+    const { g } = syncedButMissing();
+    const x = transportWith(() => 'exists');
+    expect(await runGroupSync(g, x.transport, OPTS)).toEqual({ kind: 'uploaded', version: 1 });
+  });
+
+  it('a transport without confirmAccount keeps the old behaviour', async () => {
+    const { g } = syncedButMissing();
+    const t = fakeTransport();
+    expect(await runGroupSync(g, t.transport, OPTS)).toEqual({ kind: 'uploaded', version: 1 });
+  });
+
+  it('⚠️ is never asked for a lineage this device has not synced under this uid — including another account\'s marks', async () => {
+    for (const m of [emptyMarks(), marks({ uid: 'someone-else', lastSyncedVersion: 7, lastSyncedFingerprint: 'x' })]) {
+      const s = makeStore({ content: { value: 'fresh' }, version: 0, updatedAt: 0, marks: m });
+      const x = transportWith(() => 'gone');
+      expect(await runGroupSync(group({ store: s.store }), x.transport, OPTS)).toEqual({ kind: 'uploaded', version: 1 });
+      expect(x.asks).toEqual([]);
+    }
+  });
+
+  it('runCloudSync stops at the first account-gone', async () => {
+    const a = syncedButMissing();
+    const b = syncedButMissing();
+    const gB = defineSyncGroup<Content>({ ...(b.g as unknown as Parameters<typeof defineSyncGroup<Content>>[0]), id: 'second' });
+    const x = transportWith(() => 'gone');
+    const result = await runCloudSync([a.g, gB], x.transport, OPTS);
+    expect(result.outcomes.g).toEqual({ kind: 'account-gone', uid: OPTS.uid });
+    expect(result.outcomes.second).toBeUndefined();
+  });
+});
+
+// ── account continuity — a previous account deleted while this device was closed (#1274) ─────────────────
+
+describe('account continuity', () => {
+  const PREV = 'deleted-uid';
+  const NOW_UID = OPTS.uid;
+  /** A continuity whose record starts as `record` and whose signed-in account has `keys`. */
+  function continuityWith(record: LoginRecord | null, keys: readonly string[] | (() => never)) {
+    const writes: LoginRecord[] = [];
+    let stored = record;
+    const c: AccountContinuity = {
+      loginKeys: async () => (typeof keys === 'function' ? keys() : keys),
+      read: () => stored,
+      write: (r) => { stored = r; writes.push(r); },
+    };
+    return { c, writes, stored: () => stored };
+  }
+  /** A group holding a save exchanged under `uid` (v3), with the server still at v3 for whoever reads it. */
+  function heldBy(uid: string, lastSyncedVersion = 3) {
+    const s = makeStore({
+      content: { value: 'old save' }, version: 3, updatedAt: 0,
+      marks: marks({ uid, lastSyncedVersion, lastSyncedFingerprint: 'old save' }),
+    });
+    return { s, g: group({ store: s.store }) };
+  }
+  function countingTransport() {
+    const t = fakeTransport();
+    let loads = 0;
+    const transport: GroupTransport = { ...t.transport, load: async (id) => { loads++; return t.transport.load(id); } };
+    return { t, transport, loads: () => loads };
+  }
+
+  it('the same login under a new uid: account-gone for the PREVIOUS uid, before any group loads or writes', async () => {
+    const { s, g } = heldBy(PREV);
+    const x = countingTransport();
+    const k = continuityWith({ uid: PREV, keys: ['google-key'] }, ['google-key']);
+    const result = await runCloudSync([g], x.transport, { ...OPTS, continuity: k.c });
+    expect(result.outcomes.g).toEqual({ kind: 'account-gone', uid: PREV });
+    expect(x.loads()).toBe(0);
+    expect(x.t.pushes).toHaveLength(0);
+    expect(s.writes).toHaveLength(0);
+    // Left for the sync after the wipe to replace.
+    expect(k.writes).toEqual([]);
+  });
+
+  it('a different login is an ordinary account switch: the groups run, and the new account is recorded', async () => {
+    const { g } = heldBy(PREV);
+    const x = countingTransport();
+    const k = continuityWith({ uid: PREV, keys: ['apple-key'] }, ['google-key']);
+    const result = await runCloudSync([g], x.transport, { ...OPTS, continuity: k.c });
+    expect(result.outcomes.g?.kind).not.toBe('account-gone');
+    expect(x.loads()).toBe(1);
+    expect(k.writes).toEqual([{ uid: NOW_UID, keys: ['google-key'] }]);
+  });
+
+  it('⚠️ a matching login is not enough when no group holds a save that account exchanged', async () => {
+    for (const held of [heldBy(PREV, 0), heldBy('someone-else')]) {
+      const k = continuityWith({ uid: PREV, keys: ['google-key'] }, ['google-key']);
+      const result = await runCloudSync([held.g], countingTransport().transport, { ...OPTS, continuity: k.c });
+      expect(result.outcomes.g?.kind).not.toBe('account-gone');
+    }
+  });
+
+  it('a record with no keys (written before this check existed) never matches', async () => {
+    const { g } = heldBy(PREV);
+    const k = continuityWith({ uid: PREV, keys: [] }, ['google-key']);
+    const result = await runCloudSync([g], countingTransport().transport, { ...OPTS, continuity: k.c });
+    expect(result.outcomes.g?.kind).not.toBe('account-gone');
+  });
+
+  it('⚠️ unknown keys ([] or a throw) skip the check, leave the record alone, and say so when a match was possible', async () => {
+    for (const keys of [[] as string[], () => { throw new Error('bridge'); }]) {
+      journalWarn.mockClear();
+      const { g } = heldBy(PREV);
+      const k = continuityWith({ uid: PREV, keys: ['google-key'] }, keys as never);
+      const result = await runCloudSync([g], countingTransport().transport, { ...OPTS, continuity: k.c });
+      expect(result.outcomes.g?.kind).not.toBe('account-gone');
+      expect(k.writes).toEqual([]);
+      expect(journalWarn.mock.calls).toEqual([['sync.account-continuity.keys-unknown', {}]]);
+    }
+  });
+
+  it('unknown keys with nothing to match (the same account, or no previous save) journal nothing', async () => {
+    for (const [record, held] of [
+      [{ uid: NOW_UID, keys: ['k'] }, heldBy(NOW_UID)],
+      [{ uid: PREV, keys: ['k'] }, heldBy(PREV, 0)],
+      [null, heldBy(PREV)],
+    ] as const) {
+      journalWarn.mockClear();
+      const k = continuityWith(record, []);
+      await runCloudSync([held.g], countingTransport().transport, { ...OPTS, continuity: k.c });
+      expect(journalWarn).not.toHaveBeenCalled();
+    }
+  });
+
+  it('an unreadable record reads as none: no match, and the current account is recorded', async () => {
+    const { g } = heldBy(PREV);
+    const k = continuityWith(null, ['google-key']);
+    k.c.read = () => { throw new Error('corrupt'); };
+    const result = await runCloudSync([g], countingTransport().transport, { ...OPTS, continuity: k.c });
+    expect(result.outcomes.g?.kind).not.toBe('account-gone');
+    expect(k.writes).toEqual([{ uid: NOW_UID, keys: ['google-key'] }]);
+  });
+
+  it('the same account is re-recorded only when its keys change', async () => {
+    const { g } = heldBy(NOW_UID);
+    const same = continuityWith({ uid: NOW_UID, keys: ['a', 'g'] }, ['g', 'a']);
+    await runCloudSync([g], countingTransport().transport, { ...OPTS, continuity: same.c });
+    expect(same.writes).toEqual([]);
+    const linked = continuityWith({ uid: NOW_UID, keys: ['a'] }, ['a', 'g']);
+    await runCloudSync([g], countingTransport().transport, { ...OPTS, continuity: linked.c });
+    expect(linked.writes).toEqual([{ uid: NOW_UID, keys: ['a', 'g'] }]);
+  });
+
+  it('no signed-in uid: nothing is asked or recorded', async () => {
+    const { g } = heldBy(PREV);
+    let asked = 0;
+    const k = continuityWith({ uid: PREV, keys: ['google-key'] }, ['google-key']);
+    k.c.loginKeys = async () => { asked++; return ['google-key']; };
+    await runCloudSync([g], countingTransport().transport, { ...OPTS, uid: '', continuity: k.c });
+    expect(asked).toBe(0);
+    expect(k.writes).toEqual([]);
+  });
+
+  it('loginKey is a stable SHA-256 hex of provider AND id — the same id under another provider is another login', async () => {
+    const google = await loginKey('google.com', '1234');
+    expect(google).toMatch(/^[0-9a-f]{64}$/);
+    expect(await loginKey('google.com', '1234')).toBe(google);
+    expect(await loginKey('apple.com', '1234')).not.toBe(google);
+    expect(google).not.toContain('1234');
+  });
+
+  it('parseLoginRecord accepts exactly { uid: string, keys: string[] }', () => {
+    expect(parseLoginRecord({ uid: 'u', keys: ['k'] })).toEqual({ uid: 'u', keys: ['k'] });
+    for (const bad of [null, 'u', { uid: 1, keys: [] }, { uid: 'u' }, { uid: 'u', keys: [1] }]) {
+      expect(parseLoginRecord(bad)).toBeNull();
+    }
+  });
+});
+
+describe('an asking fork carries the store as it is when the question is asked (#679)', () => {
+  it('⚠️ a game write landing during a push that then loses is in the fork\'s local, not the pass-start read', async () => {
+    const s = makeStore({ content: { value: 'before' }, version: 0, updatedAt: 0, marks: emptyMarks() });
+    const t = fakeTransport();
+    const transport: GroupTransport = {
+      ...t.transport,
+      push: async (id, doc) => {
+        s.store.write({ ...s.state, content: { value: 'played meanwhile' } });   // the player, during the round trip
+        t.set(id, { content: { value: 'other phone' }, version: 1, updatedAt: 0 });   // another device wins the race
+        return t.transport.push(id, doc);
+      },
+    };
+    const outcome = await runGroupSync(group({ store: s.store }), transport, OPTS);
+    expect(outcome.kind).toBe('fork');
+    expect((outcome as { local: LocalGroup<Content> }).local.content).toEqual({ value: 'played meanwhile' });
+  });
+});
+
 // ── resolveGroupFork ─────────────────────────────────────────────────────────────
 
 describe('resolveGroupFork', () => {
@@ -697,6 +998,32 @@ describe('resolveGroupFork', () => {
     expect(t.get('g')).toEqual({ content: { value: 'mine' }, version: 10, updatedAt: 0 });
     expect(s.state.marks.lastSyncedVersion).toBe(10);
     expect(s.state.marks.lastSyncedFingerprint).toBe('mine');
+  });
+
+  // The push is the await a real game write races. After the acknowledgement the device must still hold
+  // that write, and read DIRTY — marks describing what was uploaded — so the next sync carries it up.
+  it('a game write landing during the push survives the acknowledgement and reads dirty', async () => {
+    const s = makeStore({
+      content: { value: 'mine' }, version: 5, updatedAt: 0,
+      marks: marks({ uid: 'u1', lastSyncedVersion: 5, lastSyncedFingerprint: 'mine-old' }),
+    });
+    const g = group({ store: s.store });
+    const server: CloudGroup<Content> = { content: { value: 'theirs' }, version: 9, updatedAt: 0 };
+    const t = fakeTransport({ g: server as CloudGroup<unknown> });
+    const racing: GroupTransport = {
+      load: t.transport.load,
+      push: async (id, doc) => {
+        s.store.write({ ...s.state, content: { value: 'mine+solve' } });
+        return t.transport.push(id, doc);
+      },
+    };
+
+    const outcome = await resolveGroupFork(g, server as never, 'local', { transport: racing, ...OPTS });
+
+    expect(outcome).toEqual({ kind: 'uploaded', version: 10 });
+    expect(t.get('g')?.content).toEqual({ value: 'mine' });
+    expect(s.state.content).toEqual({ value: 'mine+solve' });          // the raced write is still there
+    expect(s.state.marks).toMatchObject({ lastSyncedVersion: 10, lastSyncedFingerprint: 'mine' }); // ...and dirty
   });
 
   it('a merge that teaches the server nothing adopts at its version, with no push at all', async () => {

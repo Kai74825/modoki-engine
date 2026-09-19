@@ -40,7 +40,7 @@ export const modifierEnum = z.enum(EDITOR_INPUT_MODIFIERS);
 export const makeEntitySpec = () => z.object({
   guid: z.string().optional(),
   name: z.string().optional(),
-  id: z.number().optional(),
+  id: z.number().int().optional(),
   surface: z.enum(['game-3d', 'game-2d', 'scene-view', 'game-ui']).optional()
     .describe('Which on-screen surface to aim in. REQUIRED for a 2D/3D entity, even when only one ' +
       'viewport shows it. For a UI entity it is optional until the entity resolves to more than ' +
@@ -54,10 +54,10 @@ export const makeEntitySpec = () => z.object({
       'on EVERY scope, whether the cover is another entity or a DOM element over the viewport (a ' +
       'modal, a menu, a panel), because the press lands on it either way. `occlusionScope` in the ' +
       'response says how far the check could SEE.'),
-}).describe(
-  'Aim at a SCENE ENTITY by {guid} | {name} | {id}, resolved to its live screen rect INSIDE this ' +
-  'call, so there is no read-then-tap race. Prefer guid: runtime ids are reassigned on every ' +
-  'scene reload. A name matching several entities is REFUSED, never first-match. A 2D/3D entity ' +
+}).strict('an entity aim accepts only: guid, name, id, surface, allowOccluded').describe(
+  'Aim at a SCENE ENTITY by exactly one of {guid} | {name} | {id}, resolved to its live screen rect ' +
+  'INSIDE this call, so there is no read-then-tap race. {id} only for an entity with no guid: ' +
+  'runtime ids are reassigned on every reload. A name matching several entities is REFUSED, never first-match. A 2D/3D entity ' +
   'additionally REQUIRES `surface`, and a UI entity requires it whenever it is mounted in more ' +
   'than one panel. Overrides `selector` and x/y. The response reports `entity`, `surface` (WHICH ' +
   'on-screen copy was aimed at), `aimedAt` ("centre" | "sampled"), `occluded`, ' +
@@ -68,12 +68,21 @@ export const makeEntitySpec = () => z.object({
   '§ Aiming.');
 
 /** The one description of the occlusion escape hatch, shared by every aimed input tool — a rule
- *  worded differently per tool is a rule an agent reads as two rules (mcp-tool-conventions.md §2). */
+ *  worded differently per tool is a rule an agent reads as two rules (mcp-tool-conventions.md §2).
+ *
+ *  ⚠️ The scope sentence named only `entity` and `selector` until #1218's close-out, and it was
+ *  wrong in both directions: a `label` aim rides the selector path and IS refused, while
+ *  `tap_handle`/`drag_handle` have NEITHER of the two modes it named — their only aim is a handle
+ *  id, so an agent reading it literally would conclude the flag is inert there. That is exactly the
+ *  "a covered gizmo handle reads as an inert one" bug the per-tool text on those two was written to
+ *  prevent. Stated by what the flag ACTUALLY governs — any aim the surface RESOLVES — so it stays
+ *  true as aim modes are added. */
 export const ALLOW_OCCLUDED_BASE =
   'Aim there even though something covers the target (default false = REFUSED, naming the cover). '
   + 'A covered press lands on the covering element, so reporting ok would be a false success — the '
-  + 'worst outcome on this surface. Applies to `entity` and `selector` aims; raw {x,y} is never '
-  + 'refused, because a coordinate is exactly what you asked for';
+  + 'worst outcome on this surface. Applies to every aim this surface RESOLVES — `entity`, '
+  + '`selector`, `label`, a handle id; only a raw {x,y} is never refused, because a coordinate is '
+  + 'exactly what you asked for';
 export const allowOccludedParam = z.boolean().optional().describe(`${ALLOW_OCCLUDED_BASE}.`);
 
 /** The shared half of every `timeoutMs` description (#1154 made it three tools). Each tool
@@ -109,8 +118,8 @@ export const flatEntityAlias = z.object({
 }).strict('an entity ref here accepts only: guid, id')
   .optional().describe(
     'Alternative to this tool\'s flat `guid`/`id`: the same nested ref shape the aimed-input tools '
-    + 'take, accepted here so one addressing form works across the surface. Prefer guid — runtime '
-    + 'ids are reassigned on every scene reload. NO `name` HERE, unlike the aimed-input tools: the '
+    + 'take, accepted here so one addressing form works across the surface. {id} only for an entity '
+    + 'with no guid — runtime ids are reassigned on every scene reload. NO `name` HERE, unlike the aimed-input tools: the '
     + 'ops behind these tools address by guid/id and have no name resolver, so accepting one would '
     + 'advertise a capability that does not exist (it reaches the op as an empty ref and comes back '
     + 'as a misleading "this ref is stale"). Look the guid up with modoki_get_scene_state {name} '
@@ -137,7 +146,8 @@ export function foldEntityRef(
   if (!entity || Object.keys(entity).length === 0) return flat;
   // `!== undefined`, not truthiness: `id: 0` is the ROOT entity, and a truthiness test would read
   // it as "no address given" and silently fall through to the other branch.
-  const flatKeys = Object.entries(flat).filter(([, v]) => v !== undefined).map(([k]) => k);
+  // An empty string is ABSENT, as in the live resolver (`app/debug/entityRef.ts`, #1223).
+  const flatKeys = Object.entries(flat).filter(([, v]) => v !== undefined && v !== '').map(([k]) => k);
   if (flatKeys.length) {
     return { conflict: `both \`entity\` and the flat ${flatKeys.join('/')} were given — they are two ways to say the same thing, and sending both leaves it ambiguous which target you meant. Pass exactly one.` };
   }
@@ -160,6 +170,43 @@ export const PRECISION_BASE =
   + '3.5e-7. Verify a value with a TOLERANCE, never string/=== equality. Pass 0 for exact float64';
 export const precisionParam = (fields?: string) => z.number().int().nonnegative().optional()
   .describe(`${PRECISION_BASE}.${fields ? ` Rounded fields: ${fields}.` : ''}`);
+
+/** `displayName` — the name the EDITOR records for an opened asset, in ONE wording (#1266).
+ *
+ *  Shared by four of the `open_*_editor` tools. It was `name` on all five, which is the word that
+ *  addresses an ENTITY everywhere else on this surface — so passing an entity name here succeeded,
+ *  labelled something with it, and reported ok. Renamed rather than excused, because a param that
+ *  silently accepts the wrong thing is §0's rank-1 failure.
+ *
+ *  ⚠️ Two things the first version of this constant got WRONG, both found by review, and both worth
+ *  stating because a shared wording makes a false claim five times instead of once:
+ *
+ *  1. It said "the editor TAB". No tool sets a tab name — `EditorApp`'s docking effect adds each
+ *     panel with `Actions.addNode({name: '<Editor> Editor'})`, a hard-coded literal this never
+ *     reaches.
+ *  2. It then said "the panel's HEADER", which is true only of the Skin editor. So the base is now
+ *     the one thing that IS true of all four — it sets `SelectedAsset.name`, the name the editor
+ *     holds for that open asset — and `extra` carries where each one surfaces it, because on two of
+ *     them it is consumed as DATA rather than shown: the Animation editor uses it as the CLIP NAME
+ *     for a scaffolded clip, and the Skin editor's "Make Prefab" uses it as the ROOT ENTITY NAME
+ *     written into a `.prefab.json`. A caller told "label" would not expect either.
+ *
+ *  ⚠️ `modoki_open_particle_editor` takes NO `displayName`, deliberately. `editingParticleAsset.name`
+ *  is read in exactly two places, both `fileName={asset.path.split('/').pop() || asset.name}` — and
+ *  `requireAssetPath` guarantees a non-empty path, so that fallback arm is unreachable and the value
+ *  had no observable effect anywhere. CLAUDE.md: an unwired field is a lie with a tooltip, so it was
+ *  dropped rather than advertised.
+ *
+ *  `extra` APPENDS. It does not substitute into the sentence, because §2's containment check reds
+ *  unless every longer wording contains the shortest VERBATIM — a variant that rewrites the tail is
+ *  a second wording, which is exactly what this constant exists to prevent. */
+export const DISPLAY_NAME_BASE =
+  'The name the editor records for this opened asset (`SelectedAsset.name`) — NOT the dock tab, '
+  + 'whose name is fixed. WHERE it then surfaces differs by editor: a panel header, the Inspector\'s '
+  + 'asset label (echoed by modoki_get_editor_state as selection.asset.name), or a clip name. '
+  + 'Defaults to the filename stem';
+export const displayNameParam = (extra?: string) => z.string().optional()
+  .describe(`${DISPLAY_NAME_BASE}.${extra ? ` ${extra}` : ''}`);
 
 /** `force` — "proceed even though the editor has unsaved work", in ONE wording.
  *
@@ -219,10 +266,20 @@ export const unsavedForceParam = z.boolean().optional().describe(
  *  of a 3+-tool param must contain the shortest verbatim, so a fourth tool cannot quietly restate
  *  the rule its own way, and it cannot be given a different NAME either — same consequence, same
  *  name. The base therefore states the CONSEQUENCE (unsaved editor work is destroyed) and each tool
- *  appends what that work is for it. */
+ *  appends what that work is for it.
+ *
+ *  ⚠️ **That fix was HALF-APPLIED until #1218's close-out.** The opening sentence was rewritten and
+ *  the undo-stack clause — the specific thing this comment says was false for `write_asset_meta` —
+ *  was left in the string, so three more tools inherited it as they adopted the base. It now states
+ *  what is true of every member: the discarded work's undo entries go with it (#1409 — a world
+ *  swap drops a DIRTY scene's history; a clean one is parked per scene), and a parked sidecar or
+ *  document edit was never ON it, so in both cases undo is not the way back. The containment guard
+ *  could never have caught this: all six wordings contained the base verbatim, wrong clause and
+ *  all. A shared constant makes one wrong clause wrong N times, silently. */
 export const DISCARD_UNSAVED_BASE =
   'Proceed even though this DESTROYS unsaved editor work. ⚠️ DESTRUCTIVE and IRREVERSIBLE: what '
-  + 'it destroys is gone — from the editor, from the file, and from the undo stack. It destroys '
+  + 'it destroys is gone from the editor and from the file, and undo is not the way back — its '
+  + 'undo entries go with it, and a parked edit was never on it. It destroys '
   + 'only what THIS operation overwrites or replaces, NOT everything the editor is holding: a '
   + 'world swap leaves a parked .meta.json import-settings edit untouched, and a sidecar write '
   + 'leaves the live world untouched — so this is never a way to clear an unrelated '

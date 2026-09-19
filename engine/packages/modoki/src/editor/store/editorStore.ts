@@ -1,9 +1,12 @@
 /** Editor state — separate from game state. Tracks selection, mode, etc. */
 
 import type { EntityPin } from '../../runtime/core/ecs/entityPin';
+import { durableGuid } from '../../runtime/core/assetRefRules';
 import { create } from 'zustand';
 import { pushSelectionChange, isExecutingUndoRedo } from '../undo/undoManager';
 import { entityRef, buildGuidIndex, resolveWith, type EntityRef } from '../undo/entityRef';
+import { getCurrentWorld } from '../../runtime/core/ecs/world';
+import { holdEntity, resolveHeld, type HeldEntity } from './heldEntity';
 import { setParticleEffect } from '../../runtime/loaders/particleCache';
 import { setSpriteAnim, type SpriteAnimDef } from '../../runtime/loaders/spriteAnimCache';
 import { setRig2D, type Rig2DFile } from '../../runtime/loaders/rig2dCache';
@@ -52,10 +55,67 @@ export function lsBool(key: string, fallback: boolean): boolean {
   const v = localStorage.getItem(key);
   return v === null ? fallback : v === '1';
 }
+function sameSlices(a: readonly string[] | undefined, b: readonly string[] | undefined): boolean {
+  if (a === b) return true;
+  if (!a || !b || a.length !== b.length) return false;
+  return a.every((g, i) => g === b[i]);
+}
+
 export function lsEnum<T extends string>(key: string, allowed: readonly T[], fallback: T): T {
   if (typeof localStorage === 'undefined') return fallback;
   const v = localStorage.getItem(key);
   return v !== null && (allowed as readonly string[]).includes(v) ? (v as T) : fallback;
+}
+
+/** The vocabularies of the SceneView toolbar's settings — a table, not only a type, so the agent ops
+ *  that set them can REFUSE an unknown value with the real options instead of storing (and, for the
+ *  gizmo, persisting) a typo or dropping it and answering ok (#1213). */
+export const GIZMO_MODES = ['translate', 'rotate', 'scale'] as const;
+export type GizmoMode = typeof GIZMO_MODES[number];
+export const GIZMO_SPACES = ['world', 'local'] as const;
+export type GizmoSpace = typeof GIZMO_SPACES[number];
+export const SCENE_VIEW_MODES = ['3d', 'ui'] as const;
+export type SceneViewMode = typeof SCENE_VIEW_MODES[number];
+
+/** The asset editors an agent op can address (#1213). Each one publishes an `AssetEditorMount` into
+ *  `editorMounts` from its own mount effect, so an op can tell "the editor is showing" apart from
+ *  "the store names an asset" — which is all an op could see before, and why `select-sprite-slice`,
+ *  `set-skin-mode` and the openers answered ok with no editor on screen. */
+export const ASSET_EDITOR_KINDS = ['animation', 'particle', 'skin', 'sprite', 'nineslice'] as const;
+export type AssetEditorKind = typeof ASSET_EDITOR_KINDS[number];
+export interface AssetEditorMount {
+  /** The asset the mounted editor is showing; null for a panel mounted with nothing loaded. */
+  path: string | null;
+  /** Sprite editor only: the guids of the slices it currently holds (`select-sprite-slice`'s table). */
+  slices?: readonly string[];
+  /** `true` while this editor holds edits that are not on disk (#1362).
+   *
+   *  ⚠️ This is the ONLY place that knows. The Sprite and 9-slice editors park nothing in
+   *  `dirtyAsset`/`pendingMeta`, so the unsaved-work registries those gates read are blind to them —
+   *  a move that yanked the modal away destroyed the edits with `unsavedChanges` still reporting
+   *  false. A move/rename of the asset an editor holds this way is REFUSED (owner, 2026-09-18),
+   *  which is why the flag has to be published rather than inferred. */
+  dirty?: boolean;
+}
+
+/** Asset editors currently holding edits that are not on disk — the Sprite and 9-slice editors
+ *  (#1362).
+ *
+ *  ⚠️ **This is the ONLY thing that knows.** Both modals keep their edits in local component state
+ *  and park NOTHING in `dirtyAsset`/`pendingMeta`, so every unsaved-work gate that reads those
+ *  registries is blind to them: a move that unmounted the modal destroyed the edits while
+ *  `unsavedChanges` still reported false. Read by the `resolve-unsaved` probe (so the backend's
+ *  move route can refuse) and by the Assets panel's own move paths, which run in this process —
+ *  one implementation, because a second copy is how the two answers drift.
+ *
+ *  Not a hook: called from event handlers and from an op, neither of which is a render. */
+export function dirtyAssetEditorHolds(): Array<{ kind: AssetEditorKind; path: string }> {
+  const mounts = useEditorStore.getState().editorMounts;
+  const out: Array<{ kind: AssetEditorKind; path: string }> = [];
+  for (const [kind, mount] of Object.entries(mounts)) {
+    if (mount?.dirty && mount.path) out.push({ kind: kind as AssetEditorKind, path: mount.path });
+  }
+  return out;
 }
 
 export interface SelectedAsset {
@@ -98,9 +158,9 @@ interface EditorState {
    *  selection. When length > 1 and all share a type, the Inspector renders a
    *  batch editor (edit import settings across all at once). */
   selectedAssets: SelectedAsset[];
-  gizmoMode: 'translate' | 'rotate' | 'scale';
+  gizmoMode: GizmoMode;
   /** Coordinate space for gizmo transforms */
-  gizmoSpace: 'world' | 'local';
+  gizmoSpace: GizmoSpace;
   /** Multi-select rotation/scale pivot (Unity's Pivot/Center toggle). Only matters when >1
    *  entity is selected — it chooses WHERE the single pivot point sits; the group rotates/scales
    *  rigidly around it either way. 'pivot' = the active (last-selected) entity's origin (that
@@ -126,7 +186,7 @@ interface EditorState {
   /** SceneView viewport mode: '3d' (Three.js) or 'ui' (2D/UI overlay). Lifted from
    *  SceneView-local state into the store so it's agent-drivable (set-scene-view-mode)
    *  — the mode selector is a native <select> that trusted input can't operate. */
-  sceneViewMode: '3d' | 'ui';
+  sceneViewMode: SceneViewMode;
   /** Which view the Animation editor's timeline area is showing: the Dopesheet (keyframe
    *  TIMING, diamonds) or Curves (keyframe VALUES + easing, a graph). Lifted from
    *  AnimationEditor-local state into the store so it is agent-drivable
@@ -145,17 +205,21 @@ interface EditorState {
    *  being unmounted/reselected within a session, which the local `useState` did not — that is
    *  the same continuity `sceneViewMode` has, and the better behaviour. */
   animationViewMode: 'dopesheet' | 'curves';
-  /** Whether the Animation panel is actually MOUNTED and running its effects.
+  /** Which asset editors are actually MOUNTED and running their effects, and on what — keyed by
+   *  `AssetEditorKind`, absent when not mounted. Written ONLY by each editor's own mount effect (and
+   *  its cleanup), through `setEditorMount`.
    *
-   *  Same requirement, and the same reason, as `gameViewMounted` below: FlexLayout defaults
+   *  For the Animation panel — the first editor to publish this — the reason is the same as
+   *  `gameViewMounted` below: FlexLayout defaults
    *  `tabEnableRenderOnDemand: true`, so an Animation tab that EXISTS in the layout but has never
    *  been selected does not mount — and `openPanels` reports it anyway, which is exactly the
    *  derivation #367 rejected as wrong. Without this the agent surface answers
    *  `animationViewMode:'curves'` for an editor showing no Animation view at all, and neither
    *  view's handle provider is registered, so `modoki_handles editor=curves` is empty for a
-   *  reason the payload cannot express. Written by AnimationEditor's mount effect; nothing else
-   *  may set it. */
-  animationPanelMounted: boolean;
+   *  reason the payload cannot express. The modal editors (sprite, nine-slice) have the stronger
+   *  version of the same problem: their open state lived in `TextureAssetView`'s local `useState`,
+   *  invisible to every op (#1213). */
+  editorMounts: Partial<Record<AssetEditorKind, AssetEditorMount>>;
   /** Which FlexLayout panel owns the keyboard ('scene' | 'hierarchy' | 'animation-editor' | …),
    *  or null when nothing has been engaged yet. Set on capture-phase mousedown (click-to-focus).
    *
@@ -413,8 +477,10 @@ interface EditorState {
   setSceneViewMode: (mode: '3d' | 'ui') => void;
   /** Set the Animation editor's timeline view. No-ops (and does not journal) on a re-set. */
   setAnimationViewMode: (mode: 'dopesheet' | 'curves') => void;
-  /** Set from AnimationEditor's mount effect + its cleanup. Nothing else may call it. */
-  setAnimationPanelMounted: (mounted: boolean) => void;
+  /** Set from an editor's own mount effect (`mount`) and its cleanup (`null`). Nothing else may call
+   *  it. A cleanup clears only its OWN entry: an unmount that lands after a remount on another asset
+   *  must not erase the new mount, so a `null` for a path that is no longer the published one is ignored. */
+  setEditorMount: (kind: AssetEditorKind, mount: AssetEditorMount | null, ownPath?: string | null) => void;
   setFocusedPanel: (panel: string | null) => void;
   setOpenPanels: (ids: string[]) => void;
   setGizmoSpace: (space: 'local' | 'world') => void;
@@ -585,20 +651,43 @@ export const useEditorStore = create<EditorState>((set, get) => {
   // so selection undo/redo re-resolve to current ids after a world rebuild
   // (Play→Stop) instead of restoring stale numeric ids. Asset selection is
   // path-based and needs no resolution.
-  type SelectionRefs = { primary: EntityRef | null; ids: EntityRef[]; asset: SelectionSnapshot['selectedAsset']; assets: SelectionSnapshot['selectedAssets'] };
+  // Each ref also carries a HOLD of the entity it named (#1221): the guid resolves across a world
+  // rebuild, and the hold is what may stand in for the raw id when it does not.
+  type HeldRef = { ref: EntityRef; held: HeldEntity | null };
+  type SelectionRefs = { primary: HeldRef | null; ids: HeldRef[]; asset: SelectionSnapshot['selectedAsset']; assets: SelectionSnapshot['selectedAssets'] };
+  const capture = (id: number): HeldRef => ({ ref: entityRef(id, false), held: holdEntity(id, getCurrentWorld()) });
   const captureRefs = (snap: SelectionSnapshot): SelectionRefs => ({
-    primary: snap.selectedEntityId != null ? entityRef(snap.selectedEntityId, false) : null,
-    ids: snap.selectedEntityIds.map((id) => entityRef(id, false)),
+    primary: snap.selectedEntityId != null ? capture(snap.selectedEntityId) : null,
+    ids: snap.selectedEntityIds.map(capture),
     asset: snap.selectedAsset,
     assets: snap.selectedAssets,
   });
   const resolveSnap = (r: SelectionRefs): SelectionSnapshot => {
     const idx = buildGuidIndex();
-    // Fall back to the captured raw id when a ref can't be guid-resolved (a
-    // guid-less entity, or no backing world) — preserves the prior raw-id
-    // restore behavior; selectionRestore handles live remap on the next swap.
-    const ids = r.ids.map((ref) => resolveWith(ref, idx) ?? ref.rawId);
-    const primary = r.primary ? (resolveWith(r.primary, idx) ?? r.primary.rawId) : null;
+    // The durable guid first. Failing that, never the bare raw id: it is koota's recycled index, and
+    // falling back to it re-selected whatever took the index of a destroyed selection — the capture
+    // keeps DURABLE guids only, so this reached every runtime spawn (#1221 close-out reviews). The
+    // hold answers instead: the same entity in the same world → its id; gone → nothing.
+    const world = getCurrentWorld();
+    const resolve = (h: HeldRef): number | null => {
+      if (h.ref.guid) {
+        const byGuid = resolveWith(h.ref, idx);
+        if (byGuid !== null) return byGuid;
+      }
+      // ⚠️ Not `resolveWith` for a guid-less ref: it answers the raw id whenever ANY entity lives there.
+      // No hold (it named nothing registered when captured), or a hold from ANOTHER world (undo history
+      // survives a same-scene reload, A→B→A and the prefab-edit round trip): the pre-#1221 rule — a
+      // guid ref that missed is gone, a guid-less ref keeps its raw id. The hold's own number means
+      // nothing in this world, and returning it re-selected a newcomer (final close-out review).
+      if (!h.held || h.held.world !== world) return h.ref.guid ? null : h.ref.rawId;
+      return resolveHeld(h.held, world)?.id ?? null;
+    };
+    const ids = [...new Set(r.ids.map(resolve).filter((id): id is number => id !== null))];
+    const primaryId = r.primary ? resolve(r.primary) : null;
+    // A primary that was captured but is gone falls back to the last remaining member, so it never
+    // points outside the set (selectionRestore's rule). A snapshot captured WITHOUT a primary keeps none.
+    const primary = r.primary === null ? null
+      : primaryId !== null && (ids.includes(primaryId) || ids.length === 0) ? primaryId : (ids[ids.length - 1] ?? null);
     // Asset selection is path-based — no guid resolution needed, just restore verbatim.
     return { selectedEntityId: primary, selectedEntityIds: ids, selectedAsset: r.asset, selectedAssets: r.assets };
   };
@@ -625,8 +714,8 @@ export const useEditorStore = create<EditorState>((set, get) => {
   entityRevealRequest: 0,
   selectedAsset: null,
   selectedAssets: [],
-  gizmoMode: lsEnum('editor:gizmoMode', ['translate', 'rotate', 'scale'] as const, 'translate'),
-  gizmoSpace: lsEnum('editor:gizmoSpace', ['world', 'local'] as const, 'world'),
+  gizmoMode: lsEnum('editor:gizmoMode', GIZMO_MODES, 'translate'),
+  gizmoSpace: lsEnum('editor:gizmoSpace', GIZMO_SPACES, 'world'),
   gizmoPivot: lsEnum('editor:gizmoPivot', ['pivot', 'center'] as const, 'pivot'),
   unlockedGhostSelKey: null,
   colliderEditMode: false,
@@ -634,7 +723,7 @@ export const useEditorStore = create<EditorState>((set, get) => {
   showFocusGraph: (typeof localStorage !== 'undefined' && localStorage.getItem('editor:showFocusGraph') === '1'),
   sceneViewMode: (typeof localStorage !== 'undefined' && localStorage.getItem('editor:sceneViewMode') === 'ui') ? 'ui' : '3d',
   animationViewMode: 'dopesheet',
-  animationPanelMounted: false,
+  editorMounts: {},
   focusedPanel: null,
   openPanels: [],
   particlePreview: lsBool('editor:particlePreview', false),
@@ -803,7 +892,26 @@ export const useEditorStore = create<EditorState>((set, get) => {
     editorEmit('!animationviewmode', { mode });
     set({ animationViewMode: mode });
   },
-  setAnimationPanelMounted: (mounted) => { if (get().animationPanelMounted !== mounted) set({ animationPanelMounted: mounted }); },
+  setEditorMount: (kind, mount, ownPath) => {
+    const cur = get().editorMounts[kind];
+    if (mount === null) {
+      if (!cur || (ownPath !== undefined && cur.path !== ownPath)) return;
+      const next = { ...get().editorMounts };
+      delete next[kind];
+      set({ editorMounts: next });
+      return;
+    }
+    // ⚠️ `dirty` is part of the comparison, and leaving it out made the whole #1362 hold inert.
+    // The dedup exists so `select-sprite-slice` does not churn on an unchanged slice table; a
+    // publish that flips ONLY `dirty` is a real change. Without this clause the 9-slice editor
+    // (which publishes no `slices` and whose `path` never changes for a mounted instance) could
+    // never register a hold at all, and the Sprite Editor's hold degraded to "the guid list
+    // changed" — which is precisely what `spriteSheetDigest` exists NOT to be, since a rect drag
+    // keeps every guid.
+    if (cur && cur.path === mount.path && sameSlices(cur.slices, mount.slices)
+      && !!cur.dirty === !!mount.dirty) return;
+    set({ editorMounts: { ...get().editorMounts, [kind]: mount } });
+  },
   /** Click-to-focus. Journals `!focus` on a real SCOPE CHANGE only — a commit point, so the
    *  stream stays sparse (never per-keystroke), and it is what makes "why did my key go there?"
    *  answerable from data instead of a re-run. Focus is NOT undoable: it is transient chrome, and
@@ -914,7 +1022,8 @@ export const useEditorStore = create<EditorState>((set, get) => {
   openParticleEditor: (asset) => set((s) => ({ editingParticleAsset: asset, editingParticleDef: null, particleEditNonce: s.particleEditNonce + 1 })),
   openPanel: (id) => set((s) => ({ panelOpenRequest: { id, nonce: (s.panelOpenRequest?.nonce ?? 0) + 1 } })),
   setCameraGizmoShown: (guid, on) => set((s) => {
-    if (!guid) return {};
+    // Durable only: a runtime guid (#1210) is re-issued to another entity next session.
+    if (!durableGuid(guid)) return {};
     const next = new Set(s.cameraGizmoShown);
     if (on) next.add(guid); else next.delete(guid);
     saveCamGizmoShown(next);

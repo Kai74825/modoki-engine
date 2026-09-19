@@ -11,7 +11,7 @@ of `--target playable` is refused, #40). (Grew out of the `advideo-playable-expo
 
 | File | Role |
 |---|---|
-| `engine/vite.config.ts` (the `isPlayable` branch) | `outDir=ads/`, `inlineDynamicImports` (single JS chunk), sets `MODOKI_PLAYABLE=1`, the `__MODOKI_PLAYABLE__` / `__MODOKI_PLAYABLE_CLICK_URL__` defines, and the playable-only aliases (`@zappar/msdf-generator` + `@<game>/app-services` → stubs) |
+| `engine/vite.config.ts` (the `isPlayable` branch) | `outDir=ads/`, `inlineDynamicImports` (single JS chunk), sets `MODOKI_PLAYABLE=1`, the `__MODOKI_PLAYABLE__` / `__MODOKI_PLAYABLE_CLICK_URL__` defines, and the playable-only aliases (`@zappar/msdf-generator`, its wasm and worker subpaths, + `@<game>/app-services` → stubs) |
 | `engine/plugins/playable-profile.ts` | `isPlayableBuild()` (reads `MODOKI_PLAYABLE`) + the asset-shrink overrides — WebP @ ≤512, downscaled HDR, KTX2-transcoder skip |
 | `engine/plugins/inlinePlayable.ts` | The single-file inliner — gzip+base64 the `{js,css,assets}` payload, a self-extract bootstrap (`DecompressionStream` + inlined `fflate` fallback) that rehydrates assets as `blob:` URLs on `__PLAYABLE_ASSETS__`, and the hard `≤ playableMaxBytes` gate |
 | `engine/plugins/vite-asset-scanner.ts` | Applies the playable profile inside `computeKeptAssets().kept` copy loops; bakes `loadType:'buffer'` for all audio in a playable |
@@ -108,6 +108,15 @@ unreferenced either.
   but dropping a referenced asset can be deliberate (a decorative model an ad does not need), so
   it is a warning. `unreachableRefs`, the mechanism that would otherwise catch it, is computed
   before the drop on purpose and is blind to it.
+  - ⚠️ **For a dropped AUDIO clip, "resolves to nothing" is not enough on its own.** An autoplaying
+    `AudioSource` whose clip is missing is retried EVERY frame for the life of the ad
+    (`audioSystem`'s `unresolved` path warns once and keeps trying), so the game must also remove
+    that source on the playable build. Worked example: wordweave (#1350) drops its music beds with
+    a `music-*.mp3` glob and strips its music-bus source at GAME priority when `__MODOKI_PLAYABLE__`
+    is set ([wordweave audio-haptics.md](../games/wordweave/docs/audio-haptics.md) § "The playable has no music"). The scene's
+    `resources` preload still names the dropped clips, so the build prints the `still references it
+    by guid` warning above once per clip, and the ad logs one `[AudioCache] Unknown asset guid`
+    warning per clip at load. Both are expected, and neither can be removed from the game side.
 - ⚠️ **`keep` is transitive; `drop` is NOT.** A keep-list entry is WALKED — listing a prefab pulls
   its meshes, materials and textures in with it — while a drop removes exactly the path it names.
   "Drop the level index and its levels go too" is the natural wrong assumption; list each file.
@@ -327,6 +336,21 @@ removes nothing" below for the two that were not, and why they are gone rather t
 - **Single chunk = `inlineDynamicImports`, NOT `codeSplitting`.** `codeSplitting` is not a real Rollup
   option — Rollup silently ignores it, the lazy renderer chunk stays split, and the inliner's stray-JS
   guard aborts every 3D-game playable. Only `inlineDynamicImports:true` folds dynamic imports into the entry.
+- **A `new URL('x.js', import.meta.url)` asset trips the same guard — strip it at the source, never
+  exempt it** (#1340). three r185's `KTX2Loader` added two such defaults for the Basis transcoder
+  (r184 had none), so after the 2026-09-15 three bump every playable with 3D reachable failed on a
+  hashed `assets/basis_transcoder-*.js`, and every web/native build shipped a dead ~585 KB pair.
+  It is dead because `getKTX2Loader` always calls `setTranscoderPath('/basis/')`, and the loader only
+  reads the defaults when that path is empty. `engine/plugins/ktx2LoaderAssetStrip.ts` blanks both at
+  build time, and THROWS if `import.meta.url` survives, so a reshaped expression in a later three
+  cannot silently bring the pair back. The guard cannot tell a URL asset from a real chunk, so the
+  guard stays strict and the emitter gets fixed.
+- **A `?worker` import trips the same guard, even aimed at a stub** (#1356). The runtime imports
+  `@zappar/msdf-generator/worker?worker&url`; the playable alias for it must REPLACE THE QUERY along
+  with the specifier (`(?:\?.*)?$`) and point at `plugins/playable-msdf-worker-url-stub.ts`.
+  Keeping the query, as the wasm entry does, makes Vite build whatever stub it points at as a worker
+  (observed with the query kept and the target `playable-msdf-stub.ts`: the export failed on
+  `assets/playable-msdf-stub-*.js`).
 - **A playable never runs the boot ramp probe** (#221) — `main.tsx` sets
   `setBootProbeAllowed(!__MODOKI_PLAYABLE__)` at module scope, and `tierResolve` refuses on BOTH its
   probe call sites. It is not covered by "one config ⇒ no probe": that short-circuit needs the

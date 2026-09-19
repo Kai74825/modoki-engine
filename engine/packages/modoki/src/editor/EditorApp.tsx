@@ -37,6 +37,7 @@ import PublishOtaDialog from './panels/PublishOtaDialog';
 import OtaKeysDialog from './panels/OtaKeysDialog';
 import PanelErrorBoundary from './panels/PanelErrorBoundary';
 import { runSaveAll, toastForSave } from './scene/saveCommand';
+import { confirmDiscardUnsaved, answerUnsavedGateRequest } from './scene/unsavedGate';
 import { enterPlay, pausePlay } from './scene/playMode';
 import { getPlayState, setPlayState, getRunMode, onRunModeChange } from '../runtime/core/playState';
 import { useEditorStore } from './store/editorStore';
@@ -80,7 +81,9 @@ const PANELS: Record<string, React.ComponentType> = {
   ...Object.fromEntries(getCustomPanels().map(p => [p.id, p.component])),
 };
 
-function resetLayout() {
+async function resetLayout() {
+  // A reload unloads the page, so everything unsaved is lost — ask first (#1419).
+  if (!(await confirmDiscardUnsaved('reset the layout (the editor reloads)', 'page-unload'))) return;
   clearStoredLayout();
   console.log('[Editor] Layout reset to default');
   // Reload for a clean panel remount (live Three.js/Pixi viewports don't tear
@@ -92,6 +95,9 @@ function resetLayout() {
 
 import MenuBar, { type BarMenuItem } from './components/MenuBar';
 import { buildMenuSpec, handleMenuAction } from './menuSpec';
+import { isModalOpen, subscribeOverlays } from './input/focusScope';
+import { suppressesGameInput } from './input/gameInputGate';
+import { ModalShell } from './components/ModalShell';
 
 // ── Main Editor ─────────────────────────────────────────
 
@@ -350,16 +356,10 @@ export default function EditorApp() {
     // WASD in the Hierarchy latches the character's movement keys, and a gamepad drives
     // the game while you edit the Inspector (gamepadSource polls with no guard at all).
     //
-    // The policy lives HERE, in the editor. The mechanism lives in the runtime's source
-    // registry, because keyboardSource ships inside every game and must never know what
-    // a "panel" is. A shipped game never installs a gate.
-    //
-    // null focus (nothing engaged yet) deliberately does NOT suppress: pressing Play and
-    // immediately using WASD has to work without first clicking the GameView.
-    setInputGate(() => {
-      const p = useEditorStore.getState().focusedPanel;
-      return p !== null && p !== 'game';
-    });
+    // The policy lives HERE, in the editor — in `input/gameInputGate.ts`, where it is tested. The
+    // mechanism lives in the runtime's source registry, because keyboardSource ships inside every
+    // game and must never know what a "panel" is. A shipped game never installs a gate.
+    setInputGate(() => suppressesGameInput(useEditorStore.getState().focusedPanel, isModalOpen()));
     // The gate above decides what the game READS each frame; it cannot stop a press on a panel from
     // being LATCHED and pointer-captured by the game at press time, before any frame samples. This
     // scope does that: only a press inside the Game panel's play area starts a game gesture (#1182).
@@ -643,6 +643,8 @@ export default function EditorApp() {
   // async listing that must not block editor start. Bump → rebuild the tree AND re-push the
   // Electron spec, or the OS menu keeps the boot-time labels forever.
   const extraMenusVersion = useSyncExternalStore(subscribeExtraMenus, getExtraMenusVersion, getExtraMenusVersion);
+  // A modal dialog greys the whole OS menu while it is up (#1270) — see buildMenuSpec's `modal`.
+  const modalOpen = useSyncExternalStore(subscribeOverlays, isModalOpen, isModalOpen);
 
   // Build the menu tree + its serializable Electron spec ONCE per relevant input
   // change (layout name, undo/redo state) instead of on every render. Recomputing
@@ -683,7 +685,7 @@ export default function EditorApp() {
       { label: 'Save Layout As...', action: handleSaveLayoutAs },
       { label: 'Load Layout...', action: () => setShowLoad(true) },
       { label: '', separator: true },
-      { label: 'Reset Layout', action: () => resetLayout() },
+      { label: 'Reset Layout', action: () => { void resetLayout(); } },
     ],
     ...getExtraMenus(),
     // Window stays last (before Help) per the conventional menu-bar order. A ✓
@@ -710,9 +712,9 @@ export default function EditorApp() {
     // Spec + action map are built together by `menuSpec.ts` — they must agree on ids, and the id
     // scheme is load-bearing enough to be unit-tested (see `menuItemId` for why an id carries its
     // label, not just its position).
-    const { menuSpec, menuActionMap } = buildMenuSpec(menus);
+    const { menuSpec, menuActionMap } = buildMenuSpec(menus, { modal: modalOpen });
     return { menus, menuSpecJson: JSON.stringify(menuSpec), menuActionMap };
-  }, [layoutName, undoVersion, extraMenusVersion, runMode, handleSaveLayout, handleSaveLayoutAs, showPanel, isPanelVisible, layoutVersion]);
+  }, [layoutName, undoVersion, extraMenusVersion, runMode, handleSaveLayout, handleSaveLayoutAs, showPanel, isPanelVisible, layoutVersion, modalOpen]);
 
   // Keep the click-relay's action map current with the latest memoized spec.
   menuActionRef.current = menuActionMap;
@@ -733,6 +735,13 @@ export default function EditorApp() {
         showToast: (message, kind) => useEditorStore.getState().showToast(message, kind),
         warn: (message) => console.warn(message),
       });
+    });
+  }, []);
+  // Main asks before a window close / quit / project switch / reload discards this page (#1419).
+  useEffect(() => {
+    if (!electronBridge) return;
+    return electronBridge.on('unsaved-gate', (req) => {
+      void answerUnsavedGateRequest(req, (data) => electronBridge.send('unsaved-gate-reply', data));
     });
   }, []);
   // Cmd/Ctrl+wheel → whole-app UI zoom (VS Code–style). Forward the intent to main,
@@ -840,7 +849,7 @@ function SaveLayoutAsModal({ initial, onSave, onExport, onClose }: { initial: st
   const commit = () => { const n = name.trim(); if (n) onSave(n); };
   const exportToFile = () => { const n = name.trim(); if (n) onExport(n); };
   return (
-    <div style={{ position: 'fixed', inset: 0, zIndex: 9999, background: 'rgba(0,0,0,0.5)', display: 'flex', alignItems: 'center', justifyContent: 'center' }} onClick={onClose}>
+    <ModalShell kind="save-layout-as" onDismiss={onClose}>
       <div onClick={(e) => e.stopPropagation()} style={{ background: '#1e1e30', border: '1px solid #555', borderRadius: 6, padding: '16px 20px', minWidth: 300, fontFamily: 'monospace' }}>
         <div style={{ color: '#fff', fontSize: 13, marginBottom: 12 }}>Save Layout As</div>
         <input
@@ -864,7 +873,7 @@ function SaveLayoutAsModal({ initial, onSave, onExport, onClose }: { initial: st
           </div>
         </div>
       </div>
-    </div>
+    </ModalShell>
   );
 }
 
@@ -884,7 +893,8 @@ function LoadLayoutModal({ onClose }: { onClose: () => void }) {
       .catch(() => setLayouts([]));
   }, []);
 
-  const load = (name: string) => {
+  const load = async (name: string) => {
+    if (!(await confirmDiscardUnsaved(`load layout ${name} (the editor reloads)`, 'page-unload'))) return;
     localStorage.setItem(LAYOUT_NAME_KEY, name);
     window.location.reload(); // reload applies the layout via loadInitialModel (clean panel remount)
   };
@@ -912,7 +922,7 @@ function LoadLayoutModal({ onClose }: { onClose: () => void }) {
         if (!isLayoutJson(parsed)) { console.error('[Editor] Not a valid layout file (missing "layout")'); return; }
         const name = deriveLayoutBaseName(file.name);
         if (!(await writeLayoutJson(name, parsed))) { console.error('[Editor] Failed to import layout'); return; }
-        load(name);
+        await load(name);
       } catch (e) {
         console.error('[Editor] Failed to read layout file:', e);
       }
@@ -921,7 +931,7 @@ function LoadLayoutModal({ onClose }: { onClose: () => void }) {
   };
 
   return (
-    <div style={{ position: 'fixed', inset: 0, zIndex: 9999, background: 'rgba(0,0,0,0.5)', display: 'flex', alignItems: 'center', justifyContent: 'center' }} onClick={onClose}>
+    <ModalShell kind="load-layout" onDismiss={onClose}>
       <div onClick={(e) => e.stopPropagation()} style={{ background: '#1e1e30', border: '1px solid #555', borderRadius: 6, padding: '16px 20px', minWidth: 280, maxWidth: 360, fontFamily: 'monospace' }}>
         <div style={{ color: '#fff', fontSize: 13, marginBottom: 12 }}>Load Layout</div>
         {layouts === null ? (
@@ -932,7 +942,7 @@ function LoadLayoutModal({ onClose }: { onClose: () => void }) {
           <div style={{ display: 'flex', flexDirection: 'column', gap: 4, maxHeight: 320, overflowY: 'auto' }}>
             {layouts.map((l) => (
               <div key={l.name} style={{ display: 'flex', gap: 4 }}>
-                <button data-ui-id={`layout.load.${l.name}`} onClick={() => load(l.name)} style={{
+                <button data-ui-id={`layout.load.${l.name}`} onClick={() => { void load(l.name); }} style={{
                   flex: 1, textAlign: 'left', padding: '6px 10px', border: '1px solid #444', borderRadius: 3,
                   background: '#2a2a40', color: '#ccc', cursor: 'pointer', fontFamily: 'monospace', fontSize: 12,
                 }}
@@ -961,7 +971,7 @@ function LoadLayoutModal({ onClose }: { onClose: () => void }) {
           }}>Cancel</button>
         </div>
       </div>
-    </div>
+    </ModalShell>
   );
 }
 
@@ -974,10 +984,7 @@ function ImportProgressModal() {
   const determinate = totalSteps > 0;
   const pct = determinate ? Math.min(100, Math.round((step / totalSteps) * 100)) : 0;
   return (
-    <div style={{
-      position: 'fixed', inset: 0, zIndex: 9999,
-      background: 'rgba(0,0,0,0.5)', display: 'flex', alignItems: 'center', justifyContent: 'center',
-    }}>
+    <ModalShell kind="import-progress">
       <div style={{
         background: '#1e1e30', border: '1px solid #555', borderRadius: 6,
         padding: '20px 32px', minWidth: 320, maxWidth: 560, textAlign: 'center', fontFamily: 'monospace',
@@ -1023,7 +1030,7 @@ function ImportProgressModal() {
           </>
         )}
       </div>
-    </div>
+    </ModalShell>
   );
 }
 
@@ -1052,10 +1059,7 @@ function SceneLoadModal() {
   const determinate = total > 0;
   const pct = determinate ? Math.min(100, Math.round((loaded / total) * 100)) : 0;
   return (
-    <div style={{
-      position: 'fixed', inset: 0, zIndex: 9999,
-      background: 'rgba(0,0,0,0.5)', display: 'flex', alignItems: 'center', justifyContent: 'center',
-    }}>
+    <ModalShell kind="scene-load-progress">
       <div style={{
         background: '#1e1e30', border: '1px solid #555', borderRadius: 6,
         padding: '20px 32px', minWidth: 320, maxWidth: 480, textAlign: 'center', fontFamily: 'monospace',
@@ -1079,7 +1083,7 @@ function SceneLoadModal() {
         </div>
         <div style={{ color: '#666', fontSize: 10 }}>First load bakes textures &amp; models — this can take a moment.</div>
       </div>
-    </div>
+    </ModalShell>
   );
 }
 
@@ -1113,10 +1117,7 @@ function BuildProgressModal() {
   const done = step >= totalSteps && !failed;
 
   return (
-    <div style={{
-      position: 'fixed', inset: 0, zIndex: 9999,
-      background: 'rgba(0,0,0,0.5)', display: 'flex', alignItems: 'center', justifyContent: 'center',
-    }}>
+    <ModalShell kind="build-progress">
       <div style={{
         background: '#1e1e30', border: '1px solid #555', borderRadius: 6,
         padding: '20px 32px', minWidth: 320, textAlign: 'center', fontFamily: 'monospace',
@@ -1167,6 +1168,6 @@ function BuildProgressModal() {
           </div>
         )}
       </div>
-    </div>
+    </ModalShell>
   );
 }

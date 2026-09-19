@@ -85,7 +85,8 @@ Violations that produced this rule:
 **A tool's name must distinguish it from its neighbours without its description**, because an agent
 often cannot see the description. Claude Code advertises this surface **deferred** — names only,
 schemas fetched on demand ([mcp-response-budget.md](./mcp-response-budget.md) § "Definition surface
-under tool deferral") — so a name is chosen from a list of ~148 strings and nothing else. A pair
+under tool deferral") — so a name is chosen from a list of ~150 strings and nothing else, and each
+string reads `mcp__<server>__<tool>` (`mcp__modoki__modoki_dnd`, `mcp__game-debug__device_list`). A pair
 that reads the same at that width is a coin flip, and §0 ranks a wrong action above an unclear one.
 
 Audit of the whole surface, 2026-08-31 (24 lexically-similar pairs examined; most are fine —
@@ -132,6 +133,15 @@ touching the contracts table, the generated catalog, `liveCoverage`, and every d
 the tool. That is the same cost that made §7 decline splitting `watch` and the journals. They stay
 recorded so a *new* tool does not add a fifth. **When naming a new tool, the test is: could an agent
 seeing only this name and its neighbours pick wrong?**
+
+**The mitigation that costs no rename: a look-alike NAMES its sibling in its description** (#1208,
+2026-09-14). The name alone still cannot choose, but the first schema an agent loads then points at
+the other one. The 2026-09-14 review found four more recoverable pairs the table above does not
+list (`dnd`/`drag`, `journal`/`editor_journal`/`get_console_logs`, `watch`/`input_watch`,
+`wait_for`/`wait_for_edit`) and 24 directed pairs across 16 look-alike groups that did not name each
+other. Guarded: `LOOKALIKE_GROUPS` in `mcpToolContracts.test.ts`. A new look-alike goes into that
+table, and the guard then holds its description to naming the sibling. Findings:
+[the 2026-09-14 ledger](reviews/2026-09-14-mcp-tool-audit.md) § Phase 3.
 - **`position`** — documented as "World position" on `set_transform` while writing `Transform.x/y/z`,
   which is **local**. Every parented entity silently lands somewhere else, reported as success (S1).
 
@@ -159,9 +169,73 @@ Two lessons outlast the rename:
   copy — the per-tool part is a SUFFIX, so the shared text stays a verbatim prefix of every variant.
 
 Rules:
-- A count of **returned rows** is `returnedCount`; a count of **everything that exists** is
-  `totalCount`. Never `entityCount` for either. When a filter or limit applied, **both** are present
-  — a total that appears only when truncation happened is not recoverable by the caller.
+- A count of **returned rows** is `returnedCount`; a count of **everything the query matched**,
+  before any limit, is `totalCount` (the meaning `hit_regions` and `find_references` already had).
+  Never `entityCount` for either. When a filter or limit applied, **both** are present — a total that
+  appears only when truncation happened is not recoverable by the caller.
+- **Landed in #1223 P5 (D3, closing #1217):**
+  - `get_scene_state` always carries both, plus `resourcesExcluded` when its default resource filter
+    left entities out. That is F8's constant, now stated.
+  - A count of **every entity in the world**, resources included, is `worldEntityTotal`: editor state,
+    both `load_scene`s and the `!scene-load` journal event.
+  - `get_layout_bounds` counts RECTS in `totalCount`/`returnedCount` (`returnedCount` only when
+    `entities` came back) and the distinct entities behind them in `entityTotal`. Its old `count` is
+    gone.
+  - A capped SECONDARY list in a reply (one that is not the reply's main rows) states its total as
+    `<list>Total`, present only past the cap: `alsoDeleted` + `alsoDeletedTotal`, `addedTraits` +
+    `addedTraitsTotal` (P4 had shipped that one as a bare `addedTraitsTruncated: true`). An absent
+    total then means the list is complete, so the count is always recoverable.
+  - `engine/tests/framework/replyCountVocabulary.test.ts` runs the real ops and fails on any
+    `entityCount` key.
+- **Landed in #1266 — the remainder, so the rule now holds everywhere:** the journals and console
+  logs, `handles`, `list_assets` and `list_scenes` all answer `returnedCount`/`totalCount`, and
+  `list_assets` no longer gates its total on truncation. Four things that change are worth knowing
+  before writing the next reply:
+  - **`ringTotal` is a THIRD population and keeps its own name** — the whole ring, filter ignored.
+    The journals and the console ring need all three numbers; neither `returnedCount` nor
+    `totalCount` covers it.
+  - **Both are emitted even where nothing can truncate** (`handles`, `list_scenes`, `diagnose`'s
+    video cache). An absent total cannot be told apart from "this tool does not report one", which
+    is the ambiguity the rule exists to remove.
+  - **`count` and `total` are retired at the TOP LEVEL only.** A bare top-level `count` is the
+    ambiguity; a NESTED one is qualified by the key above it, so `diagnose`'s `refs.count`,
+    `camera.count`, `offScreen.count` and `uiOverflow.count` stay. None is a returned-vs-matched
+    pair, and renaming them would imply a truncation that cannot happen. (`watch`'s `series[].count`
+    is the weak case — genuinely a capped pair wearing a nested name — recorded in the guard.)
+  - ⚠️ **A summary that returns NO rows must DROP `returnedCount`, not rename into it.** `handles`'
+    bare call strips its rows and answers counts; carrying a field defined as "the rows in this
+    reply" made it state a falsehood (`returnedCount: 2000` beside no `handles` key). Precision cuts
+    both ways — the vague old name was merely unhelpful there, the precise one was wrong.
+  - Guarded by `replyCountVocabulary.test.ts` (walks real op replies) plus, for the bodies that
+    walker structurally cannot reach, `editorActionRouter.test.ts` for the Node-router `/api/scenes`
+    and `handlesReplyShape.test.ts` for the shared summary.
+- **A filtered read discloses its population (#1214).** An empty filtered result is two different
+  facts — "nothing exists" and "the filter missed" (a typo, the wrong layer) — and the rows alone
+  cannot say which. The #1208 sweep found 17 of 33 filtered reads answering an empty list with
+  nothing beside it, and several *explaining* it from the filtered list ("the surface is not
+  hit-testable") — because no shared rule existed, each read re-decided. The rule now has one
+  implementation, `engine/tools/shared/filterDisclosure.ts`, and two shapes chosen by what the
+  population is:
+  - **A ring** (console logs, the game and editor journals, the device console) always answers
+    `ringTotal` plus its histogram (`byLevel`/`byType`) over the WHOLE ring, filter ignored.
+    `editor_journal`'s `byType` described the filtered list until #1214 — the one ring that did not.
+  - **A set** (entities, layout rects, watch series, handles, hit regions) answers, only when a
+    filter matched nothing, a `hint` from `emptyFilterHint`: the unfiltered count, and the live
+    vocabulary listed closest-to-the-asked-value first (`liveSet(…, near)` — an alphabetical cut of a
+    300-name scene never shows the name a typo meant). Only the empty case pays for the second read.
+  - A read whose filter runs where the rows are produced and cannot count the rest (the app's native
+    logs, the host's logcat/syslog read) at least names the filter in its empty answer, never a bare
+    "No logs.".
+  - An explanation is computed from the population it describes. A provider that THREW is
+    `failedProviders`, not "not hit-testable"; a note beside `manifestRebuilt` is derived from it.
+  - Guarded by `engine/tests/framework/filteredReadDisclosure.test.ts`, which runs the real ops with
+    a filter that cannot match over a world where the unfiltered read is not empty. Add a filtered
+    read to its table when you add one.
+- **A cursor names the life it belongs to (#1214 B-3).** The editor journal's `seq` is module state,
+  so a renderer reload — every game-code edit — restarts it, and a pre-reload `since` filters out
+  every new event: `wait_for_edit` answered `timedOut` while the human edited. Its replies carry
+  `epoch`; a caller that sends it back with `since` gets `cursorReset` (a replay of this life)
+  instead of an empty stream, and a `since` past the counter is reset even without it.
 - A field whose meaning depends on the entity's layer/kind must either be renamed per meaning or
   carry the qualifier in the payload (e.g. `onScreen` + `onScreenBasis: 'viewport'|'size-only'`).
 - Space matters: any transform-shaped value states `world` or `local` **in its name or its
@@ -175,18 +249,73 @@ calls. Raw `{x,y}` is refused wherever a resolvable aim exists (`modoki_capture_
 legitimate exception: it *measures* a path).
 
 - `guid` is the only address that always works; `id` is reassigned on every scene reload.
+- **ONE live resolver decides what an entity address means: `app/debug/entityRef.ts`
+  (`resolveEntityAddress`, #1223).** Every live op that aims at an entity goes through it: the editor
+  structural ops, `apply-scene-ops`, the device lifecycle ops and `set-traits`, aimed input,
+  `scene-query`'s `exclude`, `dispatch-action`'s `targetGuid`, and `capture_gesture`'s sample (via the
+  `resolve-entity` op). There were
+  eight copies with four precedence orders. Its rules:
+  - **Exactly one of `guid` | `name` | `id`.** An empty string counts as absent, and two addresses are
+    refused (`AMBIGUOUS`). The FILE path (`sceneMutate.ts`) applies the same one-address rule; it used
+    to let `id` win where the live path let `guid` win.
+  - **`{id}` addresses only a REGISTERED entity that has NO guid.** An entity with a guid is refused
+    (`REFUSED_BY_OP`), with the guid as the one `options` entry. Since #1248 that is every entity
+    except one whose EntityAttributes was removed (or removed and re-added). koota's own world entity
+    (id 0) is not registered and is `NOT_FOUND`. `get_editor_state`'s `selection` reports `guid`/`guids`
+    beside the ids, so a read → `set_selection` restore can hand back what the op accepts.
+    A set-shaped op (`delete-entities`, `set-selection`) refuses the whole call for such an id rather
+    than skipping it. A member that matches nothing is handled as before: the EDITOR ops skip it and
+    say so, while the device `delete-entities` refuses the whole call and deletes nothing. The FILE path's `id` is the file's authored id, not a runtime one, and
+    stays accepted. Filters (`get_scene_state`'s `id`, `layout_bounds`, `watch`) are not addresses and
+    are untouched.
+  - **A miss is `NOT_FOUND`, plus `stale` when the guid is a runtime one the page can place.** The
+    values are `'despawned'` and `'world-swapped'` (`classifyRuntimeGuidMiss`, [engine-concepts.md](engine-concepts.md)
+    § Entity identity). The recovery is the same as any miss, re-reading the guid, so it is a field and
+    not a code. It travels in the op's refusal body, which the MCP envelope echoes in `got`.
+- **Every entity has a guid a tool can hand out** (#1210, #1248: `spawnEntity` gives an entity
+  spawned without EntityAttributes the trait, Time and Input included). A
+  code-spawned one carries a RUNTIME guid (`00000000-GGGG-GGGG-0000-…`, `isRuntimeGuid`). It works
+  in every guid-addressed op now, still resolves after a `save_all` gives the entity a durable guid,
+  and is **valid only until the scene reloads**, after which it misses rather than naming another
+  entity. Its generation is salted per page load, so a guid from before an editor reload misses too. Replies report it in `guid` like any other; the rules and the mechanism are in
+  [engine-concepts.md](engine-concepts.md) § Entity identity. ⚠️ It is a live-world address: the
+  FILE path (`/api/scene-mutate`) refuses a write carrying one, because a file outlives the world.
+- **A reply names every entity by guid, never by a bare id (#1223 P2).** An id is reassigned on every
+  reload, and the mutating tools refuse it for an entity that has a guid, so a reply that hands one out
+  hands out an address the next call refuses. Three shapes, one helper each:
+  - **An object** keeps its id and gains the matching guid key beside it: `id`/`entityId`/`entity` →
+    `guid`, `parentId` → `parentGuid`, `boxEntityId` → `boxGuid`, `canvasId` → `canvasGuid`,
+    `animatorRootEntityId` → `animatorRootGuid`. In-process readers join on the id, so it stays.
+    `guidOfEntityId` (runtime `core/ecs/entityUtils.ts`) is the one reader; `liveGuidOf` names it.
+  - **An id list** becomes a guid list plus `<field>NoGuidIds` for the entities that have none, present
+    only when non-empty (`guidListFields`, `app/debug/entityRef.ts`): `delete_entities`' `deleted` (the
+    editor and device ops now share it; the device one was a count beside `guids: [null]`),
+    `layout_bounds`' `offScreen`/`zeroSize`, `diagnose`'s `transforms.zeroScale` and
+    `offScreen.guids`. `selection.entityIds` keeps its parallel `guids` array instead (P1).
+  - **A string** holds the guid, or `id:<n>` for a guid-less entity: the editor journal
+    (`journalRefOf`, `editor/undo/entityRef.ts`; it wrote `String(id)`), `input_watch`'s blocker
+    label, and `contacts`/`overlaps` partners.
+  - **Not an address:** a trait's own stored fields, echoed as the component holds them in
+    `get_scene_state`'s `full`/`trait=` rows. `traits.EntityAttributes.parentId` stays a number, because
+    set-traits reads that shape back, and the row carries `parentGuid` for it (the guard exempts exactly
+    this path). `traits.PrefabInstance.rootInstanceId` is the same kind of stored id and has NO guid
+    beside it yet; the guard's fixture has no prefab instance, so it does not see it.
+  `tests/framework/replyEntityNaming.test.ts` runs the real ops over a durable/runtime/guid-less
+  fixture and walks each reply for a bare id, so a field added later is held to this. It cannot reach
+  the `handles` meta or the pose ops' root guids, which need the panels. The editor `delete_entities`
+  mints a durable guid on every listed entity BEFORE naming it, so each guid in `deleted` resolves after
+  undo, and the `!delete` journal event names the same guids for the roots (it lists roots only). It
+  mints the descendants it names in `alsoDeleted` the same way (#1216 C-6), and so does the live
+  `mutate_scene` `removeEntity` (#1262).
 - **A reply reports `guid: null` for an entity that has no guid. It never reports `String(id)`**
-  (#1199). Runtime spawns have no guid, and neither does anything not yet saved or edited. The id
-  in `guid` looked addressable, and every guid-addressed op refused it: a guid-less entity is not in
-  the guid index. The refusal then told the caller to use guids. `liveGuidOf`
-  (`app/debug/liveLifecycle.ts`) is the one helper. Two shapes differ, because a bare element has
-  no `id` beside it: `contacts`/`overlaps` list a guid-less partner as `id:<n>`, and a `watch`
-  series reports `guid: null` plus `id`, with `id:<n>` as its internal key. A `watch read` with
-  `guids` therefore cannot select a guid-less series by its old id string. Select it with `name`.
-  `guids: ["id:<n>"]` also matches, but it is not an advertised form. A producer that hands out a guid should
-  **mint** one (the live `create-entity`, `newScene`'s starter set), not disguise the id. A
-  scene-state warning for null rows was tried and dropped: it fired on every read of a world with
-  runtime spawns.
+  (#1199). Since #1248 no spawn produces one; only an entity whose EntityAttributes was removed after
+  spawn has no guid. The id in `guid` looked addressable, and every guid-addressed op refused it. A
+  `watch` series reports `guid: null` plus `id`, with `id:<n>` as its internal key. A `watch read` with `guids`
+  therefore cannot select that series by its old id string. Select it with `name`. A producer that
+  hands out a guid should **mint** one (the live `create-entity`, `newScene`'s starter set), not
+  disguise the id.
+- **A refusal offers only what the same op accepts** (#1207). An ambiguous-name refusal lists guids
+  in `options`, never `id:<n>`, and says "address one by guid". A match with no guid is not listed.
 - A `name` matching several entities is **refused**, everywhere — live path, file path, and input
   aim alike. First-matching is never acceptable (this was measured: one of two `DUP_probe` entities
   moved, `{ok:true, changed:1}`).
@@ -219,6 +348,16 @@ legitimate exception: it *measures* a path).
 - **Any id-shaped argument is validated.** `parentGuid` is validated today while `parentId` is
   passed through raw, so a stale numeric id produces an orphan entity — parented to nothing,
   invisible in the Hierarchy — reported as success (S1 `create_entity`/`reparent_entity`/`prefab`).
+- **A ROLE prefix is not a second spelling.** `parentGuid`/`entityGuid` (`modoki_prefab`) and
+  `sampleGuid` (`modoki_capture_gesture`) name WHICH entity, because those tools address two, and a
+  bare `guid` could not say which. A tool that addresses one entity uses bare `id`/`guid`.
+  `set_selection`'s `entityId`/`entityIds` beside `guid`/`guids` is the one mixed spelling left
+  (#1208 P1-5).
+- **A `guid` and an `id` given together are REFUSED (`AMBIGUOUS`)**, flat or nested, and so are
+  `parentGuid` beside ANY `parentId` (0 included: "the root" and "under this entity" are two answers)
+  and `entityGuid` beside `entityId` (#1223 D1, which
+  settles #1208 P2-2). They used to be resolved by precedence, with the guid silently winning, which
+  acted on the guid's entity when the caller's stale id named a different one.
 - **Both addressing SHAPES are accepted, so the choice is not a guess.** Aimed-input tools nest
   (`entity:{guid|name|id}`) because they also take a selector or a raw point and the aim modes must
   stay distinguishable; the editor-op tools take a flat `guid`. That rule was written nowhere and
@@ -354,12 +493,28 @@ Rules:
   through `relayResponseFor`; the Electron IPC handler deliberately does not use it — IPC reaches
   exactly one `webContents`, so there is no broadcast and no decline to count (`main.ts`'s
   `requestRenderer` docblock) — so a conversion placed in only one of them is dead in
-  the other — the packaged editor. **The device TCP relay is a third, and it does NOT carry a code:**
+  the other — the packaged editor. **The device TCP relay is a third, and a THROW does not carry a code
+  there** (a RETURNED aim refusal does since #1223 P3: the `Error:` string ends in a
+  `[modoki-refusal]{code,options,stale}` line, `tools/shared/deviceRefusal.ts`, which
+  `deviceReplyFailure` decodes)**:**
   `bridge.ts`'s `delegateToAgentOps` flattens any throw into the `Error: <msg>` string sentinel the
   game-debug MCP flags, so an `OpRefusal` thrown by a RUNTIME op would lose its code there. None is
   thrown by one today — every recoded site is an editor op, which never runs on a device — and
-  making the device channel carry §5 codes is a protocol change to that MCP, not an extra call to
-  `opReplyFor`. Four riders:
+  making the device channel carry THROWN §5 codes is a protocol change to that MCP, not an extra
+  call to `opReplyFor`. A RETURNED code needs no protocol: it crosses the wire intact, and since
+  #1211 the game-debug MCP relays it (`codeFromBody`/`optionsFromBody`, shared in
+  `tools/shared/mcpResult.ts`) where `perceptCall`/`writeCall` used to stamp `REFUSED_BY_OP` over it.
+  ⚠️ **The rule every hop follows: relay the classification you were handed; never invent one.**
+  This class has been re-entered at five hops — op → route (#1012, #1070), `/api/eval`'s bare 504
+  (#1013), the device wire's string protocol (#1223 P3), device wire → device MCP (#1211), and op →
+  editor route again (#1212) — each fixed locally while the next hop kept re-deriving. Two guards
+  hold it, and neither alone is enough: `engine/tests/architecture/refusalCodeRelay.test.ts` flags
+  an open-coded test of the closed code set outside the shared decoders, but it CANNOT see a literal
+  `code: 'REFUSED_BY_OP'` stamped over a body in hand — the table in
+  `engine/tests/tools/deviceRefusalCodeRelay.test.ts` catches that for every `perceptCall`/`writeCall`
+  tool plus `device_mutate_scene` and `device_type_text` (`device_dispatch_action` has
+  `deviceDispatchActionCode.test.ts`), and reads the relay callers from source so a new relay tool
+  cannot skip a row. Four riders:
   - **The discriminator is a code from the CLOSED set**, not `ok:false`. Dozens of ops report a bad
     parameter as `{ok:false, reason}` at HTTP 200, where `isFailureBody` picks them up; only a
     named code is a claim to know which §5 failure this is, and only that claim earns a status.
@@ -493,11 +648,47 @@ Rules:
     inserts nothing — so `type_text {submitKey:'Retrun'}` answered `ok, typed:3` having submitted
     nothing. On the DEVICE side it is worse: `new KeyboardEvent({key:'Excape'})` is well-formed and
     carries the typo, so there is no signal at all and only the table can catch it.
+  - **The table is a RUNTIME value, and the op checks it — a TypeScript union is not a table**
+    (#1213). Thirteen ops held a vocabulary only as a type (`'3d' | 'ui'`), an inline literal or a
+    `switch`, so there was nothing to refuse WITH, and each fell back to "do nothing, answer ok":
+    `set-gizmo` stored and persisted a typo, `set-scene-view-mode` dropped one, `profiler`'s
+    `default:` served an unknown action as a read, `wait-for-edit`'s `type` matched nothing and
+    parked its whole timeout, `resolve-unsaved` filtered out an unknown registry and answered
+    "nothing held", `sim-step` clamped `frames` and turned `'abc'` into a NaN no frame count
+    reaches. The shape now: an `as const` tuple beside the state it describes, the type DERIVED from
+    it, and the op refusing with the tuple as `options` (`refuseUnknownValue` in
+    `agentEditorOps.ts`). Where a compiler can keep the table complete, make it: `editorEmit` takes
+    `EditorJournalType`, so an emit site with a type the table lacks does not build — it caught
+    `!batch` the day it landed. Three corollaries:
+    - **A param the chosen action does not use is refused, not ignored** — above all on the
+      destructive action. `write_player_prefs {action:'clear', key, confirm}` read as "clear that
+      key" and wiped the namespace.
+    - **A number outside the range is refused, not clamped** — a silent clamp answers ok about a run
+      nobody asked for. Two exceptions, both documented on the tool: a clamp the reply REPORTS
+      (`set-playhead`'s `clampedFrom`), and a TIMEOUT budget (`timeoutMs`), which is clamped to its
+      stated range like `modoki_eval`'s, because it bounds the wait rather than choosing the work.
+      A non-finite timeout is still refused (`sim-step`).
+    - **An explicit argument that CONTRADICTS what the op can infer is refused** (`read-asset-def`'s
+      `type` vs the path's suffix), rather than winning and producing a confident wrong negative.
+  - **An op that acts ON an editor refuses when that editor is not showing anything** (#1213). The
+    store naming an asset is not the editor on screen: `select-sprite-slice` stored any guid with no
+    Sprite Editor mounted, `set-skin-mode` answered ok with no Skin editor, and every opener except
+    `open-animation-editor` answered as soon as the store was pointed. Each asset editor now
+    publishes an `AssetEditorMount` into `editorMounts` from its own mount effect (the rule
+    `docs/editor.md` § Tab mounting latches sets for `panelMounted`); `requireEditorOpen(kind)`
+    refuses `NOT_FOUND` naming the opener, and each opener waits for its own mount and refuses
+    `NOT_AVAILABLE_HERE` if it never comes. Where the gate lives in a COMPONENT that undoes the
+    state (SceneView's collider button switching edit mode back off), the gate moves into a shared
+    predicate both call (`colliderEditBlocker`) — otherwise the op answers from before the undo.
+    ⚠️ **Not every editor op needs the gate:** `particle-set`, `anim-set-clip`, `anim-add-key` and
+    the timeline ops write the ASSET and the panel only mirrors it, so they work with nothing open.
+    `set-animation-view-mode` is also exempt on purpose — it is a view preference applied at mount,
+    and its reply already carries `panelNote`.
   - **SWEPT AND CLEARED, so the next sweep does not re-derive it: `modoki_handles`' `editor`/`kind`.**
     They look like the last unrefused vocabulary on this surface — free-form strings that FILTER a
     read, where an unknown value would yield an empty list and the tool's own description says an
     empty result should "read as a correct negative answer". **Driven live (2026-09-12), and it does
-    not conflate:** `GET /api/enact-handles?editor=zzzzz` answers `count:0` with
+    not conflate:** `GET /api/enact-handles?editor=zzzzz` answers `returnedCount:0` with
     `hint: "no handle matches editor=zzzzz. Live now: editor ∈ {chrome}, kind ∈ {button, span} —
     check the spelling, or drop the filter for counts."` It names the live vocabulary and says to
     check the spelling, which is the recovery information a refusal would have carried. A closed
@@ -570,7 +761,10 @@ choice, not a necessity (F9).
 
 Splitting rule: **if one argument value changes the tool's method, its route, or whether it writes to
 disk, it is more than one tool.** Current offenders (F10): `project_settings` (get/set),
-`watch` (start/read/list/clear, spanning both methods), `journal` (read + capture-window control).
+`watch` (start/read/list/clear, spanning both methods), `journal` (read + capture-window control),
+and, added since that list was written, `profiler` and `input_watch` (read actions GET, capture
+control POST) and `hit_regions` (`action:'show'|'hide'` flips an overlay on a read route). A game
+tool counts too: `wordweave_crossword_view` reads with no params and writes with any (#1208 B-20).
 `play_control`/`history` are acceptable — the op varies but the job does not.
 
 `varies` / `opVaries` in the contract table is a **smell marker**, not a blessing. It exists so the
@@ -587,7 +781,7 @@ variance is machine-readable while it lasts.
 - **An operation that swaps the world, or READS OR WRITES a file the editor holds unsaved work
   for, refuses when that work would be lost or omitted**, with `REQUIRES_SAVE` and an escape hatch
   — `discardUnsaved` where the work is DESTROYED (`load_scene`/`new_scene`/`prefab edit-open`/
-  `write_asset_meta`), `force` where it merely goes un-included (`build`/`add_native_target`/
+  `write_asset_meta`/`delete_asset`), `force` where it merely goes un-included (`build`/`add_native_target`/
   `ota_publish`/`reimport_asset`/`duplicate_asset`). Two consequences, two names: one word for both
   is how an agent carries a harmless habit into an irreversible one. `load_scene`/`new_scene`/
   `build` do this; **`ota_publish` does not** — it builds from the scene file and ships over the
@@ -613,6 +807,20 @@ variance is machine-readable while it lasts.
   `ok:false`: a caller who reads `ok:false` reasonably assumes nothing happened, so a partial apply
   behind a failure verdict is worse than either honest outcome. An entity-not-found, by contrast,
   can only be learned while applying, so it stays a per-op error alongside whatever succeeded.
+- **A write refuses what it would silently replace or orphan, and never changes an identity the
+  caller did not name** (#1215). A create over an existing file is refused rather than replaced
+  (`create_registered_asset` via `/api/write-file`'s `ifNoneMatch:'*'`, beside the 409s
+  `create_asset`/`duplicate_asset`/`move_asset`/`create_folder`/`import_file` already had); an edit
+  (`write_asset`) or a sidecar (`write_asset_meta`) for an asset that is not on disk is `NOT_FOUND`;
+  an omitted `id` keeps the one on disk. ⚠️ These refusals are for the AGENT path: the editor's own
+  flush (`selfWrite`/`rendererWrite`) is exempt, because a flush re-parks on failure, and refusing a
+  park whose file vanished wedges `hasUnsavedChanges()` forever. The human's Replace is asked in-app
+  on EVERY create path, and keeps the replaced guid (#1264, one primitive:
+  [mcp-persistence.md](mcp-persistence.md) § "A create asks before it replaces"). A
+  write that changes a path↔GUID mapping rebuilds the manifest before replying (`manifestRebuilt`),
+  so the read it names as its check is not racing the watcher. Scar: `create_registered_asset`
+  replaced an existing material under a fresh guid, answered `ok:true`, and every ref to the old
+  guid dangled.
 - **A write is verifiable.** For every authoring tool there is a read that returns what was written,
   from the same place the write landed (`read_asset_def` reads the LIVE cache, because an unsaved
   edit exists only there). A write whose effect cannot be read back cannot be verified without
@@ -636,9 +844,11 @@ variance is machine-readable while it lasts.
 ## 9. Cross-surface parity
 
 **These rules bind all three surfaces.** `device_*` and the `curl` API are not exempt, and the audit
-found the predictable result of treating them as separate: the device server has **no
-`isFailureBody` equivalent**, so a 200-with-`{ok:false}` is reported to the agent as success across
-all six device Percept tools — the exact class fixed on the editor side and silently unfixed here.
+found the predictable result of treating them as separate: the device server had **no
+`isFailureBody` equivalent**, so a 200-with-`{ok:false}` was reported to the agent as success across
+all six device Percept tools — the exact class fixed on the editor side and silently unfixed there.
+(Closed since: `perceptCall` runs the shared `isFailureBody`. Its sibling `writeCall` and two inline
+checks still carry hand-copied predicates, #1208 C-16.)
 
 - **A rule implemented twice diverges.** `result.ts` and `summarize.ts` exist in both MCP servers,
   diverged (136 vs 64 lines). Shared behaviour lives in ONE module both import (F5).
@@ -698,6 +908,18 @@ already applied. `/api/scene-mutate` reported the second as a 500, which `contex
 `NOT_AVAILABLE_HERE` ("relaunch the editor"), so a caller retried and **double-applied a write**. It
 now answers 200 `{ok:false, code:'PARTIAL'}`: `isFailureBody` makes it a failure and `codeFromBody`
 lifts the code, so `PARTIAL` reaches the agent with no new plumbing.
+
+**The device MCP cannot cast at all (#1313).** `backendGet`/`backendPost` in
+`game-debug-mcp/src/mcp-tools.ts` take a decoder as a REQUIRED argument (`Decoder<T>` in `reply.ts`)
+and return what it decoded. A 2xx body the decoder rejects throws `BackendShapeError`, and so does a
+2xx body that is not JSON. That second case used to become `{}` and decode as an empty answer. The
+backend itself answers a missing route with a JSON 404, but a host that falls through to the SPA
+answers 200 with HTML (the case above). `caughtFailure` reports both as
+`NOT_AVAILABLE_HERE`. **When a POST answered JSON, the route RAN**, so the refusal says the request
+may already have applied and must not be retried blindly. That is the remedy rule below, applied at
+the one helper every device tool goes through. The routes share decoders: one `decodeLeaseStatus`
+covers status, connect and disconnect, and one `decodeDeviceRequestReply` covers all the relay
+tools. `deviceStatusShape.test.ts` fails if a helper result is cast again.
 
 ⚠️ **`raw call()` skips the shared guards.** `htmlFallthrough` runs inside `getJson`/`postJson`
 only, so a raw-`call()` site gets no SPA-fallthrough protection — a missing dev-server route answers
@@ -777,6 +999,20 @@ site must apply `ctx.htmlFallthrough`/`ctx.noSuchRoute` itself.
   its own real path, which no argument redirects and no precondition can see. A case that saves must
   inspect `extraSaved` and fail loudly naming those files. General rule: verify a smoke case with
   `git status` after the run, not its own ✓.
+- **A smoke probe FILE goes under the run-owned `/assets/mcp-smoke/`, never under a type folder**
+  (#1415). Every write route mkdirs its target's parent (`writeJsonAtomic`, `/api/write-file`, the
+  save-as route, `/api/import-file`), and a case's cleanup trashes only the files it made. So a probe
+  at `/assets/particles/…` on a project without that folder (`games/anim-bug`) left an empty
+  `particles/` behind while printing "trashed its 2 probe file(s) ✓". Finder then dropped a `.DS_Store`
+  into it, and `qaCaseReferences.test.ts` read it as QA residue. `test-smoke.mjs` creates the folder
+  up front and trashes it whole at the end, asserting `trashed:1`. ⚠️ The teardown sits after a
+  top-level `try` around every case. The file has no top-level catch and `withCleanup` rethrows,
+  so without that `try` a failing case would skip the teardown, and the leftover would block every
+  later run. It **refuses** a folder that is already there rather than trashing it, because that is
+  either a killed run's leftover or a second smoke run live against the same editor.
+  Suffix-typed assets (`.particle.json`, `.mat.json`, `.scene.json`) register from any folder. The
+  #1414 save-as probe must sort before the open scene (`mcp-smoke/` < `scenes/`). The run checks this
+  with `localeCompare`, and a project where it does not hold reports SMOKE INCOMPLETE.
 - **A refusal the sweep expects is declared too** (`EXPECTED_REFUSALS`, matched on the refusal text
   with the reason it is correct). Without that, the sweep either flags three correct refusals every
   run — and gets ignored — or blanket-accepts `REFUSED_BY_OP` and stops seeing a real one. A stale
@@ -928,10 +1164,29 @@ The description is the tool's contract with the agent — it is read far more of
   inversion to every reader learning the rule from it, and the same sentence is still copied
   verbatim across ~10 `qa/cases/**` (filed as a class, not patched here).
 - **Name the verification.** A mutating tool's description names the read that confirms it.
+  Guarded by a PROXY (`mcpToolContracts.test.ts`): the description must name SOME other tool, or
+  carry a `VERIFICATION_EXEMPT` row saying why the reply is the evidence (it returns the
+  post-state, the read is an action of the same tool, or the effect lies outside the editor). The
+  proxy catches a tool that points nowhere, not one that points at the wrong read.
+- **The first sentence says what the tool DOES** (#1208). It is what a keyword `ToolSearch` and a
+  skim of a loaded schema meet first. A caveat about the reply (`RETURNS {…}`, `NOTE …`), a question
+  (`What references this?`) and an issue number all belong after it. Guarded over both servers —
+  **and, since #1218, over a GAME's own tools too.** That gap was structural rather than an
+  oversight: the #1208 guards take their population from `loadSurface()`/`loadDeviceSurface()`,
+  while `registerAgentTool` runs at runtime from whichever project is open, so the rule held on the
+  engine surface and nowhere else, and all five game tools had drifted to an issue-number opening.
+  ⚠️ **It matters MORE for a game tool.** An engine tool has a fallback — the generated catalog in
+  `docs/debug-tools-mcp.md` — and a game tool has none, so its description is its entire
+  documentation. `gameToolFirstSentence.test.ts` reads the `registerAgentTool` call sites out of the
+  corpus (booting a project is not available to a unit test), which makes the EXTRACTOR the thing
+  that can lie — so it is tested against its own fixtures, and it fails LOUDLY in both directions a
+  scanner can go quiet: a description shape it cannot parse is recorded as unreadable rather than
+  excused, and an independent count of `registerAgentTool` call sites catches a registration it
+  never saw at all (a call made through a variable yields no row, so nothing else could).
 
 ## Decisions taken (the surface changes these rules implied)
 
-These three needed owner sign-off because each changes the advertised surface. All three are DONE.
+These needed owner sign-off because each changes the advertised surface. All are DONE.
 
 1. **§1 strict everywhere — LANDED.** An unknown key is now an error naming the real params, at the
    single registration point (`registerAll.ts`), so it covers direct calls and every `modoki_batch`
@@ -967,7 +1222,47 @@ These three needed owner sign-off because each changes the advertised surface. A
    it belongs in the shared `resolve-dom-point` op (§9's registration rule), not in a second
    per-route check.
 
+5. **§2 param + count renames — LANDED (#1266, 2026-09-16).** Three breaking changes, all hard: no
+   alias, no deprecation window. §1 strict validation is what makes that safe rather than silent —
+   the old spelling now refuses by name, on direct calls and `modoki_batch` steps alike, so a caller
+   self-corrects in one round trip instead of having its parameter dropped. (#1223's `device_scroll`
+   alias precedent exists to protect names that were already CANONICAL; these were not.)
+   - `name` → **`displayName`** on four `open_*_editor` tools. `name` addresses an ENTITY everywhere
+     else on this surface, so the one place it meant "what to call this asset" was the one a caller
+     gets wrong silently: a string is a string, the call succeeds, and it labels something with an
+     entity name — §1's measured `set_selection {name:'Capsule'}` bug wearing a different hat.
+   - `max` → **`maxPresses`** on `input_watch`, both surfaces. ⚠️ The audit filed this as "one
+     meaning under two names" with `maxSamples`, and **that was wrong**: `maxSamples` caps each
+     (entity,field) series, `max` capped ONE global press ring. Sharing a name would have made it
+     lie. The real defect was the opposite — `watch` names its two axes (`maxSamples` + `maxSeries`)
+     while `input_watch` spelled its one as a bare `max`.
+   - The count vocabulary remainder, above.
+6. **A parameter nothing reads is DROPPED, not renamed (#1266).** `modoki_open_particle_editor` lost
+   its `name` rather than gaining a `displayName`: `editingParticleAsset.name` is read only as the
+   `|| asset.name` arm of two `fileName=` fallbacks, and `requireAssetPath` guarantees a non-empty
+   path, so that arm is unreachable and the value had no observable effect. Renaming it would have
+   advertised a knob that does nothing — CLAUDE.md's "an unwired field is a lie with a tooltip",
+   reached from the schema side. ⚠️ The general lesson for a SHARED wording: `displayName`'s one
+   sentence was false on one of its five tools and incomplete on two more, because the value is
+   consumed as DATA rather than shown on two of them (the Animation editor uses it as a CLIP NAME;
+   the Skin editor's "Make Prefab" writes it as a root entity name into a `.prefab.json`). A
+   constant that satisfies the containment check states its claim N times — check it on every
+   member, not on the one you wrote it for.
+
 The remaining known asymmetries are recorded rather than churned: the device↔editor NAMING
 differences (`device_console_logs` vs `modoki_get_console_logs`, …) are tabulated in
-`docs/debug-tools-mcp.md`, and the two genuine device gaps (`device_type_text`, `device_pointer`) are
-features rather than convention violations.
+`docs/debug-tools-mcp.md`. The two device gaps this paragraph once named (`device_type_text`,
+`device_pointer`) have both shipped, and the device input tools aim by `entity` too (#1223 P3,
+`docs/enact.md` § "The device surface aims the same way now"). #1223 P4 closed the rest of #1216 and wrote each
+closure into that same doc: a strict `create_entity` spec on both, `alsoDeleted` on both deletes,
+`device_handles` shaped like `modoki_handles`, `addedTraits` on every trait-adding write, and the
+invalidate-assets enum. The one difference left there, no `modoki_invalidate_assets`, is recorded as
+deliberate, with its reason.
+
+**The pattern those closures shared: the reply or schema shaping lived in the one place a surface
+passes through** (an editor route, a tool's switch, an op wrapper), so the other surface skipped it.
+Most of the fixes moved that shaping into `tools/shared/` or into the op itself. `addedTraits` needed
+the field added at each of the four places a reply is rebuilt field by field (the op wrapper, the
+relay decoder, and the route's live and file branches); dropping it at any one loses it. `alsoDeleted`
+on `mutate_scene`'s `removeEntity` (#1262) went through the same four places, and
+`persistenceRouter.test.ts` pins the decoder and both route branches, `deleteCascadeReport.test.ts` the op wrapper.

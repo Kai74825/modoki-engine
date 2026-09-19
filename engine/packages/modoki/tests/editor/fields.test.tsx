@@ -5,8 +5,8 @@
 // @vitest-environment jsdom
 import { describe, it, expect, vi } from 'vitest';
 import { renderHook, act, render, fireEvent } from '@testing-library/react';
-import { useState } from 'react';
-import { applyWheelStep, useBufferedValue, parseNumber, clampRange, BufferedNumberInput } from '../../src/editor/panels/fields';
+import { useState, createElement, type ReactNode } from 'react';
+import { applyWheelStep, useBufferedValue, parseNumber, parseString, clampRange, BufferedNumberInput, BufferedFieldScope } from '../../src/editor/panels/fields';
 
 describe('applyWheelStep', () => {
   it('steps up/down by step × multiplier', () => {
@@ -257,3 +257,94 @@ describe('useBufferedValue — the echo of our own commit is not an external cha
     expect(result.current.localValue).toBe('');
   });
 });
+
+// #1411: the hook's wiring of `resyncBuffered` (bufferedEcho.test.ts pins the decision itself).
+// No focus event fires in any of these — the unfocused-window condition the bug needs.
+describe('useBufferedValue — its own late echo is not an external change (#1411)', () => {
+  const hook = (initial: { v: string; scope: string }, onChange = vi.fn()) => renderHook(
+    ({ v, scope }) => useBufferedValue(v, onChange, parseString),
+    { initialProps: initial,
+      wrapper: ({ children }: { children: ReactNode }) => createElement(BufferedFieldScope.Provider, { value: currentScope.s }, children) },
+  );
+  const currentScope = { s: 'A' };
+
+  it('a late echo of an earlier keystroke keeps the text typed since', () => {
+    currentScope.s = 'A';
+    const { result, rerender } = hook({ v: '', scope: 'A' });
+    act(() => result.current.handleChange('a'));
+    act(() => result.current.handleChange('ab'));
+    rerender({ v: 'a', scope: 'A' });            // the store echoes the FIRST keystroke, late
+    expect(result.current.localValue).toBe('ab');
+  });
+
+  it('a selection change forgets the previous owner\'s commits — an equal value on the new owner shows', () => {
+    currentScope.s = 'A';
+    const { result, rerender } = hook({ v: '', scope: 'A' });
+    act(() => result.current.handleChange('a'));
+    act(() => result.current.handleChange('ab'));
+    currentScope.s = 'B';                        // select entity B, whose value is 'a'
+    rerender({ v: 'a', scope: 'B' });
+    expect(result.current.localValue).toBe('a');
+  });
+
+  it('a slow onChange does not expire its own entry before the echo arrives', () => {
+    currentScope.s = 'A';
+    let clock = 0;
+    const spy = vi.spyOn(performance, 'now').mockImplementation(() => clock);
+    try {
+      // The FIRST write stalls the main thread for 1.2 s (a heavy re-render); its echo lands after.
+      let calls = 0;
+      const { result, rerender } = hook({ v: '', scope: 'A' }, vi.fn(() => { if (calls++ === 0) clock += 1200; }));
+      act(() => result.current.handleChange('a'));
+      act(() => result.current.handleChange('ab'));
+      rerender({ v: 'a', scope: 'A' });
+      expect(result.current.localValue).toBe('ab');
+    } finally { spy.mockRestore(); }
+  });
+});
+
+// #1407: the component's wiring of `precision` (bufferedEcho.test.ts pins the decision itself).
+// The harness is the Inspector's degrees field: the store holds RADIANS, the field shows degrees at
+// 2dp, so every echo comes back through a noisy unit round trip. No focus event fires.
+describe('BufferedNumberInput — its own echo at the displayed precision is not an external change (#1407)', () => {
+  function DegreesField({ initialRad, precision }: { initialRad: number; precision?: number }) {
+    const [rad, setRad] = useState(initialRad);
+    return (
+      <>
+        <BufferedNumberInput value={rad * 180 / Math.PI} precision={precision} onChange={(v) => setRad(v * Math.PI / 180)} />
+        <output data-testid="committed">{String(rad)}</output>
+      </>
+    );
+  }
+  // Each keystroke APPENDS to what the field shows now, so a mid-edit rewrite survives into the
+  // next keystroke, as it does live. Setting each prefix would overwrite the rewrite and hide it.
+  const typeInto = (input: HTMLInputElement, text: string) => {
+    for (const ch of text) fireEvent.change(input, { target: { value: input.value + ch } });
+  };
+
+  it('⭐ typing past the precision keeps the text — "12.345", not the re-synced "12.35"', () => {
+    // 12.345° comes back as 12.345000000000002°: neither equal to the commit nor to parse(text), so
+    // matched exactly it is an "external change" and the field rewrites itself to the rounded 12.35.
+    const { container, getByTestId } = render(<DegreesField initialRad={0} precision={2} />);
+    const input = container.querySelector('input')!;
+    fireEvent.change(input, { target: { value: '' } });
+    typeInto(input, '12.345');
+    expect(input.value).toBe('12.345');
+    expect(Number(getByTestId('committed').textContent)).toBeCloseTo(12.345 * Math.PI / 180, 12);
+  });
+
+  it('a blur reconciles to the stored value AT the precision', () => {
+    const { container } = render(<DegreesField initialRad={0} precision={2} />);
+    const input = container.querySelector('input')!;
+    fireEvent.change(input, { target: { value: '' } });
+    typeInto(input, '12.345');
+    fireEvent.blur(input);
+    expect(input.value).toBe('12.35'); // not 12.345000000000002
+  });
+
+  it('the initial text is shown at the precision, not with the round trip\'s noise', () => {
+    const { container } = render(<DegreesField initialRad={30 * Math.PI / 180} precision={2} />);
+    expect(container.querySelector('input')!.value).toBe('30');
+  });
+});
+

@@ -53,7 +53,7 @@ import { getSkin2DBuffer, clearSkin2DBuffers, frameSkin2DUVs } from '../skinning
 import { clearDeform2DBuffers } from '../animation/deform2DBuffers';
 import { registerFrameCallback, unregisterFrameCallback, PRIORITY_RENDER_2D, PRIORITY_EDITOR_2D } from './frameDriver';
 import { sceneManager } from '../scene/SceneManager';
-import { isImagePath, isVideoRef, resolveImageUrl, resolvePrimitiveShape, getWorldTransform2D, resolveSprite, type ResolvedSprite } from './renderUtils';
+import { isImagePath, isVideoRef, isUnknownAssetGuid, resolveImageUrl, resolvePrimitiveShape, getWorldTransform2D, resolveSprite, type ResolvedSprite } from './renderUtils';
 import { syncVideoTextures2D, disposeVideoTextures2D, flushPendingVideoDestroy2D } from './videoTextureSync2D';
 /** Shared empty result for the video pass when the module is excluded — a fresh [] per frame
  *  would allocate for a subsystem that isn't even in the build. */
@@ -62,11 +62,13 @@ import { computePivotOffset, computeSpriteScale, drawPrimitiveShapeGfx, drawColl
 import { computeCanvasScale, canvasPxToClient } from './canvas2DScaler';
 import { getSpriteEpoch } from '../loaders/assetManifest';
 import { ensureSpriteMaterial, clearSpriteMaterialCache } from '../loaders/spriteMaterialCache';
+import { MaterialTexRetry } from '../loaders/materialTexRetry';
 import { makePixiShaderInstance, buildUniformValues, type PixiShaderProgram } from './pixiShaderBuilder';
 import { coerceParamValue } from '../loaders/shaderSchema';
 import { register2DMaterialShaderMap, isEntity2DMaterialDirty, hasAny2DMaterialDirty } from './sprite2DMaterialBroker';
 import type { Entity2DShaderEntry } from './sprite2DMaterialBroker';
 import { computePaintOrder } from './paintOrder';
+import { collectOrderInLayer } from './orderInLayer';
 import { computeGroupAlpha } from './groupAlpha';
 import { computeMaskGroups } from './maskGroups';
 import { buildMaskRamp } from './maskRamp';
@@ -136,8 +138,11 @@ interface Slot { kind: DisplayKind; obj: Graphics | Sprite | Mesh | Container; s
   // the extra-sampler set — see `matBuildSig` at its use site). `matQuadSig` gates a cheaper
   // in-place resize of just the quad's 8 position floats (size/pivot only, #692) — split from
   // `matBuildSig` because a Shader rebuild adds two permanent entries to WebGPU's
-  // `BindGroupSystem._hash` (#699) and a never-deleted key to pixi's `GCManagedHash` (#707), so an
-  // animated size must never force one. `textureUrl` holds the retained sprite url (shared
+  // `BindGroupSystem._hash` (#699, filed upstream as pixijs/pixijs#12214 with the measurement), so
+  // an animated size must never force one. ⚠️ This used to also cite "a never-deleted key to pixi's
+  // `GCManagedHash` (#707)" — that half was WRONG (the null is a tombstone, compacted at 10k by
+  // `GCSystem.runOnHash`); see docs/rendering.md § the two-tier gate. The rule is unchanged: the
+  // `_hash` half alone is unbounded. `textureUrl` holds the retained sprite url (shared
   // spriteTextureRefs — released in disposeSlot). The shader is also registered in
   // Scene2DRenderer.entityShaders for MaterialInstance driving.
   // `materialTexUrls` holds the resolved urls of the shader's extra `texture` params
@@ -507,7 +512,8 @@ export function buildMaterialQuad(w: number, h: number, px: number, py: number):
  *  the indices, the texture bindings and the shader are all independent of the quad's size, so a
  *  size/pivot edit never needs a new Mesh — and never needs a new Shader, which is the part that
  *  matters, because every Shader rebuild adds two permanent entries to WebGPU's
- *  `BindGroupSystem._hash` (#699) and a never-deleted key to pixi's `GCManagedHash` (#707).
+ *  `BindGroupSystem._hash` (#699, filed upstream as pixijs/pixijs#12214). It is NOT also a
+ *  `GCManagedHash` key as this comment once claimed — that cache tombstones and compacts.
  *  Same in-place shape the skinned-mesh deform and the text animation passes already use. */
 export function resizeMaterialQuad(geo: MeshGeometry, w: number, h: number, px: number, py: number): void {
   writeMaterialQuadPositions(geo.positions as Float32Array, w, h, px, py);
@@ -881,10 +887,13 @@ export class Scene2DRenderer {
   // Pooled per-frame set of entity ids drawn by the material pass — used to purge stale
   // entityShaders entries without a per-frame allocation.
   private readonly _materialIdsScratch = new Set<number>();
-  // Sprite-texture urls a material entity has kicked an async Assets.load for but that
-  // aren't resident yet — dedupes the load so the every-running-frame material pass
-  // doesn't re-issue it. Cleared per-url on settle (then markDirty wakes the rebuild).
-  private readonly _materialTexLoading = new Set<string>();
+  // Sprite-texture loads a material entity has kicked but that aren't resident yet — deduped so the
+  // every-running-frame material pass doesn't re-issue them, and a FAILED url backs off instead of
+  // refetching every dirty frame (#1374). Settle wakes the rebuild via markDirty. Also carries the
+  // skinned-part textures, which the SkinnedSprite2D pass asks for at the same rate, and the plain
+  // sprite slots' loads (`whenResident`) — every Pixi sprite-texture load in this renderer
+  // (#1397).
+  private readonly _materialTex = new MaterialTexRetry(loadPixiTexture, () => this.markDirty());
   // Entity id → the packed entity (`entity.valueOf()`) that claimed it THIS pass. Cleared at the top
   // of the pass and consumed by the slot-disposal sweep at its end — and, between passes, by
   // `bounds2DProvider`, which refuses a slot whose owner is no longer alive: koota hands a destroyed
@@ -1390,24 +1399,20 @@ export class Scene2DRenderer {
       sp.texture = frameTexture(cachedBase, resolved);
     } else {
       if (cachedBase) Assets.cache.remove(url);
-      loadPixiTexture(url).then((base: Texture) => {
-        // F12 — the `sp.destroyed` check is the LOAD-BEARING guard against a stale async
-        // load clobbering the wrong texture. A sprite is NEVER reused across URL changes:
-        // a ref change disposes the slot (sp.destroy()) + makes a FRESH Sprite, so an
-        // in-flight load for the OLD url always resolves onto an already-destroyed object
-        // and is dropped here; disposeSlot already released its refcount.
-        // ⚠️ Exception, one frame wide: a `texture`-mode MASK sprite's destroy is now DEFERRED
-        // (`pendingMaskDestroy`, #455), so a load landing in that window resolves onto a
-        // live-but-doomed detached sprite and this guard does NOT catch it. Consequence is
-        // benign — a spurious `markDirty` redraw on an object about to be destroyed anyway,
-        // never a wrong texture landing on screen.
-        if (sp.destroyed) return;
-        sp.texture = frameTexture(base, resolved);
-        // The texture's size feeds the sprite's scale — force a redraw so the gate
-        // recomputes it (and wakes an idle frame if the sim is stopped).
-        this.markDirty();
-      }).catch((e: unknown) => {
-        console.warn(`[Scene2D] Sprite texture load failed: ${url}`, e);
+      // Through the retrier (#1397). A bare load's failure used to leave the sprite
+      // `Texture.EMPTY` for as long as the slot lived — `makeSprite` runs once per slot, so nothing
+      // ever asked again. The retrier backs a failure off, wakes the frame when a retry is due, and
+      // `renderFrame`'s drain re-asks it and binds on arrival.
+      //
+      // F12 — the `sp.destroyed` check is the LOAD-BEARING guard against a stale load landing on the
+      // wrong sprite. A sprite is NEVER reused across URL changes: a ref change disposes the slot
+      // (`sp.destroy()`) + makes a FRESH Sprite, so a waiter for the OLD url is always dead by the
+      // time its texture lands, and is dropped; `disposeSlot` already released its refcount.
+      // ⚠️ Exception, one frame wide: a `texture`-mode MASK sprite's destroy is DEFERRED
+      // (`pendingMaskDestroy`, #455), so a texture landing in that window binds onto a
+      // live-but-doomed detached sprite. Benign — never a wrong texture on screen.
+      this._materialTex.whenResident(url, () => sp.destroyed, () => {
+        sp.texture = frameTexture(Assets.get(url) as Texture, resolved);
       });
     }
     return sp;
@@ -1438,7 +1443,12 @@ export class Scene2DRenderer {
    *  textureMatrix maps the quad's 0..1 UVs into the sub-rect, so the shader samples the
    *  right pixels; a whole image borrows the base texture. */
   private resolveMaterialTextureRef(spriteRef: string, wholeOnly = false): { base: Texture; resolved: ResolvedSprite | null; url: string; hasFrame: boolean } {
-    if (!isImagePath(spriteRef)) return { base: Texture.WHITE, resolved: null, url: '', hasFrame: false };
+    if (!isImagePath(spriteRef)) {
+      // A deleted texture guid (#1408): warn through resolveSprite, as the sprite pass does — a
+      // material entity rarely reaches that pass, so without this it drew WHITE with a clean console.
+      if (isUnknownAssetGuid(spriteRef)) resolveSprite(spriteRef);
+      return { base: Texture.WHITE, resolved: null, url: '', hasFrame: false };
+    }
     const resolved = resolveSprite(spriteRef);
     if (!resolved) return { base: Texture.WHITE, resolved: null, url: '', hasFrame: false }; // guid not in manifest yet
     const url = resolved.url;
@@ -1462,15 +1472,7 @@ export class Scene2DRenderer {
       Assets.cache.remove(url);
       this.markDirty();
     }
-    if (!this._materialTexLoading.has(url)) {
-      this._materialTexLoading.add(url);
-      loadPixiTexture(url)
-        .then(() => { this._materialTexLoading.delete(url); this.markDirty(); })
-        .catch((e: unknown) => {
-          this._materialTexLoading.delete(url);
-          console.warn(`[Scene2D] Material sprite texture load failed: ${url}`, e);
-        });
-    }
+    this._materialTex.request(url);
     return { base: Texture.WHITE, resolved: null, url: '', hasFrame: false };
   }
 
@@ -1564,6 +1566,9 @@ export class Scene2DRenderer {
     // A material uniform the driver wrote this frame counts too: its per-entity read is inside the
     // scan below, which this skip would otherwise make unreachable (#1141 sibling).
     if (!isSimRunning() && !this._externalDirty && !previewing2D && !previewChanged2D && !hasAny2DMaterialDirty()) return;
+    // Sprite slots waiting on a texture (#1397). Binding one changes its size, which feeds its
+    // scale, so a bind redraws everything.
+    if (this._materialTex.waitingUrls && this._materialTex.drain(isPixiTextureLive)) this._externalDirty = true;
     let forceAll = this._externalDirty; // external edit / load / resize / swap ⇒ redraw all
     this._externalDirty = false;
 
@@ -1604,17 +1609,15 @@ export class Scene2DRenderer {
     // its id's next occupant to inherit (see `Orphan2DTracker.prune`). Runs right after the live
     // set is fully built and before any pass below calls `note`/`clear` on it.
     this.orphan2D.prune(this.liveEntities);
-    // Explicit Order-in-Layer overrides (Renderable2D) → sprites can stack independent of
+    // Explicit Order-in-Layer overrides (Renderable2D + Text2D) → sprites can stack independent of
     // the entity tree (e.g. a cut-out character's parts parented to scattered bones).
-    const orderInLayerOfEntity = new Map<number, number>();
-    world.query(Renderable2D).updateEach(([r]: any[], entity: any) => {
-      if (r.orderInLayer) orderInLayerOfEntity.set(entity.id(), r.orderInLayer);
-    });
-    world.query(Text2D).updateEach(([t]: any[], entity: any) => {
-      if (t.orderInLayer) orderInLayerOfEntity.set(entity.id(), t.orderInLayer);
-    });
+    // ⚠️ Collected by the SHARED helper, not inline (#1228): the editor SceneView derives the same
+    // map, and when each side collected its own the two drifted — the editor never read Text2D.
+    const orderInLayerOfEntity = collectOrderInLayer(world);
     // Global paint order (hierarchy DFS by sortOrder, re-ranked by orderInLayer) — drives
-    // Pixi child z so 2D siblings stack by hierarchy, matching the editor SceneView.
+    // Pixi child z so 2D siblings stack by hierarchy. The editor SceneView feeds the same two
+    // inputs to the same function, so the two surfaces agree by construction rather than by
+    // a comment asserting it.
     this.paintOrderOf = computePaintOrder(this.sortOrderOfEntity, this.parentOfEntity, orderInLayerOfEntity.size ? orderInLayerOfEntity : undefined);
     // Group alpha (#211): the ancestor product that the flat PixiJS tree cannot give us for
     // free. Same parent map as the paint order, one pass, and skipped entirely when nothing
@@ -1720,9 +1723,10 @@ export class Scene2DRenderer {
         // Custom 2D material: once its shader program is ready, the material pass (Step
         // 3b) owns this entity — skip it here. While the program is still loading (or
         // failed) we fall through and render the default sprite/tint, so it's never blank.
-        // The onReady wake makes the entity swap to the material Mesh when the async compile
-        // finishes even while the sim is stopped (else the idle gate would skip it forever).
-        if (rend.material && ensureSpriteMaterial(rend.material, () => this.markDirty())) return;
+        // The cache's store fires the shared dirty wake when the compile lands (#1368), so the
+        // entity swaps to the material Mesh even while the sim is stopped (else the idle gate
+        // would skip it forever) — `addDirtyListener` below is how this renderer hears it.
+        if (rend.material && ensureSpriteMaterial(rend.material)) return;
 
         // Find which Canvas2D this entity belongs to
         const canvasId = this.findCanvasAncestor(id);
@@ -1753,6 +1757,16 @@ export class Scene2DRenderer {
         if (needResolve) {
           resolved = resolveSprite(rend.sprite);
           if (!resolved) return; // guid not yet in manifest — wait for next frame
+        } else if (!imageMode && !videoMode &&
+          (!displaySlot || displaySlot.spriteRef !== rend.sprite || displaySlot.kind !== spriteKind) &&
+          isUnknownAssetGuid(rend.sprite)) {
+          // A guid the manifest does not know (deleted texture, #1408) is not an "image" to
+          // isImagePath, so it draws as the plain graphics fallback and would never reach
+          // resolveSprite's `[Sprite2D] Unknown asset guid` warning — a wrong sprite with a clean
+          // console. Resolve it for the warning alone whenever the slot is (re)built: a new slot,
+          // a ref change, or the kind flip that a texture deleted UNDER a live sprite produces
+          // (same ref, sprite → graphics). The fallback still draws.
+          resolveSprite(rend.sprite);
         }
 
         // FRAME SWAP (sprite-sheet animation / atlas swap): the ref changed but it
@@ -1941,7 +1955,7 @@ export class Scene2DRenderer {
       ([tf, rend]: [any, any], entity: any) => {
         if (!rend.isVisible || this._collidersOnly || deactivatedEntities.has(entity.id())) return;
         if (!rend.material) return;
-        const program = ensureSpriteMaterial(rend.material, () => this.markDirty()) as PixiShaderProgram | undefined;
+        const program = ensureSpriteMaterial(rend.material) as PixiShaderProgram | undefined;
         if (!program) return; // still loading / failed → Step 3 drew the default; nothing here
 
         const id = entity.id();
@@ -2267,9 +2281,10 @@ export class Scene2DRenderer {
           // `isPixiTextureLive`'s banner.
           if (!isPixiTextureLive(part.url)) {
             allLoaded = false;
-            loadPixiTexture(part.url).then(() => this.markDirty()).catch((e: unknown) => {
-              console.warn(`[Scene2D] Skinned mesh texture load failed: ${part.url}`, e);
-            });
+            // Through the material-sprite retrier, not a bare `loadPixiTexture` (#1397): this pass
+            // runs every frame while the rig is buffered, and Pixi's loader drops a rejected url
+            // from its promise cache, so a missing part texture was requested again every frame.
+            this._materialTex.request(part.url);
           }
         }
         if (!allLoaded) return;
@@ -2395,7 +2410,7 @@ export class Scene2DRenderer {
         // guard below then skips every page: the string renders as nothing. For a BAKED provider
         // that is permanent, not transient — `atlasVersion` is `readonly = 0`, so the
         // "rebuilds on atlasVersion/textDirty bump" consolation below cannot fire for it.
-        const gate = getFontTexturePixi(provider, 0, () => this.markDirty());
+        const gate = getFontTexturePixi(provider, 0);
         if (!gate || gate.destroyed) return;
 
         this.activeIds.set(id, entity.valueOf());
@@ -2474,7 +2489,7 @@ export class Scene2DRenderer {
               // (`fontTexturePixi.ts` caches by provider id + page); the full rebuild path
               // self-heals a moved texture by rebuilding the Mesh, the fast path does not.)
               const texturesReady = slot.pageNums.every((page, i) => {
-                const ptex = getFontTexturePixi(provider, page, () => this.markDirty());
+                const ptex = getFontTexturePixi(provider, page);
                 const shader = slot!.textShaders?.[i];
                 return !!ptex && !ptex.destroyed && !!shader && canReuseMtsdfPixiShader(shader, ptex, atlas);
               });
@@ -2532,7 +2547,7 @@ export class Scene2DRenderer {
               slot.pageMeshes = []; slot.textShaders = []; slot.pageNums = [];
               try {
                 for (const { page, geo } of buildTextGeometryByPage(layout.quads)) { // Y-down, top-origin UVs (Pixi native)
-                  const ptex = getFontTexturePixi(provider, page, () => this.markDirty());
+                  const ptex = getFontTexturePixi(provider, page);
                   // A destroyed Texture is still truthy — `!ptex` alone would miss the contract hole
                   // where a just-minted texture is torn down inside the same call (#481, an
                   // already-disposed provider's addDisposable running synchronously). Same posture as
@@ -2897,7 +2912,7 @@ export class Scene2DRenderer {
       this.parentMaskOf.clear();
       this.warnedMaskIds.clear();
       this.entityShaders.clear();
-      this._materialTexLoading.clear();
+      this._materialTex.clear();
       // 2D-material programs are world-lifecycle — clear UNCONDITIONALLY (not renderer-count
       // gated like the texture net): every live per-entity Shader holds its OWN program
       // reference, so wiping the shared cache can't strand the other viewport's already-drawn
@@ -2905,7 +2920,8 @@ export class Scene2DRenderer {
       // it's memoised at module scope in `pixiShaderBuilder`'s program cache, keyed on the
       // manifest path, and this clear never evicts it — so the clear no longer forces a
       // recompile at all. It ALSO bumps a generation that supersedes any in-flight compile —
-      // what keeps a sibling safe from THAT is that the clear fires the pending waiters (#523),
+      // what keeps a sibling safe from THAT is that a clear which superseded a compile fires the
+      // shared dirty wake (#523, #1368 — every Scene2DRenderer subscribes via addDirtyListener),
       // not that it's maps-only. Gating this on liveRenderers<=1 was the bug that left an
       // EDITED .shader.json serving its stale compiled program on hot-reload whenever both
       // GameView + SceneView were live (the default editor).
@@ -2996,9 +3012,10 @@ export class Scene2DRenderer {
     // ramp textures it holds leak their GPU memory (#455).
     this.flushPendingMaskDestroy();
     this.entityShaders.clear();
-    this._materialTexLoading.clear();
-    // Unconditional (see onWorldSwap): safe with a sibling renderer live because the clear wakes
-    // pending waiters, not because it's maps-only — this call site NEEDS that wake, since below
+    this._materialTex.clear();
+    // Unconditional (see onWorldSwap): safe with a sibling renderer live because a clear that
+    // superseded a compile fires the shared dirty wake (#1368), not because it's maps-only — this
+    // call site NEEDS that wake, since below
     // only re-dirties the instance that's going away, not the surviving sibling.
     clearSpriteMaterialCache();
     this.activeIds.clear();

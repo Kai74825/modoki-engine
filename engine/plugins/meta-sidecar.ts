@@ -37,8 +37,27 @@
  *  Nothing breaks without it — the serving path already treats a missing/stale
  *  hash as a cache miss and re-bakes (see `autoBakeThenServe` in
  *  backend/staticAssets.ts, written for the sibling "fresh checkout" case).
+ *  `audioCache.durationSec` is peeled for the same reason by a different route
+ *  (#1289). It is not derived from source + settings at all: it is ffprobe's
+ *  MEASUREMENT of the file ffmpeg just produced, so it moves when either binary
+ *  does, and until #1297 `resolveTool` (ffmpeg-tool.ts) resolved both per machine
+ *  (env override -> provisioned toolchain -> PATH). Both are pinned now, but the
+ *  pin is per PLATFORM (each OS gets a different build of the same npm package),
+ *  so the measurement still is not portable. Measured on `games/wordweave`
+ *  2026-09-16: 4 of 26 clips encode to DIFFERENT BYTES under ffmpeg-static 6.0 vs
+ *  Homebrew 8.1.1 (`silenceremove` trims a different sample count), and the two
+ *  ffprobe builds on that Mac disagree about duration on all 26. Nothing consumes
+ *  it — `AudioManifestBlock` bakes loadType/format/ext and no duration — so its
+ *  one reader is AudioAssetView's inspector row, which gets it back from the
+ *  merged local half.
+ *
  *  The OTHER blocks' hashes stay committed: they mix only source bytes, settings
  *  and an in-repo encoder version, so they ARE reproducible across machines.
+ *  ⚠️ That is a claim about the HASH, not about the artifact it names. The in-repo
+ *  literal stands in for an external CLI whose real version is hashed nowhere, so
+ *  one committed hash can cover different converted bytes on two machines (#1297,
+ *  measured on the audio clips above). Reproducible key, machine-dependent
+ *  artifact — do not read this paragraph as promising the second.
  */
 
 import fs from 'fs';
@@ -109,20 +128,142 @@ function localSidecarPath(absPath: string): string {
   return absPath + '.meta.local.json';
 }
 
-/** Content-cache blocks that carry byte-size stats. */
-const CACHE_BLOCKS = ['textureCache', 'modelCache', 'fontCache', 'audioCache', 'environmentCache', 'atlasCache'] as const;
-type CacheBlock = (typeof CACHE_BLOCKS)[number];
-/** Machine-local, inspector-only size fields peeled out of EVERY cache block. */
+/** Content-cache blocks whose contents are split between the COMMITTED sidecar and this machine's
+ *  gitignored one. Being listed here does NOT mean "peel everything" — what gets peeled is decided
+ *  per block by {@link LOCAL_KEYS}. */
+export const CACHE_BLOCKS = ['textureCache', 'modelCache', 'fontCache', 'audioCache', 'environmentCache', 'atlasCache', 'videoCache'] as const;
+export type CacheBlock = (typeof CACHE_BLOCKS)[number];
+
+/** Machine-local, inspector-only size fields. Spread into most blocks below — but NOT all of them,
+ *  which is why this is a named list rather than an unconditional prefix (#1300). */
 const VOLATILE_STAT_KEYS = ['variantBytes', 'lodBytes', 'triCounts', 'bytes'] as const;
-/** Extra per-block keys that are host-dependent rather than merely volatile, so
- *  committing them churns the tree between clones. See the module note for why
- *  `modelCache.hash` is the only one. */
-const HOST_LOCAL_KEYS: Partial<Record<CacheBlock, readonly string[]>> = { modelCache: ['hash'] };
+
+/** Every key peeled out of each block into the gitignored local sidecar.
+ *
+ *  ⚠️ **This table is authoritative and EXHAUSTIVE** — `Record<CacheBlock, …>` means adding a block
+ *  to `CACHE_BLOCKS` fails to compile until someone decides what it peels. That is deliberate: the
+ *  previous shape applied `VOLATILE_STAT_KEYS` to every block unconditionally and kept a small
+ *  per-block table of *extras*, which made "peel `bytes`" and "be split at all" the same decision.
+ *  `videoCache` needs those separated, so the composition moved here where each block states its
+ *  own whole answer.
+ *
+ *  ⚠️ **`videoCache` peels `durationSec` but KEEPS `bytes` committed, and the asymmetry is the
+ *  point.** A video's byte size is not Inspector-only: the manifest bakes it
+ *  (`vite-asset-scanner.ts` → `video.bytes`) because `resolveDeliveryPolicy`'s `policy: 'auto'`
+ *  decides stream-vs-download from it with no network round-trip (`videoUrl.ts` passes `v?.bytes`
+ *  and nothing else). Peeling it would blank that on every machine but the importing one, silently
+ *  flipping the runtime's choice on a fresh clone — the exact machine-dependence this split exists
+ *  to remove (#1279; do not "complete the list"). Its `durationSec` has no such consumer: the only
+ *  reader anywhere is the Inspector's duration row (`VideoAssetView.tsx`), and
+ *  `VideoManifestBlock.durationSec` is declared but consumed by nothing. It is measured by ffprobe
+ *  on the file ffmpeg produced, so it tracks the MACHINE — and already had: two byte-identical
+ *  `cutscene.mp4` copies (`games/video-test`, `demos/video-demo`) were committed with the same
+ *  hash and bytes but `24.009002` against `24.01` (#1300). */
+const LOCAL_KEYS: Record<CacheBlock, readonly string[]> = {
+  textureCache: VOLATILE_STAT_KEYS,
+  fontCache: VOLATILE_STAT_KEYS,
+  environmentCache: VOLATILE_STAT_KEYS,
+  atlasCache: VOLATILE_STAT_KEYS,
+  // `hash` mixes local CLI versions (hashKey/riggedHash, the latter encoding whether toktx exists
+  // at all), so committing it churns between clones — #127.
+  modelCache: [...VOLATILE_STAT_KEYS, 'hash'],
+  // ffprobe MEASURES durationSec on the file ffmpeg produced, and the pinned build still differs
+  // per platform (the PATH fallback that made it per MACHINE is gone, #1297) — #1289.
+  audioCache: [...VOLATILE_STAT_KEYS, 'durationSec'],
+  // See the ⚠️ above: duration is host-measured, `bytes` is load-bearing and stays committed.
+  videoCache: ['durationSec'],
+};
 
 /** Every key peeled out of `block` into the gitignored local sidecar. */
 function localKeysFor(block: CacheBlock): readonly string[] {
-  const extra = HOST_LOCAL_KEYS[block];
-  return extra ? [...VOLATILE_STAT_KEYS, ...extra] : VOLATILE_STAT_KEYS;
+  return LOCAL_KEYS[block];
+}
+
+/** The key under which a local sidecar records WHICH peel table wrote it. */
+const PEEL_STAMP = '__peel';
+
+/** A short fingerprint of {@link LOCAL_KEYS}, stamped into every local sidecar this build writes.
+ *
+ *  ⚠️ **Derived from the table, never bumped by hand.** The thing a local half can be stale
+ *  against is precisely the set of keys that were being peeled when it was written, so hashing that
+ *  set makes every future peel migration self-invalidating with no constant for anyone to forget.
+ *  A hand-maintained `PEEL_VERSION` would be the second list this file already warns about twice.
+ *
+ *  ## The defect this exists to close (#1305 close-out)
+ *
+ *  Without it, "does this machine hold the peeled values" was answered by "does the local block
+ *  hold ANY peeled key" — and a local half written BEFORE a later peel holds exactly the keys that
+ *  earlier peel produced, which is a non-empty subset. Measured on `~/Projects/modoki` (the hub)
+ *  2026-09-17: **19 audio local halves, every one `{bytes}` only, none carrying `durationSec`** —
+ *  `bytes` was peeled by #1279 and `durationSec` only by #1289. The predicate read all 19 as
+ *  healed, so the Duration row would have stayed blank on the owner's own clone while the fix
+ *  reported success. A stamp mismatch is the honest signal: this file was written under a peel
+ *  table that no longer exists, so nothing in it can be trusted to be complete. */
+export function peelSchemaId(): string {
+  return crypto.createHash('sha256').update(JSON.stringify(LOCAL_KEYS)).digest('hex').slice(0, 8);
+}
+
+/** Cache blocks this asset has COMMITTED but whose peeled values this machine does not hold —
+ *  i.e. the merge in {@link readMetaSidecar} had nothing to merge, so every Inspector row fed by
+ *  {@link LOCAL_KEYS} for that block is blank (or, worse, renders a defaulted `0`).
+ *
+ *  ## Why this exists: a peel migration deletes, and nothing treated the absence as a miss (#1305)
+ *
+ *  #127, #1289 and #1300 each stripped a field out of the committed sidecars. None of them could
+ *  seed the local half — `.meta.local.json` is gitignored, so no commit can carry one — and nothing
+ *  re-derived it, because a peeled value is only ever written as a side-effect of a reimport
+ *  handler and the handler runs only on a CONVERTED-ARTIFACT cache miss. With a warm `.cache/`
+ *  there is no miss, so the value never came back: measured 2026-09-17, `durationSec` appeared zero
+ *  times on disk repo-wide across 29 committed audio and 7 video blocks.
+ *
+ *  ⚠️ **`modelCache` looked like a counter-example and is the reason this went unnoticed twice.**
+ *  It self-heals, but only because the field it peels is `hash` — the cache KEY — so `staticAssets`
+ *  cannot locate the artifact without it and the miss is structural. `lodBytes`/`triCounts` ride
+ *  back on that same handler write. Every other block keeps its `hash` committed, so the warm-cache
+ *  early return fires and nothing heals. The analogy does not generalise, and both prior changes
+ *  cited it as though it did.
+ *
+ *  ⚠️ **"Incomplete" is NOT "some peeled key is absent."** `LOCAL_KEYS` is a superset per block:
+ *  `textureCache` lists all four {@link VOLATILE_STAT_KEYS} but a healthy texture local half holds
+ *  only `variantBytes` (66 of them do, in this repo). Requiring every listed key would report every
+ *  texture on the machine as broken forever. The signal is that NONE of the peeled keys arrived —
+ *  which is what a never-seeded block actually looks like, and what an absent local file gives.
+ *
+ *  Takes the two halves rather than a merged doc on purpose: after {@link readMetaSidecar} has
+ *  merged, a value that came from the local file is indistinguishable from one that was committed,
+ *  so the question cannot be asked of the result. */
+export function blocksMissingLocalHalf(absPath: string): CacheBlock[] {
+  const sidecar = sidecarPath(absPath);
+  if (!fs.existsSync(sidecar)) return [];
+  let committed: Record<string, unknown>;
+  try { committed = JSON.parse(fs.readFileSync(sidecar, 'utf-8')); } catch { return []; }
+
+  let local: Record<string, Record<string, unknown> | undefined> = {};
+  const localPath = localSidecarPath(absPath);
+  if (fs.existsSync(localPath)) {
+    // An unreadable local half is treated as an ABSENT one — the peeled values are equally
+    // unavailable either way, and re-deriving them is also how a corrupt one gets rewritten.
+    try { local = JSON.parse(fs.readFileSync(localPath, 'utf-8')); } catch { local = {}; }
+  }
+
+  // A local half written under a DIFFERENT peel table cannot be judged key-by-key: it holds
+  // exactly what that table peeled, which is a non-empty subset of what this one does. Treat the
+  // whole file as stale — see peelSchemaId's note and the 19 `{bytes}`-only audio halves on the hub.
+  const stampMatches = (local as Record<string, unknown>)[PEEL_STAMP] === peelSchemaId();
+
+  const missing: CacheBlock[] = [];
+  for (const block of CACHE_BLOCKS) {
+    const peeled = localKeysFor(block);
+    if (peeled.length === 0) continue; // nothing is peeled out of it, so nothing can be missing
+    const target = committed[block];
+    if (!target || typeof target !== 'object') continue; // not converted on this asset at all
+    const localBlock = local[block];
+    const held = stampMatches && localBlock && typeof localBlock === 'object'
+      ? peeled.some((k) => k in localBlock)
+      : false;
+    if (!held) missing.push(block);
+  }
+  return missing;
 }
 
 /** Read the sidecar JSON — the committed `.meta.json` with this machine's local
@@ -135,7 +276,22 @@ function localKeysFor(block: CacheBlock): readonly string[] {
  *  the authored fields. The DATA-LOSS half is now closed at the write path — `writeMetaSidecar`
  *  quarantines an unreadable sidecar before overwriting it — so this merge-read stays simple
  *  and total on purpose. A caller that needs the distinction itself calls
- *  {@link classifySidecarOnDisk}, which is exported for exactly that. */
+ *  {@link classifySidecarOnDisk}, which is exported for exactly that.
+ *
+ *  ⚠️ **The local file fills blocks in; it never CREATES one** (#1279). For audio and environments,
+ *  a cache block's mere existence is what the build reads as "this asset has been converted" — it
+ *  ships the converted variant when the block is there and the source verbatim when it is not
+ *  (`vite-asset-scanner.ts`: `if (!hasCache) { shipSource(); continue; }`), and the same test bakes
+ *  the manifest's texture and environment blocks. (Textures and models convert unconditionally and
+ *  are then overwritten from the build-time conversion; fonts gate on the `font` settings block.)
+ *  Merging stats into a block the committed
+ *  sidecar does not have therefore made a GITIGNORED file decide what a build SHIPS: a
+ *  `{"audioCache":{"bytes":1236743}}` left behind on the machine that once imported the clip
+ *  converted, while a fresh clone or CI shipped the source — same commit, different bytes, nothing
+ *  reporting it. So the committed sidecar alone decides WHICH blocks exist, and the local file only
+ *  supplies this host's values inside them. A local block with no committed counterpart is inert
+ *  (a stale leftover from a sidecar that was since rewritten without it); the next write through
+ *  `writeMetaSidecar` clears it. */
 export function readMetaSidecar(absPath: string): Record<string, unknown> {
   const sidecar = sidecarPath(absPath);
   if (!fs.existsSync(sidecar)) return {};
@@ -148,8 +304,9 @@ export function readMetaSidecar(absPath: string): Record<string, unknown> {
       for (const block of CACHE_BLOCKS) {
         const localBlock = local[block];
         if (!localBlock || typeof localBlock !== 'object') continue;
-        const target = (meta[block] ??= {}) as Record<string, unknown>;
-        for (const k of localKeysFor(block)) if (k in localBlock) target[k] = localBlock[k];
+        const target = meta[block];
+        if (!target || typeof target !== 'object') continue; // no committed block → nothing to fill in (#1279)
+        for (const k of localKeysFor(block)) if (k in localBlock) (target as Record<string, unknown>)[k] = localBlock[k];
       }
     } catch { /* unreadable local stats → whatever the committed sidecar has stands */ }
   }
@@ -197,6 +354,25 @@ function rawSidecarVersion(absPath: string): unknown {
   }
 }
 
+/** The deliberate "a newer build wrote this sidecar" refusal (#1212 A-9). A CLASS, so a route can
+ *  tell it from an I/O failure (EACCES, ENOSPC) that the same `writeMetaSidecar` call can throw —
+ *  the refusal is the caller's to resolve (merge the branch), the I/O failure is a genuine 500.
+ *  Plain fields, not parameter properties: the root tsconfig sets `erasableSyntaxOnly`. */
+export class SidecarTooNewError extends Error {
+  sidecar: string;
+  version: number;
+  constructor(sidecar: string, version: number) {
+    super(
+      `Sidecar ${sidecar} is format version ${version}, newer than this build's ` +
+      `SIDECAR_FORMAT_VERSION (${SIDECAR_FORMAT_VERSION}) — refusing to overwrite a sidecar ` +
+      `written by a newer build — merge the branch that bumped the format.`,
+    );
+    this.name = 'SidecarTooNewError';
+    this.sidecar = sidecar;
+    this.version = version;
+  }
+}
+
 export function assertSidecarWritable(absPath: string): void {
   const verdict = classifySidecarOnDisk(absPath);
   // ⚠️ A NON-INTEGER version that is numerically newer still refuses. Classification calls
@@ -207,18 +383,10 @@ export function assertSidecarWritable(absPath: string): void {
   // that is currently hypothetical; it costs one line and keeps the refusal monotonic.
   const rawVersion = rawSidecarVersion(absPath);
   if (typeof rawVersion === 'number' && Number.isFinite(rawVersion) && rawVersion > SIDECAR_FORMAT_VERSION) {
-    throw new Error(
-      `Sidecar ${sidecarPath(absPath)} is format version ${rawVersion}, newer than this build's ` +
-      `SIDECAR_FORMAT_VERSION (${SIDECAR_FORMAT_VERSION}) — refusing to overwrite a sidecar ` +
-      `written by a newer build — merge the branch that bumped the format.`
-    );
+    throw new SidecarTooNewError(sidecarPath(absPath), rawVersion);
   }
   if (verdict.kind === 'too-new') {
-    throw new Error(
-      `Sidecar ${sidecarPath(absPath)} is format version ${verdict.version}, newer than this build's ` +
-      `SIDECAR_FORMAT_VERSION (${SIDECAR_FORMAT_VERSION}) — refusing to overwrite a sidecar ` +
-      `written by a newer build — merge the branch that bumped the format.`
-    );
+    throw new SidecarTooNewError(sidecarPath(absPath), verdict.version);
   }
 }
 
@@ -289,6 +457,20 @@ export function salvageIdIfCorrupt(absPath: string): string | undefined {
   }
 }
 
+/** The GUID the sidecar on disk already carries — read from a sidecar that parses, or salvaged
+ *  textually from one that does not ({@link salvageIdIfCorrupt}). `undefined` when there is no
+ *  sidecar or it carries no guid. Must be called BEFORE `quarantineCorruptSidecar` moves the file. */
+export function existingSidecarId(absPath: string): string | undefined {
+  const salvaged = salvageIdIfCorrupt(absPath);
+  if (salvaged) return salvaged;
+  try {
+    const id = (JSON.parse(fs.readFileSync(sidecarPath(absPath), 'utf-8')) as { id?: unknown }).id;
+    return typeof id === 'string' && isGuid(id) ? id : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 export function quarantineCorruptSidecar(absPath: string): string | undefined {
   if (classifySidecarOnDisk(absPath).kind !== 'unreadable') return undefined;
   const sidecar = sidecarPath(absPath);
@@ -320,12 +502,19 @@ export function quarantineCorruptSidecar(absPath: string): string | undefined {
  *  supply `version`. */
 export function writeMetaSidecar(absPath: string, meta: Record<string, unknown>): void {
   assertSidecarWritable(absPath);
-  // ⚠️ Capture the salvageable `id` BEFORE the quarantine moves the file away. The editor panels
+  // ⚠️ Capture the existing `id` BEFORE the quarantine moves the file away. The editor panels
   // reach here via `/api/read-meta`, which returns `{}` for an unparsable sidecar exactly as it
   // does for a missing one — so the payload they POST carries no `id`, and without this the write
   // below would produce an id-less sidecar and the next scan would mint a fresh GUID, dangling
   // every scene/prefab reference. Preserving the bytes does not preserve the ASSET; this does.
-  const salvagedId = salvageIdIfCorrupt(absPath);
+  //
+  // ⚠️ And from a sidecar that PARSES, not only a corrupt one (#1215 A-10). This used to salvage
+  // only on the corrupt branch, so `modoki_write_asset_meta` posting a complete-looking sidecar
+  // that simply omitted `id` — a valid call, the schema does not require it — wrote the file
+  // id-less, and the next scan re-minted the texture's GUID out from under every ref to it.
+  // Nothing a caller omits should be able to change an asset's identity; a caller that wants a
+  // different id has to say so, and still can.
+  const salvagedId = existingSidecarId(absPath);
   // An unparsable sidecar is moved aside, not overwritten (#778). This sits at the choke point
   // deliberately: every reimport handler reaches disk through here, and each one has already
   // lost the authored fields by this line — `readMetaSidecar` returns `{}` for a corrupt file
@@ -348,10 +537,37 @@ export function writeMetaSidecar(absPath: string, meta: Record<string, unknown>)
         delete b[k];
       }
     }
+    // A block left holding NOTHING once its stats are peeled is not a conversion record — and
+    // committing `"audioCache": {}` would tell every machine and CI "already converted" exactly
+    // as a real block does (#1279's truthiness test, now in the committed half rather than the
+    // gitignored one). No reimport handler can produce this — each writes a `hash`, or
+    // `processedPath`/`lodPaths` for models — so it only arises from a wholesale external write
+    // (`/api/write-meta`, `modoki_write_asset_meta`) that carried stats and nothing else. Drop
+    // the local half with it: with no committed block to merge into, those bytes are unreadable.
+    //
+    // ⚠️ #1289 widened what reaches this branch: `durationSec` is now a peeled key, so a wholesale
+    // external write carrying `audioCache: { durationSec }` and nothing else lands here and commits
+    // NO audio block — where before it committed a truthy one. The scanner keys convert-or-ship on
+    // that truthiness, so the same agent call now makes the build ship the source clip verbatim.
+    // Left as-is deliberately: a block with a duration and no `hash`/`ext` is not a conversion
+    // record either way, and dropping it is the honest reading. Noted because the failure is
+    // silent, and because it is the one behaviour the peel changed outside the sidecar itself.
+    //
+    // ⚠️ #1300 brought `videoCache` under the same branch, and video HAS the same convert-or-ship
+    // truthiness (`plugins/backend/staticAssets.ts` auto-bakes on a variant cache miss). The reach
+    // is narrower than audio's on purpose: `videoCache` keeps `bytes` committed, so a block written
+    // by the reimport handler can never peel to empty — only a wholesale external write carrying
+    // `videoCache: { durationSec }` ALONE can land here. Same reading as audio's, and pinned by a
+    // test rather than left as an assumption, because this is the seam where the previous peel
+    // changed behaviour outside the sidecar.
+    if (Object.keys(b).length === 0) { delete committed[block]; delete local[block]; }
   }
   writeJsonAtomic(sidecarPath(absPath), committed);
   const localPath = localSidecarPath(absPath);
-  if (Object.keys(local).length > 0) writeJsonAtomic(localPath, local);
+  // Stamped with the peel table that produced it, so a LATER peel migration can tell this file is
+  // incomplete rather than reading its subset of keys as "healed" (#1305 close-out). Written only
+  // alongside real blocks — a bare stamp would be a local half with no values in it.
+  if (Object.keys(local).length > 0) writeJsonAtomic(localPath, { ...local, [PEEL_STAMP]: peelSchemaId() });
   else if (fs.existsSync(localPath)) fs.rmSync(localPath, { force: true }); // no stats now → drop a stale local file
 }
 

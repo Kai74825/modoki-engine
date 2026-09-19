@@ -187,7 +187,21 @@ export function writeProjectUserConfig(user: RawProjectConfig | ProjectUserConfi
  *  `source` selects which object the dot-path reads from: the committed config or
  *  the per-machine user config. NOTE: `build.webDeployCommand` is intentionally
  *  absent — it is a full shell command the project author wrote, so it needs
- *  metacharacters and is trusted like the user's own terminal. */
+ *  metacharacters and is trusted like the user's own terminal.
+ *
+ *  `FS_PATH` guards the three `sdk.*` fields, and those do NOT reach a shell string today: JAVA_HOME
+ *  and ANDROID_HOME go into the gradle step's spawn `env`, and the gcloud path only through `path`
+ *  ops and a PATH prepend (traced for #1444). The allowlist is kept as defence in depth — a future
+ *  consumer that interpolates one inside double quotes stays safe — so it is widened only by
+ *  characters that cannot inject there: any letter/digit/mark (a non-ASCII user folder,
+ *  `C:/Users/<日本語>/AppData/Local/Android/Sdk`) and `()` (`C:/Program Files (x86)/…`, the Windows
+ *  Cloud SDK's default home) — a paren does nothing without a `$` or backtick, both still refused.
+ *  It admits ONE colon, only as a leading Windows drive (`D:/Android/Sdk`), and never a backslash —
+ *  the one character that can swallow a closing quote. Without the drive every Windows absolute
+ *  path was refused, so Project Settings ▸ Browse… for an SDK folder produced a value its own Apply
+ *  rejected (#1441). A picked path arrives with `/` separators (`portablePath`, projectPaths.ts); a
+ *  hand-typed `\` gets a hint below rather than a silent rewrite. */
+const FS_PATH = /^(?:[A-Za-z]:)?[\p{L}\p{N}\p{M} ._@\-/()]*$/u;
 const BUILD_FIELD_RULES: { key: string; label: string; pattern: RegExp; allowEmpty: boolean; source: 'config' | 'user' }[] = [
   { key: 'app.appId',                 label: 'Bundle ID',              pattern: /^[A-Za-z0-9._-]+$/,          allowEmpty: false, source: 'config' },
   { key: 'build.appleTeamId',         label: 'Apple Team ID',          pattern: /^[A-Za-z0-9]+$/,             allowEmpty: true,  source: 'config' },
@@ -198,9 +212,9 @@ const BUILD_FIELD_RULES: { key: string; label: string; pattern: RegExp; allowEmp
   { key: 'device.iosDeviceId',        label: 'iOS device UDID',        pattern: /^[A-Za-z0-9-]+$/,            allowEmpty: true,  source: 'user' },
   { key: 'device.iosDevicectlId',     label: 'iOS devicectl id',       pattern: /^[A-Za-z0-9-]+$/,            allowEmpty: true,  source: 'user' },
   { key: 'device.androidDeviceId',    label: 'Android serial',         pattern: /^[A-Za-z0-9._:-]+$/,         allowEmpty: true,  source: 'user' },
-  { key: 'sdk.javaHome',              label: 'JAVA_HOME',              pattern: /^[A-Za-z0-9 ._@\-/]*$/,      allowEmpty: true,  source: 'user' },
-  { key: 'sdk.androidHome',           label: 'ANDROID_HOME',           pattern: /^[A-Za-z0-9 ._@\-/]*$/,      allowEmpty: true,  source: 'user' },
-  { key: 'sdk.gcloudPath',            label: 'gcloud path',            pattern: /^[A-Za-z0-9 ._@\-/]*$/,      allowEmpty: true,  source: 'user' },
+  { key: 'sdk.javaHome',              label: 'JAVA_HOME',              pattern: FS_PATH,                      allowEmpty: true,  source: 'user' },
+  { key: 'sdk.androidHome',           label: 'ANDROID_HOME',           pattern: FS_PATH,                      allowEmpty: true,  source: 'user' },
+  { key: 'sdk.gcloudPath',            label: 'gcloud path',            pattern: FS_PATH,                      allowEmpty: true,  source: 'user' },
 ];
 
 /** Validate the shell-interpolated build fields (across BOTH the committed config
@@ -226,7 +240,9 @@ export function validateBuildConfig(config: ProjectConfig, user: ProjectUserConf
       continue;
     }
     if (!rule.pattern.test(s)) {
-      errors.push(`${rule.label} (${rule.key}) contains invalid characters: ${JSON.stringify(s)}`);
+      // A hand-typed Windows path is the likely source of a `\` — say what to type instead.
+      const hint = rule.pattern === FS_PATH && s.includes('\\') ? ' — use / as the separator (C:/Program Files/…)' : '';
+      errors.push(`${rule.label} (${rule.key}) contains invalid characters: ${JSON.stringify(s)}${hint}`);
     }
   }
   return errors;

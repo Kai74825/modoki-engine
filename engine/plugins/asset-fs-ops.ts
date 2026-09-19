@@ -13,6 +13,12 @@ import path from 'path';
 import { execFileSync } from 'child_process';
 import { randomUUID } from 'crypto';
 import { writeMetaSidecar, CORRUPT_SIDECAR_SUFFIX } from './meta-sidecar';
+import { durableGuid, remapGuidValues } from '../packages/modoki/src/runtime/core/assetRefRules';
+import {
+  derivedMemberPathsByAnchor, deriveMemberChain, derivedMemberPaths, sceneMemberAnchors, memberGuidRemap,
+  rewritePrefabMemberTokens, MAX_INSTANCE_DEPTH, type PrefabReader,
+} from '../packages/modoki/src/runtime/loaders/memberPaths';
+export { derivedMemberPathsByAnchor, deriveMemberChain, derivedMemberPaths, type PrefabReader };
 // The ONE subtree pre-flight (#883/#990/#989/#1004) — see engine/scripts/deleteBoundary.mjs. Used
 // only by the Linux `rmSync` fallback in `moveToTrash`; the darwin/win32 paths hand the delete to
 // the OS trash, which moves rather than unlinks and so cannot orphan a link's payload.
@@ -189,6 +195,9 @@ export interface TrashResult {
    *  A refused path holds back its SIDECARS too (`<path>.meta.json` &c), so a group is never split
    *  — see `moveToTrash`'s fallback for why splitting it is worse than the bug it guards. */
   failed: string[];
+  /** What the OS said, when it refused something and said anything (darwin: Finder's AppleScript
+   *  error). A short first line, for the refusal's prose — never a path list; `failed` is that. */
+  reason?: string;
 }
 
 /** Pull the failing paths out of the script's stderr.
@@ -241,7 +250,30 @@ export function moveToTrash(
   const paths = Array.isArray(absPaths) ? absPaths : [absPaths];
   if (paths.length === 0) return { failed: [] };
   const { command, args, input } = trashCommand(paths, platform);
-  if (platform === 'darwin' || platform === 'win32') {
+  if (platform === 'darwin') {
+    // #1212 A-8: Finder's `delete` names no path when it refuses (a locked file, a denied volume,
+    // Finder not answering), so the exec rethrew and the route answered 500 → "relaunch the editor"
+    // about a file that was simply locked, with `failed` — which the tool documents — never set.
+    // The DISK is the witness instead: whatever is still there did not go. `lstat`, not `exists`,
+    // because a dangling symlink is still an entry Finder failed to move.
+    try {
+      return (exec(command, args, input) as TrashExecResult | undefined) ?? { failed: [] };
+    } catch (e) {
+      const said = String((e as { stderr?: unknown })?.stderr ?? '').trim() || (e instanceof Error ? e.message : String(e));
+      // -1712 is the AppleEvent TIMEOUT: osascript gave up while Finder may still be moving the
+      // files, so "still on disk" is not yet an answer. Could-not-tell stays a thrown failure.
+      if (/\(-1712\)/.test(said)) throw e;
+      // Measured on macOS 26 (2026-09-17, a locked file via `chflags uchg`): Finder's `delete` of a
+      // list is ALL-OR-NOTHING — one refused item and NOTHING moves, in either list order — so an
+      // asset and its sidecar are not split by this path.
+      const stillThere = paths.filter((p) => { try { fs.lstatSync(p); return true; } catch { return false; } });
+      // Everything went despite the error exit — the delete happened, and saying otherwise would
+      // send the caller to retry a delete of files that are already in the Trash.
+      if (stillThere.length === 0) return { failed: [] };
+      return { failed: stillThere, reason: said.split('\n')[0].slice(0, 300) };
+    }
+  }
+  if (platform === 'win32') {
     return (exec(command, args, input) as TrashExecResult | undefined) ?? { failed: [] };
   }
   try { exec(command, args, input); return { failed: [] }; }
@@ -326,6 +358,150 @@ export function moveToTrash(
   }
 }
 
+/** Give every entity a scene file DEFINES a fresh guid, and carry every reference to it along
+ *  (#1293). The file-level counterpart of `regenerateSnapshotGuids`, which mints fresh guids for a
+ *  subtree duplicated inside one scene and carries the refs inside it the same way (#1338). A
+ *  copied scene is its own content, so it gets its own identities.
+ *
+ *  **What "defines" means — three places, not one.** An ordinary row keeps its guid in
+ *  `traits.EntityAttributes.guid`, but a prefab-instance ROOT keeps it on the row itself
+ *  (`entry.guid`), and an instance's structural adds keep theirs on each `added[]` node (recursing
+ *  through `children` and a nested reference node's `added`). Collecting only the first is what
+ *  the scaffolder does, and on a scene with instances it would leave every root shared.
+ *
+ *  **What follows the remap: every string VALUE equal to a defined guid**, wherever it sits —
+ *  `parentId`, `PrefabInstance.rootInstanceId`, every registry `entityRef` field (including a
+ *  game's own) and `UIAction.bindings[].target`. A walk rather than a field list, so a newly
+ *  registered entityRef field is covered with nothing to keep in sync; the scaffolder's whole-text
+ *  substitution is the same idea (`remapGuidValues`). Every committed entity guid is a UUID, so an exact-value match
+ *  cannot hit a name.
+ *
+ *  **What deliberately does NOT follow:** a guid the file references but does not define — a
+ *  level's ref into its BASE scene keeps pointing at the base. Override keys are localIds, never
+ *  guids.
+ *
+ *  **Prefab MEMBERS follow too (#1324), given `readPrefab`.** A member's guid is not stored —
+ *  `deriveInstanceMemberGuids` derives it on load as `deriveMemberGuid(anchor, path)` — so the members
+ *  re-derive from the new anchor on their own, but a stored REFERENCE to one (a `UIAction` target,
+ *  an `entityRef` into an instance) would keep the old anchor's value and dangle. So for every
+ *  reminted anchor the member paths are enumerated from its prefab file(s) (`derivedMemberPaths`)
+ *  and `old|p` → `new|p` joins the remap. The anchor is the one the LOADER picks, which is not
+ *  always the instance root (#1339): a prefab row with a zero or unknown parent hangs off the
+ *  instance's scene parent, and a guid-less (pre-#1248) root derives from that parent too —
+ *  `sceneAnchorOf` finds it. Without `readPrefab`, for a prefab it cannot read, or under a parent
+ *  without a durable guid (see `sceneAnchorOf`), those refs are left as before. See
+ *  docs/scene-loading.md.
+ *
+ *  ⚠️ **Accepted cost (owner ruling, #1293):** a `Persistent` entity in the copy no longer matches
+ *  its original by guid, so `filterPersistentDuplicates` stops treating the two as one. */
+export function remintSceneEntityGuids(
+  scene: Record<string, unknown>,
+  genGuid: () => string = randomUUID,
+  readPrefab?: PrefabReader,
+): Record<string, unknown> {
+  const remap = new Map<string, string>();
+  const define = (g: unknown): void => {
+    // durableGuid: a stale RUNTIME guid (#1210) is no identity — the loader derives a distinct one
+    // per row. Minting one durable guid for it would turn two such rows into a same-file collision.
+    const d = typeof g === 'string' ? durableGuid(g) : '';
+    if (d && !remap.has(d)) remap.set(d, genGuid());
+  };
+  type Row = { guid?: unknown; added?: unknown; children?: unknown; traits?: { EntityAttributes?: { guid?: unknown } } };
+  const visit = (rows: unknown): void => {
+    if (!Array.isArray(rows)) return;
+    for (const row of rows as Row[]) {
+      if (!row || typeof row !== 'object') continue;
+      define(row.guid);
+      define(row.traits?.EntityAttributes?.guid);
+      visit(row.children);
+      visit(row.added);
+      // A `nestedStructure` slot — on an entry (#1358) or on a reference node (#1369) — holds added
+      // nodes with their own guids too; missed here, the copy kept them and two files shared them.
+      const slot = (row as { nestedStructure?: unknown }).nestedStructure;
+      if (slot && typeof slot === 'object') {
+        for (const delta of Object.values(slot as Record<string, { added?: unknown } | null>)) visit(delta?.added);
+      }
+    }
+  };
+  visit(scene.entities);
+  if (remap.size === 0) return scene;
+  if (readPrefab) {
+    // Every (anchor, member paths) pair: each anchor this file defines, and each top-level instance — whose
+    // members derive from its own guid and, for a row the loader parents to the SCENE parent or a guid-less
+    // (pre-#1248) root, from that parent's anchor (#1339).
+    const carries: [string, string[]][] = [];
+    for (const a of sceneMemberAnchors(scene)) {
+      const byAnchor = derivedMemberPathsByAnchor(a.node, readPrefab, a.opts);
+      if (a.self) carries.push([a.self, byAnchor.self]);
+      if (a.parent && byAnchor.parent.length) carries.push([a.parent, byAnchor.parent]);
+    }
+    // A derived guid wins where a node DEFINES it. The walk emits no path for a node that carries its
+    // own guid, so a defined guid meets a derivation only where a save stored the derived one: a
+    // template-keyed node in scene form, its key dropped. The load heal restores that key only while
+    // the guid still matches its derivation, so a random remint left the copy's node unkeyed for good
+    // (#1430). Such a node can itself be an ANCHOR (a keyed reference node, or a keyed plain node the
+    // scene hung a reference under), and re-pointing it moves every member below it — so carry until
+    // nothing moves, each pass against the anchors' guids as the last one left them. A pass settles at
+    // least one more level of that nesting; the bound only stops a pathological file.
+    // The OLD side of every carry never changes between passes — derive it once.
+    const froms = carries.map(([oldAnchor, paths]) => paths.map((p) => deriveMemberChain(oldAnchor, p)));
+    for (let pass = 0; pass <= MAX_INSTANCE_DEPTH; pass++) {
+      const next = new Map<string, string>();
+      carries.forEach(([oldAnchor, paths], i) => {
+        const newAnchor = remap.get(oldAnchor);
+        if (newAnchor) paths.forEach((p, j) => next.set(froms[i]![j]!, deriveMemberChain(newAnchor, p)));
+      });
+      let moved = false;
+      for (const [k, v] of next) if (remap.get(k) !== v) { remap.set(k, v); moved = true; }
+      if (!moved) break;
+    }
+  }
+  return remapGuidValues(scene, remap) as Record<string, unknown>;
+}
+
+/** One scene or prefab file as {@link planMemberPathRepair} reads it. */
+export type RepairFile = { key: string; type: 'scene' | 'prefab'; guid?: string; text: string };
+
+/** The files that need rewriting because prefab `prefabGuid` changed from `before` to what `readNew`
+ *  returns for it, and each one's new document (#1437: applying a move re-parents a row, which changes
+ *  member PATHS). A scene stores each member ref as the guid its path derives, so it gets
+ *  `memberGuidRemap`; a prefab stores it as a path token, so it gets `rewritePrefabMemberTokens`. The
+ *  changed prefab itself comes back unchanged: its caller rewrote its tokens before writing it, and an old
+ *  path never names a different row under the new document (a path ends in the row's own localId).
+ *
+ *  Only a file that names the prefab, directly or through prefabs that nest it, can hold such a ref,
+ *  so the rest are never parsed: the users are found by the guid's TEXT, to a fixpoint. */
+export function planMemberPathRepair(
+  files: readonly RepairFile[], prefabGuid: string, before: unknown, readNew: PrefabReader,
+): { key: string; doc: Record<string, unknown> }[] {
+  const self = prefabGuid.toLowerCase();
+  const readOld: PrefabReader = (g) => (g.toLowerCase() === self ? before : readNew(g));
+  const users = new Set([self]);
+  const names = (f: RepairFile): boolean => { const t = f.text.toLowerCase(); return [...users].some((g) => t.includes(g)); };
+  for (let grew = true; grew;) {
+    grew = false;
+    for (const f of files) {
+      const g = f.guid?.toLowerCase();
+      if (f.type === 'prefab' && g && !users.has(g) && names(f)) { users.add(g); grew = true; }
+    }
+  }
+  const out: { key: string; doc: Record<string, unknown> }[] = [];
+  for (const f of files) {
+    if (!names(f)) continue;
+    let doc: Record<string, unknown>;
+    try { doc = JSON.parse(f.text.replace(/^\uFEFF/, '')); } catch { continue; }
+    if (!doc || typeof doc !== 'object') continue;
+    if (f.type === 'prefab') {
+      const next = f.guid ? rewritePrefabMemberTokens(doc, f.guid, readOld, readNew) : null;
+      if (next) out.push({ key: f.key, doc: next });
+    } else {
+      const remap = memberGuidRemap(doc, readOld, readNew);
+      if (remap.size) out.push({ key: f.key, doc: remapGuidValues(doc, remap) as Record<string, unknown> });
+    }
+  }
+  return out;
+}
+
 /** Copy an asset to a new path with a freshly-generated GUID so the duplicate
  *  doesn't collide with the original in the manifest. JSON assets carry their
  *  id inline (rewritten); binary assets get a copied `.meta.json` sidecar with
@@ -338,6 +514,7 @@ export function duplicateAssetFile(
   absFrom: string,
   absTo: string,
   genGuid: () => string = randomUUID,
+  readPrefab?: PrefabReader,
 ): string | null {
   const destDir = path.dirname(absTo);
   if (!fs.existsSync(destDir)) fs.mkdirSync(destDir, { recursive: true });
@@ -346,10 +523,13 @@ export function duplicateAssetFile(
   const ext = path.extname(absFrom).toLowerCase();
   if (ext === '.json') {
     // JSON asset: copy + rewrite top-level id
-    const txt = fs.readFileSync(absFrom, 'utf-8');
+    // A UTF-8 BOM makes JSON.parse throw, and the verbatim fallback below then leaves the copy with
+    // the ORIGINAL's asset id — two assets claiming one guid (#1293 review). Parse past it.
+    const txt = fs.readFileSync(absFrom, 'utf-8').replace(/^\uFEFF/, '');
     let json: Record<string, unknown>;
     try { json = JSON.parse(txt); } catch { fs.copyFileSync(absFrom, absTo); return null; }
     json.id = newGuid;
+    if (absFrom.toLowerCase().endsWith('.scene.json')) json = remintSceneEntityGuids(json, genGuid, readPrefab);
     // Bytes from the one definition (#831) — a copied asset must not be born without the trailing
     // newline every committed asset doc has, or its first edit shows a spurious
     // `\ No newline at end of file` on a line nobody touched.

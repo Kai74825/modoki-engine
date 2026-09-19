@@ -93,11 +93,60 @@ export function jsonFileBody(data: unknown): string {
  *  which reports `write GLB failed (${res.status})`). `content` is passed through completely
  *  unchanged — compose a JSON document's bytes with `jsonFileBody` FIRST; this function does not
  *  know or care whether it is writing JSON or binary. */
-export function postWriteFile(filePath: string, content: string, encoding?: string): Promise<Response> {
+export function postWriteFile(
+  filePath: string, content: string, encoding?: string,
+  /** `createOnly` sends `ifNoneMatch:'*'`: the route answers 409 instead of overwriting a file that
+   *  is already there (#1215). Absent, the write replaces — which every save depends on. */
+  opts?: { createOnly?: boolean },
+): Promise<Response> {
   return backendFetch('/api/write-file', {
     method: 'POST', headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ path: filePath, content, encoding }),
+    body: JSON.stringify({ path: filePath, content, encoding, ...(opts?.createOnly ? { ifNoneMatch: '*' } : {}) }),
   });
+}
+
+/** Write the OPEN scene to another file as a COPY with its own identity (#1414): the backend stamps
+ *  a fresh scene id and re-mints the entity guids, then overwrites whatever scene is at `filePath`.
+ *  `content` is the scene as serialized (`jsonFileBody`). Resolves to the copy's new guid and the
+ *  path the disk spells it with; `'same-file'` when `filePath` resolves to `openPath`'s own file, or
+ *  `'target-loaded'` to another of `loadedPaths` (nothing written either way — the backend compares
+ *  the files the DISK resolves, which a client string compare cannot); or null when the write was
+ *  refused or failed. */
+export async function writeSceneCopy(filePath: string, content: string, openPath: string, loadedPaths: readonly string[]): Promise<{ guid: string; path: string } | 'same-file' | 'target-loaded' | null> {
+  try {
+    const res = await backendFetch('/api/scene-save-as', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ path: filePath, content, openPath, loadedPaths }),
+    });
+    if (res.status === 409) {
+      const j = await res.json().catch(() => ({})) as { sameFile?: boolean; targetLoaded?: boolean };
+      return j.sameFile ? 'same-file' : j.targetLoaded ? 'target-loaded' : null;
+    }
+    if (!res.ok) return null;
+    const j = await res.json() as { guid?: string; path?: string };
+    return typeof j.guid === 'string' ? { guid: j.guid, path: typeof j.path === 'string' ? j.path : filePath } : null;
+  } catch { return null; }
+}
+
+/** After a prefab changed from `before` in a way that moved member PATHS (#1437: an applied move),
+ *  re-point the member refs stored in every OTHER scene and prefab file that uses it
+ *  (`/api/prefab-member-paths`). Resolves to what was rewritten and what was left because an asset view
+ *  holds it unsaved, or `null` when the backend could not do it (the reason is in the console). */
+export async function repairPrefabMemberPaths(prefab: string, before: unknown): Promise<{ rewritten: string[]; held: string[] } | null> {
+  try {
+    const res = await backendPostJson('/api/prefab-member-paths', { prefab, before });
+    const j = await res.json().catch(() => ({})) as { rewritten?: unknown; held?: unknown; error?: unknown };
+    if (!res.ok) { console.error(`[Prefab] member refs in other files were NOT repaired: ${String(j.error ?? res.status)}`); return null; }
+    const list = (v: unknown): string[] => (Array.isArray(v) ? v.filter((x): x is string => typeof x === 'string') : []);
+    const out = { rewritten: list(j.rewritten), held: list(j.held) };
+    // Said HERE, once, for every caller (apply, undo, redo): a held document's own save would write its old
+    // refs back, and nothing else tells the user which files those are.
+    if (out.held.length) console.warn(`[Prefab] member refs NOT repaired in ${out.held.join(', ')}: open with unsaved edits. Their refs to the moved members will dangle once saved.`);
+    return out;
+  } catch (e) {
+    console.error('[Prefab] member refs in other files were NOT repaired:', e);
+    return null;
+  }
 }
 
 /** Write a text or base64-encoded file via /api/write-file — the ONE client write wrapper every

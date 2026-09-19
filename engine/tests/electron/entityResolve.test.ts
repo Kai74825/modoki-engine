@@ -20,6 +20,7 @@ const collectScreenBounds = vi.fn();
 // exercising the old `occlusionScope:'canvas'` fallback unchanged — only the tests that opt in by
 // setting a return value exercise the new `'entity'` scope.
 const pickAt = vi.fn();
+const findEntityByGuid = vi.fn();
 // ⚠️ **The tap-zone veto is imported for REAL, not stubbed** (#1016). `resolveTapZoneVeto` is
 // `pressOrigin.ts`'s own banner-described "part with the decisions in it" — the ancestor rule, the
 // owner rule, the first-non-zone rule — and a fake would make every case below assert this file's
@@ -37,6 +38,16 @@ vi.mock('@modoki/engine/runtime', () => ({
   getAllEntities: (...a: unknown[]) => getAllEntities(...a),
   collectScreenBounds: (...a: unknown[]) => collectScreenBounds(...a),
   pickAt: (...a: unknown[]) => pickAt(...a),
+  findEntityByGuid: (...a: unknown[]) => findEntityByGuid(...a),
+  // What the shared resolver (`entityRef.ts`, #1223) reads besides the list — answered FROM the
+  // mocked list, so an entity's id, guid and name agree across every lookup.
+  findEntityById: (id: number) => (getAllEntities() as Ent[]).find((e) => e.id === id),
+  getTraitByName: () => ({ name: 'EntityAttributes' }),
+  readTraitData: (id: number) => {
+    const e = (getAllEntities() as Ent[]).find((x) => x.id === id);
+    return e ? { guid: e.guid ?? '', name: e.name } : null;
+  },
+  classifyRuntimeGuidMiss: () => null,
   resolveTapZoneVeto: (...a: unknown[]) => (resolveTapZoneVeto as (...x: unknown[]) => unknown)(...a),
   // The REAL constants, not string copies: this file already has them in scope from the
   // `importActual` above, and a hand-synced duplicate of a value you are holding is the
@@ -75,6 +86,10 @@ beforeEach(() => {
   // leaves their CALL HISTORY intact and any "was it called?" assertion would silently read
   // calls from an earlier test.
   getAllEntities.mockReset().mockReturnValue([PUCK, BUTTON]);
+  findEntityByGuid.mockReset().mockImplementation((g: string) => {
+    const e = (getAllEntities() as Ent[]).find((x) => x.guid === g);
+    return e ? { id: () => e.id } : undefined;
+  });
   collectScreenBounds.mockReset().mockReturnValue(bounds());
   pickAt.mockReset().mockReturnValue(undefined); // no picker registered — the pre-existing default
   // jsdom has no layout; give the window a viewport so the in-window guard has something real
@@ -104,29 +119,69 @@ describe('addressing', () => {
     ]);
     const r = resolveEntityPointReport({ name: 'Enemy', surface: 'game-3d' });
     expect(r.ok).toBe(false);
-    expect(r.error).toContain('2 entities are named');
+    expect(r.error).toContain('2 LIVE entities are named');
     expect(r.error).toContain('address by guid');
+    expect(r.options).toEqual(['g-a', 'g-b']);
     // QA-TOOL-0003: the machine-readable twin of the same refusal — was REFUSED_BY_OP,
     // indistinguishable from any other refusal without string-matching `error`.
     expect(r.code).toBe('AMBIGUOUS');
   });
 
-  it('resolves by id, but guid wins when both are given', () => {
+  it('lists only guids when refusing an ambiguous name — never an `id:<n>` it would not accept (#1207)', () => {
+    getAllEntities.mockReturnValue([
+      { id: 1, name: 'Shot', guid: '00000000-0000-0002-0000-000000000001', layer: '3d' },
+      { id: 2, name: 'Shot', guid: '00000000-0000-0002-0000-000000000002', layer: '3d' },
+      { id: 3, name: 'Shot', guid: '', layer: '3d' }, // EntityAttributes added after spawn: no address
+    ]);
+    const r = resolveEntityPointReport({ name: 'Shot', surface: 'game-3d' });
+    expect(r.ok).toBe(false);
+    expect(r.error).toContain('(00000000-0000-0002-0000-000000000001, 00000000-0000-0002-0000-000000000002)');
+    expect(r.options).toEqual(['00000000-0000-0002-0000-000000000001', '00000000-0000-0002-0000-000000000002']);
+    expect(r.error).not.toMatch(/id:/);
+  });
+
+  it('when no ambiguous match has a guid, says to address by id rather than listing nothing (#1207)', () => {
+    getAllEntities.mockReturnValue([
+      { id: 1, name: 'Late', guid: '', layer: '3d' },
+      { id: 2, name: 'Late', guid: '', layer: '3d' },
+    ]);
+    const r = resolveEntityPointReport({ name: 'Late', surface: 'game-3d' });
+    expect(r.error).toContain('none has a guid, so address one by id');
+    expect(r.error).not.toContain('()');
+    // …and the id it points at is one this resolver accepts, because those entities have no guid (#1223 D2).
     stubTopmost(document.createElement('canvas'));
+    collectScreenBounds.mockReturnValue([{ ...bounds()[0], id: 1 }]);
+    expect(resolveEntityPointReport({ id: 1, surface: 'game-3d' })).toMatchObject({ ok: true, entity: { id: 1 } });
+  });
+
+  it('resolves a runtime guid a save has since replaced, through findEntityByGuid (#1210)', () => {
+    stubTopmost(document.createElement('canvas'));
+    findEntityByGuid.mockImplementation((g: string) => (g === '00000000-0000-0002-0000-000000000007' ? { id: () => 7 } : undefined));
+    expect(resolveEntityPointReport({ guid: '00000000-0000-0002-0000-000000000007', surface: 'game-3d' }))
+      .toMatchObject({ ok: true, entity: { id: 7, guid: 'g-puck' } });
+  });
+
+  it('resolves {id} only for an entity with no guid, and refuses a guid given beside an id (#1223 D1/D2)', () => {
+    stubTopmost(document.createElement('canvas'));
+    // The puck HAS a guid, so an id aim is refused with that guid as the way out.
+    expect(resolveEntityPointReport({ id: 7, surface: 'game-3d' }))
+      .toMatchObject({ ok: false, code: 'REFUSED_BY_OP', options: ['g-puck'] });
+    // A guid-less entity has only its id, so the id aim resolves.
+    getAllEntities.mockReturnValue([{ ...PUCK, guid: '' }, BUTTON]);
     expect(resolveEntityPointReport({ id: 7, surface: 'game-3d' })).toMatchObject({ ok: true, entity: { id: 7 } });
-    // A stale id alongside a guid must not steer the aim — ids are reassigned on every reload.
-    getAllEntities.mockReturnValue([PUCK, { ...BUTTON, id: 7, guid: 'g-other' }]);
-    expect(aimPuck({ id: 7 })).toMatchObject({ entity: { guid: 'g-puck' } });
+    // A stale id alongside a guid used to lose silently to the guid; now the pair is refused.
+    getAllEntities.mockReturnValue([PUCK, BUTTON]);
+    expect(aimPuck({ id: 9 })).toMatchObject({ ok: false, code: 'AMBIGUOUS' });
   });
 
   it('reports a miss as a result, never a throw', () => {
     expect(resolveEntityPointReport({ guid: 'nope', surface: 'game-3d' })).toMatchObject({
-      ok: false, error: expect.stringContaining('no entity with guid'), code: 'NOT_FOUND',
+      ok: false, error: expect.stringContaining('no LIVE entity with guid'), code: 'NOT_FOUND',
     });
     // No `{guid}|{name}|{id}` at all is a different mistake (a malformed call, not "not found")
     // and stays uncoded — the caller's REFUSED_BY_OP fallback is the honest answer for it.
     const noSpec = resolveEntityPointReport({});
-    expect(noSpec).toMatchObject({ ok: false, error: expect.stringContaining('provide an entity') });
+    expect(noSpec).toMatchObject({ ok: false, error: expect.stringContaining('no entity address') });
     expect(noSpec.code).toBeUndefined();
   });
 });

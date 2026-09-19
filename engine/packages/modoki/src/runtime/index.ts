@@ -23,6 +23,8 @@ export {
 export { emptyDocMap, hasDocKey, putOwn } from './core/docKeys';
 export { WHITE_HDR_GUID, DEFAULT_FONT_GUID } from './assets/builtinAssets';
 export { getCurrentWorld, setCurrentWorld, onWorldSwap } from './core/ecs/world';
+// Module state that belongs to one world: keyed by it, so a world swap needs no reset list (#1315).
+export { worldScoped, type WorldScoped } from './core/ecs/worldScoped';
 export { hostCanvases, hostCanvasUnder } from './ui/hostCanvas';
 // `computeCanvasScale` alongside the two point-mappers because a game that draws a FULL-SCREEN
 // quad in design space needs the same scale the mappers use internally: with a letterboxing
@@ -111,6 +113,9 @@ export { createPrefsDocStore, type PrefsDocStore } from './storage/prefsDocStore
 export {
   defineSyncGroup, emptyMarks, neverSynced, decideGroup, hasLocalWrites, scopeMarksToAccount,
   runGroupSync, runCloudSync, resolveGroupFork, CloudSyncCoordinator,
+  // #1274 — what a game needs to wire `RunSyncOptions.continuity`. `loginKey` has its own narrow subpath
+  // (`runtime/sync/accountContinuity`) for the auth wrappers, which stay off the barrel.
+  parseLoginRecord, type AccountContinuity, type LoginRecord,
   type AnySyncGroup, type CloudGroup, type CloudSyncDeps, type ConflictChoice, type ForkPolicy,
   type GroupAtomicity, type GroupDecision, type GroupMarks, type GroupOutcome, type GroupStore,
   type GroupTransport, type LocalGroup, type PendingConflict, type ResolveForkOptions,
@@ -123,6 +128,7 @@ export {
 export {
   ALL_PROVIDERS, reauthProviderFor,
   type AccountProvider, type AccountState, type AvailableProviders, type SignInFailure,
+  supportId, supportIdView, type SupportId, type SupportIdView, type SupportIdWords, type CopyFeedback,
 } from './account';
 // In-app purchases (#196). `reconcile()` MUST run once per launch before the player can buy
 // anything — it is the recovery pass for a purchase interrupted by a crash or force-close.
@@ -138,7 +144,7 @@ export {
   type ConfigureIapOptions, type StoreBackend, type StoreCancelled, type IapLedgerStore, type PurchaseVerifier,
   type ProductKind, type IapProduct, type IapProductInfo, type StoreTransaction,
   type PurchaseOutcome, type PurchaseResult, type IapGrant,
-  shelfProductId, sellableShelfOffers, buildShelfCatalog, shelfOfferForProduct, shelfEffectOf,
+  shelfProductId, sellableShelfOffers, buildShelfCatalog, shelfStoreKinds, shelfOfferForProduct, shelfEffectOf,
   visibleShelfOffers, extendPassExpiry, isPassActive, noAdsActive, noAdsRemaining, shelfView, quickBuyView,
   type ShelfOffer, type ShelfEffect, type NoAdsState, type NoAdsRemaining, type ShelfState, type ShelfRefusal,
   type ShelfRowWords, type ShelfRowView, type ShelfNoticeWords, type ShelfInputs, type ShelfView, type QuickBuyView,
@@ -149,6 +155,7 @@ export { registerIapControls } from './actions/iapControls';
 export { hapticsSystem } from './haptics/hapticsSystem';
 export { registerHapticControls } from './actions/hapticControls';
 export { registerQualityControls } from './actions/qualityControls';
+export { registerSystemControls, copyToClipboard } from './actions/systemControls';
 export {
   playHaptic, configureHaptics, areHapticsEnabled, canDeviceVibrate,
   hapticLatencyMean, hapticLatencySamples, clearHapticLatency,
@@ -266,12 +273,15 @@ export { suggestBones, type SuggestBonesOptions } from './skinning/rig2dAutoBone
 export { buildRig2D, autoRig2D, type BuildRig2DOptions, type AutoRig2DOptions } from './skinning/rig2dBuild';
 export { paintWeights, boneWeightField, dominantBoneField, type PaintWeightsOptions, type PaintWeightsResult } from './skinning/rig2dWeightPaint';
 export {
-  findEntity, getEntityTraits, readTraitData, readTraitDataFull, writeTraitField,
+  findEntity, guidOfEntityId, getEntityTraits, readTraitData, readTraitDataFull, writeTraitField, carryEntityIdFields, cloneTraitValues,
   getAllEntities, entityDisplayName, buildEntityTree, deleteEntity, deleteEntities, deriveLayer,
   onStructureDirty, markStructureDirty, getStructureVersion,
   type EntityInfo,
 } from './core/ecs/entityUtils';
-export { findEntityById, findEntityByGuid, registerEntity, spawnEntity, unregisterEntity, destroyEntity } from './core/ecs/world';
+export { findEntityById, findEntityByGuid, registerEntity, spawnEntity, unregisterEntity, destroyEntity, classifyRuntimeGuidMiss, saltRuntimeGuidGeneration, type RuntimeGuidStale } from './core/ecs/world';
+// Per-entity state keyed so a recycled index cannot inherit it (#868). Exported for games (#1198, owner
+// ruling): a game fixes an id-keyed map the engine's way, not with a hand-rolled `entity.valueOf()`.
+export { EntityTable, packedOf, isPackedAlive, type PackedEntity, type EntityTableOptions } from './core/ecs/entityTable';
 export { findUnrenderable2D, type Unrenderable2D } from './rendering/canvas2DRouting';
 export {
   registerModelPostprocessor, getModelPostprocessor, getAllModelPostprocessors, getModelPostprocessorIds,
@@ -286,23 +296,48 @@ export {
   registerRuntimeMeshTemplate, unregisterRuntimeMeshTemplate,
   resolveMaterial, resolveMaterialForMesh,
   getTemplatesForModel,
-  invalidateModel, invalidateMaterial, disposeAllCachedResources,
+  invalidateModel, invalidateMaterial, invalidateMeshAsset, disposeAllCachedResources,
   invalidateEnvironment,
   onModelInvalidated,
+  // ⚠️ A RE-IMPORT evicts through `REIMPORT_INVALIDATORS` below, never by calling these
+  // directly — `model` alone misses the rigged prototype (#1366).
   // Refcount API for SceneManager
   acquireModel, releaseModel,
   acquireMesh, releaseMesh,
   acquireMaterial, releaseMaterial,
-  acquirePrefab, releasePrefab, getCachedPrefab, invalidatePrefab,
+  acquirePrefab, releasePrefab, getCachedPrefab, invalidatePrefab, replaceCachedPrefab, getPrefabRevision,
   acquireEnvironment, releaseEnvironment, getCachedEnvironment,
   releaseAllForScene, getResourceStats,
   type SceneId,
 } from './loaders/meshTemplateCache';
+// A game loader that fetches something itself (a level list, a manifest) classifies its failures
+// the same way the engine's caches do (#1397): a missing file stays failed, an outage backs off.
+// Rule: docs/architecture.md § "A load failure is classified before it is remembered".
+export {
+  createLoadFailureMemo, classifyLoadFailure, rethrowFetchFailure, retryDelayMs,
+  RETRY_BASE_MS, RETRY_CAP_MS,
+  type LoadFailureMemo, type LoadFailureClass,
+} from './core/loadFailureMemo';
+export {
+  AssetNetworkError, MissingAssetError, absentIfBundled, checkAssetResponse, isAppBundleUrl, readAssetBytes, statusIsAbsent,
+} from './core/assetLoadErrors';
+// The JSON half of the same recipe: status, SPA fallback and a mid-body drop typed for the memo.
+// `checkAssetResponse` + `res.json()` would leave that drop an untyped `TypeError` (#1399).
+export { parseAssetJson } from './loaders/assetFetch';
+export {
+  requestPrefab, MAX_PREFAB_FETCH_ATTEMPTS,
+  type PrefabDocLike, type RequestPrefabOptions,
+} from './loaders/prefabRequest';
 export {
   acquireRiggedModel, releaseRiggedModelsForScene, ensureRiggedModelLoaded,
   ensureRiggedModelLoadedFor,
   getRiggedModel, getClipNames, getBoneNames, disposeAllRiggedModels, type RiggedModel,
 } from './loaders/riggedModelCache';
+// The one asset-kind → eviction table a RE-IMPORT goes through, shared by the Assets-panel batch
+// loop and the agent/MCP `invalidate-assets` op. `model` is two evictions, not one (#1366).
+export {
+  REIMPORT_INVALIDATORS, invalidateModelAndRig, type ReimportableAssetKind,
+} from './loaders/reimportInvalidation';
 // GPU-memory report (Phase 3 of #590, docs/ios-gpu-memory.md) — 3D bytes read
 // straight from `renderer.info.memory` and 2D (PixiJS) bytes computed per canvas2DPool slot
 // (compressed-format-aware), plus the live GL-context count, sampled on an interval that survives
@@ -385,10 +420,10 @@ export {
 // be seen in an inspector, a scene view or a screenshot. A game publishes them from the code that
 // OWNS the geometry (never a second copy of it) via registerHitRegionProvider.
 export {
-  registerHitRegionProvider, collectHitRegions, hitRegionProviders,
+  registerHitRegionProvider, collectHitRegions, collectHitRegionsReport, hitRegionProviders,
   isHitRegionOverlayVisible, setHitRegionOverlayVisible, subscribeHitRegionOverlay,
   hitShapeContains, hitShapeDistance, regionsAt, nearestRegionTo,
-  type HitRegion, type HitShape, type HitRegionFilter, type HitRegionProvider,
+  type HitRegion, type HitShape, type HitRegionFilter, type HitRegionProvider, type HitRegionProviderFailure,
 } from './rendering/hitRegions';
 // Quality tiers (#121 P3) — THREE tiers since #188 (`low`/`mid`/`high`), measurement as ground
 // truth, allowlist as a shortcut. The allowlist still ships EMPTY on purpose; see the module
@@ -454,10 +489,10 @@ export { loadSceneFile, collectResourceRefsFromEntities, instantiatePrefabIntoWo
 export { markOverride, getOverrideMarkSet, clearOverrideMarks, clearAllOverrideMarks } from './loaders/overrideMarks';
 export { resolveCanvas2DHost, type ResolveCanvas2DHostOptions } from './scene/canvas2DHost';
 export { loadedScenePath } from './core/ecs/sceneLoaded';
-export { sceneManager, gameIdFromScenePath, type Scene, type SceneState, type LoadOptions as SceneLoadOptions, type SceneManager, type LoadedSceneEntry } from './scene/SceneManager';
+export { sceneManager, gameIdFromScenePath, type Scene, type SceneState, type LoadOptions as SceneLoadOptions, type SceneLoadResult, type SceneManager, type LoadedSceneEntry } from './scene/SceneManager';
 export { validateSceneData, typeMismatch, REF_FIELDS_BY_TRAIT, type SceneSchema, type ValidationResult, type AssetRefVerdict, type AssetRefResolver, makeAssetRefResolver } from './loaders/sceneValidation';
 export { buildSceneSchema } from './scene/sceneSchema';
-export { applyOps, type MutateOp, type MutableScene, type MutableEntity, type EntityRef as MutateEntityRef, type ApplyResult } from './scene/sceneMutate';
+export { applyOps, alsoDeletedTally, ALSO_DELETED_CAP, type AlsoDeletedFields, type MutateOp, type MutableScene, type MutableEntity, type EntityRef as MutateEntityRef, type ApplyResult } from './scene/sceneMutate';
 // Entity-creation spec builders + the anchor-first UI authoring rules. In runtime (not editor)
 // since #166 so the DEVICE create-entity op can build the SAME entities the editor does — the
 // editor half of the package is stripped from a shipped game build. See
@@ -468,7 +503,8 @@ export { resolveCreateEntitySpec, type CreateEntitySpecResolution } from './scen
 export { buildUiCreateSpecs, type UiPreset, type UiTraitSpec } from './ui/uiAuthoring';
 // Hierarchy legality (#166 P7) — the ONE self-parent/cycle rule, shared by the editor's undoable
 // reparent and the device's direct parentId write. See runtime/core/ecs/hierarchy.ts.
-export { isAncestorOf, reparentRefusal, type ReparentRefusal } from './core/ecs/hierarchy';
+export { isAncestorOf, isResourceEntity, parentRefusal, parentOrRootFor, reparentRefusal, type ReparentRefusal } from './core/ecs/hierarchy';
+export { traitRemoveRefusal, traitWriteRefusal } from './core/ecs/traitEditPolicy';
 /** LOCAL↔WORLD Transform authoring (`set_transform {space}`) — the FILE-path conversion.
  *  The live path uses `worldToLocal3D`/`getWorldTransform3D` from core/ecs/worldTransform. */
 export { parentWorldTrs, localToWorldTrs, worldToLocalTrs, mergeTrs, matrixToTrs, persistedTrsKeys, collapsedParentAxes, type TRS } from './scene/transformSpace';
@@ -485,6 +521,10 @@ export { layoutText, type LayoutFont, type LayoutOptions, type TextLayout, type 
  *  `measureText2D` wraps the `ensureGlyphs` + `layoutText` pair so that trap is not re-exported
  *  with it. */
 export { measureText2D, type MeasureText2DOptions } from './loaders/measureText2D';
+// Runtime guids (#1210): tell an entity's live-only address from its durable identity.
+export { isRuntimeGuid, durableGuid, remapGuidValues } from './core/assetRefRules';
+export { planCopyGuids, type CopyGuidPlan } from './core/copyIdentity';
+export { templateKeyOf, setTemplateKey } from './core/templateIdentity';
 export {
   isGuid, isExternalUrl, isInternalAssetPath, newGuid, deriveGuid, registerAsset, unregisterAsset, resolveGuidToPath,
   getGuidForPath, getAssetType, getAssetEntry, getAudioLoadType, resolveRef, loadManifestJson, ensureManifestLoaded, serializeManifest,
@@ -512,7 +552,7 @@ export {
 export {
   wireDomGestureTracking, unwireDomGestureTracking, isDomGestureActive, resetDomGestureTracking,
 } from './ui/domGestureTracking';
-export { registerUIAction, unregisterUIAction, dispatchUIAction, dispatchGameAction, hasUIAction, getUIActionNames, getUIActionParams, refuseAction, isActionRefusal } from './core/actionRegistry';
+export { registerUIAction, registerEngineAction, isControlLessAction, unregisterUIAction, dispatchUIAction, dispatchGameAction, hasUIAction, getUIActionNames, getUIActionParams, refuseAction, isActionRefusal } from './core/actionRegistry';
 export type { UIActionRefusal } from './core/actionRegistry';
 export type { UIActionContext, UIActionHandler, UIActionDef, UIActionPayload, DispatchOptions } from './core/actionRegistry';
 export { registerEngineActions } from './actions/engineActions';
@@ -663,6 +703,7 @@ export {
 
 // ── Engine Systems ──
 export { timeSystem, resetTimeBaseline } from './core/timeSystem';
+export { holdTimeForLoading, isTimeHeldForLoading } from './core/loadingTimeHold';
 export { getTime, getSimDelta, getVisualDelta, getTimeScale, setTimeScale } from './core/getTime';
 // Input resource accessors — `input`-prefixed on the public surface to avoid
 // colliding with the generic short names (`axis`/`held`/`pressed`/`released`).
@@ -707,6 +748,21 @@ export {
   type LoginBonusClaim, type LoginBonusPayout, type LoginBonusPolicy, type LoginBonusSegment,
   type LoginBonusSegmentId, type LoginBonusSubstitution, type LoginBonusVerdict,
 } from './core/loginBonus';
+export {
+  createAdLifecycle,
+  type AdEventSink, type AdLifecycle, type AdLifecycleHooks, type AdLifecycleOptions, type AdListenerHandle,
+  type AdRevenue, type AdReward, type AdSdk, type FullscreenKind, type RewardHandler,
+} from './core/adLifecycle';
+export {
+  mayShowInterstitial,
+  type InterstitialContext, type InterstitialPolicy, type InterstitialVerdict, type InterstitialWithheld,
+} from './core/adPacing';
+export {
+  adBreakCountdownLabel, mayOfferNoAds, midLevelBreakDue, planAdBreak, stepAdBreak,
+  type AdBreakEffect, type AdBreakEvent, type AdBreakState, type AdBreakStep, type AdBreakTransition,
+  type AdBreakTrigger, type MidLevelBreakContext, type MidLevelBreakPolicy, type NoAdsOfferContext,
+  type NoAdsOfferPolicy, type NoAdsOfferVerdict, type NoAdsOfferWithheld,
+} from './core/adBreak';
 export { stepSimulation, type StepOptions } from './core/stepSimulation';
 export { seedRng, rngNext, rngFloat, rngInt, rngBool, rngPick } from './core/rng';
 export {
@@ -754,7 +810,7 @@ export {
   setLinvel3D, setAngvel3D, setBodyTranslation3D, resetForces3D, wakeBody3D,
 } from './physics/physics3DSystem';
 export { initRapier3D, isRapier3DReady } from './physics/rapier3DLoader';
-export { ensurePhysicsReady, pendingPhysics, type PhysicsReadiness } from './physics/physicsReady';
+export { ensurePhysicsReady, ensurePhysicsModuleReady, pendingPhysics, type PhysicsReadiness, type PhysicsModuleName } from './physics/physicsReady';
 export { getContactState } from './physics/physicsContactIndex';
 export { zone2DSystem } from './zones/zone2DSystem';
 export { zone3DSystem } from './zones/zone3DSystem';
@@ -911,7 +967,7 @@ export {
   getRegisteredManagers,
   disposeActiveGameManagers, initGameManagersFor, getActiveGameId,
 } from './managers/managerRegistry';
-export type { ManagerDef, ManagerContext, ManagerScope } from './managers/managerRegistry';
+export type { ManagerDef, ManagerContext, ManagerScope, ManagerStartupError } from './managers/managerRegistry';
 export { timeManager, type TimeManager } from './managers/TimeManager';
 export { navigationManager, type NavigationManager } from './managers/NavigationManager';
 export { physics2DEvents, physics2DEventsManager } from './physics/Physics2DEvents';
@@ -927,11 +983,13 @@ export {
 } from './physics/physicsLayers';
 export type { PhysicsLayersConfig } from './physics/physicsLayers';
 export {
-  type PlayState, getPlayState, setPlayState, onPlayStateChange, isSimRunning,
+  type PlayState, PLAY_STATES, RUN_MODES, getPlayState, setPlayState, onPlayStateChange, isSimRunning,
   type RunMode, getRunMode, setRunMode, isAdvancing, onRunModeChange,
   shouldFireActions, shouldRunSimTier, isPoseOnly, isLiveRender, canEdit, inPreviewSession,
 } from './core/playState';
 export { uiTreeProjection, markUIDirty, setEditorDirtyCallback, onEditorDirty } from './ui/uiTreeStore';
+export { actionControlOnScreen, uiEntityShownNow } from './ui/actionCarriers';
+export type { ActionControlReport } from './ui/actionCarriers';
 // A game that registers its OWN InputSource should call `noteUserInput` from it — see
 // `core/userActivity.ts`. Without it, quality-tier calibration reads that game as idle.
 export { noteUserInput, msSinceUserInput, hasRecentUserInput } from './core/userActivity';

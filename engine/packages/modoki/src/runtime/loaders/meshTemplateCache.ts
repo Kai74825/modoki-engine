@@ -12,6 +12,8 @@ import { registerBuiltinMaterialTypes } from './materialPresets';
 import { isGuid, isExternalUrl, resolveGuidToPath, resolveRef, registerAsset, getAssetEntry, getGuidForPath } from './assetManifest';
 import { assetUrl } from './assetUrl';
 import { ASSET_FETCH_INIT, parseAssetJson } from './assetFetch';
+import { classifyLoadFailure, createLoadFailureMemo, rethrowFetchFailure } from '../core/loadFailureMemo';
+import { absentIfBundled } from '../core/assetLoadErrors';
 import { modelGlbUrl, resolveRefWarnOnce } from './modelGlbUrl';
 import { classifyFormatVersion } from '../core/formatVersion';
 import { MESH_FORMAT_VERSION, MATERIAL_FORMAT_VERSION } from '../traits/Renderable3D';
@@ -22,7 +24,6 @@ import { MESH_FORMAT_VERSION, MATERIAL_FORMAT_VERSION } from '../traits/Renderab
 // (`render3dBoundary.test.ts` fails, #214). NPRPostProcess re-exports this for its own callers.
 import { ensureLineColorOnMaterials } from '../rendering/materialExtras';
 import { takeParsedGltf, clearParsedGltfHandoff } from './parsedGltfHandoff';
-import { notifyModelTemplatesLoaded } from './modelLoadNotify';
 import { addToOwnerSet, removeFromOwnerSet } from './ownerSet';
 import { loadTexture3D, releaseTexture3D, isSharedTexture, isRetiredTexture, resolveEnvVariantUrl, getEnvFormat } from './textureResolver';
 import { clearParticleCache } from './particleCache';
@@ -757,9 +758,13 @@ export function loadModelTemplates(
         if (typeof (model as { clear?: () => void }).clear === 'function') (model as { clear: () => void }).clear();
 
         console.log(`[MeshCache] Loaded ${count} templates from ${path}`);
-        // Re-arm the editor SceneView's dirty gate — see modelLoadNotify.ts for why the
-        // invalidation edge alone does not close QA-ASSET-0008.
-        notifyModelTemplatesLoaded(path);
+        // Re-arm EVERY idle-gated surface — the refill edge, and it is the one that gets
+        // forgotten. The invalidation edge already fires this (via `emitAssetInvalidated`) and
+        // empties the viewport at once; the REBUILD only happens on a frame that runs
+        // `syncSceneRenderables3D`, and a GLB re-fetch+re-parse routinely outlasts the ~1 s
+        // grace, so without this the object is evicted and never comes back. See
+        // `core/renderDirty.ts` for the measurement (QA-ASSET-0008, and #1363 for the Game view).
+        fireDirtyListeners();
         resolve();
       } catch (err) {
         console.error(`[MeshCache] Failed during template processing for ${path}:`, err);
@@ -849,6 +854,13 @@ type MeshAsset = { model: string; mesh: string; postprocessor: string; material?
  *  so repeated `resolveMeshTemplate` calls short-circuit instead of re-fetching
  *  the same 404 forever. Mirrors MATERIAL_FAILED in fetchMaterial. */
 const MESH_FAILED: unique symbol = Symbol('MESH_FAILED');
+/** This file's failure memory beside the sentinels (#1371). Every failed fetch is RECORDED here, so
+ *  it is announced once on the console and in the journal (`@asset-load-failed`). A permanent one
+ *  (missing, unreadable, refused) also takes `MESH_FAILED`/`MATERIAL_FAILED`, which the resolvers
+ *  read. A transient one (no response, a non-404 status) takes no sentinel, and
+ *  `fetchMeshAsset`/`fetchMaterial` refuse to refetch it until its backoff expires. A landed load
+ *  forgets the key. `.mesh.json`/`.mat.json` paths cannot collide, so one memo serves both caches. */
+const netRetry = createLoadFailureMemo({ label: 'MeshCache', unknownIs: 'permanent' });
 
 /** Mesh asset file cache (path → parsed MeshAsset or MESH_FAILED) */
 const meshAssetCache = new Map<string, MeshAsset | typeof MESH_FAILED>();
@@ -866,6 +878,51 @@ export function getMeshAsset(meshRef: string): MeshAsset | undefined {
 
 /** In-flight mesh-asset fetches, keyed by path. Awaitable for the refcount API. */
 const meshAssetLoadPromises = new Map<string, Promise<void>>();
+
+/** Re-read one `.mesh.json` because the FILE changed — its `model` or `mesh` binding may now name
+ *  something else (#1380). (Its `material` field is re-read too, but a live entity never draws it —
+ *  see `resolveMaterialForMesh`, #1385 — so a change to it alone announces nothing.)
+ *
+ *  Before this, the entry was evicted only through its MODEL (`invalidateModel`, keyed on the
+ *  GLB) and at scene-swap release, so a `.mesh.json`-only edit — the GLB untouched — reached no
+ *  invalidator and the old binding rendered until the next scene swap.
+ *
+ *  **Stale-while-revalidate, not evict.** A cached entry keeps serving while the file is re-read,
+ *  and is replaced only once the new definition AND its model templates are loaded. An eager evict
+ *  made `resolveMeshTemplate` return undefined for the refetch's duration — during Play that is a
+ *  mesh collider rebuilt with no geometry (`physics3DSystem`'s `'nomesh'` signature) — and did so
+ *  even for a byte-identical write. A re-read that fails (a half-typed hand edit) keeps the old
+ *  entry, the rule #1169 set for prefabs.
+ *
+ *  Replacing the entry is only half of it. `scene3DSync` builds an entity's object once and caches
+ *  it keyed on the `Renderable3D.mesh` REF STRING, which a file edit does not change — so the swap
+ *  alone would go on drawing the old mesh. The `'mesh'` event, fired just before the swap and only
+ *  when the binding changed, is what tears that object down (`attachInvalidationListener`).
+ *
+ *  An entry that is NOT cached (never loaded, or MESH_FAILED) has nothing to keep serving: it is
+ *  dropped so the next resolve loads the file fresh. Either way the #863 token refuses an in-flight
+ *  fetch of the pre-edit bytes.
+ *
+ *  Ownership (`meshAssetOwners`, `meshTransitiveDeps`) is left alone: the scene still owns the
+ *  ref. A model the EDITED file newly names is therefore loaded unowned until the next swap — the
+ *  F6 render-path-resolver case `acquireMesh` already documents, not a new one.
+ *
+ *  Takes the asset PATH — the watcher's `urlPath`, the same form every key in this cache is. */
+export function invalidateMeshAsset(meshPath: string): void {
+  cacheToken.invalidateKey(meshPath);
+  netRetry.forget(meshPath);
+  meshAssetLoadPromises.delete(meshPath);
+  const stale = meshAssetCache.get(meshPath);
+  if (!stale || stale === MESH_FAILED) {
+    // Still announced: nothing is BUILT from an uncached entry, so the renderer's teardown finds
+    // nothing, but the Inspector's MeshAssetView/MeshPreview listen for this event too — a panel
+    // showing "Failed to load geometry." for a broken file must re-read when the file is fixed.
+    emitAssetInvalidated('mesh', meshPath);
+    meshAssetCache.delete(meshPath);
+    return;
+  }
+  void fetchMeshAsset(meshPath, { stale });
+}
 
 /** Resolve a mesh reference — handles legacy sprite names, *.mesh.json paths,
  *  and asset guids. For mesh assets: fetches the JSON, lazy-loads the model,
@@ -888,7 +945,13 @@ export function resolveMeshTemplate(meshRef: string): MeshTemplate | undefined {
 
   // Check if we already resolved this mesh asset
   const cached = meshAssetCache.get(meshRef);
-  if (cached === MESH_FAILED) return undefined; // permanently failed — stop re-fetching
+  if (cached === MESH_FAILED) {
+    // The sentinel short-circuits before `fetchMeshAsset` ever asks `netRetry.blocked`, so tell the
+    // memo a consumer in THIS world asked — or a failure recorded during a scene load stays in the
+    // outgoing world's journal (#1371 close-out §2d).
+    netRetry.seen(meshRef);
+    return undefined; // permanently failed — stop re-fetching
+  }
   if (cached) {
     // cached.model may be a guid; resolve transitively
     const modelPath = refToPath(cached.model);
@@ -986,27 +1049,34 @@ export function resolveMeshLodInfo(
 }
 
 /** Async: fetch a .mesh.json file and preload its model. Returns a promise the
- *  refcount API can await; safe to call multiple times — dedupes via meshAssetCache + meshAssetLoadPromises. */
-function fetchMeshAsset(meshPath: string): Promise<void> {
-  if (meshAssetCache.has(meshPath)) return Promise.resolve();
-  if (meshAssetLoadPromises.has(meshPath)) return meshAssetLoadPromises.get(meshPath)!;
+ *  refcount API can await; safe to call multiple times — dedupes via meshAssetCache + meshAssetLoadPromises.
+ *
+ *  `revalidate` is the REVALIDATE mode {@link invalidateMeshAsset} uses: `stale` is the entry
+ *  still being served. The fetch then runs even though the path is cached, a failure KEEPS `stale`
+ *  instead of stamping the permanent MESH_FAILED (a half-typed hand edit must not kill a mesh that
+ *  was rendering), and the new definition replaces `stale` only once its model templates are
+ *  loaded — announced with a `'mesh'` event, and only when the binding actually changed. */
+function fetchMeshAsset(meshPath: string, revalidate?: { stale: MeshAsset }): Promise<void> {
+  if (!revalidate && meshAssetCache.has(meshPath)) return Promise.resolve();
+  if (!revalidate && meshAssetLoadPromises.has(meshPath)) return meshAssetLoadPromises.get(meshPath)!;
+  if (!revalidate && netRetry.blocked(meshPath)) return Promise.resolve();
 
   // Same per-key liveness as its sibling fetchers (#863 close-out). This cache had none at all,
   // and it IS invalidated per-key: `invalidateModel` drops every meshAssetCache entry whose
   // `asset.model` resolves to the re-imported GLB, so without this an in-flight fetch of the
   // PRE-import `.mesh.json` re-seats the stale asset on top of the refetch. Outside #863's own
-  // sweep only because that one enumerated `invalidate*` functions and there is no
-  // `invalidateMeshAsset` — the cache is invalidated through the model's name, not its own.
+  // sweep only because that one enumerated `invalidate*` functions and there was no
+  // `invalidateMeshAsset` then — the cache was invalidated only through the model's name. It
+  // now has its own ({@link invalidateMeshAsset}, #1380), which refuses through this same token.
   const stillLive = cacheToken.capture(meshPath);
 
   const promise = (async () => {
     try {
-      const res = await fetch(assetUrl(meshPath), ASSET_FETCH_INIT);
+      const res = await fetch(assetUrl(meshPath), ASSET_FETCH_INIT).catch(rethrowFetchFailure(assetUrl(meshPath)));
       if (!stillLive()) return;
-      if (!res.ok) {
-        meshAssetCache.set(meshPath, MESH_FAILED); // cache failure — don't retry
-        return;
-      }
+      if (!res.ok && revalidate) { console.warn(`[MeshCache] kept the previous ${meshPath}: re-read failed (${res.status})`); return; }
+      // Any other non-ok status throws `MissingAssetError` from `parseAssetJson` below, and the
+      // catch splits it: 404/410 → permanent `MESH_FAILED`, anything else → back off (#1371).
       // A missing asset arrives as 200 OK index.html (dev server SPA fallback) — parseAssetJson detects it.
       const asset = await parseAssetJson(res, meshPath) as { id?: string } & MeshAsset;
       // Format-version REFUSAL (docs/format-versioning.md § 2b-bis, #784 phase C2b item 6):
@@ -1021,12 +1091,15 @@ function fetchMeshAsset(meshPath: string): Promise<void> {
               `this build's MESH_FORMAT_VERSION (${MESH_FORMAT_VERSION}) — not caching it.`
             : `[MeshCache] refusing ${meshPath}: version field is unreadable (${verdict.reason}) — not caching it.`,
         );
-        if (!stillLive()) return;
+        if (!stillLive() || revalidate) return;
         meshAssetCache.set(meshPath, MESH_FAILED);
+        netRetry.markPermanent(meshPath, `format refused: ${verdict.kind}`);
         return;
       }
       if (!stillLive()) return;
-      meshAssetCache.set(meshPath, asset);
+      // A load that lands ends any failure streak, so a later outage starts at the base delay and is
+      // announced again (#1371 review: `netRetry` was forgotten only by invalidate/dispose).
+      if (!revalidate) { meshAssetCache.set(meshPath, asset); netRetry.forget(meshPath); }
       // Self-register so future ref-by-guid resolves to this path
       if (asset.id) registerAsset(asset.id, meshPath, 'mesh');
 
@@ -1059,9 +1132,30 @@ function fetchMeshAsset(meshPath: string): Promise<void> {
           await loadModelTemplates(modelPath, undefined, asset.postprocessor || 'none');
         }
       }
+      if (revalidate) {
+        if (!stillLive()) return;
+        // Swap only now, with the new model's templates loaded, so the rebuild the event triggers
+        // resolves at once — an eager evict left the entity (and a mesh collider built from it)
+        // without geometry until the refetch landed, even for a byte-identical write.
+        const changed = !sameMeshBinding(revalidate.stale, asset);
+        if (changed) emitAssetInvalidated('mesh', meshPath);
+        meshAssetCache.set(meshPath, asset);
+        if (changed) return; // emitAssetInvalidated already fired the wake
+      }
+      // The asset is readable NOW, and neither upstream wake is guaranteed to have fired (#1368 D):
+      // `registerAsset` wakes only on a manifest change, and `loadModelTemplates` wakes only on a
+      // real parse — it hands back the settled promise for a GLB some other consumer already
+      // parsed, so a `.mesh.json` landing after that parse redrew nothing on an idle surface.
+      if (stillLive()) fireDirtyListeners();
     } catch (e) {
-      console.warn(`[MeshCache] Failed to load mesh asset ${meshPath}:`, e);
-      meshAssetCache.set(meshPath, MESH_FAILED);
+      if (revalidate) {
+        console.warn(`[MeshCache] kept the previous ${meshPath}: re-read failed:`, e);
+      } else {
+        // The memo announces it (console + journal) and backs a transient one off; a permanent one
+        // also takes the sentinel every resolver here reads.
+        netRetry.record(meshPath, e, stillLive());
+        if (classifyLoadFailure(e) !== 'transient' && stillLive()) meshAssetCache.set(meshPath, MESH_FAILED);
+      }
     } finally {
       meshAssetLoadPromises.delete(meshPath);
     }
@@ -1069,6 +1163,14 @@ function fetchMeshAsset(meshPath: string): Promise<void> {
 
   meshAssetLoadPromises.set(meshPath, promise);
   return promise;
+}
+
+/** The fields that decide what a `.mesh.json` renders or shows (`id` and `version` do not).
+ *  `material` is deliberately NOT one: no live entity draws it (see `resolveMaterialForMesh`,
+ *  #1385) and `MeshAssetView` does not display it, so announcing a material-only edit would rebuild
+ *  every entity on the path to identical output. The entry still takes the new bytes. */
+function sameMeshBinding(a: MeshAsset, b: MeshAsset): boolean {
+  return a.model === b.model && a.mesh === b.mesh && a.postprocessor === b.postprocessor;
 }
 
 // ── Material Asset Resolution ──
@@ -1189,6 +1291,7 @@ export function invalidateMaterial(matPath: string) {
   if (mat && mat !== MATERIAL_FAILED) { retiredMaterials.add(mat); retiredMaterialPaths.set(mat, matPath); }
   materialCache.delete(matPath);
   materialLoadPromises.delete(matPath);
+  netRetry.forget(matPath);
   // #863: an in-flight fetch of THIS path is carrying pre-invalidation bytes — refuse it, or it
   // re-caches the stale material on top of whatever refetch follows.
   cacheToken.invalidateKey(matPath);
@@ -1256,7 +1359,14 @@ export function disposeRetiredMaterial(mat: THREE.Material): void {
 }
 
 /** Resolve material for a mesh: checks Renderable.material, then mesh asset's material field.
- *  Accepts guid or path refs for both arguments. Returns undefined if not resolved yet. */
+ *  Accepts guid or path refs for both arguments. Returns undefined if not resolved yet.
+ *
+ *  ⚠️ The mesh-asset fallback is NOT what a live GLB entity draws. With an empty
+ *  `Renderable3D.material`, `scene3DSync`'s `syncMaterial` binds the engine default over this pick
+ *  in the same frame — deliberately: a mesh with no material authored on the entity renders grey
+ *  (#1385, the owner's choice over honouring this fallback; it also keeps identical grey entities
+ *  batched into one draw call). So the `.mesh.json` `material` field is a record of what the import
+ *  bound, which the importer copies onto the entity at spawn — not a live fallback. */
 export function resolveMaterialForMesh(renderableMaterial: string, meshRef: string): THREE.Material | undefined {
   // 1. Explicit material on Renderable. Pass the ORIGINAL ref (guid or path) to
   //    resolveMaterial — it does its own refToPath. Passing the already-resolved
@@ -1286,7 +1396,7 @@ export function resolveMaterial(materialRef: string): THREE.Material | undefined
   const matPath = refToPath(materialRef);
   if (!matPath || !matPath.endsWith('.mat.json')) return undefined;
   const cached = materialCache.get(matPath);
-  if (cached === MATERIAL_FAILED) return undefined; // permanently failed
+  if (cached === MATERIAL_FAILED) { netRetry.seen(matPath); return undefined; } // permanently failed (see resolveMeshTemplate)
   if (cached) return cached as THREE.Material;
   if (!materialLoadPromises.has(matPath)) fetchMaterial(matPath);
   return undefined;
@@ -1297,21 +1407,16 @@ export function resolveMaterial(materialRef: string): THREE.Material | undefined
 function fetchMaterial(matPath: string): Promise<void> {
   if (materialCache.has(matPath)) return Promise.resolve();
   if (materialLoadPromises.has(matPath)) return materialLoadPromises.get(matPath)!;
+  if (netRetry.blocked(matPath)) return Promise.resolve();
 
   const stillLive = cacheToken.capture(matPath); // per-key: detects disposal OR a per-path invalidate during async load
 
   const promise = (async () => {
     try {
-      const res = await fetch(assetUrl(matPath), ASSET_FETCH_INIT);
-      if (!res.ok) {
-        // Liveness-guarded like every other write in this function (#863 residual, found by
-        // #864's close-out): MATERIAL_FAILED is a PERMANENT sentinel — `resolveMaterial` returns
-        // undefined for it forever — so a stale continuation stamping it over a material that was
-        // re-imported and refetched successfully kills that material for the session.
-        if (!stillLive()) return;
-        materialCache.set(matPath, MATERIAL_FAILED); // cache failure — don't retry
-        return;
-      }
+      const res = await fetch(assetUrl(matPath), ASSET_FETCH_INIT).catch(rethrowFetchFailure(assetUrl(matPath)));
+      // A non-ok status throws `MissingAssetError` from `parseAssetJson` below and lands in the
+      // catch, which splits 404/410 (permanent `MATERIAL_FAILED`) from every other status
+      // (back off and retry, #1371). This branch used to stamp the permanent sentinel for a 503.
       // A missing asset arrives as 200 OK index.html (dev server SPA fallback) — parseAssetJson detects it.
       // eslint-disable-next-line @typescript-eslint/no-explicit-any -- matches the untyped `res.json()` this replaces
       const data = await parseAssetJson(res, matPath) as any;
@@ -1328,8 +1433,9 @@ function fetchMaterial(matPath: string): Promise<void> {
               `this build's MATERIAL_FORMAT_VERSION (${MATERIAL_FORMAT_VERSION}) — not building it.`
             : `[MeshCache] refusing ${matPath}: version field is unreadable (${verdict.reason}) — not building it.`,
         );
-        if (!stillLive()) return; // see the MATERIAL_FAILED note above (#863 residual)
+        if (!stillLive()) return; // liveness-guarded: MATERIAL_FAILED is permanent (#863 residual; note in the catch below)
         materialCache.set(matPath, MATERIAL_FAILED);
+        netRetry.markPermanent(matPath, `format refused: ${verdict.kind}`);
         return;
       }
       // Self-register so future ref-by-guid resolves to this path
@@ -1372,8 +1478,9 @@ function fetchMaterial(matPath: string): Promise<void> {
       const builder = getMaterialBuilder(type);
       if (!builder) {
         console.warn(`[MeshCache] Unknown material type "${type}" in ${matPath}. Falling back to a pink material.`);
-        if (!stillLive()) return; // see the MATERIAL_FAILED note above (#863 residual)
+        if (!stillLive()) return; // liveness-guarded: MATERIAL_FAILED is permanent (#863 residual; note in the catch below)
         materialCache.set(matPath, MATERIAL_FAILED);
+        netRetry.markPermanent(matPath, `unknown material type "${type}"`);
         return;
       }
       const mat = await builder.build(data);
@@ -1482,6 +1589,7 @@ function fetchMaterial(matPath: string): Promise<void> {
         retiredMaterialPaths.set(prevMat, matPath);
       }
       materialCache.set(matPath, mat);
+      netRetry.forget(matPath); // a landed load ends the failure streak (see fetchMeshAsset)
       // Wake the render loop so syncMaterial re-binds this freshly-built instance.
       // Critical for a LIVE material edit: invalidateMaterial() drops the old
       // instance and this refetch is async (fetch + KTX2 texture transcode). The
@@ -1493,11 +1601,15 @@ function fetchMaterial(matPath: string): Promise<void> {
       // (Harmless during initial scene load — the frame loop is already drawing.)
       fireDirtyListeners();
     } catch (e) {
-      console.warn(`[MeshCache] Failed to load material ${matPath}:`, e);
-      // The FOURTH post-await MATERIAL_FAILED write, and the most reachable of them in dev:
-      // `parseAssetJson` THROWS (MissingAssetError on the dev-server SPA fallback, a plain Error
-      // on a bad parse), so a missing or half-written .mat.json lands HERE, not in the `!res.ok`
-      // branch above. Same guard as its three siblings and for the same reason — the sentinel is
+      // A network failure or a non-404 status is not the file's fault — back off and retry
+      // instead of stamping the permanent sentinel below (#1371).
+      // The memo announces every class (console + journal); only a permanent one takes the sentinel.
+      netRetry.record(matPath, e, stillLive());
+      if (classifyLoadFailure(e) === 'transient') return;
+      // The most reachable post-await MATERIAL_FAILED write: `parseAssetJson` THROWS
+      // (MissingAssetError on a 404 or the dev-server SPA fallback, a plain Error on a bad parse),
+      // so a missing or half-written .mat.json lands HERE. Liveness-guarded like its siblings
+      // above (#863 residual, found by #864's close-out) and for the same reason — the sentinel is
       // PERMANENT and `fetchMaterial` short-circuits on `materialCache.has`, so a stale
       // continuation stamping it over a successfully refetched material kills that material for
       // the session with nothing to retry it.
@@ -1567,6 +1679,7 @@ export function disposeAllCachedResources() {
   hierarchyCache.clear();
   meshAssetCache.clear();
   meshAssetLoadPromises.clear();
+  netRetry.clear();
 
   // Dispose .mat.json materials (may overlap with template materials — dedupe)
   for (const [, mat] of materialCache) {
@@ -1596,6 +1709,7 @@ export function disposeAllCachedResources() {
   envCache.clear();
   envLoadPromises.clear();
   envOwners.clear();
+  envFailures.clear();
   // Retired envs too: their sweep runs from `syncEnvironment`, so a surface that stops
   // rendering (or a build with no 3D surface at all) would otherwise strand them forever.
   // Everything binding them is being torn down with this generation anyway.
@@ -1611,6 +1725,7 @@ export function disposeAllCachedResources() {
   meshTransitiveDeps.clear();
   prefabCache.clear();
   prefabLoadPromises.clear();
+  prefabFailures.clear();
 
   // Particle effect defs and animation clips are plain data (no GPU resources),
   // but they accumulate across scene loads and a late fetch could re-register a
@@ -1698,6 +1813,21 @@ const meshDepKey = (sceneId: SceneId, meshPath: string) => `${sceneId}\x00${mesh
 const prefabCache = new Map<string, unknown>();
 /** In-flight prefab fetches. */
 const prefabLoadPromises = new Map<string, Promise<void>>();
+/** What a FAILED prefab fetch left behind (#1397). Before it, nothing — `fetchPrefab` swallowed a
+ *  non-ok status, a network error and a parse error alike and resolved with the cache empty, so
+ *  `requestPrefab` could not tell a deleted prefab from an outage and had to spend a flat attempt
+ *  budget on both (#1376). A 404 or a bad file is now remembered until the prefab is invalidated,
+ *  replaced or its last scene lets go; an outage backs off, and {@link prefabFetchRetryAt} tells
+ *  `requestPrefab` it is one. */
+const prefabFailures = createLoadFailureMemo({ label: 'MeshCache:prefab', unknownIs: 'permanent' });
+
+/** When a prefab whose fetch failed TRANSIENTLY may be fetched again (`rawNow()` ms), or undefined
+ *  when its last fetch did not fail transiently (never failed, loaded, or failed for good). For
+ *  `requestPrefab`, which must not spend its give-up budget on an outage (#1397). */
+export function prefabFetchRetryAt(prefabRef: string): number | undefined {
+  const prefabPath = refToPath(prefabRef);
+  return prefabPath ? prefabFailures.retryAt(prefabPath) : undefined;
+}
 
 const addOwner = (map: Map<string, Set<SceneId>>, key: string, sceneId: SceneId): boolean =>
   addToOwnerSet(map, key, sceneId);
@@ -1819,7 +1949,7 @@ export async function acquireMesh(sceneId: SceneId, meshRef: string): Promise<vo
   // release lands inside THAT await rather than this one — is fixed at its own
   // post-await guard below (#552).
   if (!meshAssetOwners.get(meshPath)?.has(sceneId)) {
-    if (!meshAssetOwners.get(meshPath)?.size) meshAssetCache.delete(meshPath);
+    if (!meshAssetOwners.get(meshPath)?.size) { meshAssetCache.delete(meshPath); netRetry.forget(meshPath); }
     return;
   }
 
@@ -1899,6 +2029,9 @@ function releaseMeshByPath(sceneId: SceneId, meshPath: string): void {
   const wasLast = removeOwner(meshAssetOwners, meshPath, sceneId);
   if (wasLast) {
     meshAssetCache.delete(meshPath);
+    // A mesh's failure memory is SCENE-scoped like its entry: the next scene's acquire refetches a
+    // path the last one could not load, exactly as it did before `netRetry` held permanent entries.
+    netRetry.forget(meshPath);
   }
 
   // Release transitive dependencies — these are stored as guids on disk so
@@ -1980,6 +2113,13 @@ export async function acquirePrefab(sceneId: SceneId, prefabRef: string): Promis
 const envCache = new Map<string, THREE.DataTexture>();
 const envLoadPromises = new Map<string, Promise<void>>();
 const envOwners = new Map<string, Set<SceneId>>();
+/** What a FAILED HDR load left behind (#1397). Before it, nothing: `syncEnvironment` asks every
+ *  frame while `envCache` misses, so a missing HDR was requested again every frame. Its own memo,
+ *  not `netRetry` — that one keys mesh/material paths and is `unknownIs: 'permanent'`, and three's
+ *  HDRLoader/UltraHDRLoader report a dropped connection and a parse error through one `onError`
+ *  (a 404 arrives as FileLoader's `HttpError`, which is classified). `onRetryDue` wakes an idle
+ *  render-on-demand viewport. */
+const envFailures = createLoadFailureMemo({ label: 'MeshCache:env', unknownIs: 'transient', onRetryDue: () => fireDirtyListeners() });
 // Both memoise the PROMISE rather than the loader: construction is async since #254, and a
 // field assigned after an await is observable half-done by a concurrent caller. Nothing is
 // configured after construction here, so the worst case would only be a wasted second loader
@@ -2090,6 +2230,7 @@ export function invalidateEnvironment(hdrRef: string): void {
   if (tex) retiredEnvs.add(tex);
   envCache.delete(hdrPath);
   envLoadPromises.delete(hdrPath);
+  envFailures.forget(hdrPath); // a re-import may have fixed the file
   // #863: an in-flight fetch of THIS path is carrying pre-invalidation bytes — refuse it, or it
   // re-caches the stale texture on top of whatever refetch follows.
   cacheToken.invalidateKey(hdrPath);
@@ -2162,6 +2303,7 @@ function runEnvDisposeHooks(tex: THREE.DataTexture): void {
 function fetchEnvironment(hdrPath: string): Promise<void> {
   if (envCache.has(hdrPath)) return Promise.resolve();
   if (envLoadPromises.has(hdrPath)) return envLoadPromises.get(hdrPath)!;
+  if (envFailures.blocked(hdrPath)) return Promise.resolve();
 
   // Snapshot liveness BEFORE the async load so a release-mid-load (or a
   // full disposeAllCachedResources) is observable when the texture arrives.
@@ -2177,12 +2319,13 @@ function fetchEnvironment(hdrPath: string): Promise<void> {
     try {
       loader = await loaderForEnv(hdrPath);
     } catch (err) {
-      console.warn(`[MeshCache] HDR loader unavailable for ${hdrPath}:`, err);
+      envFailures.record(hdrPath, err, stillLive() && envOwners.has(hdrPath));
       return; // syncEnvironment falls back to no env — same degrade as a failed load
     }
+    const envUrl = resolveEnvVariantUrl(hdrPath) ?? assetUrl(hdrPath);
     await new Promise<void>((resolve) => {
       loader.load(
-        resolveEnvVariantUrl(hdrPath) ?? assetUrl(hdrPath),
+        envUrl,
         (texture) => {
           // If the cache was disposed or the owner released this HDR mid-load,
           // dispose the just-loaded texture instead of leaving it owner-less in
@@ -2201,6 +2344,7 @@ function fetchEnvironment(hdrPath: string): Promise<void> {
           const prev = envCache.get(hdrPath);
           if (prev && prev !== texture) retiredEnvs.add(prev);
           envCache.set(hdrPath, texture);
+          envFailures.forget(hdrPath);
           // Wake the render-on-demand viewport so syncEnvironment applies this IBL.
           // Like the material refetch above, an HDR that finishes loading after the
           // Inspector's dirty grace window (editor live-edit / re-import) would otherwise
@@ -2210,13 +2354,18 @@ function fetchEnvironment(hdrPath: string): Promise<void> {
         },
         undefined,
         (err) => {
-          console.warn(`[MeshCache] HDR load failed for ${hdrPath}:`, err);
+          // Owner-checked like the success path above: the last release does not bump the token,
+          // so a failure landing after it would otherwise remember a path nobody holds.
+          envFailures.record(hdrPath, absentIfBundled(envUrl, err), stillLive() && envOwners.has(hdrPath));
           resolve(); // resolve anyway — syncEnvironment will fall back to no env
         },
       );
     });
   })().finally(() => {
-    envLoadPromises.delete(hdrPath);
+    // Identity-checked, as riggedModelCache/fontAtlasLoader do: an invalidateEnvironment mid-flight
+    // deletes this entry and the next frame starts a REPLACEMENT; deleting unconditionally here
+    // would evict the replacement when this stale load settles.
+    if (envLoadPromises.get(hdrPath) === promise) envLoadPromises.delete(hdrPath);
   });
 
   envLoadPromises.set(hdrPath, promise);
@@ -2233,6 +2382,7 @@ function releasePrefabByPath(sceneId: SceneId, prefabPath: string): void {
   const wasLast = removeOwner(prefabOwners, prefabPath, sceneId);
   if (wasLast) {
     prefabCache.delete(prefabPath);
+    prefabFailures.forget(prefabPath); // failure memory is scene-scoped, like the mesh cache's (#1371)
   }
 }
 
@@ -2267,15 +2417,81 @@ export function invalidatePrefab(prefabRef: string): void {
     if (!key) continue;
     prefabCache.delete(key);
     prefabLoadPromises.delete(key);
+    prefabFailures.forget(key); // an edit may have fixed the file
     // #863: an in-flight fetch of THIS path is carrying pre-invalidation bytes — refuse it, or it
     // re-caches the stale prefab on top of whatever refetch follows.
     cacheToken.invalidateKey(key);
+    bumpPrefabRevision(key);
   }
+}
+
+/** Per-key content revision of the runtime prefab cache — bumped whenever the bytes under a key
+ *  are replaced or evicted, so a runtime spawner holding instances built from the OLD bytes can
+ *  tell (#1308: a `UIEntries` pool re-spawns its rows on a change). Monotonic for the session and
+ *  deliberately NOT cleared by `disposeAllCachedResources`: a reset to 0 could land back on a value
+ *  a spawner recorded before the teardown and read as "unchanged". Keyed like the cache (resolved
+ *  path, or the raw ref `invalidatePrefab` was handed). */
+const prefabRevision = new Map<string, number>();
+function bumpPrefabRevision(key: string): void {
+  prefabRevision.set(key, (prefabRevision.get(key) ?? 0) + 1);
+}
+
+/** The content revision of a cached prefab (see `prefabRevision`); 0 for a prefab whose bytes
+ *  were never replaced this session. Accepts a guid or the resolved path — the path form is taken
+ *  as-is, like `replaceCachedPrefab`, because `resolveRef` rejects it loudly. */
+export function getPrefabRevision(prefabRef: string): number {
+  const prefabPath = prefabCacheKey(prefabRef);
+  return prefabPath ? prefabRevision.get(prefabPath) ?? 0 : 0;
+}
+
+/** The cache key a prefab ref names: a GUID resolves through the manifest; anything else is taken
+ *  as the resolved path already. ⚠️ Not `refToPath` for the path form — `resolveRef` rejects an
+ *  internal asset path with a console.error and returns undefined, and `writePrefabFile`'s agent
+ *  `create` caller hands a PATH: that turned a replace into an eviction plus a false error (#1308
+ *  close-out). `invalidatePrefab` carves the same exception out for the same reason. */
+function prefabCacheKey(prefabRef: string): string | undefined {
+  return isGuid(prefabRef) ? refToPath(prefabRef) : prefabRef || undefined;
+}
+
+/** Replace a prefab's runtime cache entry with bytes the caller just WROTE — the editor's
+ *  apply/save/create path (#1308).
+ *
+ *  ⚠️ **Replace, not evict, whenever a scene still owns the prefab.** An eviction leaves the owner
+ *  set intact but the cache empty, and only `acquirePrefab` refills it — which only a scene load
+ *  calls. Every SYNCHRONOUS runtime reader (the `UIEntries` pool, timeline scrub + control-track
+ *  spawns, a nested row inside any spawn) then reads `undefined` until the next reload: an
+ *  applied edit blanked a pooled scroll view outright. The caller already holds the bytes, so
+ *  there is nothing to refetch.
+ *
+ *  With NO owner it evicts exactly like `invalidatePrefab`: seating an entry nothing owns would
+ *  leave a cache row that no `releaseAllForScene` ever drops.
+ *
+ *  Accepts a guid or the resolved path (see `prefabCacheKey`).
+ *
+ *  The seated value is a CLONE run through the same load-path migration `fetchPrefab` applies, so
+ *  a later mutation of the caller's object (the editor cache keeps its own) cannot leak in, and a
+ *  reader sees the shape a fetch would have produced. The key's #863 token is still bumped, so an
+ *  in-flight fetch carrying the pre-write bytes is refused rather than landing on top. */
+export function replaceCachedPrefab(prefabRef: string, data: unknown): void {
+  const prefabPath = prefabCacheKey(prefabRef);
+  if (!prefabPath || !prefabOwners.get(prefabPath)?.size || !data || typeof data !== 'object') {
+    invalidatePrefab(prefabRef);
+    return;
+  }
+  invalidatePrefab(prefabRef); // drops the pending promise + refuses an in-flight stale fetch
+  // A JSON round trip, not structuredClone: the entry must be exactly what a FETCH of the written
+  // file would parse to (no `undefined`-valued keys, no non-JSON values).
+  const copy = JSON.parse(JSON.stringify(data)) as { id?: unknown; entities?: { traits?: Record<string, unknown> }[] };
+  for (const entry of copy.entities ?? []) migrateUIAnchorZIndexStructured(entry);
+  prefabCache.set(prefabPath, copy);
+  prefabFailures.forget(prefabPath);
+  if (typeof copy.id === 'string') registerAsset(copy.id, prefabPath, 'prefab');
 }
 
 function fetchPrefab(prefabPath: string): Promise<void> {
   if (prefabCache.has(prefabPath)) return Promise.resolve();
   if (prefabLoadPromises.has(prefabPath)) return prefabLoadPromises.get(prefabPath)!;
+  if (prefabFailures.blocked(prefabPath)) return Promise.resolve();
 
   // Snapshot liveness so a fetch that resolves AFTER an invalidatePrefab (or full teardown)
   // doesn't re-seat the pre-invalidation bytes into the freshly-cleared cache (#863). Mirrors
@@ -2284,9 +2500,9 @@ function fetchPrefab(prefabPath: string): Promise<void> {
 
   const promise = (async () => {
     try {
-      const res = await fetch(assetUrl(prefabPath), ASSET_FETCH_INIT);
-      if (!res.ok) return;
-      // A missing asset arrives as 200 OK index.html (dev server SPA fallback) — parseAssetJson detects it.
+      const res = await fetch(assetUrl(prefabPath), ASSET_FETCH_INIT).catch(rethrowFetchFailure(assetUrl(prefabPath)));
+      // parseAssetJson types a non-ok status and the SPA fallback (a missing asset arriving as
+      // 200 OK index.html), so the failure memo can tell absent from unreachable (#1397).
       const data = await parseAssetJson(res, prefabPath) as { id?: string; entities?: { traits?: Record<string, unknown> }[] };
       // Prefabs carry no migration chain at all — `PREFAB_FORMAT_VERSION` is a writer-only
       // stamp nothing on the loading path inspects (#365/#379). Applying the zIndex
@@ -2299,13 +2515,16 @@ function fetchPrefab(prefabPath: string): Promise<void> {
       for (const entry of data.entities ?? []) migrateUIAnchorZIndexStructured(entry);
       if (!stillLive()) return; // invalidated (or torn down) while this fetch was in flight
       prefabCache.set(prefabPath, data);
+      prefabFailures.forget(prefabPath);
       if (typeof data.id === 'string') registerAsset(data.id, prefabPath, 'prefab');
     } catch (e) {
-      console.warn(`[MeshCache] Failed to load prefab ${prefabPath}:`, e);
-    } finally {
-      prefabLoadPromises.delete(prefabPath);
+      prefabFailures.record(prefabPath, e, stillLive() && prefabOwners.has(prefabPath));
     }
-  })();
+  })().finally(() => {
+    // Identity-checked, as the env/rigged/font twins are: an invalidatePrefab mid-flight deletes
+    // this entry and the next ask starts a REPLACEMENT this stale settle must not evict.
+    if (prefabLoadPromises.get(prefabPath) === promise) prefabLoadPromises.delete(prefabPath);
+  });
 
   prefabLoadPromises.set(prefabPath, promise);
   return promise;
@@ -2335,6 +2554,13 @@ export function releaseAllForScene(sceneId: SceneId): void {
   for (const path of [...envOwners.keys()]) {
     if (envOwners.get(path)?.has(sceneId)) releaseEnvironmentByPath(sceneId, path);
   }
+  // Env failure memory ends with ANY scene release, not just the last owner's (#1397 review).
+  // `syncEnvironment`'s per-frame fallback acquires under owner -1, which no scene release ever
+  // removes — and a failed HDR always misses the cache, so it always carries that stamp. Keyed on
+  // the owner set, a 404'd HDR would stay blocked for the session: a restored file, or the next
+  // scene using the same HDR, would never be retried. A scene swap is the unit of memory here, and
+  // clearing costs at most one request per failed HDR.
+  envFailures.clear();
   // Rigged skeletal GLBs (parallel cache) — release this scene's holds too.
   releaseRiggedModelsForScene(sceneId);
   // Audio buffers (parallel cache) — release this scene's holds too.

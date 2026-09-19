@@ -56,25 +56,48 @@ export function mergeOverrideMaps(
  *  one-level form, so older scene files remain valid unchanged. */
 export type NestedOverridePaths = Record<string, Record<number, Record<string, Record<string, unknown>>>>;
 
-/** Split path-keyed overrides at one expansion step (nested row `rowLocalId`):
- *  `direct` is the override map for that child instance's OWN members (the exact
- *  key `rowLocalId`); `forward` re-keys every deeper path (`rowLocalId.…`) with the
- *  leading segment stripped, to thread into the child's own expansion. */
-export function descendNestedOverrides(
-  paths: NestedOverridePaths | undefined,
+/** Build the key addressing a nested instance from a chain of nested-prefab row localIds,
+ *  outermost first — `[3]` → `"3"`, `[3, 5]` → `"3.5"`.
+ *
+ *  ⚠️ This is the ONLY place the path grammar is written. It used to be a bare `join('.')` at the
+ *  one save site with `descendPathKeyed`'s `startsWith` as the only reader, i.e. two independent
+ *  implementations of one format; #1358 added a second path-keyed slot beside the overrides, which
+ *  would have made a third. A writer and a reader that disagree here mis-address an override or a
+ *  structural edit to the wrong depth, which reads as the edit being silently dropped. */
+export function nestedPathKey(path: readonly number[]): string {
+  return path.join('.');
+}
+
+/** Split ANY path-keyed map at one expansion step (nested row `rowLocalId`): `direct` is the value
+ *  addressed at that child instance itself (the exact key `rowLocalId`); `forward` re-keys every
+ *  deeper path (`rowLocalId.…`) with the leading segment stripped, to thread into the child's own
+ *  expansion.
+ *
+ *  Generic over the payload so the value overrides (`NestedOverridePaths`) and the structural slot
+ *  (`NestedStructurePaths`, #1358) descend by exactly the same rule — see `nestedPathKey`. */
+export function descendPathKeyed<T>(
+  paths: Record<string, T> | undefined,
   rowLocalId: number,
-): { direct?: Record<number, Record<string, Record<string, unknown>>>; forward?: NestedOverridePaths } {
+): { direct?: T; forward?: Record<string, T> } {
   if (!paths) return {};
   const prefix = String(rowLocalId);
-  let direct: Record<number, Record<string, Record<string, unknown>>> | undefined;
-  let forward: NestedOverridePaths | undefined;
+  let direct: T | undefined;
+  let forward: Record<string, T> | undefined;
   for (const [key, map] of Object.entries(paths)) {
     if (key === prefix) direct = map;
     // `emptyDocMap()` (#986): the key is a dot-joined localId chain taken from the file, so a
     // crafted `"3.__proto__"` would assign through the setter and lose the map silently.
-    else if (key.startsWith(prefix + '.')) (forward ??= emptyDocMap())[key.slice(prefix.length + 1)] = map;
+    else if (key.startsWith(prefix + '.')) (forward ??= emptyDocMap() as Record<string, T>)[key.slice(prefix.length + 1)] = map;
   }
   return { direct, forward };
+}
+
+/** Split path-keyed overrides at one expansion step — `descendPathKeyed` at the override payload. */
+export function descendNestedOverrides(
+  paths: NestedOverridePaths | undefined,
+  rowLocalId: number,
+): { direct?: Record<number, Record<string, Record<string, unknown>>>; forward?: NestedOverridePaths } {
+  return descendPathKeyed(paths, rowLocalId);
 }
 
 /** Merge two path-keyed override maps; `b` (the outer layer) wins per field. Used
@@ -93,6 +116,27 @@ export function mergeNestedOverridePaths(
   const out: NestedOverridePaths = emptyDocMap();
   for (const [k, m] of Object.entries(a)) out[k] = m;
   for (const [k, m] of Object.entries(b)) out[k] = out[k] ? mergeOverrideMaps(out[k], m) : m;
+  return out;
+}
+
+/** Merge two path-keyed STRUCTURE maps (`NestedStructurePaths`, #1381); `outer` wins per PATH, and
+ *  wins WHOLE — never element-wise. A layer that addresses a path owns that instance's interior (all
+ *  three lists, see the loader's `structDirect`), so merging two `removed` arrays would make an
+ *  un-delete by the outer layer unrepresentable. Used where a prefab ROW's own `nestedStructure`
+ *  meets the structure an outer layer forwarded into the same expansion. Neither input is mutated.
+ *
+ *  Generic over the payload only because `NestedStructurePaths` is declared in loadSceneFile.ts,
+ *  which imports this module. */
+export function mergeNestedStructurePaths<T>(
+  inner: Record<string, T> | undefined,
+  outer: Record<string, T> | undefined,
+): Record<string, T> | undefined {
+  if (!inner) return outer;
+  if (!outer) return inner;
+  // `emptyDocMap()` (#986): the keys are path strings read out of a file.
+  const out = emptyDocMap() as Record<string, T>;
+  for (const [k, v] of Object.entries(inner)) out[k] = v;
+  for (const [k, v] of Object.entries(outer)) out[k] = v;
   return out;
 }
 

@@ -583,6 +583,44 @@ the obvious "the knight is the bright bit" key does not work.
 ground, simulates the Android adaptive mask at the real inset, shows the tinted variant under a
 tint, and shows each splash as a device crops it.
 
+### Notification small icon — Android (#1203)
+
+`@capacitor/local-notifications` finds its small icon **by drawable name**: `capacitor.config.json`
+`plugins.LocalNotifications.smallIcon`, else `android.R.drawable.ic_dialog_info`. That fallback is the
+generic white "i", and `dumpsys notification` shows it as `id=0x0108009b` (a framework `0x01` id).
+`@capacitor/assets` emits nothing for that slot, so a game that posts notifications needs one emitted.
+
+- **Opt in with `app.notificationIconSource`** (Project Settings → "Notification icon (Android)").
+  `engine/scripts/notificationIcon.mjs` then writes
+  `res/drawable-{mdpi,hdpi,xhdpi,xxhdpi,xxxhdpi}/ic_stat_notification.png` at 24dp. Unset emits
+  nothing, and clearing it removes what an earlier build wrote. Then name it in
+  `capacitor.config.json`: `"LocalNotifications": { "smallIcon": "ic_stat_notification" }`.
+  ⚠️ **Nothing at build time can see that join fail**: a wrong name just posts the framework "i". A
+  game that opts in pins it in a test (`games/wordweave/tests/config.test.ts`).
+- **Android draws the alpha only.** The source must be a silhouette, and the emitter forces the RGB to
+  white. The themed-launcher `iconMonochromeSource` is usually the right file.
+  - There is deliberately **no derivation**. A silhouette recovered from a painting is the #397
+    fallback, and at 24dp it is a smudge.
+  - A fully opaque source (including an RGB or JPEG file) is not emitted, because it would render
+    as a solid square. The previous icon stays, and the run is not stamped.
+- **The crop keys on alpha ≥ 64, not ≥ 1.** Brush art carries a faint wash to the canvas edge.
+  Cropping to that kept 19..1011 of Weaveling's 1024 px master, where the grid itself is 81..943, so
+  the mark lost a fifth of its size. The mark is then fitted to Material's 22dp live area and centred.
+- **Stamp.** The source's content is hashed into the Android stamp only, so opting in does not
+  regenerate a game's iOS set. ⚠️ **`notificationIcon.mjs` is a `PIPELINE_SOURCES` entry, and that
+  hash is shared by both platforms.** Any edit to the file, a comment included, regenerates every
+  project's icons on both platforms once, as an edit to `iconVariants.mjs` always has. Three degrades
+  join the #1028 no-stamp list:
+  - an unreadable source;
+  - a source with no pixel at alpha ≥ 64;
+  - a fully opaque source.
+- **Clearing is POSITIVE, like the splash's facet B.** A previously emitted icon is removed only when
+  the config was read and names no source, or when the caller passes `--notification-icon-cleared
+  true` (the packaged editor). A hand run over an unreadable config removes nothing.
+- **Tint:** `plugins.LocalNotifications.iconColor`. ⚠️ The plugin passes it to `Color.parseColor`
+  and, on a parse failure, rejects and returns BEFORE building the notification. So a malformed colour
+  means no notification at all, not an untinted one.
+
 **The generator does not stay inside the platform it is given** (#236). Measured on
 `forest-camp`: `generate --android` also rewrites `ios/App/App.xcodeproj/project.pbxproj`,
 stripping the leading zero off `LastUpgradeCheck = 0920` → `920` — an **iOS** file mangled by an
@@ -812,6 +850,42 @@ times, and one release rule cannot serve both:
   awaiting a spawned child. The editor's own force-reload reaches that: editing a game `.ts`
   reloads the page, tearing down the EventSource mid-build, and a retry then writes the same dist
   from two processes. Exactly the bug the lock exists to prevent, re-entered through the back door.
+
+**Every stream ends with a status, even when the handler throws (#1259).** The dialog learns that a
+job is over in one way only: a final `DONE` or `FAILED:…` status followed by the response ending. A
+rejection used to skip both. The build and OTA pipelines ran in a detached `(async () => …)()` with
+only a `.finally`, which freed the slot and left the response open (add-native-target and toolchain
+install each had a hand-written `try`). The middleware is an `async` function,
+and connect catches only a synchronous throw. So the dialog spun until a human closed it. Observed:
+`healNativeProject` rejects on a malformed project `package.json` (a bare `JSON.parse` in
+`ensureCapacitorDeps`). A throw in the preflight half was worse, because that half releases the slot
+on `close`, and `close` never came, so every other build was refused until the dialog was dismissed.
+Both seams now go through `engine/plugins/ssePipeline.ts`:
+
+- `runSsePipeline` wraps all four SSE pipelines (build, OTA publish, add-native-target, toolchain
+  install). A rejection becomes `FAILED:<headline>\n<message>`, and the slot's `onPipelineEnd` still
+  runs exactly once.
+- `catchMiddlewareRejection` wraps the middleware. An open SSE response gets `FAILED:Unexpected
+  error`. Any other response goes to `next(err)`, which is what connect does for a synchronous throw.
+
+Neither writes to a response that is already over. A rejection after the handler's own `res.end()`
+(following `DONE` or a deliberate refusal) must not add a second verdict, and a disconnected client
+has nobody to tell. The message travels in the status only: the Build Support dialog appends every
+log line as well, so an extra `ERROR:` line showed it twice. A per-site `try` is still worth having
+where it words the failure better (the generated-input writes). It is no longer the only guard.
+`ssePipelineWiring.test.ts` refuses the literal detached async IIFE and the literal bare async
+middleware in `vite-asset-scanner.ts`. It does not recognise an equivalent written another way (a
+named async function, `Promise.resolve().then(async …)`), and says so.
+
+**A client that has left by the time setup finishes starts no job (#1259 close-out).** Each route registers the
+slot's `close` handler, then awaits setup (`buildStepEnv`), then starts its pipeline. A disconnect
+inside that await released the slot as "never started", and the pipeline started anyway, holding
+nothing. On `/api/ota/publish` the abort listener is registered after the await, so the whole publish
+ran: the build into `dist` and the upload. `onPipelineStart()` now returns `false` once `close` has
+released the slot, and every route returns without starting. In a dev editor the window is a
+microtask, so in practice no real disconnect lands in it. In a packaged editor that provisions Node,
+it lasts as long as `ensureNode` takes. A disconnect dispatched after the pipeline starts is the
+ordinary mid-pipeline abort: the pipeline keeps the slot, and the step it already spawned is killed.
 
 **Aborting a step kills the process GROUP, not the shell (#176).** For a long time the slot's
 guarantee was bounded by what "the pipeline stopped" could observe — the step's `bash` exiting — and
@@ -1338,7 +1412,7 @@ It stops the local dev editor and builds a throwaway `.app` on a **per-clone por
 Four things, and the last two exist because this gate has twice reported a cheerful result while the
 thing it was watching was broken:
 
-1. **The renderer mounted** — `entityCount > 0` from `/api/scene-state`, which relays through the
+1. **The renderer mounted** — `returnedCount > 0` from `/api/scene-state`, which relays through the
    renderer, so a non-zero count already proves it answered.
 2. **No Vite resolve/transform error** in the dev-server log, and no renderer console error.
 3. **The app provisioned its own pinned Node.** `ensureNodeProvisioned()` catches its own failure and
@@ -2513,7 +2587,7 @@ well-known dirs and completes ("✅ deployed successfully").
 MODOKI_PROJECT=games/<id> npm run build -- --target native
 (cd games/<id> && npx cap sync ios)
 xcodebuild -project games/<id>/ios/App/App.xcodeproj -scheme App -configuration Debug \
-  -sdk iphonesimulator -destination 'id=<SIM_UDID>' build
+  -sdk iphonesimulator -destination 'id=<SIM_UDID>' build $(cat games/<id>/ios/App/build/modoki-build-number.args)
 xcrun simctl boot <SIM_UDID>
 xcrun simctl install booted <path-to-App.app>
 xcrun simctl launch booted <appId>
@@ -2524,7 +2598,7 @@ xcrun simctl launch booted <appId>
 MODOKI_PROJECT=games/<id> npm run build -- --target native
 (cd games/<id> && npx cap sync ios)
 xcodebuild -project games/<id>/ios/App/App.xcodeproj -scheme App -configuration Debug \
-  -destination 'id=<DEVICE_UDID>' -allowProvisioningUpdates build
+  -destination 'id=<DEVICE_UDID>' -allowProvisioningUpdates build $(cat games/<id>/ios/App/build/modoki-build-number.args)
 xcrun devicectl device install app --device <DEVICE_ID> \
   ~/Library/Developer/Xcode/DerivedData/App-*/Build/Products/Debug-iphoneos/App.app
 xcrun devicectl device process launch --device <DEVICE_ID> <appId>
@@ -2545,7 +2619,7 @@ see "Hands-free install (go-ios)" below. The manual equivalent is shorter than l
 
 ```bash
 xcodebuild -project games/<id>/ios/App/App.xcodeproj -scheme App -configuration Debug \
-  -destination 'id=<UDID>' -allowProvisioningUpdates -derivedDataPath /tmp/<id>-dd build
+  -destination 'id=<UDID>' -allowProvisioningUpdates -derivedDataPath /tmp/<id>-dd build $(cat games/<id>/ios/App/build/modoki-build-number.args)
 ios install --path=/tmp/<id>-dd/Build/Products/Debug-iphoneos/App.app --udid=<UDID>
 ios launch <appId> --udid=<UDID>
 ```
@@ -2639,7 +2713,7 @@ class (an iPhone 7) that took a development-signed build with **no Xcode run at 
 ```bash
 idevice_id -l                                   # the UDID; xcrun xctrace also lists 16.x devices
 xcodebuild -project games/<id>/ios/App/App.xcodeproj -scheme App -configuration Debug \
-  -destination 'id=<UDID>' -allowProvisioningUpdates -derivedDataPath /tmp/court-dd build
+  -destination 'id=<UDID>' -allowProvisioningUpdates -derivedDataPath /tmp/court-dd build $(cat games/<id>/ios/App/build/modoki-build-number.args)
 mkdir -p /tmp/ipa/Payload && cp -R /tmp/court-dd/Build/Products/Debug-iphoneos/App.app /tmp/ipa/Payload/
 (cd /tmp/ipa && zip -qry app.ipa Payload)
 ideviceinstaller -u <UDID> install /tmp/ipa/app.ipa
@@ -2733,7 +2807,7 @@ when you want the loop hands-free on such a device.
 MODOKI_PROJECT=games/<id> npm run build -- --target native
 (cd games/<id> && npx cap sync android)
 eval "$(node engine/scripts/print-toolchain-env.mjs)"   # JAVA_HOME + ANDROID_HOME, resolved as the editor does
-games/<id>/android/gradlew -p games/<id>/android assembleDebug
+games/<id>/android/gradlew -p games/<id>/android assembleDebug $(cat games/<id>/android/.gradle/modoki-build-number.args)   # build number, #1226
 adb install games/<id>/android/app/build/outputs/apk/debug/app-debug.apk
 adb shell am start -n <appId>/.MainActivity
 ```
@@ -2828,19 +2902,17 @@ once, and why it reads the **highest** of a file's occurrences: a pbxproj carrie
 configuration, and a Debug left at 1 must not authorise lowering a Release at 11.
 
 **Auto-increment is deliberately not offered.** A build number that changes itself makes builds
-non-reproducible and churns a committed file on every build (the write-behind-your-back hazard in
-CLAUDE.md). The owner bumps it, in the same change as the native edit it ships — a native change
-that is not bumped never reaches the device.
+non-reproducible. The owner bumps it, in the same change as the native edit it ships — a native
+change that is not bumped never reaches the device.
 
 ### `app.buildNumberAuto` — derive it from the commit count (2026-08-25)
 
 Hand-bumping per upload is exactly the chore this checkbox removes. With **Auto build number**
 checked in Project Settings (General → App Identity), the typed `app.buildNumber` is IGNORED and
 the effective number is derived from `git rev-list --count HEAD` of the project's repo at every
-open/build, with the typed value kept as a **FLOOR** (`max` of the two) — so a store-forced jump
+native build, with the typed value kept as a **FLOOR** (`max` of the two) — so a store-forced jump
 typed by hand still wins, and the never-lower guard keeps its role as the last line of defence
-either way. The native files always see ONE resolved number; how it was derived never leaks into
-them.
+either way.
 
 ⚠️ **Typing that floor means unchecking Auto first.** `app.buildNumber`'s input carries
 `disabledIf: { key: 'app.buildNumberAuto', is: 'true' }`, which is a real native `disabled` — not
@@ -2851,22 +2923,44 @@ it never could, and the help text added in the same commit contradicted it.) The
 round-trip because `buildNumber` is stored independently of `buildNumberAuto` — that is precisely
 why the field is greyed out rather than hidden.
 
-Two known wrinkles, both absorbed by the floor + never-lower pair rather than by cleverness:
-commit counts differ between clones (`main` vs a worker branch), and the count is shared by every
-game in the repo. Only store uploads care about the absolute value, and only monotonicity matters
-there. A project copied OUT of its repo (no git) falls back to `app.buildNumber` with a note.
+Two known wrinkles: commit counts differ between clones (`main` vs a worker branch), and the count
+is shared by every game in the repo. Only store uploads care about the absolute value, and only
+monotonicity matters there. ⚠️ **Since #1226 nothing catches the first one** — see the floor below:
+a `release_*` hotfix or a worker clone at count 10302, after `main` uploaded 10500, is handed 10302
+and refused silently by the store. Upload from one line of history. A project copied OUT of its repo (no git) falls back to `app.buildNumber` with a note.
 
-⚠️ **Auto mode re-introduces committed-file churn on purpose.** The rationale above rejects a
-self-incrementing build number because it churns committed native files on every build — auto does
-exactly that (the count moves with every merged commit, so whichever clone builds first rewrites
-`versionCode`/`CURRENT_PROJECT_VERSION`). That is accepted noise here, not an accident: the churn
-is the number staying TRUE instead of drifting stale, and merge conflicts from two concurrent
-builds resolve to the higher value either way. The #18 rule still applies — don't sweep these into
-unrelated commits.
-⚠️ **"On every build" undersells when it fires: a plain `launch-editor.sh games/<id>` is enough.**
-Observed 2026-09-07 on `games/court` — launching the editor with no game build requested rewrote
-`versionCode` 6106 → 7173 and both `CURRENT_PROJECT_VERSION`s with it. Nothing is wrong when you
-see that diff after a read-only editor session; revert it rather than hunting it.
+⚠️ **An auto number is handed to the build, never written into a committed file (#1226,
+2026-09-15).** It used to be: the heal wrote it into `versionCode` / both `CURRENT_PROJECT_VERSION`s
+on every build AND every project open (a plain `launch-editor.sh games/court` rewrote 6106 → 7173,
+2026-09-07), because the count moves with nearly every commit. Measured before the change, one
+`build --target native` of `games/court` modified exactly those two files and nothing else. Now:
+- **The heal writes the number only in MANUAL mode**, where it changes only when the owner types a
+  new one (owner, 2026-09-15). The marketing version is synced in both modes.
+- **`/api/build` resolves the number once** (`injectedBuildNumbers`: the commit count, the floor, and
+  never below the value the committed file already carries). ⚠️ That last floor is much WEAKER than
+  the never-lower guard it replaces: nothing raises the committed value in auto mode any more, so it
+  is frozen at the last committed number and only catches a count below THAT. No high-water mark of
+  uploaded numbers exists anywhere. The route passes the number to all four compiles:
+  `CURRENT_PROJECT_VERSION=N` to the xcodebuild debug `build` and the release `archive`, and
+  `-PmodokiVersionCode=N --init-script .gradle/modoki-version-code.init.gradle` to gradle debug and
+  release. The export takes none — it does not compile, and `manageAppVersionAndBuildNumber` stays
+  pinned off, so it ships the archive's value.
+- ⚠️ **Not `-Pandroid.injected.version.code`.** AGP's own property looks like exactly this and is
+  ignored on a command-line build: with it set to 424242, AGP 8.13 produced an APK and a bundle
+  manifest still at the committed 10125. The init script (written per build into the gitignored
+  `android/.gradle/` by `renderAndroidVersionCodeInitScript`) sets each application variant's output
+  `versionCode` through `androidComponents.onVariants`, and produced 424242 in both. The xcodebuild
+  override gave `CFBundleVersion` 424242 in a simulator build. Both runs left `git status` clean.
+- **Hand-run builds read it from a file.** `build --target native` writes
+  `android/.gradle/modoki-build-number.args` and `ios/App/build/modoki-build-number.args` (both
+  gitignored; `writeBuildNumberArgFiles`), and the CLI recipes above append
+  `$(cat games/<id>/android/.gradle/modoki-build-number.args)` to gradle and the iOS twin to
+  xcodebuild. ⚠️ **Not optional on Android:** without it a hand-run APK carries the frozen committed
+  versionCode, and installing it over an editor build fails with `INSTALL_FAILED_VERSION_DOWNGRADE`.
+  Recover with `adb -s <serial> install -r -d` (a debug APK may downgrade) — never an uninstall, which destroys
+  the app's data.
+- **The accepted cost:** an archive made directly in Xcode or Android Studio ships the stale committed
+  number. Store builds go through **Build → iOS/Android Release**.
 
 The defaults (`"1.0"` / `1`) are exactly what `cap add` scaffolds, so adopting these fields rewrote
 nothing: running the heal across all 20 projects touched **one file**, `games/iap-test`'s pbxproj,
@@ -2986,8 +3080,6 @@ git checkout -- games/<id>/project.config.json games/<id>/android/variables.grad
 
 ⚠️ **Revert before committing anything.** Verified working 2026-08-12: `games/sling` installed and
 ran on the Y6 at API 28, and produced a probe-vs-identity A/B that nothing else could.
-⚠️ `npx cap sync android` also rewrites the **#206** escaping `@capacitor/haptics` gradle path on
-every run — revert that too (`git status` after every build).
 
 ### iOS (iPhone 7 — iOS 15.x max)
 

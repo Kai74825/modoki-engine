@@ -10,6 +10,8 @@ import { isSimRunning } from '../playState';
 import { inSystemTick } from '../systemTick';
 import { noteAuthoredWriteWhileStopped } from './authoredWrites';
 import { compareSiblings } from './entityOrder';
+import { collectSubtreeIds } from './subtreeCollect';
+import { endFrames, type DetachedMember } from './memberHome';
 // Re-exported for backward compatibility — every existing caller imports these from here.
 // The implementation lives in `renderDirty.ts` (a side-effect-free L0 module) so a module
 // that only needs the dirty signal (e.g. `loaders/assetManifest.ts`) doesn't have to import
@@ -117,6 +119,20 @@ export function findEntity(entityId: number): Entity | null {
   return null;
 }
 
+/** An entity's guid, runtime or durable, or `null` when it has none or no live entity has that id.
+ *  The one way a reply names an entity it only holds an id for (#1199, #1223).
+ *
+ *  ⚠️ Never `String(id)` as the fallback: an id disguised as a guid looks addressable, and every
+ *  guid-addressed op refuses it. Looked up through `findEntity`, fallback scan included, because a
+ *  TEST world spawns without registering — the reply rows it builds must still name their entities. */
+export function guidOfEntityId(entityId: number): string | null {
+  const e = findEntity(entityId);
+  if (!e) return null;
+  try {
+    return e.has(EntityAttributes) ? ((e.get(EntityAttributes) as { guid?: string } | undefined)?.guid || null) : null;
+  } catch { return null; }
+}
+
 /** Get all registered traits present on an entity */
 export function getEntityTraits(entityId: number): TraitMeta[] {
   const entity = findEntity(entityId);
@@ -207,7 +223,32 @@ function noteIfAuthoredWriteWhileStopped(
   const attrs = entity.has(EntityAttributes)
     ? (entity.get(EntityAttributes) as { name?: string } | undefined)
     : undefined;
-  noteAuthoredWriteWhileStopped(entityId, attrs?.name ?? `#${entityId}`, traitName, field);
+  noteAuthoredWriteWhileStopped(entityId, attrs?.name || `#${entityId}`, traitName, field);
+}
+
+/** After a subtree has been spawned as a copy (or re-spawned from a snapshot), carry every NUMERIC
+ *  entity reference held inside it — a registry field flagged `entityId`, i.e.
+ *  `PrefabInstance.rootInstanceId` — from the source ids to the new ones. `idMap` is source id →
+ *  new id for the spawned subtree only, so a reference to an entity outside it is left alone.
+ *  `EntityAttributes.parentId` is skipped: the spawn sets it. Without this a copied prefab instance
+ *  keeps naming the SOURCE root (#1338). */
+export function carryEntityIdFields(
+  copies: Iterable<{ id: number; traits: ReadonlyArray<{ name: string; data?: Record<string, unknown> | true }> }>,
+  idMap: ReadonlyMap<number, number>,
+): void {
+  for (const { id, traits } of copies) {
+    for (const { name, data } of traits) {
+      if (!data || data === true) continue;
+      const meta = getTraitByName(name);
+      if (!meta) continue;
+      for (const [field, hint] of Object.entries(meta.fields ?? {})) {
+        if (!hint?.entityId || (name === 'EntityAttributes' && field === 'parentId')) continue;
+        const old = data[field];
+        const mapped = typeof old === 'number' ? idMap.get(old) : undefined;
+        if (mapped !== undefined && mapped !== old) writeTraitField(id, meta, field, mapped);
+      }
+    }
+  }
 }
 
 /** Write a field value to a trait on an entity */
@@ -570,59 +611,23 @@ export function buildEntityTree(entities: EntityInfo[]): EntityInfo[] {
  *  with no entity has no subtree to speak of. */
 export function subtreeIds(flat: EntityInfo[], rootId: number): number[] {
   if (!flat.some((e) => e.id === rootId)) return [];
-  const childrenByParent = new Map<number, number[]>();
-  for (const e of flat) {
-    if (e.parentId > 0) {
-      let arr = childrenByParent.get(e.parentId);
-      if (!arr) { arr = []; childrenByParent.set(e.parentId, arr); }
-      arr.push(e.id);
-    }
-  }
-  const out: number[] = [];
-  const stack = [rootId];
-  while (stack.length > 0) {
-    const id = stack.pop()!;
-    out.push(id);
-    const children = childrenByParent.get(id);
-    if (children) stack.push(...children);
-  }
-  return out;
+  return collectSubtreeIds(flat.map((e) => [e.id, e.parentId] as const), [rootId]);
 }
 
 /** Delete multiple entities and all their children in one pass.
- *  Builds the child index once (O(n)), then collects subtrees for all IDs. */
-export function deleteEntities(entityIds: number[]) {
-  if (entityIds.length === 0) return;
+ *  Builds the child index once (O(n)), then collects subtrees for all IDs. The shared walk has a visited
+ *  set, so a parent cycle terminates (it used to loop forever here). */
+export function deleteEntities(entityIds: number[]): DetachedMember[] {
+  if (entityIds.length === 0) return [];
 
-  // Build child index from all entities once
-  const allEnts = getAllEntities();
-  const childrenByParent = new Map<number, number[]>();
-  for (const e of allEnts) {
-    if (e.parentId > 0) {
-      let arr = childrenByParent.get(e.parentId);
-      if (!arr) { arr = []; childrenByParent.set(e.parentId, arr); }
-      arr.push(e.id);
-    }
-  }
+  const toDelete = collectSubtreeIds(getAllEntities().map((e) => [e.id, e.parentId] as const), entityIds);
+  // A moved prefab member whose home is going keeps its identity path through it, and one moved OUT of an
+  // instance being deleted outlives it, unlinked or promoted (#1437, #1451). Returned for an undo.
+  const detached = endFrames(new Set(toDelete));
 
-  // Collect entire subtrees depth-first
-  const toDelete: number[] = [];
-  for (const entityId of entityIds) {
-    const stack = [entityId];
-    while (stack.length > 0) {
-      const id = stack.pop()!;
-      toDelete.push(id);
-      const children = childrenByParent.get(id);
-      if (children) stack.push(...children);
-    }
-  }
-
-  // Delete in reverse (children before parents), dedup in case of overlapping subtrees
-  const seen = new Set<number>();
+  // Delete in reverse: within one walk, children before parents
   for (let i = toDelete.length - 1; i >= 0; i--) {
     const id = toDelete[i];
-    if (seen.has(id)) continue;
-    seen.add(id);
     const entity = findEntity(id);
     if (entity) {
       destroyEntity(entity);
@@ -630,9 +635,10 @@ export function deleteEntities(entityIds: number[]) {
   }
   fireDirtyListeners();
   markStructureDirty();
+  return detached;
 }
 
 /** Delete an entity and all its children. Delegates to deleteEntities. */
-export function deleteEntity(entityId: number) {
-  deleteEntities([entityId]);
+export function deleteEntity(entityId: number): DetachedMember[] {
+  return deleteEntities([entityId]);
 }

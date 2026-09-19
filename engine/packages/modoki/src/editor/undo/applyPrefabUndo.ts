@@ -22,9 +22,14 @@ import type { SceneData } from '../../runtime/loaders/loadSceneFile';
 import { serializeScene, saveScene, getCurrentScenePath, setCurrentScenePath, setCurrentBaseScene } from '../scene/serialize';
 import {
   applyToPrefabSelective, installPrefabSnapshot, guidForEntityId, entityIdForGuid,
+  resolveInstanceContext, getPrefabSource, captureInstanceOverrides, captureInstanceStructure,
+  rebuildInstance, preloadNestedPrefabsForSubtree, refreshBaseInstances,
   type ApplyResult, type PrefabFile,
 } from '../scene/prefab';
 import { useEditorStore } from '../store/editorStore';
+import { repairPrefabMemberPaths } from '../backend/editorBackend';
+import { resolveAffectedScenes } from '../scene/sceneDirty';
+import { ensureGuid } from './entityRef';
 
 const clone = <T,>(v: T): T => JSON.parse(JSON.stringify(v)) as T;
 
@@ -37,8 +42,12 @@ async function restoreSnapshot(
   scene: SceneData,
   scenePath: string | null,
   selGuid: string,
+  /** The prefab document the files on disk were last repaired for, when the apply moved member paths
+   *  (#1437): they are repaired from it to `prefab`, the way the apply repaired them the other way. */
+  repairFrom?: PrefabFile,
 ): Promise<void> {
   await installPrefabSnapshot(source, prefab);
+  if (repairFrom && prefab.id) await repairPrefabMemberPaths(prefab.id, repairFrom);
   if (scenePath) {
     await sceneManager.loadScene(scenePath, { preloaded: clone(scene) });
     setCurrentScenePath(scenePath);
@@ -52,6 +61,37 @@ async function restoreSnapshot(
   useEditorStore.getState().selectEntity(id || null);
 }
 
+/** A BASE scene's instance, as it stood on one side of the apply (#1431). `restoreSnapshot` rebuilds
+ *  only the PRIMARY: a base loaded with it is CARRIED live across `loadScene`, so its instance
+ *  would keep its post-apply state against the restored prefab — and since the base is dirty, Save
+ *  All would then write that into the base file (a promoted added node was lost exactly so). The
+ *  instance is rebuilt from this capture instead, the same way Revert's own undo rebuilds it. */
+interface BaseInstanceSide {
+  rootGuid: string;
+  prefab: PrefabFile;
+  overrides: ReturnType<typeof captureInstanceOverrides>;
+  structure: ReturnType<typeof captureInstanceStructure>;
+}
+
+function captureSide(rootInstanceId: number, rootGuid: string, prefab: PrefabFile): BaseInstanceSide {
+  return {
+    rootGuid, prefab,
+    overrides: captureInstanceOverrides(rootInstanceId, prefab),
+    structure: captureInstanceStructure(rootInstanceId, prefab),
+  };
+}
+
+/** After `restoreSnapshot`: rebuild the carried base instance to `side`. Its root guid survives
+ *  every rebuild, so it is found by guid; one that is gone (the base was unloaded) is left alone. */
+async function restoreBaseInstance(source: string, side: BaseInstanceSide | null): Promise<void> {
+  if (!side) return;
+  const id = side.rootGuid ? entityIdForGuid(side.rootGuid) : 0;
+  if (!id) return;
+  await preloadNestedPrefabsForSubtree(id);
+  const newId = rebuildInstance(id, source, side.prefab, side.overrides, side.structure);
+  useEditorStore.getState().selectEntity(newId);
+}
+
 function makeApplyPrefabAction(opts: {
   source: string;
   prefabBefore: PrefabFile;
@@ -60,11 +100,27 @@ function makeApplyPrefabAction(opts: {
   sceneAfter: SceneData;
   scenePath: string | null;
   selGuid: string;
+  memberPathsChanged?: boolean;
+  affectedScenes: string[];
+  baseBefore: BaseInstanceSide | null;
+  baseAfter: BaseInstanceSide | null;
 }): UndoAction {
+  const paths = opts.memberPathsChanged;
   return {
     label: 'Apply to Prefab',
-    undo: () => restoreSnapshot(opts.source, opts.prefabBefore, opts.sceneBefore, opts.scenePath, opts.selGuid),
-    redo: () => restoreSnapshot(opts.source, opts.prefabAfter, opts.sceneAfter, opts.scenePath, opts.selGuid),
+    affectedScenes: opts.affectedScenes,
+    // The world restore reaches only the primary; every carried base instance of the prefab is
+    // re-derived against the prefab being restored, and the applied one rebuilt from its capture.
+    undo: async () => {
+      await restoreSnapshot(opts.source, opts.prefabBefore, opts.sceneBefore, opts.scenePath, opts.selGuid, paths ? opts.prefabAfter : undefined);
+      refreshBaseInstances(opts.source, opts.prefabAfter, opts.prefabBefore, opts.baseBefore?.rootGuid);
+      await restoreBaseInstance(opts.source, opts.baseBefore);
+    },
+    redo: async () => {
+      await restoreSnapshot(opts.source, opts.prefabAfter, opts.sceneAfter, opts.scenePath, opts.selGuid, paths ? opts.prefabBefore : undefined);
+      refreshBaseInstances(opts.source, opts.prefabBefore, opts.prefabAfter, opts.baseAfter?.rootGuid);
+      await restoreBaseInstance(opts.source, opts.baseAfter);
+    },
   };
 }
 
@@ -88,6 +144,20 @@ export async function applyToPrefabWithUndo(
     return selId != null ? guidForEntityId(selId) : '';
   })();
 
+  // A BASE scene's instance (#1431): the apply rebuilds it and consumes its overrides/additions into
+  // the prefab, so the base's file is stale too — and `saveScene` below writes only the primary.
+  // Carried as the action's `affectedScenes`, so push, undo and redo each dirty the base for Save All.
+  // Read BEFORE the apply: it tears the instance down.
+  const affectedScenes = resolveAffectedScenes([rootInstanceId]);
+  // …and the undo needs the base instance itself, which `sceneBefore` (primary-only) does not hold.
+  // Found again by a DURABLE guid: a runtime one is not carried by the rebuild nor across the carry,
+  // and a miss would silently drop back to saving the post-apply instance. Warmed first, as Revert
+  // does: a cold cache drops a user-added nested instance from the capture (#1284).
+  const ctx = affectedScenes.length ? resolveInstanceContext(rootInstanceId) : null;
+  const rootGuid = ctx ? ensureGuid(rootInstanceId) : '';
+  if (ctx) await preloadNestedPrefabsForSubtree(rootInstanceId);
+  const prefabNow = ctx ? await getPrefabSource(ctx.source) : null;
+  const baseBefore = prefabNow && rootGuid ? captureSide(rootInstanceId, rootGuid, prefabNow) : null;
   const result = await applyToPrefabSelective(rootInstanceId, selectedKeys);
   if (!result.applied || !result.source || !result.prefabBefore || !result.prefabAfter) {
     return result; // no-op apply — nothing to undo
@@ -98,6 +168,8 @@ export async function applyToPrefabWithUndo(
   if (result.promotedAdditions > 0 && scenePath) await saveScene();
 
   const sceneAfter = (await serializeScene({ assignGuids: true })) as unknown as SceneData;
+  const liveAfter = baseBefore && rootGuid ? entityIdForGuid(rootGuid) : 0;
+  const baseAfter = liveAfter ? captureSide(liveAfter, rootGuid, result.prefabAfter) : null;
   pushAction(makeApplyPrefabAction({
     source: result.source,
     prefabBefore: result.prefabBefore,
@@ -106,6 +178,10 @@ export async function applyToPrefabWithUndo(
     sceneAfter,
     scenePath,
     selGuid,
+    memberPathsChanged: result.memberPathsChanged,
+    affectedScenes,
+    baseBefore: baseBefore && liveAfter ? { ...baseBefore, prefab: result.prefabBefore } : null,
+    baseAfter,
   }));
   return result;
 }

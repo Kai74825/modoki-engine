@@ -8,19 +8,26 @@ pipeline.
 
 ## Prerequisite
 
-The **KTX-Software CLI** (`toktx`) must be on `PATH` for KTX2 encoding. It is
-**not in Homebrew** — install the macOS package from the
-[KhronosGroup/KTX-Software releases](https://github.com/KhronosGroup/KTX-Software/releases)
-(`toktx` + `ktx` land in `/usr/local/bin`). `ensureKtxCli()` probes `toktx
---version` and throws a clear install hint when it's missing; without it,
-conversion falls back to shipping the source PNG and the build logs a hint.
+KTX2 encoding needs the **pinned KTX-Software CLI** (`toktx` 4.4.2). A copy on
+`PATH` is **never used** (#1327): provision the pinned one with
+
+```bash
+npm run toolchain:install -- toktx msdf-atlas-gen
+```
+
+or from **Build → Build Support…** (an Install button in a dev editor; the
+packaged editor installs it unprompted). It lands in the machine-wide toolchain dir, so every clone on the machine
+shares it. `ensureKtxCli()` throws that install hint when it's missing; the build
+then falls back to shipping the source PNG and says so.
 
 `sharp` (an npm devDependency) handles the WebP encode + resize — no external
 install needed.
 
-The dev/CLI path resolves the binary via `toktxBinary()` in
-`plugins/texture-convert.ts`: an explicit `MODOKI_TOKTX` path wins, else the bare
-name `toktx` (resolved on `PATH`).
+`ensureKtxCli()` in `plugins/texture-convert.ts` resolves through the shared
+toolchain (`pinnedConversionCli('toktx')`): an explicit `MODOKI_TOKTX` path wins
+(the packaged editor sets it to its bundled copy), else the pinned copy under the
+toolchain dir, else it fails. Why and how it is pinned:
+[editor-toolchain.md](editor-toolchain.md) § "Conversion CLIs are pinned".
 
 ### Bundling `toktx` in the packaged editor
 
@@ -28,12 +35,14 @@ The packaged Electron editor has no `PATH` guarantee, so the KTX CLI is bundled
 into the app bundle (macOS-only — the only signed target today):
 
 - **`engine/scripts/stage-toktx.cjs`** is electron-builder's `beforePack` hook. It
-  copies `toktx` + its one non-system dependency (`libktx.4.dylib`) into
-  `build/bin/`, `chmod +x`es both, and sanity-runs the staged copy (`toktx
-  --version`) to confirm the sibling dylib resolves. `toktx` already carries an
-  `@executable_path` rpath, so `libktx` resolves next to it with no
-  `install_name_tool` surgery. The hook resolves its own source binary via
-  `MODOKI_TOKTX` → `which toktx` → `/usr/local/bin/toktx`.
+  copies `toktx` + `ktx` (gltf-transform's rigged-model encoder, #1351) + their one
+  non-system dependency (`libktx.4.dylib`) into `build/bin/`, `chmod +x`es them, and
+  sanity-runs both staged CLIs (`--version`) to confirm the sibling dylib resolves. Both
+  CLIs carry an `@executable_path` rpath, so `libktx` resolves next to them with no
+  `install_name_tool` surgery. The hook bundles the PINNED copy
+  (`pinnedToolForStaging.cjs`: `MODOKI_TOKTX`, else `toolchain:install toktx`,
+  which provisions it if missing) — never a `PATH` or `/usr/local` one, because
+  the packaged editor converts with whatever it bundles.
 - **`electron-builder.yml`** ships `build/bin` as `extraResources` →
   `Contents/Resources/bin`. The signing pass signs both binaries; the
   `disable-library-validation` entitlement lets `toktx` load the sibling `libktx`
@@ -41,9 +50,11 @@ into the app bundle (macOS-only — the only signed target today):
 - **`engine/electron/main.ts`** (`app.isPackaged`) points
   `process.env.MODOKI_TOKTX` at `<resourcesPath>/bin/toktx` when the env isn't
   already set, so `toktxBinary()` picks up the bundled copy.
-- **Graceful degradation**: if `toktx`/`libktx` aren't installed on the *build*
-  machine, the hook logs a warning and skips — the packaged app then falls back to
-  shipping source textures, exactly as a dev build without `toktx` does.
+- **Graceful degradation**: if the pinned `toktx` cannot be provisioned on the
+  *build* machine (offline), the hook logs a warning and skips — the packaged app
+  then falls back to shipping source textures, exactly as a dev build without
+  `toktx` does. The release workflow provisions it in its own step first, so a
+  release fails instead of shipping toolless.
 
 ## Per-texture settings
 
@@ -188,12 +199,267 @@ different-sized file per host from identical input) and, as of #127,
 CONSTRUCTION, not merely volatile: `hashKey()` (`plugins/model-cache.ts`) mixes
 in local gltfpack/gltf-transform/meshopt CLI versions, and `riggedHash`
 (`plugins/rigged-model-optimize.ts`) additionally encodes whether `toktx`
-exists on PATH at all — a manual, per-machine install. With four+ clones the
+is available at all and its version — a per-machine provisioning fact (a PATH
+install before #1327, the pinned copy since). With four+ clones the
 hash never converges: each rewrites it back on its own next build (measured:
 commit 471ca0cf's entire GLB-sidecar diff was 7 `"hash"` lines and nothing
 else). The other cache blocks' hashes (`textureCache.hash`, `fontCache.hash`,
 ...) stay committed — they mix only source bytes + settings + an in-repo
 encoder version, so they ARE reproducible across machines.
+
+⚠️ **A reproducible hash does not mean a reproducible artifact** (#1297). The hash
+names the source, the settings and an in-repo version tag, never the CLI that did
+the converting — so wherever that CLI can differ per machine, two machines hold the
+same hash over different bytes. Where each converter stands:
+
+| Converter | CLI | Status |
+|---|---|---|
+| audio, video | `ffmpeg` / `ffprobe` | **Pinned** (#1297): only the provisioned `ffmpeg-static` / `@ffprobe-installer` copy (or a deliberate `MODOKI_FFMPEG`/`MODOKI_FFPROBE`), never PATH — [editor-toolchain.md](editor-toolchain.md) § "Conversion CLIs are pinned". The same build per PLATFORM, not across platforms. |
+| textures, atlases | `toktx` | **Pinned** (#1327): KTX-Software 4.4.2, sha256-checked, from the toolchain dir, the packaged editor's bundle, or a deliberate `MODOKI_TOKTX` — never PATH. Same build per platform. |
+| fonts | `msdf-atlas-gen` | **Pinned** (#1327): 1.4 with **Skia** (pin label `1.4-skia`) — on macOS our own static build (upstream ships Windows only), on Windows Chlumsky's zip; never PATH. Both preprocess overlapping contours, so a font that has them — variable-font instances usually do — bakes by the same geometry pipeline on both platforms (owner, 2026-09-17). Before that, the Mac build (like Homebrew's) had no Skia and resolved overlaps in overlap mode. Same algorithm across platforms; not the same compiler. |
+| models (rigged) | `gltf-transform`, `ktx` | Took the other route — hashes the tool versions INTO its key, which is why `modelCache.hash` is peeled above. gltf-transform encodes with KTX-Software's `ktx`, which is pinned in the same install as `toktx` and REQUIRED beside it (#1351); the key names that toktx's version. |
+| environments | none (JS) | Not exposed. |
+
+**Pinning both changed no committed value on the machine that did it** (#1327, measured
+2026-09-17). The unpacked pinned `toktx` + `libktx` are byte-identical to the hand-installed
+4.4.2, and five fonts (Latin and CJK) baked byte-identical atlas PNG and JSON under the
+Homebrew build and the FIRST pinned static build (no Skia — superseded, see below). `tex-3`/`atlas-2`/`font-6` exist to evict the
+entries a DIFFERENT machine's unpinned build left in its local cache. All 293 affected sidecars
+were re-imported through the real handlers, and no committed width/height/mipLevels/glyph/atlas
+value moved; the commit carries only the `hash` fields. (A re-import also normalises older
+sidecars — a `type` stamp, `srcWidth`/`srcHeight`, and on 5 2D textures a `webp` variant their
+committed `variants` lacks — which that commit deliberately left out.) A Windows machine converts with the Windows builds of the same
+versions, so its bytes are not claimed to match a Mac's.
+
+**Adding Skia DID change the font atlases, but not the glyph shapes** (measured 2026-09-17, all 18
+repo fonts, importer flags, old no-Skia pin against the `1.4-skia` pin). The glyph layout JSON is
+byte-identical for every font. Every PNG differs, mostly because edges land in different colour
+channels. Decoded the way the renderer reads it (median of RGB against 0.5), no pixel flips between
+inside and outside the glyph in any font. The distance values away from the edge moved on 0–0.25%
+of pixels: 0.1–0.25% in the variable fonts with overlapping contours (Merriweather Sans, Roboto,
+Nunito), 0.02% or less in the rest, and only outline and glow effects read those values. Court's VarelaRound and Wordweave's
+KleeOne show no alpha change at all. `font-7` evicts the old atlases; the 10 committed font sidecars
+changed only their `hash`.
+
+**`audioCache.durationSec` joined the peel in #1289** — the same "machine-dependent
+by construction" test, reached from the other side. It is not derived from
+(source + settings) at all: ffprobe MEASURES it on the MP3 `ffmpeg` has just
+written, and until #1297 `resolveTool` (`plugins/ffmpeg-tool.ts`) resolved BOTH
+binaries per machine (env override → the editor's provisioned toolchain copy → bare
+name on PATH; both are now pinned, see the table above). Measured on `games/wordweave`, 2026-09-16: 4 of 26 clips encode to
+different BYTES under the provisioned `ffmpeg-static` 6.0 vs Homebrew `ffmpeg`
+8.1.1 — `silenceremove` trims a different sample count, which on those four
+crosses an MP3 granule — and this Mac's two ffprobe builds disagree about
+duration on all 26. Nothing consumes the value (`AudioManifestBlock` bakes
+`loadType`/`format`/`ext` and no duration); its one reader is `AudioAssetView`'s
+Inspector row, which gets it back from the merged local half — which, until #1305,
+no machine had (below).
+
+### A peel migration cannot seed, so absence has to be the trigger (#1305)
+
+⚠️ **For a year the peel worked in one direction only: every migration DELETED the
+committed value, and nothing ever put a local one back.** Measured 2026-09-17 by
+walking every committed sidecar in `games/`, `demos/` and `engine/packages/`:
+
+| block | peeled keys | committed | has local half | missing |
+|---|---|---|---|---|
+| `textureCache` | `variantBytes` | 282 | 66 | **216** |
+| `audioCache` | `bytes`, `durationSec` | 29 | **0** | **29** |
+| `fontCache` | `bytes` | 10 | 3 | 7 |
+| `videoCache` | `durationSec` | 7 | **0** | **7** |
+| `environmentCache` | `bytes` | 3 | 1 | 2 |
+| `atlasCache` | `bytes` | 1 | **0** | 1 |
+| `modelCache` | `hash`, `lodBytes`, `triCounts` | 46 | 38 | 8 |
+
+`durationSec` appeared **zero times on disk repo-wide**. This is a property of the
+mechanism, not an oversight in any one migration: **`.meta.local.json` is
+gitignored, so no commit can carry one.** "Seed at migration time" was never a
+shippable option — only a script every clone would have to run by hand, and none
+was written.
+
+⚠️ **`modelCache` heals, but only by accident of WHICH field was peeled — and
+citing it as a general self-heal is what hid this twice.** `hash` is the cache
+*key*: `staticAssets.ts` cannot locate the artifact without it, so the miss is
+structural and the reimport handler runs; `lodBytes`/`triCounts` ride back on that
+same write. Every other block keeps its `hash` committed, so the warm-cache early
+return fires and nothing re-derives. A stale model hash IS a cache miss; a missing
+`durationSec` is not, and the routes auto-bake only when `fs.existsSync(cached)` is
+false — i.e. when the converted BYTES are gone. With a warm `.cache/`, never.
+
+**The repair is the human's Re-import button; the route only REPORTS the gap.**
+`blocksMissingLocalHalf` (in `meta-sidecar.ts`, derived from `LOCAL_KEYS`) names the
+committed blocks whose peeled values this machine does not hold, and
+`/api/read-meta` returns them in an `X-Meta-Local-Missing` header. The Inspector
+turns that into "re-import to compute stats" beside the rows it cannot fill, instead
+of a blank — or, as texture and model did before this, a confidently defaulted
+`0 B`. Nothing is written by a read.
+
+⚠️ **An automatic heal was built first and then removed, and the reason is worth
+keeping.** It made the read route re-derive the values itself, which measured well
+on one clone and was wrong in four ways at once: it re-encoded rather than
+re-probed (**106 of this clone's 215 affected textures have no `.cache` entry**, so
+each is a full `toktx` run, and `games/video-test` has none at all); `metaBatchLoad`
+fetches this route once per path in a multi-selection, so a folder click fanned out
+to a hundred of those; the reimport handlers rebuild their block in canonical key
+order and stamp `meta.type`, so it rewrote **43 of 282 committed texture sidecars**
+byte-for-byte differently, meaning a GET dirtied tracked `games/**` files
+(`CLAUDE.md`'s "never `git add -A`" rule, #18); and it bypassed the `pendingMeta`
+park gate `/api/reimport` enforces (#882), so a parked settings edit could be baked
+with pre-edit values. Each had a fix — a concurrency cap, a snapshot-and-restore, a
+deferred gate probe, a `heal=0` opt-out for observers — and the owner's call
+(2026-09-17) was that a button needs none of them. **The lesson is not "healing is
+hard" but that a GET which writes acquires every obligation a write has**, and pays
+them in a place no caller asked for work.
+
+⚠️ **The hint is recorded in `noteMetaReadResult`, not in `readMetaPreferringPark` —
+and the first version got that wrong.** `VideoAssetView` reads this route raw (the
+#871 exemption: it keeps an `applied` state that must reflect disk) and calls only
+`noteMetaReadResult` on the response. With the hint recorded inside the helper, the
+video panel never showed it on a human's read, and could not clear one an agent's
+passive read had set. Recorded in `noteMetaReadResult` (`editor/scene/pendingMeta.ts`),
+the `'seeds'` rule in `metaReadPreferringPark.test.ts`, which forces every exemption
+declared `'seeds'` to make that call, now enforces the hint as well. The helper's
+`passive` read skips only the CAS baseline (the hint is a fact about the files, not
+about what a panel displays), and that option is module-private so an exempted
+reader cannot pass it and record no baseline with the guard still green.
+The store is `editor/scene/missingLocalStats.ts`; the audio, video, texture, model,
+font and environment views read it through `useMissingLocalStats`. The atlas view
+renders no peeled row, so it has nothing to hint.
+
+⚠️ **The header only works in Electron because it is in
+`Access-Control-Expose-Headers`** (`engine/electron/backendServer.ts`). The renderer
+talks to that backend cross-origin, so an unexposed header reads `null` on a 200
+with no console error, while the same-origin Vite dev server reads it fine — the
+feature shipped inert that way once. `engine/tests/architecture/metaHeaderExposure.test.ts`
+derives the required set from the router's own `X-*` keys.
+
+⚠️ **The button a hint points at can dirty tracked files.** The reimport handlers
+rebuild their block in canonical key order (the texture handler also stamps
+`meta.type`) — the same property that rewrote 43 of 282 texture sidecars under the
+automatic heal. As a human click it
+is an intended write, but check `git diff -- games/ demos/` after re-importing before
+committing a no-op sidecar change.
+
+⚠️ **"Incomplete" is a two-part question, and getting the second part wrong made the
+first version of this fix do nothing on the hub.** Within one peel generation the
+test is *none of the block's peeled keys arrived* — not *some are missing*, because
+`LOCAL_KEYS` is a superset per block: `textureCache` lists all four
+`VOLATILE_STAT_KEYS` but a healthy texture local half holds only `variantBytes` (66
+do; none has the other three), so requiring the full list would mark every texture on
+every machine permanently broken.
+
+But that test alone reads a local half written by an EARLIER peel as healthy, since
+it holds exactly the keys that peel produced — a non-empty subset. Measured on
+`~/Projects/modoki` (the hub) 2026-09-17: **19 audio local halves, every one
+`{bytes}` only, none carrying `durationSec`** — `bytes` was peeled by #1279 and
+`durationSec` only by #1289. All 19 read as healed. So each local sidecar now carries
+`__peel`, a fingerprint **derived from `LOCAL_KEYS`** (`peelSchemaId()`), and a
+mismatch invalidates the whole file: it was written under a table that no longer
+exists, so nothing in it can be trusted to be complete. Derived rather than a
+hand-bumped version constant, so the next peel migration self-invalidates with
+nothing for anyone to remember.
+
+⚠️ **An absent stat is not zero, and rendering it as zero was the worse half.**
+Audio and video gate their rows on `!== undefined` and vanish; texture and model
+defaulted to `0` and *rendered* it — `Total 0 B` across 216 texture blocks, and
+`0 tri · 0 B` per LOD. A blank row is honest about not knowing. Both now go through
+`assetViews/measuredStats.ts`, whose one job is keeping a measured zero and an
+absent value distinguishable.
+
+Its siblings `channels`/`sampleRate` stay committed, but ⚠️ **not because the
+settings force them.** That reason holds for wordweave's 26 clips and is false for
+`demos/forest-camp`'s 3, which set `forceMono: false` and no `sampleRate`, so
+`buildFfmpegArgs` passes neither `-ac` nor `-ar` and both values are ffprobe
+readings of the source. They stay committed because their value follows the source
+deterministically and no divergence has been observed in them.
+
+⚠️ **A machine with no ffprobe used to DELETE them, and the fix was to stop the
+deletion rather than to peel more** (#1300). `probeStats` swallows every ffprobe
+failure and returns `{}`, and nothing gated ffprobe the way `ensureFfmpeg()` gates
+ffmpeg — `ffprobeBinary()` simply returned a name. (Since #1297 a missing pinned
+ffprobe is warned about once by `withFfprobe`, and still yields `{}` rather than a
+PATH build's reading.) The reimport handlers then wrote
+their cache block WHOLESALE, so a reimport on such a machine dropped
+`channels`/`sampleRate` from all 29 audio sidecars (and `width`/`height`/`fps`/
+`hasAudio` from video's, which carries more probe-only fields), and the machine that
+does have ffprobe put them back on its next bake — the non-converging ping-pong this
+whole split exists to stop.
+
+**Both handlers now MERGE**: the previous block is spread first, so a probe reading
+that is absent leaves the committed value alone, while the conversion's own
+`hash`/`ext`/`bytes` still win unconditionally and a stale hash can never survive a
+reimport. Peeling `channels`/`sampleRate` was rejected — it would remove reviewable
+values to fix a churn nobody has observed. Failing loudly on a missing ffprobe was
+considered and rejected too (owner, 2026-09-16): merging also covers ffprobe present
+but erroring on ONE file, which a startup gate would not, and it breaks no machine
+that imports successfully today. **Accepted cost:** a clip re-encoded to different
+channels on a run where the probe fails keeps the old reading until a run that can
+measure it — a stale number instead of a deleted one.
+
+⚠️ ffmpeg-present/ffprobe-absent is **constructible but never observed** on a real
+machine (the two are separate auto-installs, `engine/toolchain/index.ts`). What was
+driven is the consequence: the real writer, fed the block a no-ffprobe reimport
+produces.
+
+⚠️ **"The hash is reproducible" is not "the artifact is."** The in-repo
+`*_ENCODER_VERSION` literal each key mixes stands in for an external CLI whose
+real version is hashed nowhere, so one committed hash can name different
+converted bytes on two machines — audio and video via `ffmpeg`, textures and
+environments via `toktx` (a manual install, so nothing pins it). The peel above
+removes the sidecar churn that exposed this for audio and video; **#1297 tracks the
+divergence itself, and after #1289 and #1300 a clean `git status` is no longer
+evidence about it.** ⚠️ #1300 widened exactly that blind spot — the divergent
+`videoCache.durationSec` is gone from the tree, which removes the last committed
+signal that two machines' ffprobe builds disagree. Do not read the quiet as
+agreement.
+
+**The local file fills a cache block in; it never CREATES one (#1279).** For
+**audio and environments**, a block's mere existence is what the build reads as
+"this asset has been converted": `vite-asset-scanner.ts` ships the converted
+variant when it is there and the source verbatim when it is not
+(`if (!hasCache) { shipSource(); continue; }`). The same truthiness test bakes
+the manifest's texture and environment blocks. (Textures and models convert
+unconditionally at build time and have their manifest hash overwritten from
+that conversion; fonts gate on the `font` SETTINGS block, and audio/font emit a
+manifest block from their settings too — the cache block controls only the
+converted-variant fields. So the shipped-bytes blast radius is audio and
+environments.) So until #1279 the merge let a
+GITIGNORED file decide what a build SHIPS: a `{"audioCache":{"bytes":1236743}}`
+left behind by an earlier import made that machine convert, while a fresh clone
+or CI — which cannot have the file — shipped the source. Same commit, different
+shipped bytes, nothing reporting it. Observed on `games/wordweave` while closing
+out #921: with `audioCache` stripped from all 26 committed sidecars and both
+caches deleted, the native build still logged `converted 26 audio clip(s)`. The
+committed sidecar now decides WHICH blocks exist and the local file only
+supplies this host's values inside them; a local block with no committed
+counterpart is inert, and the next `writeMetaSidecar` clears it.
+
+⚠️ **`videoCache` is SPLIT DOWN THE MIDDLE, and the asymmetry is deliberate: `durationSec` is
+peeled, `bytes` stays committed** (#1300, resolving what #1279 left open).
+
+`bytes` is not Inspector-only. The manifest bakes it so `resolveDeliveryPolicy`'s
+`policy: 'auto'` can choose stream-vs-download without a network round-trip —
+`videoUrl.ts` passes `v?.bytes` and nothing else. Peeling it would blank that
+everywhere but the importing machine: the very machine-dependence the split
+exists to remove. Asked and answered in #1279, and still the answer.
+
+`durationSec` has no such consumer. Its only reader anywhere is `VideoAssetView`'s
+Inspector duration row — `VideoManifestBlock.durationSec` is declared and consumed
+by nothing — and ffprobe MEASURES it on the file ffmpeg produced, so it tracks the
+machine exactly as audio's does. It had already diverged in the committed tree: the
+byte-identical `cutscene.mp4` under `games/video-test` and `demos/video-demo`
+carried the same `videoCache.hash` and the same `bytes` against `24.009002` and
+`24.01`. ⚠️ Five other video sidecars agreed across both local ffprobe builds and
+were peeled anyway — "this clip happens to be stable" is the reasoning #1300 exists
+to correct, and reading `loop-screen.mp4`'s agreement as "video is fine" is the
+mistake that was made once already.
+
+**What made this a mechanism change rather than a list entry:** per-key peeling
+already existed (`HOST_LOCAL_KEYS`), but `VOLATILE_STAT_KEYS` — which contains
+`bytes` — was applied to every split block unconditionally, so "peel `bytes`" and
+"be split at all" were one decision. `LOCAL_KEYS` is now authoritative per block and
+`Record<CacheBlock, …>`, so adding a cache block does not compile until someone
+states what it peels.
 
 A fresh checkout has no `.meta.local.json` (gitignored), so it self-heals for
 free: the serving path already treats a missing/stale model hash as a cache
@@ -349,6 +615,36 @@ fail the scene load outright on a 2D-only project; see
 
 `invalidateTexture(ref)` evicts the cached bytes for every variant from
 `THREE.Cache` so a re-import re-fetches the freshly-converted files.
+
+### A deleted image guid must warn, on every path that draws one (#1408)
+
+A texture deleted while a 2D sprite or UI image still references it should not leave a wrong
+picture and a clean console. The trap is that the path decides "is this an image?" BEFORE it
+resolves. `isImagePath` (`runtime/core/textureRefs.ts`) asks the manifest for the guid's type, and
+an unknown guid answers "not an image" on purpose, so a material guid is never treated as one. So
+Scene2D drew the graphics fallback (a white square, kept on purpose) and never reached
+`resolveSprite`, the only place `[Sprite2D] Unknown asset guid` is emitted.
+
+`isUnknownAssetGuid` names that case. Each path routes such a ref to its warning:
+
+| Path | Warning | Where |
+|---|---|---|
+| A plain 2D sprite: on a new slot, a ref change, or the sprite → graphics flip of a texture deleted UNDER a live sprite | `[Sprite2D] Unknown asset guid` | Scene2D's Renderable2D pass |
+| A 2D-material entity's sprite and texture params (the material pass owns the entity, so the sprite pass is not reached) | `[Sprite2D] Unknown asset guid` | `resolveMaterialTextureRef` |
+| A UI `<img>`/background: every `UINode` render, in the editor's UI preview too (the `warnKtx` opt-in; only the SceneView's Canvas2D draw path stays quiet). A sprite guid whose parent texture is gone names that texture | `[UIImage] Unknown asset guid` | `resolveBrowserImageUrl` |
+
+Each warning fires once per guid, and is forgotten once the guid resolves again, so a later
+genuine break warns again.
+
+⚠️ **Limit: a texture deleted UNDER a UI image already on screen does not warn until the node
+re-renders** (a scene reload, or an edit to that element). The manifest prune (`unregisterAsset`)
+neither marks the UI tree dirty nor changes the node's `imageEpoch`, so the memoised `UINode` never
+calls the resolver again, and the old picture stays up. Scene2D has no such gap, because the
+sprite → graphics flip rebuilds its slot. This only happens in the editor (nothing is deleted at
+runtime), and closing it means UI-tree invalidation on prune, which is a different change. The 3D side needs none of this: `loadTexture3D` throws on an unresolved
+ref, and every caller warns. Tests: `engine/tests/assets/unknownSpriteGuid.test.ts`, and the
+call sites in `engine/packages/modoki/tests/runtime/Scene2D.test.ts` § "an unknown sprite guid
+reaches resolveSprite".
 
 ### 2D KTX2 sprites (PixiJS)
 
@@ -527,16 +823,44 @@ Two formats ship instead, both selectable per-asset (`EnvImportSettings.format` 
   `HDRLoader`, area-averages down to `maxSize` in linear radiance space, and re-encodes RGBE —
   measured **0.10% mean-luminance error**, and the real download win (2K→1K ≈ 3×, →512 ≈ 12×).
   `env-convert.ts` drives it; `env-cache.ts` content-hashes the result; served as `~env.hdr`.
-- **`ultrahdr` — browser-side gainmap encode.** `@monogrid/gainmap-js` (editor-only, dynamically
-  imported so it never reaches a game bundle) encodes an UltraHDR JPEG with an embedded gainmap
-  (`encodeUltraHDR.ts`: HDRLoader → `findTextureMinMax` → `encodeAndCompress` →
-  `encodeJPEGMetadata`, libultrahdr WASM); the committed `~ultrahdr.jpg` is written via
-  `/api/write-file`. Runtime decode is `UltraHDRLoader` (already vendored). Measured on a real
-  asset: 6.53 MB → 0.53 MB (**~11.7×**), ~183 ms encode, 2048×1024, 14 gainmap/XMP markers
-  confirming a real embedded gainmap. Because the encode needs WebGL +
-  `createImageBitmap`, it isn't auto-testable — it was live-verified via CDP in the running
-  Electron editor rather than in `npm test`. `maxSize` downscale is currently `hdr`-only;
-  `ultrahdr` encodes at source resolution (deferred, see below).
+- **`ultrahdr` — gainmap JPEG, encoded in Node.** `plugins/env-ultrahdr.ts` ports
+  `@monogrid/gainmap-js`'s two WebGL passes to the CPU with the library's defaults — the SDR
+  rendition (ACES filmic, then the sRGB OETF the GPU applied on write) and the gain plane
+  (`log2((hdr+1/64)/(sdr+1/64))` normalised to `[0, log2 maxContentBoost]`, computed against the
+  QUANTIZED SDR the GPU would have sampled back) — compresses both with `sharp` at quality 90, and
+  muxes them with `@monogrid/gainmap-js/libultrahdr`'s `encodeJPEGMetadata` (pure JS in 3.4: MPF +
+  XMP, no WASM, no DOM). `environmentReimportHandler` writes the result as `~ultrahdr.jpg` NEXT TO
+  THE SOURCE — it is committed, and the build copies it rather than re-encoding — and sets
+  `environmentCache` to `{ hash, bytes }` only. Runtime decode is `UltraHDRLoader`. Encodes at
+  SOURCE resolution: `maxSize` is `hdr`-only.
+  - ⚠️ **One encoder, three entry points (#1314).** The encode used to run in the renderer
+    (`encodeUltraHDR.ts`, WebGL), so the Assets-panel re-import and `modoki_reimport_asset` — both
+    Node — had no ultrahdr branch: they ran the `hdr` downscale on an `ultrahdr` asset and stamped
+    `~env.hdr`'s hash, dims and size into `environmentCache`, and only the Inspector's own Apply
+    produced the right block. Apply now posts `/api/reimport` too. Don't reintroduce a
+    format-specific path in the panel.
+  - ⚠️ **The browser encoder's variants rendered UPSIDE DOWN, and the port deliberately does not
+    copy that.** It rendered a `flipY` HDRLoader texture and read it back with `readPixels`, so its
+    planes were stored bottom row first — while `UltraHDRLoader` (`flipY = true`) expects an
+    ordinary top-row-first JPEG. Nothing had ever committed an UltraHDR env, so nobody saw it.
+    Found live on 2026-09-17: a chrome sphere in `games/3d-test` reflecting `wooden_motel_2k` showed
+    the ground overhead under `ultrahdr` and the sky overhead under `hdr`; with the planes stored
+    upright, the two reflections match. A reflection is the check to reach for: a scene's
+    background is usually a solid colour the engine re-applies every frame, so it cannot show this.
+  - **Measured against the browser encoder** (2026-09-17, `rustig_koppie_puresky_2k.hdr`,
+    2048×1024): identical XMP (`GainMapMax=18.398`, offsets 1/64, gamma 1), both planes within JPEG
+    noise once the browser's upside-down planes are turned the right way up (mean |Δ| 0.18 / 0.13
+    levels, max 5), 109 KB vs 110 KB, 653 ms in Node vs 537 ms in WebGL. Bytes are NOT identical and don't need to be — the
+    Chrome canvas JPEG encoder was the other half, and it is gone. Pinned by
+    `tests/plugins/envUltraHdr.test.ts`.
+  - **Costs and limits of running it in Node.** In the packaged editor `/api/reimport` runs in
+    Electron's MAIN process and both passes are synchronous, so Apply stalls the window for the
+    encode — measured by the #1314 review at ~0.2 s for 2K and ~1 s end-to-end for 4K on a loaded
+    Mac (the `hdr` downscale blocks the same way, for less). The output is deterministic on one
+    machine (two runs, identical bytes), but byte identity ACROSS platforms is unmeasured: if
+    Windows' libjpeg-turbo differs, a re-import there rewrites the committed JPEG and its hash.
+    The static server's on-demand `~env.hdr` bake refuses an asset whose on-disk format is
+    `ultrahdr`, so a stale renderer cannot trigger this encode.
 - The scanner's `detectType` excludes the committed `~ultrahdr.jpg` from re-classification as a
   fresh texture (it's a derived file, not a source asset) — build-gen copies the committed variant
   and drops the multi-MB HDR source; the dist verifier checks the per-format variant exists.
@@ -635,8 +959,9 @@ longer runs at invalidation time — in production that is a few frames, and fre
 be the same use-after-free one level down.
 
 **The sweep backs off when a retiree is legitimately PINNED.** A retiree can be held forever and
-correctly so: if the refetch after an invalidation fails, `fetchMaterial` caches
-`MATERIAL_FAILED`, `resolveMaterial` returns undefined for that path permanently, and
+correctly so: if the refetch after an invalidation fails PERMANENTLY (a 404 or an unreadable file — a network
+failure only backs off, #1371), `fetchMaterial` caches `MATERIAL_FAILED`, `resolveMaterial`
+returns undefined for that path permanently, and
 `syncMaterial` can never rebind — so the mesh keeps drawing the retiree. Without a backoff
 `retired.size` never returns to 0 and every surface pays a full `scene.traverse()` on every frame
 for the rest of the session. ⚠️ The grace before backing off is **3 fruitless sweeps, not 1**, and
@@ -904,7 +1229,7 @@ scraping the log.
 - `plugins/reimport-atlas.ts` — `atlas` reimport handler (pack + composite + encode).
 - `plugins/atlas-cache.ts` — atlas content hash + synthetic page url path.
 - `runtime/loaders/spriteAtlas.ts` — pure MaxRects packer + atlas schema types.
-- `scripts/stage-toktx.cjs` — electron-builder `beforePack`: bundles `toktx` + `libktx`.
+- `scripts/stage-toktx.cjs` — electron-builder `beforePack`: bundles `toktx` + `ktx` + `libktx`.
 - `runtime/loaders/pixiKtxTranscoder.ts` — registers PixiJS `loadKTX2` +
   locally-served libktx (2D KTX2 sprite decode).
 - `vite-asset-scanner.ts` — variant/transcoder serving + build-time generation.

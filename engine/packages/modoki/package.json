@@ -20,6 +20,10 @@
     "./runtime/core/jsonSafe": "./src/runtime/core/jsonSafe.ts",
     "./runtime/core/dailyCalendar": "./src/runtime/core/dailyCalendar.ts",
     "./runtime/core/loginBonus": "./src/runtime/core/loginBonus.ts",
+    "./runtime/core/adLifecycle": "./src/runtime/core/adLifecycle.ts",
+    "./runtime/core/attribution": "./src/runtime/core/attribution.ts",
+    "./runtime/core/adPacing": "./src/runtime/core/adPacing.ts",
+    "./runtime/sync/accountContinuity": "./src/runtime/sync/accountContinuity.ts",
     "./editor": "./src/editor/index.ts",
     "./editor/rendering": "./src/editor/rendering/index.ts",
     "./three": "./src/three/index.ts",
@@ -30,6 +34,7 @@
     "./testing/prefabInstances": "./tests/helpers/prefabInstances.ts",
     "./testing/exemptionLedger": "./tests/helpers/exemptionLedger.ts",
     "./testing/sourceAst": "./tests/helpers/sourceAst.ts",
+    "./testing/importClosure": "./tests/helpers/importClosure.ts",
     "./testing/inOrder": "./tests/helpers/inOrder.ts",
     "./testing/scratchDir": "./tests/helpers/scratchDir.ts"
   },
@@ -41,7 +46,7 @@
   "peerDependencies": {
     "koota": ">=0.1.0",
     "react": ">=19.0.0",
-    "three": ">=0.183.0 <0.185.0",
+    "three": ">=0.183.0 <0.186.0",
     "zustand": ">=5.0.0"
   },
   "devDependencies": {

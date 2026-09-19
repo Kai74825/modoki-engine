@@ -86,7 +86,8 @@
  */
 
 import { createWorld, type World, type Entity } from 'koota';
-import { setCurrentWorld, getCurrentWorld, spawnEntity, findEntityById } from '../core/ecs/world';
+import { durableGuid } from '../core/assetRefRules';
+import { setCurrentWorld, getCurrentWorld, spawnEntity, destroyEntity, findEntityById } from '../core/ecs/world';
 import { createTeardownToken, type LivenessCheck } from '../core/liveness';
 import { notifyListeners } from '../core/notifyListeners';
 import { getAllTraits } from '../core/ecs/traitRegistry';
@@ -97,6 +98,7 @@ import { markSceneLoaded, isSceneFilePath } from '../core/ecs/sceneLoaded';
 import { beginBootSpan, endBootSpan, bootSpanAsync } from '../core/bootTimeline';
 import { ensurePhysicsReady } from '../physics/physicsReady';
 import { clearAllOverrideMarks, getOverrideMarkSet, restoreOverrideMarks } from '../loaders/overrideMarks';
+import { captureMarkers, restoreMarkers, type CarriedMarkers } from '../core/carriedMarkers';
 import { clearAuthoredWritesWhileStopped } from '../core/ecs/authoredWrites';
 import { SCENE_FORMAT_VERSION } from '../core/version';
 
@@ -135,7 +137,7 @@ import {
 import { classifyFormatVersion } from '../core/formatVersion';
 import {
   disposeActiveSceneManagers, initSceneManagersFor,
-  disposeActiveGameManagers, initGameManagersFor, getActiveGameId,
+  disposeActiveGameManagers, initGameManagersFor, getActiveGameId, type ManagerStartupError,
   pendingManagerInits,
 } from '../managers/managerRegistry';
 
@@ -174,6 +176,22 @@ export interface Scene {
   readonly id: SceneId;
   readonly path: string;
   readonly state: SceneState;
+}
+
+/** What a successful `loadScene` did that its caller cannot see from the world alone. */
+export interface SceneLoadResult {
+  /** Guids of the base scenes this swap KEPT rather than reloaded: their entities were
+   *  snapshotted from the LIVE world and carried across, so any unsaved edit to them survived
+   *  the load (#1417). Every other scene in the new chain, the primary included, was loaded from
+   *  its file (or from `preloaded` data). Only an old BASE can be kept, and a base in
+   *  `forceReloadBases` never is. The editor clears dirty flags and
+   *  decides the undo drop from this, since nothing in the world records it. */
+  readonly keptBaseGuids: ReadonlySet<string>;
+  /** Managers whose `init()` threw or rejected while this load started them (#1425). The load
+   *  still RESOLVED, because it had already replaced the world: `loadScene` resolves exactly when
+   *  the world was replaced, and every caller's post-load bookkeeping depends on that. Each one is
+   *  also reported through `console.error`. Absent means none (a stub may omit it). */
+  readonly startupErrors?: readonly ManagerStartupError[];
 }
 
 export interface LoadOptions {
@@ -253,8 +271,9 @@ export interface SceneManager {
   /** Load a scene file. Cancels any in-flight load. Resolves when the swap is
    *  complete and the new scene is active. Rejects if the load fails or is
    *  aborted — including by a concurrent/in-flight `unloadAll()` (#535, unload
-   *  wins) — leaving the current scene untouched on failure. */
-  loadScene(path: string, opts?: LoadOptions): Promise<void>;
+   *  wins) — leaving the current scene untouched on failure. Resolves to which bases
+   *  the swap KEPT (see `SceneLoadResult`). */
+  loadScene(path: string, opts?: LoadOptions): Promise<SceneLoadResult>;
   /** Replace every entity in the live world with freshly-spawned content, through the
    *  normal mint → populate → promote → release → destroy contract, so `onWorldSwap`
    *  fires (#853). `populate` spawns into the world it is handed. Not a scene load:
@@ -278,6 +297,12 @@ class SceneManagerImpl implements SceneManager {
   // the format field through so the editor can read/round-trip it.
   private currentBaseScene: string | undefined;
   private nextLoad: { id: SceneId; path: string; controller: AbortController } | null = null;
+  /** Base guids whose FILE changed on disk (`forceReloadBases`) and that no load has reloaded yet
+   *  (#1422). Owned by the manager, not by a load: a forced load can be superseded before its swap,
+   *  and the load that superseded it can fail in turn (a bad path, a scene format that is too new).
+   *  Either way the file is still changed, so ONLY a committed swap clears an entry. At a swap every
+   *  pending guid is either reloaded from disk (a forced base is never kept) or not loaded at all. */
+  private pendingForcedBases = new Set<string>();
   private nextSceneId: SceneId = 1;
   // Unload-wins concurrency (#535, see the class docblock). `teardownInFlight` is
   // incremented at the HEAD of `unloadAll()` (before any await) and decremented in
@@ -306,13 +331,6 @@ class SceneManagerImpl implements SceneManager {
   // leak — prefer a Manager. (scene-managers F7)
   private sceneCallbacks = new Map<string, () => void>();
   private beforeSwapHooks: BeforeSwapHook[] = [];
-  // Which base-scene guids are known (from a prior FRESH load) to contain a prefab
-  // instance — checked against `keptBaseGuids` on the NEXT load so the Phase 5
-  // "editor bookkeeping may not survive a carry" warning fires at the moment the
-  // carry actually happens, not on every fresh load (a base with a prefab instance
-  // used to warn on every single editor boot, whether or not a carry ever followed).
-  private basesWithPrefabInstance = new Set<string>();
-
   /** Register an async hook that runs after entities are spawned into the
    *  staging world but before the atomic swap. Use for shader prewarm. */
   registerBeforeSwap(hook: BeforeSwapHook) {
@@ -431,8 +449,9 @@ class SceneManagerImpl implements SceneManager {
   /** Load a scene file. Cancels any in-flight load. Resolves when the swap is
    *  complete and the new scene is active. Rejects if the load fails or is
    *  aborted — including by a concurrent/in-flight `unloadAll()` (#535, unload
-   *  wins) — leaving the current scene untouched on failure. */
-  async loadScene(path: string, opts: LoadOptions = {}): Promise<void> {
+   *  wins) — leaving the current scene untouched on failure. Resolves to which bases
+   *  the swap KEPT (see `SceneLoadResult`). */
+  async loadScene(path: string, opts: LoadOptions = {}): Promise<SceneLoadResult> {
     // 0. Teardown owns the world (#535): `unloadAll()` bumps `teardownInFlight`
     // at its own head, before any await. A load that starts while a teardown is
     // already running must not race it, so it rejects immediately — before
@@ -450,7 +469,14 @@ class SceneManagerImpl implements SceneManager {
     // Boot timeline (#238): the whole load, plus a span per phase below. Always on — a cold boot
     // has nobody there to switch a profiler on, and the boot stall is only reproducible cold.
     const loadSpan = beginBootSpan('scene-load', path);
-    // 1. Cancel in-flight load
+    // 1. Cancel in-flight load. Every forced base still pending applies to THIS load too (#1422):
+    // a forced base means its FILE changed on disk, which stays true whoever loads next. Without
+    // this, a hot reload of a changed base overtaken before its swap by any other load (an editor
+    // scene open, a prefab hot reload) was lost: the overtaking load found the base in both chains
+    // and KEPT the stale live copy, and nothing re-queued the change, so a later save wrote the
+    // stale base over the external write. A guid the new chain does not use is ignored at step 5.
+    for (const g of opts.forceReloadBases ?? []) this.pendingForcedBases.add(g);
+    const forceReloadBases: ReadonlySet<string> = new Set(this.pendingForcedBases);
     if (this.nextLoad) {
       this.nextLoad.controller.abort();
       releaseAllForScene(this.nextLoad.id);
@@ -484,6 +510,8 @@ class SceneManagerImpl implements SceneManager {
     // before "12. Done" is what turns it into a rejection instead of a silent
     // resolve.
     let postSwapSuperseded = false;
+    // Managers that failed to start in the post-swap tail (#1425) — reported, never thrown.
+    const startupErrors: ManagerStartupError[] = [];
 
     try {
       // 3. Fetch + parse the PRIMARY's scene JSON (or use caller-supplied preloaded data)
@@ -603,8 +631,12 @@ class SceneManagerImpl implements SceneManager {
       // happens to match the old primary's; that mirrors today's unconditional-
       // reload behavior for a same-path reload.
       const oldEntries = [...this.loadedScenes.entries()];
-      const oldGuidToSceneId = new Map(oldEntries.map(([sid, e]) => [e.guid, sid]));
-      const forceReload = new Set(opts.forceReloadBases ?? []);
+      // Only an old BASE can be kept. The old PRIMARY's entities carry `sourceScene: ''`, so
+      // `snapshotPersistentEntities` finds no roots for it: counting it as kept (opening
+      // `/base.json`, then a level whose baseScene is that file) carried nothing, deleted the
+      // base's content from the world, and left two `role:'primary'` entries (#1417 review).
+      const oldGuidToSceneId = new Map(oldEntries.filter(([, e]) => e.role === 'base').map(([sid, e]) => [e.guid, sid]));
+      const forceReload = forceReloadBases; // the caller's, plus any a superseded load was carrying (step 1)
       const keptBaseGuids = new Set<string>();
       const keptSceneIds = new Set<SceneId>();
       for (const ref of baseRefs) {
@@ -613,18 +645,6 @@ class SceneManagerImpl implements SceneManager {
         if (oldSid !== undefined) {
           keptBaseGuids.add(ref.guid);
           keptSceneIds.add(oldSid);
-          // This is the actual moment the Phase 5 limitation bites: `ref` is being
-          // CARRIED (kept from the old chain) rather than freshly reloaded, so if a
-          // prior fresh load saw a prefab instance in it, its editor bookkeeping is
-          // about to be flattened away by the carry respawn below. Warning here
-          // (instead of on every fresh load) means this only fires when it's true.
-          if (this.basesWithPrefabInstance.has(ref.guid)) {
-            console.warn(
-              `[SceneManager] Base scene "${ref.path}" contains a prefab instance — its editor ` +
-              `instance bookkeeping does not survive this carry (this base is kept, not freshly ` +
-              `reloaded, across the swap). (scene-loading.md Phase 5 known limitation).`,
-            );
-          }
         }
       }
       const toLoadRefs: SceneRef[] = [...baseRefs.filter((r) => !keptBaseGuids.has(r.guid)), primaryRef];
@@ -733,10 +753,16 @@ class SceneManagerImpl implements SceneManager {
       // docs/reviews/a9-carried-instance-overrides-investigation.md).
       // Marks are keyed by the packed entity (#868), so resolve each carried id in the old world.
       const carriedMarks = new Map<number, string[]>();
+      // The unregistered markers too (#1427): the snapshot is built from the trait registry, which
+      // never sees them, so `Transient` and `TemplateAddedKey` were silently dropped — a runtime pool
+      // was saved into the next scene, and a template-added node showed false overrides.
+      const carriedMarkers = new Map<number, CarriedMarkers>();
       for (const entry of carriedSnapshots) {
         const old = findEntityById(entry.id);
         const set = old ? getOverrideMarkSet(old) : undefined;
         if (set && set.size > 0) carriedMarks.set(entry.id, [...set]);
+        const markers = captureMarkers(old as Parameters<typeof captureMarkers>[0]);
+        if (markers) carriedMarkers.set(entry.id, markers);
       }
       const persistentOnlySnapshots = carriedSnapshots.filter((e) => e.traits['Persistent'] === true);
       const persistentResources = collectResourceRefsFromEntities(persistentOnlySnapshots);
@@ -781,7 +807,6 @@ class SceneManagerImpl implements SceneManager {
       clearAuthoredWritesWhileStopped();
       const stagingWorld = nextWorld; // captured for closures so TS narrows from null
       const eaMeta = getAllTraits().find((m) => m.name === 'EntityAttributes');
-      const piMeta = getAllTraits().find((m) => m.name === 'PrefabInstance');
 
       for (const ref of toLoadRefs) {
         const sid = sceneIdByPath.get(ref.path)!;
@@ -795,6 +820,10 @@ class SceneManagerImpl implements SceneManager {
         await loadSceneFile(sceneData, {
           world: stagingWorld,
           clearMarks: false, // once-per-world clear above owns this (A9 defect 1)
+          // Scene identity for #1268's derived guids. Per REF, not per chain: each scene in
+          // the chain is loaded by its own call with its own path, so a base scene's entity
+          // derives the same guid no matter which level extends it.
+          scenePath: ref.path,
           fetchPrefab: async (prefabPath: string) => {
             // Use the refcounted prefab cache (already acquired in step 6)
             const cached = getCachedPrefab(prefabPath);
@@ -803,14 +832,14 @@ class SceneManagerImpl implements SceneManager {
             await acquirePrefab(sid, prefabPath);
             return (getCachedPrefab(prefabPath) as object) ?? null;
           },
-          onInstantiatePrefab: async (source, parentId, rootTransform, _oldEntityId, rootExtraTraits, overrides, structure, nestedOverrides, rootGuid, rootEditorFolder) => {
+          onInstantiatePrefab: async (source, parentId, rootTransform, _oldEntityId, rootExtraTraits, overrides, structure, nestedOverrides, rootGuid, rootEditorFolder, nestedStructure) => {
             // The prefab was already fetched + cached by fetchPrefab; spawn it
             // into the staging world (not the active world). Pass source so the
             // spawned entities get PrefabInstance traits for editor identification.
             // `overrides` carries per-localId field-level edits captured at save time;
             // `nestedOverrides` carries scene-level edits on the prefab's own nested instances.
             const cached = getCachedPrefab(source);
-            if (!cached) { console.warn(`[SceneManager] Prefab not in cache: ${source}`); return; }
+            if (!cached) { console.warn(`[SceneManager] Prefab not in cache: ${source}`); return undefined; }
             const rootEcsId = instantiatePrefabIntoWorld(
               stagingWorld,
               cached as { entities: { localId?: number; traits: Record<string, unknown> }[]; rootLocalId?: number },
@@ -821,6 +850,7 @@ class SceneManagerImpl implements SceneManager {
               structure,
               undefined,
               nestedOverrides,
+              nestedStructure,
             );
             // Re-apply the scene-authored stable guid to the instance root. The prefab
             // template clears member guids, so the freshly-spawned root has none; without
@@ -873,6 +903,8 @@ class SceneManagerImpl implements SceneManager {
                 break;
               }
             }
+            // The loader re-points every reference it resolved to the placeholder onto this root (#1353).
+            return rootEcsId || undefined;
           },
           onDeletePlaceholder: (entityId) => {
             // The placeholder lives in stagingWorld; destroy it so the prefab
@@ -880,9 +912,11 @@ class SceneManagerImpl implements SceneManager {
             // (packed worldId/generation/id) with prototype methods, so we must
             // compare via entity.id() (unpacked local id) — comparing the raw
             // packed value never matches the local id loadSceneFile passes us.
+            // destroyEntity, not a bare destroy(): the placeholder is registered, and a bare destroy
+            // left its corpse in the staging world's entity index (#1222).
             for (const e of stagingWorld.entities) {
               if ((e as unknown as { id(): number }).id() === entityId) {
-                (e as unknown as { destroy(): void }).destroy();
+                destroyEntity(e, stagingWorld);
                 break;
               }
             }
@@ -899,22 +933,13 @@ class SceneManagerImpl implements SceneManager {
         // onEntitySpawned — are covered too). The primary's entities keep the
         // schema default ''.
         if (!isPrimary && eaMeta) {
-          let sawPrefabInstance = false;
           for (const e of stagingWorld.entities) {
             const ent = e as unknown as { id(): number; has(t: unknown): boolean; get(t: unknown): Record<string, unknown>; set(t: unknown, d: unknown): void };
             const eid = ent.id();
             if (beforeIds.has(eid)) continue; // spawned by an earlier scene in the chain
-            if (piMeta && ent.has(piMeta.trait)) sawPrefabInstance = true;
             if (!ent.has(eaMeta.trait)) continue;
             ent.set(eaMeta.trait, { ...ent.get(eaMeta.trait), sourceScene: ref.guid });
           }
-          // Record rather than warn here — a base with a prefab instance is safe on
-          // ITS OWN fresh load (instantiatePrefabIntoWorld ran normally, full editor
-          // bookkeeping intact); the Phase 5 limitation only bites on a LATER load
-          // that CARRIES this same base instead of reloading it. That check (and the
-          // actual warning) lives where `keptBaseGuids` is computed, above.
-          if (sawPrefabInstance) this.basesWithPrefabInstance.add(ref.guid);
-          else this.basesWithPrefabInstance.delete(ref.guid); // no longer has one — stale flag would false-warn later
         }
       }
 
@@ -937,6 +962,11 @@ class SceneManagerImpl implements SceneManager {
           {
             world: nextWorld,
             clearMarks: false, // once-per-world clear above owns this (A9 defect 1)
+            // ⚠️ NO `scenePath` here, deliberately (#1268). These snapshots come from the
+            // live world and may originate in SEVERAL different scenes, so there is no one
+            // scene identity to seed a derived guid on — and they already carry durable
+            // guids from their own files, which is exactly what filterPersistentDuplicates
+            // matches a carried entity on. Passing a path here would re-key them mid-swap.
             fetchPrefab: async () => null, // flattened snapshots never carry a `prefab` ref
             loadModels: false,
             // Re-seed the marks captured off the dying world, per entity, against
@@ -946,6 +976,7 @@ class SceneManagerImpl implements SceneManager {
             onEntitySpawned: (entity: { id(): number }, oldId: number) => {
               const keys = carriedMarks.get(oldId);
               if (keys) restoreOverrideMarks(entity as unknown as Entity, keys);
+              restoreMarkers(entity as unknown as Parameters<typeof restoreMarkers>[0], carriedMarkers.get(oldId));
             },
           },
         );
@@ -994,10 +1025,11 @@ class SceneManagerImpl implements SceneManager {
         // never be written back to whichever scene happens to be saved next. Without
         // the tag a save silently GREW any scene lacking a Time entity by one
         // (measured on ui-focus-demo.json, 9 → 10 entities; see docs/scene-loading.md), which is a
-        // counter-example to the A10 "a no-op save is a no-op" invariant. Worse for a
-        // BASE scene: the foreign-entity filter in serialize.ts skips any entity
-        // without EntityAttributes, and this one has none, so it lands in EVERY file
-        // saved while it exists rather than being confined to the primary.
+        // counter-example to the A10 "a no-op save is a no-op" invariant. (Before #1248 it
+        // was worse for a BASE scene: it had no EntityAttributes, so the foreign-entity
+        // filter in serialize.ts could not see it and it landed in EVERY file saved. Since
+        // #1248 `spawnEntity` gives every entity EntityAttributes, so the tag is what stops
+        // the primary-save bake.)
         //
         // This does NOT stop a scene from AUTHORING its own Time ENTITY — hosting the
         // resource in a shared BASE scene is a supported setup: a Time that came from a
@@ -1015,11 +1047,13 @@ class SceneManagerImpl implements SceneManager {
       // Input is likewise a global resource — ensure the combined world has the
       // singleton so the app-pipeline inputSystem has a target to write and
       // consumers (character input, UI focus) can read it. Runtime-only; never
-      // authored into a scene file.
+      // authored into a scene file. `Transient` since #1248: every entity now carries
+      // EntityAttributes and Input is a registered resource, so without the tag a save
+      // would write an Input entity (its whole per-frame snapshot) into the scene.
       let hasInput = false;
       stagingWorld.query(Input).updateEach(() => { hasInput = true; });
       if (!hasInput) {
-        spawnEntity(stagingWorld, Input());
+        spawnEntity(stagingWorld, Input(), Transient);
       }
 
       // Prewarm: let renderers compile shaders against the staging world BEFORE
@@ -1076,6 +1110,7 @@ class SceneManagerImpl implements SceneManager {
       this.primaryId = id;
       this.currentBaseScene = data.baseScene;
       this.nextLoad = null;
+      for (const g of forceReloadBases) this.pendingForcedBases.delete(g); // applied (#1422)
 
       // #1135 — BEFORE the promote, so the first GAME tick against this world already knows its scene
       // is here, and a host-resolving system cannot mistake it for the pre-scene boot window. Only a
@@ -1185,13 +1220,13 @@ class SceneManagerImpl implements SceneManager {
         // an in-game swap keeps them running), then the new scene's scene-scoped
         // managers. Awaited so async init (e.g. entity spawning) completes before
         // loadScene resolves.
-        if (gameChanged) await bootSpanAsync('game-managers-init', () => initGameManagersFor(nextGameId, path));
+        if (gameChanged) startupErrors.push(...await bootSpanAsync('game-managers-init', () => initGameManagersFor(nextGameId, path)));
         if (this.isPostSwapSuperseded(enteredGeneration)) postSwapSuperseded = true;
         // Re-check `postSwapSuperseded` here too (#542) — a teardown can start and
         // flip it to true during the `initGameManagersFor` await just above,
         // between the outer guard's check and this one.
         if (!postSwapSuperseded && this.primaryId === id) {
-          await bootSpanAsync('scene-managers-init', () => initSceneManagersFor(path), path);
+          startupErrors.push(...await bootSpanAsync('scene-managers-init', () => initSceneManagersFor(path), path));
           if (this.isPostSwapSuperseded(enteredGeneration)) postSwapSuperseded = true;
         }
       }
@@ -1203,6 +1238,10 @@ class SceneManagerImpl implements SceneManager {
       if (postSwapSuperseded) {
         throw new DOMException('Aborted', 'AbortError');
       }
+      reportStartupErrors(path, startupErrors);
+      // Only when there are some: "absent means none" (SceneLoadResult), which keeps the clean
+      // result the exact shape it always was.
+      return startupErrors.length ? { keptBaseGuids, startupErrors } : { keptBaseGuids };
     } catch (err) {
       // Failure or abort — clean up every sceneId allocated THIS attempt (the
       // primary plus any base newly entering the chain). Skip once the swap has
@@ -1226,6 +1265,7 @@ class SceneManagerImpl implements SceneManager {
         for (const sid of allocatedSceneIds) releaseAllForScene(sid);
       }
       if (nextWorld) {
+        // eslint-disable-next-line no-restricted-syntax -- a koota World, not an entity
         try { nextWorld.destroy(); } catch { /* ignore */ }
       }
       if (this.nextLoad?.id === id) this.nextLoad = null;
@@ -1404,7 +1444,7 @@ class SceneManagerImpl implements SceneManager {
         // nothing: the new scene reads as frozen and dead to input the moment you press Play.
         //
         // ⚠️ `Input` in particular would be a REGRESSION this method introduces, not a
-        // pre-existing gap: it is absent from the trait registry, so the old in-place
+        // pre-existing gap: it was absent from the trait registry (until #1248), so the old in-place
         // `deleteEntities(getAllEntities()…)` never saw it and it survived by accident. A fresh
         // world has no such accident. (`Time` was already being lost on this path.)
         //
@@ -1417,13 +1457,14 @@ class SceneManagerImpl implements SceneManager {
         if (!hasTime) spawnEntity(staging, Time(), Transient);
         let hasInput = false;
         staging.query(Input).updateEach(() => { hasInput = true; });
-        if (!hasInput) spawnEntity(staging, Input());
+        if (!hasInput) spawnEntity(staging, Input(), Transient);
       } catch (e) {
         // `populate` is caller-supplied and this method is on the public SceneManager
         // interface. A throw here must not strand the staging world: it was never promoted, so
         // nothing will ever destroy it, and koota's pool is 16 wide. Mirrors `loadScene`'s own
         // `nextWorld.destroy()` failure path. Nothing above this point has touched the live
         // world or any global, so the editor is left exactly as it was.
+        // eslint-disable-next-line no-restricted-syntax -- a koota World, not an entity
         try { staging.destroy(); } catch { /* nothing else to do */ }
         throw e;
       }
@@ -1459,7 +1500,7 @@ class SceneManagerImpl implements SceneManager {
       // a filter-less manager's `init()` would spawn its entities straight into the brand-new
       // scene the user is about to see, and the dispose below — holding `oldWorld` — could not
       // see them to clean up. Hence the second dispose, on the same world as the activation.
-      await initSceneManagersFor('');
+      reportStartupErrors('', await initSceneManagersFor(''));
       await disposeActiveSceneManagers({ world: oldWorld, scenePath: '' });
 
       // Rebuild bookkeeping BEFORE `setCurrentWorld` — it fires `onWorldSwap` synchronously and
@@ -1512,6 +1553,7 @@ class SceneManagerImpl implements SceneManager {
     // worlds at 16; without this, every scene swap permanently consumes a
     // slot and the engine breaks after ~16 swaps.
     const destroyOldWorld = () => {
+      // eslint-disable-next-line no-restricted-syntax -- a koota World, not an entity
       try { oldWorld.destroy(); } catch (e) { console.warn('[SceneManager] Failed to destroy old world:', e); }
     };
     if (oldWorld !== promotedWorld) {
@@ -1607,7 +1649,7 @@ class SceneManagerImpl implements SceneManager {
       // (matches any path), so dispose scene managers once more afterward to leave
       // everything inactive.
       await initGameManagersFor(null, '');
-      await initSceneManagersFor('');
+      reportStartupErrors('', await initSceneManagersFor(''));
       await disposeActiveSceneManagers({ world: oldWorld, scenePath: '' });
 
       // Release every loaded scene (today, a chain of one — Phase 5 is what makes
@@ -1668,7 +1710,7 @@ class SceneManagerImpl implements SceneManager {
     this.primaryId = null;
     this.currentBaseScene = undefined;
     this.nextLoad = null;
-    this.basesWithPrefabInstance.clear();
+    this.pendingForcedBases.clear();
     this.teardownInFlight = 0;
     this.teardownToken.invalidateAll();
   }
@@ -1699,7 +1741,9 @@ export function filterPersistentDuplicates(
     const ea = snap.traits['EntityAttributes'] as Record<string, unknown> | undefined;
     // Defensive: only roots should be persistent
     if (ea && ((ea.parentId as number) ?? 0) !== 0) continue;
-    let guid = (ea?.guid as string) || '';
+    // Durable only (#1210): a root tagged Persistent without markPersistent now carries a RUNTIME
+    // guid, which is re-minted on every carry and so can match nothing — it must still warn.
+    let guid = durableGuid(ea?.guid as string);
     if (!guid) {
       const p = snap.traits['Persistent'];
       if (p && typeof p === 'object') guid = ((p as Record<string, unknown>).guid as string) || '';
@@ -1767,6 +1811,9 @@ export function filterPersistentDuplicates(
  *  Nothing else in the pipeline detects a duplicate guid across additively-
  *  loaded scenes, and two live entities answering to the same guid means an
  *  arbitrary winner for every `findEntityByGuid` lookup.
+ *
+ *  Since #1293 a scene-file duplicate REMINTS its entity guids, so a newly duplicated level no
+ *  longer trips this. It stays for the files duplicated before that, which still share guids.
  *
  *  Called once per `toLoadRefs` entry, in chain order (root-most base first,
  *  primary last) — `seenGuids` accumulates across calls, so the FIRST scene to
@@ -2100,6 +2147,14 @@ async function acquireResourceInner(sceneId: SceneId, ref: SceneResourceRef): Pr
       return acquireAudio(sceneId, ref.path, getAudioLoadType(ref.path));
     default:
       console.warn(`[SceneManager] Unknown resource type: ${(ref as { type: string }).type}`);
+  }
+}
+
+/** Report managers that failed to start (#1425). They do not reject the load — see
+ *  `SceneLoadResult.startupErrors` — so this line is what makes each one visible. */
+function reportStartupErrors(scenePath: string, errors: readonly ManagerStartupError[]): void {
+  for (const { manager, error } of errors) {
+    console.error(`[SceneManager] manager "${manager}" failed to start${scenePath ? ` for ${scenePath}` : ''}:`, error);
   }
 }
 

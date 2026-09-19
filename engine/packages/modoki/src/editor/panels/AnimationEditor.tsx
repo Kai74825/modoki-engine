@@ -9,10 +9,10 @@
  *  and written by Cmd+S (Save All) — see useParkedAssetDoc.ts (#259). */
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { writeAssetFile, jsonFileBody } from '../backend/editorBackend';
+import { jsonFileBody } from '../backend/editorBackend';
+import { writeNewAssetDocument } from '../scene/createAssetDocument';
 import { useEditorStore } from '../store/editorStore';
 import { pendingAssetDoc, adoptParkedDoc } from './pendingAssetDoc';
-import { assetWrittenToDisk } from '../scene/dirtyAssets';
 import { register, registerBindings } from '../input/keymap';
 import { useHmrEpoch } from '../input/hmrEpoch';
 import { findEntity, getStructureVersion } from '../../runtime/core/ecs/entityUtils';
@@ -50,7 +50,7 @@ import { bindClipToEntity } from '../animation/bindAnimator';
 import { applyPoseAtTime, poseClipAtTime, exitPoseEnvelope, onPoseEnvelopeExited } from '../animation/poseClip';
 import { resolveAnimatorRootForClip } from './openAssetInEditor';
 import { frameToTime, snapToFrame, timeToFrame, DEFAULT_VIEWPORT, type Viewport } from './animation/timelineMath';
-import { saveAssetDialog } from '../utils/saveDialog';
+import { chooseNewAssetPath } from '../utils/saveDialog';
 import { enterScrubMode, enterPreviewMode, exitPreviewMode, registerModeOwnerDisplaced } from '../scene/playMode';
 import {
   beginTimelinePreviewSession, hasTimelinePreviewSession,
@@ -180,11 +180,12 @@ export default function AnimationEditor() {
   // selection (docs/editor.md § Tab mounting latches), so "the Animation tab exists" is not
   // "a view is showing" — the distinction #367 had to learn on the Game panel. Without this, set-animation-view-mode answers ok:true for an
   // editor where neither view's handle provider is registered.
-  const setPanelMounted = useEditorStore((s) => s.setAnimationPanelMounted);
+  const setEditorMount = useEditorStore((s) => s.setEditorMount);
+  const mountedAssetPath = useEditorStore((s) => s.editingAnimationAsset?.path ?? null);
   useEffect(() => {
-    setPanelMounted(true);
-    return () => setPanelMounted(false);
-  }, [setPanelMounted]);
+    setEditorMount('animation', { path: mountedAssetPath });
+    return () => setEditorMount('animation', null, mountedAssetPath);
+  }, [setEditorMount, mountedAssetPath]);
   // Shared horizontal timeline viewport (zoom + pan), used by BOTH the Dopesheet
   // and Curves views so switching views keeps the same zoom. Wheel zooms toward the
   // cursor; right-drag pans (SceneView convention). Reset via Home / 0.
@@ -1096,16 +1097,15 @@ export default function AnimationEditor() {
 
   // Create a new clip via the native Save dialog, bind to the selected Animator if any.
   const newClip = useCallback(async () => {
-    const path = await saveAssetDialog({ defaultName: 'New Animation.anim.json', ext: '.anim.json', prompt: 'Create Animation Clip' });
-    if (!path) return;
-    const guid = newGuid();
-    const name = (path.split('/').pop() || 'Clip').replace(/\.anim\.json$/i, '');
-    const ok = await writeAssetFile(path, jsonFileBody(defaultAnimationClip(guid, name)));
-    // CREATE writes immediately (the file must exist for registerAsset/the manifest), so the file
-    // is authoritative — drop any parked write for that path.
-    if (ok) assetWrittenToDisk(path);
-    if (!ok) return;
-    registerAsset(guid, path, 'animation');
+    const pick = await chooseNewAssetPath({ defaultName: 'New Animation.anim.json', ext: '.anim.json', prompt: 'Create Animation Clip' });
+    if (!pick) return;
+    const name = (pick.path.split('/').pop() || 'Clip').replace(/\.anim\.json$/i, '');
+    // Create-only, asking before a Replace, which keeps the replaced clip's guid (#1264).
+    const r = await writeNewAssetDocument(pick.path, (guid) => jsonFileBody(defaultAnimationClip(guid, name)), { confirmReplace: pick.confirmReplace });
+    if (r.outcome !== 'created' && r.outcome !== 'replaced') return;
+    // `r.path`: a Replace lands on the existing file's on-disk spelling (#1273).
+    const { path } = r;
+    registerAsset(r.guid, path, 'animation');
     const sel = useEditorStore.getState().selectedEntityId;
     const animMeta = getTraitByName('Animator');
     const ent = sel != null ? findEntity(sel) : null;

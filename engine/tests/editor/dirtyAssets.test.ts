@@ -125,7 +125,7 @@ describe('the unsaved-work refusal names the ACTUAL cause (S3.11)', () => {
 
   it('a dirty LIVE WORLD is still reported as live-world scene edits', async () => {
     stubFetch();
-    await runAgentOp('create-entity', { spec: { kind: 'empty', name: 'S311Probe' } });
+    await runAgentOp('create-entity', { spec: { kind: 'empty' } });
     await expect(runAgentOp('new-scene', {})).rejects.toThrow(/LIVE-WORLD scene edits/);
     await expect(runAgentOp('new-scene', {})).rejects.not.toThrow(/pending ASSET edit/);
   });
@@ -363,6 +363,28 @@ describe('discard-asset-edits — abandoning a parked write', () => {
     expect(getDirtyAssetPaths()).toEqual([B]);
   });
 
+  it('named paths that match NOTHING pending are refused, listing what is — not "nothing was pending" (#1213 A-12)', async () => {
+    markAssetDirty(B, 'particle', def());
+    const typo = '/assets/fx/y.particle'; // the write the caller meant to drop is B
+    const e = await runAgentOp('discard-asset-edits', { paths: [typo] }).catch((x: unknown) => x) as { code?: string; options?: string[]; message?: string };
+    expect(e.code).toBe('NOT_FOUND');
+    expect(e.message).toContain(B);
+    expect(e.options).toContain(`paths:${JSON.stringify([B])}`);
+    expect(getDirtyAssetPaths()).toEqual([B]);
+  });
+
+  it('a partly-matching list still discards what it names, and reports the rest as notPending', async () => {
+    markAssetDirty(A, 'particle', def());
+    const r = await runAgentOp('discard-asset-edits', { paths: [A, '/assets/fx/typo.json'] }) as { ok: boolean; discarded: string[]; notPending: string[] };
+    expect(r).toMatchObject({ ok: true, discarded: [A], notPending: ['/assets/fx/typo.json'] });
+  });
+
+  it('with nothing pending at all, a named path is still a truthful ok "nothing was pending"', async () => {
+    const r = await runAgentOp('discard-asset-edits', { paths: [A] }) as { ok: boolean; note: string };
+    expect(r.ok).toBe(true);
+    expect(r.note).toMatch(/Nothing was pending/);
+  });
+
   it('all:true drops everything', async () => {
     markAssetDirty(A, 'particle', def());
     markAssetDirty(B, 'particle', def());
@@ -394,6 +416,11 @@ describe('discard-asset-edits — abandoning a parked write', () => {
     // The refusal must name what it would have dropped, so obeying it is a copy-paste.
     await expect(runAgentOp('discard-asset-edits', {})).rejects.toThrow(A);
     expect(getDirtyAssetPaths(), 'a refused call must not discard anything').toEqual([A]);
+    // …and the choices are OPTIONS, not only prose (#1212 A-20): the relay turns a plain throw into
+    // REFUSED_BY_OP with no options at all.
+    const e = await runAgentOp('discard-asset-edits', {}).catch((x: unknown) => x) as { code?: string; options?: string[] };
+    expect(e.code).toBe('REFUSED_BY_OP');
+    expect(e.options).toEqual([`paths:["${A}"]`, 'all:true — drops every pending asset write, unrecoverably']);
   });
 
   it('`paths` and `all` together are refused — they disagree about the scope', async () => {

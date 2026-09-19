@@ -9,6 +9,7 @@ import { z } from 'zod';
 import type { ToolDef } from '../toolDef.js';
 import type { ToolContext } from '../context.js';
 import { flatEntityAlias, foldEntityRef, precisionParam } from '../shapes.js';
+import { PROFILER_ACTIONS, PROFILER_READ_ACTIONS } from '../../../shared/profilerActions.js';
 
 export function registerRuntimeTools(tool: ToolDef, ctx: ToolContext): void {
   const { getJson, postJson, editorAction, fail } = ctx;
@@ -22,7 +23,7 @@ export function registerRuntimeTools(tool: ToolDef, ctx: ToolContext): void {
   // ── Phase A: semantic verification ──
   tool(
     'modoki_journal',
-    'RETURNS {count, total, ringTotal, byType, events}: `count` is what came back, `total` is what MATCHED your filter, and `ringTotal`+`byType` describe the WHOLE ring regardless of the filter — so a filtered read still shows you what else is in there. Read the tick-stamped game-event trace (events a game emits: match/score/win/…). The ' +
+    'Read the tick-stamped GAME-event trace (events a game emits: match/score/win/…) — not the editor-activity stream (modoki_editor_journal) or console output (modoki_get_console_logs). RETURNS {returnedCount, totalCount, ringTotal, byType, events}: `returnedCount` is what came back, `totalCount` is what MATCHED your filter, and `ringTotal`+`byType` describe the WHOLE ring regardless of the filter — so a filtered read still shows you what else is in there. The ' +
       'screenshot-free way to verify game LOGIC — assert on events, not pixels. Returns the ' +
       'LAST 100 events by default plus `byType` counts over the whole 10,000-event ring and ' +
       '`captures` (Tier-2 diagnostic state). Narrow with type= and/or level=, raise limit=N, pair ' +
@@ -134,11 +135,11 @@ export function registerRuntimeTools(tool: ToolDef, ctx: ToolContext): void {
   // ── Phase B: numeric layout/bounds ──
   tool(
     'modoki_get_layout_bounds',
-    'NOTE `count` counts RECTS, not entities: every 3D entity is measured once PER MOUNTED VIEWPORT (Scene and Game each have their own camera), so with both open it is roughly doubled. `entityCount` is the distinct-entity number, and `surfaces`/`surfaceNote` appear whenever more than one is mounted. Numeric screen-space layout (viewport CSS px) — UI (true DOM/flexbox rects), 2D, and 3D ' +
-      '(world AABB projected through the game camera). Use this INSTEAD of eyeballing a screenshot ' +
-      'to check alignment, spacing, overlap, or clipping. CALLED BARE it returns COUNTS — count, ' +
-      'layerCounts, overlapsCount — plus the cheap `offScreen` and `zeroSize` id lists. Those ids ' +
-      'are usually the whole answer ("what is invisible / collapsed?"). For per-entity rects pass ' +
+    'Numeric screen-space layout of ENTITIES (viewport CSS px) — UI (true DOM/flexbox rects), 2D, and 3D ' +
+      '(world AABB projected through the game camera); for editor HANDLES use modoki_handles. Use this INSTEAD of eyeballing a screenshot ' +
+      'to check alignment, spacing, overlap, or clipping. NOTE `totalCount` (and `returnedCount`, the rects in `entities`) count RECTS, not entities: every 3D entity is measured once PER MOUNTED VIEWPORT (Scene and Game each have their own camera), so with both open it is roughly doubled. `entityTotal` is the distinct-entity number, and `surfaces`/`surfaceNote` appear whenever more than one is mounted. CALLED BARE it returns COUNTS — totalCount, ' +
+      'layerCounts, overlapsCount — plus the cheap `offScreen` and `zeroSize` GUID lists (an entity with no ' +
+      'guid goes in `offScreenNoGuidIds`/`zeroSizeNoGuidIds`). Those lists are usually the whole answer ("what is invisible / collapsed?"). For per-entity rects pass ' +
       '`ids` or `layer`; for the same-layer overlapping PAIRS (ancestor pairs excluded) pass ' +
       '`overlaps:true` — the pair list is O(n²) and was ~105k chars on a 241-entity scene, so it is ' +
       'opt-in. Cross-check against modoki_capture_viewport when unsure.',
@@ -149,7 +150,7 @@ export function registerRuntimeTools(tool: ToolDef, ctx: ToolContext): void {
       ids: z.array(z.number()).optional().describe('Limit to these entity ids. Implies per-entity rects.'),
       entities: z.boolean().optional().describe('Force the per-entity rect list on an untargeted call. Large — prefer ids/layer.'),
       overlaps: z.boolean().optional().describe('Materialize the overlapping-pair list. Default false (only overlapsCount is reported) because it is O(n²) and dominated the response.'),
-      limit: z.number().int().positive().optional().describe('Cap the returned per-entity rects; sets truncated + totalCount. Useful with layer= on a big scene.'),
+      limit: z.number().int().positive().optional().describe('Cap the returned per-entity rects (`returnedCount`); sets truncated when it bites. Useful with layer= on a big scene.'),
       precision: precisionParam(),
     },
     async ({ layer, ids, guids, name, entities, overlaps, limit, precision }) => {
@@ -275,7 +276,7 @@ export function registerRuntimeTools(tool: ToolDef, ctx: ToolContext): void {
     {
       action: z.enum(['set', 'delete', 'clear', 'flush'])
         .describe('REQUIRED. set = write one key (needs key + value). delete = remove one key (needs key; a key that is not there is REFUSED with the real key list, not a silent no-op). clear = remove EVERY key in the namespace (needs confirm:true). flush = force pending debounced writes out and report any the backend rejected.'),
-      key: z.string().optional().describe('The key, for action set/delete. Ignored by clear/flush.'),
+      key: z.string().optional().describe('The key, for action set/delete. REFUSED on clear/flush — clear removes every key, so a key there is a mistake, not a filter.'),
       value: z.any().optional().describe('The JSON document to store, for action:"set". Any JSON value including null. Omitting it is REFUSED rather than treated as a delete — PlayerPrefs reads undefined as a delete, and that is a different operation here.'),
       confirm: z.boolean().optional().describe('Required (true) for action:"clear" only — it removes every key in the namespace and is not undoable. The refusal lists the keys it would have removed.'),
     },
@@ -319,8 +320,7 @@ export function registerRuntimeTools(tool: ToolDef, ctx: ToolContext): void {
   // ── Profiler (#166 P6) — the editor half of a gap that existed on BOTH surfaces ──
   tool(
     'modoki_profiler',
-    'Where did the frame go? — the Profiler surface (#138), which until now had NO typed tool on ' +
-      'EITHER surface and was reachable only by an agent who knew to eval the op. Called bare it ' +
+    'Read or drive the frame PROFILER — where the frame time went, per marker. Called bare it ' +
       'reads the live marker aggregate (the per-marker self-ms breakdown of a frame). ' +
       'capture-start/-stop/-read record real frames and rank the WORST by cost, not the most recent, ' +
       'so a hitch stays findable after it happened. gpu-on/gpu-off enable GPU timestamp queries — ' +
@@ -336,7 +336,7 @@ export function registerRuntimeTools(tool: ToolDef, ctx: ToolContext): void {
       'device_profiler on the target phone; this is for finding which marker owns the frame, and for ' +
       'editor-side regressions. Read actions are GET, state-changing ones POST.',
     {
-      action: z.enum(['read', 'capture-start', 'capture-stop', 'capture-read', 'capture-clear', 'gpu-on', 'gpu-off', 'reset', 'boot', 'boot-reset'])
+      action: z.enum(PROFILER_ACTIONS)
         .optional().describe('Default "read" (the live aggregate). capture-* record/read frames; gpu-* toggle GPU timestamps; reset clears markers + captures; boot reads the boot-phase timeline; boot-reset re-arms it.'),
       markers: z.number().optional().describe('action:read only — how many marker rows to return (default 12).'),
       limit: z.number().optional().describe('action:capture-read (worst frames, default 5, max 20) or action:boot (rows per section, default 15, max 200).'),
@@ -366,7 +366,7 @@ export function registerRuntimeTools(tool: ToolDef, ctx: ToolContext): void {
           options: stray.map((s) => `${s.param} applies only to action:'${s.belongsTo}'`),
         });
       }
-      if (act === 'read' || act === 'capture-read' || act === 'boot') {
+      if ((PROFILER_READ_ACTIONS as readonly string[]).includes(act)) {
         const qs = new URLSearchParams({ action: act });
         if (markers !== undefined) qs.set('markers', String(markers));
         if (limit !== undefined) qs.set('limit', String(limit));
@@ -382,7 +382,7 @@ export function registerRuntimeTools(tool: ToolDef, ctx: ToolContext): void {
     'modoki_watch',
     'Percept WATCH — a standing, change-detected numeric time-series over the live world. The way ' +
       'to see how a NUMBER moved over time (jump overshoot, spring settle, velocity decay, a bone ' +
-      'trajectory) — the animation/physics feel questions you cannot judge from a screenshot. ' +
+      'trajectory) — the animation/physics feel questions you cannot judge from a screenshot (pointer presses: modoki_input_watch). ' +
       'action:start opens a focused watch (one component, optional guid/NAME/field subset); a value ' +
       'is recorded only when it moves > epsilon (settled things record nothing). ' +
       'SCOPE by `names` (case-insensitive substrings) for a runtime-spawned, short-lived entity whose ' +
@@ -406,7 +406,7 @@ export function registerRuntimeTools(tool: ToolDef, ctx: ToolContext): void {
       epsilon: z.number().optional().describe('(start) Change threshold — record only when a value moves more than this. Default 1e-4.'),
       everyNFrames: z.number().int().positive().optional().describe('(start) Sample every Nth frame (decimation). Default 1.'),
       maxSamples: z.number().int().positive().optional().describe('(start) Ring cap per series. Default 600.'),
-      maxSeries: z.number().int().positive().optional().describe('(start) Cap on MOVING series — max distinct (entity,field) series that record movement. Default 512, max 4096. A static/never-moved entity does NOT consume this budget (its baseline is kept cheaply), so a screen of static tiles can\'t crowd out a late-joining mover (e.g. a projectile spawned mid-scene).'),
+      maxSeries: z.number().int().positive().optional().describe('(start) Cap on MOVING series — max distinct (entity,field) series that record movement. Default 512, max 4096. A static/never-moved entity does NOT consume this budget (its baseline is kept cheaply), so a screen of static tiles can\'t crowd out a late-joining mover (e.g. a projectile spawned mid-scene). A DESPAWNED entity gives its slot back, and at the 4096 memory ceiling the oldest despawned series are evicted first (read reports evictedDespawned), so a per-shot spawner cannot fill the watch with dead shots.'),
       expireFrames: z.number().int().nonnegative().optional().describe('(start) Auto-remove the watch after N observed frames (0 = never). Default 0.'),
       id: z.string().optional().describe('(read/clear) Watch id from start/list. Omit on clear to clear ALL.'),
       name: z.string().optional().describe('(read) Filter the returned series to entities whose name contains this (case-insensitive) — isolate one entity in a broad watch. `seriesTotal` still reports the full match count.'),
@@ -487,7 +487,7 @@ export function registerRuntimeTools(tool: ToolDef, ctx: ToolContext): void {
   // ── Input WATCH: what the pointer actually did (#134) ──
   tool(
     'modoki_input_watch',
-    'Input WATCH — a bounded record of what the POINTER actually did, and what it resolved to. ' +
+    'Input WATCH — a bounded record of what the POINTER actually did, and what it resolved to (numeric time-series: modoki_watch; the shapes a press missed: modoki_hit_regions). ' +
       'The journal answers "what did the game do"; this answers "what did the finger do" — the ' +
       'question with the LEAST evidence when a gesture fails (a press that resolves to nothing ' +
       'emits no journal event, no commit, no coordinates). action:start opens the window; it ' +
@@ -499,22 +499,22 @@ export function registerRuntimeTools(tool: ToolDef, ctx: ToolContext): void {
       'could look was asked); everything else either infers from absence or conflates the two. ' +
       'action:stop closes the window but KEEPS what was recorded, so you can stop then read without ' +
       'racing your own probe. action:clear drops recorded presses without closing the window. ' +
-      'Params are per-ACTION: a read-time filter on a START call (or `max` on anything but start) is ' +
+      'Params are per-ACTION: a read-time filter on a START call (or `maxPresses` on anything but start) is ' +
       'REFUSED naming the right action rather than silently dropped.',
     {
       action: z.enum(['start', 'read', 'stop', 'clear']).describe('open the window | read presses | close (keeps presses) | drop recorded presses (window stays open if it was)'),
-      max: z.number().int().positive().optional().describe('(start) Ring capacity — most recent N presses kept (default 40, ceiling 500).'),
+      maxPresses: z.number().int().positive().optional().describe('(start) Ring capacity — most recent N presses kept, ONE ring for the whole watch (default 40, ceiling 500). Not modoki_watch\'s `maxSamples`, which caps each series separately.'),
       limit: z.number().int().positive().optional().describe('(read) Most-recent N presses to return (default 20).'),
       unresolvedOnly: z.boolean().optional().describe("(read) Keep only presses whose resolved.by is 'none' or 'unknown' — presses NOTHING could explain. THE diagnostic filter: this is the one question this tool exists to answer, so start here when a reported gesture apparently did nothing."),
       precision: precisionParam('x/y/upX/upY/maxD/heldMs'),
     },
     async (args) => {
-      const { action, max, limit, unresolvedOnly, precision } = args;
+      const { action, maxPresses, limit, unresolvedOnly, precision } = args;
       // Per-action allowlist (mirrors modoki_watch's S3.19 fix) — a key belonging to a DIFFERENT
       // action is refused BY NAME, never silently dropped (which would either widen a start to the
       // default ring size unexpectedly or ignore a read-time narrow).
       const ACCEPTS: Record<string, readonly string[]> = {
-        start: ['max'],
+        start: ['maxPresses'],
         read: ['limit', 'unresolvedOnly', 'precision'],
         stop: [],
         clear: [],
@@ -534,7 +534,7 @@ export function registerRuntimeTools(tool: ToolDef, ctx: ToolContext): void {
           }),
         });
       }
-      if (action === 'start') return postJson('/api/input-watch/start', { max });
+      if (action === 'start') return postJson('/api/input-watch/start', { maxPresses });
       if (action === 'stop') return postJson('/api/input-watch/stop', {});
       if (action === 'clear') return postJson('/api/input-watch/clear', {});
       const q = new URLSearchParams();
@@ -554,7 +554,9 @@ export function registerRuntimeTools(tool: ToolDef, ctx: ToolContext): void {
       'them. The companion to modoki_input_watch: that one says a press hit nothing, this one says ' +
       'WHAT it missed and BY HOW MUCH. action:read returns the regions as data (viewport CSS px — ' +
       'the same space the input watch records presses in, so they compare with no transform). ' +
-      'action:show/hide toggles an on-screen overlay that draws the shapes AND plots the last few ' +
+      'action:show/hide toggles the OVERLAY, and action:read is its own read-back — the reply\'s ' +
+      '`visible` says whether the overlay is up, so a show/hide is confirmed without a second tool. ' +
+      'The overlay draws the shapes AND plots the last few ' +
       'recorded presses, green inside a region and red outside — the two failure classes made ' +
       'visually distinct (a press outside every shape = targeting; a press inside the right shape ' +
       'that still did nothing = latching/frame-rate). Pass at:{x,y} to ask the question directly: ' +

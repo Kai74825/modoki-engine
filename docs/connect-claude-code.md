@@ -207,6 +207,41 @@ Pure helpers (unit-testable, no Electron), consumed by IPC handlers:
 // detectClaudeCli() -> { found, path? }         // `command -v claude` / `where claude`
 ```
 
+`detectClaudeCli` runs **synchronously in the main process** on every ~2.5s status poll, so for as
+long as a probe runs, IPC, menus and window events all stall. Two rules keep that bounded (#1448):
+- **Every probe carries `CLAUDE_PROBE_TIMEOUT_MS` (4s).** `where claude` measured ~55ms on a
+  Windows desktop but ~10s on a loaded CI runner.
+- **The login-shell probe (`-lic`, macOS/Linux) must survive the user's profile** (#1449, observed
+  on macOS). An interactive zsh/bash **ignores SIGTERM**: a `sleep 10` profile held the probe
+  for 10s against the 4s bound, so it is killed with `SIGKILL`. And anything the profile
+  backgrounds inherits the shell's stdout: on a pipe, a ~10ms miss waited the full 4s and read as
+  timed out. So the probe runs with `stdio: 'ignore'` and writes its answer to a temp file
+  (`$MODOKI_PROBE_OUT`); with no pipes, spawnSync waits only for the shell. The shell is also
+  `detached` (its own session). Otherwise, under a terminal (`npm run dev`), an interactive zsh
+  takes the terminal's foreground and a SIGKILLed one never hands it back, so ^C stops reaching
+  the dev server. Its own process group also lets a timeout kill what the profile left in that
+  group instead of orphaning it: the foreground child, and `&` jobs, since with no tty there is no
+  job control. Self-daemonizing agents survive; a bash profile with `set -m` escapes. These rules live in
+  `loginShellCommandPath` (`engine/plugins/backend/loginShellProbe.ts`), which the `gcloud`
+  probe (`resolveGcloudDir`) shares, since it had both defects too. A genuinely slow
+  profile still blocks the main process for up to 4s, once per timed-out memo. Removing that
+  means making `detectClaudeCli` async, which has not been done.
+- **A timed-out probe means "unknown", not "absent".** spawnSync's own `ETIMEDOUT` **with
+  `status === null`** is what decides it, never the output: a killed probe can leave a truncated
+  path on stdout. ETIMEDOUT with a numeric status means the process exited by itself and something
+  else held the pipe, so its status is the answer (#1449). The result
+  carries `probeTimedOut: true`. The panel's claude row then reads "check timed out", with no
+  "Install Claude Code" link, because the user may already have it.
+- **The memo is stamped when detection FINISHES**, and how long it holds depends on the result:
+  - a found result: the whole session
+  - a real miss: 15s, so installing claude mid-session is picked up
+  - a timed-out check: 5 min (`CLAUDE_TIMED_OUT_MEMO_TTL_MS`). Re-probing every 15s would freeze
+    the editor for 4s every 15s on exactly the machine that is already slow. It is still not held
+    for the session, because the slowness may be passing load.
+
+  Stamping at the start once stored a result that had already expired, so every poll re-spawned
+  the slow probe.
+
 IPC handlers (registered by `main.ts` alongside the existing bridge handlers, same
 frame-guard):
 
@@ -972,7 +1007,8 @@ are the non-obvious DECISIONS and the roads not taken.
   fresh-guid spawns) is the headline fix for a runtime-spawned entity like the sling puck. For the
   un-scoped "watch all" case, `maxSeries` caps MOVING series only (a static baseline is cheap and
   doesn't consume it) — an eviction scheme was rejected because at a small cap it thrashes and can drop
-  a just-baselined mover before it records its first movement.
+  a just-baselined mover before it records its first movement. The one eviction that DID land (#1225)
+  cannot do that: at the 4096 memory ceiling it drops only DESPAWNED entities' frozen series.
 
 - **The DMG config-refresh trap (a road not taken).** `project_settings` writes reach the Electron
   backend, but the child Vite serves the renderer and caches the config module. The naive fix — watch

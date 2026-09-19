@@ -12,6 +12,7 @@ import { useState, useEffect, useCallback } from 'react';
 import { useEditorStore } from '../store/editorStore';
 import { backendFetch, backendPostJson } from '../backend/editorBackend';
 import { describeRefusedDeletes, readUnusedStaleness } from './assetOps';
+import { ModalShell } from '../components/ModalShell';
 
 interface Orphan { path: string; type: string; bytes: number }
 interface UnusedResponse {
@@ -131,7 +132,7 @@ export default function CleanupAssetsDialog() {
       // Asking for a path that is not there is free: the backend skips it and reports it in
       // `missing` rather than failing.
       const withSidecars = paths.flatMap((p) => [p, `${p}.meta.json`, `${p}.meta.local.json`]);
-      const res = await backendPostJson('/api/delete-asset', { paths: withSidecars });
+      const res = await backendPostJson('/api/delete-asset', { paths: withSidecars, rendererWrite: true });
       const j = (await res.json()) as { ok?: boolean; error?: string; trashed?: number; failed?: string[] };
       if (!res.ok || !j.ok) throw new Error(j.error || `delete failed (${res.status})`);
       // ⚠️ A PARTIAL refusal is `ok:true`, so the throw above cannot see it — this dialog was the
@@ -158,7 +159,7 @@ export default function CleanupAssetsDialog() {
   };
 
   return (
-    <div style={{ position: 'fixed', inset: 0, zIndex: 9999, background: 'rgba(0,0,0,0.5)', display: 'flex', alignItems: 'center', justifyContent: 'center' }} onClick={close}>
+    <ModalShell kind="cleanup-assets" onDismiss={close}>
       <div onClick={(e) => e.stopPropagation()} style={{
         background: '#1e1e30', border: '1px solid #555', borderRadius: 6, padding: '16px 20px',
         minWidth: 480, maxWidth: 640, maxHeight: '80vh', display: 'flex', flexDirection: 'column', fontFamily: 'monospace',
@@ -284,6 +285,6 @@ export default function CleanupAssetsDialog() {
           )}
         </div>
       </div>
-    </div>
+    </ModalShell>
   );
 }

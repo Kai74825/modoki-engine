@@ -1,3 +1,4 @@
+// @vitest-environment jsdom
 /** Pins #267: `GameShell`'s per-game boot effect (`engine/app/App.tsx`) used to list
  *  `[gameId, initialized, configReady]` as its dependency array while its own body calls
  *  `setConfigReady(true)`/`setInitialized(true)` mid-effect — an effect that writes state it
@@ -52,6 +53,7 @@ vi.mock('@modoki/engine/runtime', () => ({
   // the barrel is fully mocked, and a named export App.tsx imports and this factory omits is a
   // module-init error, not a missing call.
   waitForScenePaint: vi.fn(async () => 'idle'),
+  holdTimeForLoading: vi.fn(() => () => {}),
   // App.tsx derives its two-frame ceiling from this (#682) — an explicit-list mock missing a newly
   // imported name fails at BINDING, so this file collects zero tests rather than failing a case.
   // Mirrors `runtime/rendering/scenePaintSignal.ts`; nothing here asserts on the value.

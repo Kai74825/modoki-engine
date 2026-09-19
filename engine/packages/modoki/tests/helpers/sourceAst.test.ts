@@ -5,8 +5,8 @@ import { describe, it, expect } from 'vitest';
 import ts from 'typescript';
 import {
   accessPath, blockInnerText, boundIdentifier, calledNames, callOf, callsTo, callsToPath, calleeName, declarationOf,
-  enclosingFunction, enclosingNamedFunction, findNodes, flatText, functionBodyOf, guardProves, guardsOf, importsIn, isBlock, lineOf, namedFunctions, objectLiteralKeys, parseSource,
-  precedingStatements, printedText, readsOf, referencesToPath, scriptKindFor, siteText, statementOf, stringValueOf, ts as reexportedTs, unwrapValue, valueCarrier,
+  enclosingFunction, enclosingNamedFunction, findNodes, flatText, functionBodyOf, functionsNamed, guardProves, guardsOf, importBindings, importsIn, isBlock, lineOf, namedFunctions, objectLiteralKeys, parseSource,
+  precedingStatements, printedText, propertyValue, readsOf, referencesToPath, scriptKindFor, siteText, statementOf, stringValueOf, ts as reexportedTs, typeMembers, typesNamed, unwrapValue, valueCarrier, variablesNamed,
 } from './sourceAst';
 
 const firstCall = (sf: ts.SourceFile, name: string): ts.CallExpression => callsTo(sf, name)[0]!;
@@ -269,6 +269,84 @@ describe('function bodies and literals — the shapes a hand-written brace or qu
   });
 });
 
+describe('declarations by NAME — the units a bracket count, a column-0 slice or a fixed-indent closer used to cut (#1195)', () => {
+  it('propertyValue reads a key\'s value however it is written, and is not moved by a bracket inside a string', () => {
+    const sf = parseSource([
+      "o({ a: ')}', b, 'c-d': [1, { e: 2 }], ['f']: g(), m() { return 1; }, get h() { return 2; }, a: 'last' });",
+      'o(notALiteral);',
+    ].join('\n'), 's.ts');
+    const [lit, ref] = callsTo(sf, 'o').map((c) => c.arguments[0]);
+    expect(printedText(propertyValue(lit, 'a')!)).toBe("'last'"); // the object ends up holding the LAST one
+    expect(propertyValue(lit, 'b')!.getText(sf)).toBe('b'); // a shorthand's value is its name
+    expect(printedText(propertyValue(lit, 'c-d')!)).toBe('[1, { e: 2 }]');
+    expect(printedText(propertyValue(lit, 'f')!)).toBe('g()');
+    expect(ts.isMethodDeclaration(propertyValue(lit, 'm')!)).toBe(true);
+    expect(ts.isGetAccessorDeclaration(propertyValue(lit, 'h')!)).toBe(true);
+    expect(propertyValue(lit, 'e')).toBeUndefined(); // a nested literal's key is not this literal's
+    expect(propertyValue(ref, 'a')).toBeUndefined();
+    expect(propertyValue(undefined, 'a')).toBeUndefined();
+  });
+
+  it('variablesNamed binds the exact name in every scope, and not a longer name or a destructure', () => {
+    const sf = parseSource([
+      "const MODULES = [{ key: '];' }];",
+      'const MODULES_BY_KEY = new Map();',
+      'const { MODULES: alias } = x;',
+      'function f() { let MODULES = 1; }',
+    ].join('\n'), 's.ts');
+    const found = variablesNamed(sf, 'MODULES');
+    expect(found.map((d) => lineOf(d))).toEqual([1, 4]);
+    expect(found.filter((d) => enclosingFunction(d) === sf).map((d) => printedText(d.initializer!))).toEqual(["[{ key: '];' }]"]);
+  });
+
+  it('typesNamed + typeMembers read an interface\'s OWN members — not a nested literal\'s, and a method counts', () => {
+    const sf = parseSource([
+      'export interface A {',
+      '  a: number;',
+      '  b?: { inner: string;',
+      '}; // a column-0 brace INSIDE the interface ended the old slice',
+      "  'c-d': 1 | 2;",
+      '  run<T>(x: T): void;',
+      '  [k: string]: unknown;',
+      '}',
+      'interface A { merged: true }',
+      'type L = ({ z: 1 });',
+      'type U = { y: 1 } | null;',
+      'interface Base { hash?: string }',
+      'interface Child extends Base { own: 1 }',
+    ].join('\n'), 's.ts');
+    const decls = typesNamed(sf, 'A');
+    expect(decls).toHaveLength(2);
+    const rows = typeMembers(decls[0])!;
+    expect(rows.map((m) => `${m.kind}:${m.name}${m.optional ? '?' : ''}`)).toEqual(['property:a', 'property:b?', 'property:c-d', 'method:run', 'index:[index]']);
+    expect(printedText(rows[0]!.type!)).toBe('number');
+    expect(typeMembers(rows[1]!.type)!.map((m) => m.name)).toEqual(['inner']);
+    expect(typeMembers(decls[1])!.map((m) => m.name)).toEqual(['merged']);
+    expect(typeMembers(typesNamed(sf, 'L')[0])!.map((m) => m.name)).toEqual(['z']);
+    // A union has no single written member list: refused, not read as "no members".
+    expect(typeMembers(typesNamed(sf, 'U')[0])).toBeUndefined();
+    // Nor does an interface that extends another: a field moved into its base must not read as gone.
+    expect(typeMembers(typesNamed(sf, 'Child')[0])).toBeUndefined();
+  });
+
+  it('functionsNamed finds every function known by the name — methods and bound arrows too — and only ones with a body', () => {
+    const sf = parseSource([
+      'export function a() { one(); }',
+      "export function b() { const s = '\\nfunction '; }",
+      'const c = (x: number) => x;',
+      'const o = { a() { two(); }, d: function () {}, e: 1 };',
+      'class K { a = () => three(); get g() { return 1; } constructor() {} }',
+      'interface I { a(): void }',
+      'declare function a(): void;',
+    ].join('\n'), 's.ts');
+    expect(functionsNamed(sf, 'a').map((f) => calledNames(f.body))).toEqual([['one'], ['two'], ['three']]);
+    expect(functionsNamed(sf, 'c').map((f) => f.parameters.map((p) => p.name.getText(sf)))).toEqual([['x']]);
+    expect(['b', 'd', 'e', 'g', 'constructor'].map((n) => functionsNamed(sf, n).length)).toEqual([1, 1, 0, 1, 1]);
+    // `b`'s body is its own: a string spelling the old `'\nfunction '` closer does not end it early.
+    expect(blockInnerText(functionsNamed(sf, 'b')[0]!.body as ts.Block)).toContain("'\\nfunction '");
+  });
+});
+
 describe('guardsOf / precedingStatements / printedText — the condition an occurrence runs under is its OWN (#1179)', () => {
   const guards = (src: string, name: string) =>
     guardsOf(firstCall(parseSource(src, 's.ts'), name)).map((g) => `${g.holds ? '' : 'NOT '}${printedText(g.test)}`);
@@ -397,6 +475,60 @@ describe('importsIn — every module edge, read from the declaration (#1179)', (
       { spec: './wrapped', kind: 'dynamic', typeOnly: false, bindings: [] },
       { spec: './template', kind: 'dynamic', typeOnly: false, bindings: [] },
     ]);
+  });
+
+  it('marks each binding erased or not — the statement\'s `type`, or the binding\'s own (#1193)', () => {
+    const rows = importsIn(parseSource(`import { a, type b } from './m';
+    import type { c } from './t';
+    export { d, type e } from './r';
+    export type * as f from './s';`, 'x.ts')).flatMap((e) => e.bindings.map((b) => `${b.local}:${b.typeOnly}`));
+    expect(rows).toEqual(['a:false', 'b:true', 'c:true', 'd:false', 'e:true', 'f:true']);
+  });
+
+  it('reads type-position imports only when asked, as erased `importType` edges (#1193)', () => {
+    const code = `type A = import('./a').T;
+    const f = (x: typeof import('../../escape')) => x;
+    const s = "import('./in-a-string').T";
+    const b = await import('./b');`;
+    expect(edges(code).map((e) => e.spec)).toEqual(['./b']);
+    expect(importsIn(parseSource(code, 'x.ts'), { typePositions: true }).map(({ spec, kind, typeOnly }) => ({ spec, kind, typeOnly })))
+      .toEqual([
+        { spec: './a', kind: 'importType', typeOnly: true },
+        { spec: '../../escape', kind: 'importType', typeOnly: true },
+        { spec: './b', kind: 'dynamic', typeOnly: false },
+      ]);
+  });
+});
+
+describe('importBindings — "F imports N from M", however the import is spelt (#1193)', () => {
+  const names = (code: string, spec: string | RegExp) => importBindings(parseSource(code, 'x.ts'), spec)
+    .map((b) => (b.imported === b.local ? b.local : `${b.imported} as ${b.local}`) + (b.typeOnly ? ' (type)' : ''));
+
+  it('reads every spelling a hand-written `import\\s*\\{[^}]*N[^}]*\\}\\s*from` regex split on', () => {
+    expect(names(`import {
+      first,
+      N as renamed,
+    } from "./spriteAtlas";
+    import D, { type T } from './spriteAtlas';
+    import * as ns from './spriteAtlas';
+    import legacy = require('./spriteAtlas');`, './spriteAtlas')).toEqual([
+      'first', 'N as renamed', 'default as D', 'T (type)', '* as ns', '* as legacy',
+    ]);
+  });
+
+  it('matches the specifier exactly, or by RegExp — and a global RegExp is not stateful across edges', () => {
+    const code = "import { a } from '../loaders/spriteAtlas';\nimport { b } from './spriteAtlas';\nimport { c } from './spriteAtlasX';";
+    expect(names(code, './spriteAtlas')).toEqual(['b']);
+    expect(names(code, /(^|\/)spriteAtlas$/g)).toEqual(['a', 'b']);
+  });
+
+  it('is not fooled by a re-export, a side-effect import, a comment or a string', () => {
+    expect(names(`export { N } from './m';
+    import './m';
+    // import { N } from './m';
+    const s = "import { N } from './m'";
+    const t = \`
+    import { N } from './m'\`;`, './m')).toEqual([]);
   });
 });
 

@@ -77,8 +77,25 @@ describe('validatePrefabData — inert UI size inside a .prefab.json', () => {
   it('never throws on a malformed or foreign shape (warn-but-load contract)', () => {
     for (const bad of [null, undefined, 42, 'nope', {}, { entities: 'no' }, { entities: [null, 7, {}] }]) {
       expect(() => validatePrefabData(bad)).not.toThrow();
-      expect(validatePrefabData(bad).warnings).toEqual([]);
     }
+    // #1214 A-3: junk ENTRIES inside a real entities array are reported — skipped silently, the
+    // document validated with no warnings. An empty object IS an entity (nothing on it to check).
+    expect(validatePrefabData({ entities: [null, 7, {}, 'x', []] }).warnings).toEqual([
+      'entities[0] is null, not an entity object — it was not checked',
+      'entities[1] is a number, not an entity object — it was not checked',
+      'entities[3] is a string, not an entity object — it was not checked',
+      'entities[4] is an array, not an entity object — it was not checked',
+    ]);
+  });
+
+  // #1212: a document with no `entities` array used to produce ZERO warnings — a confident
+  // all-clear about something that is not a prefab at all. It says so now.
+  it.each([[null], [undefined], [42], ['nope'], [{}], [{ entities: 'no' }]])('%j is "not a prefab", not clean', (doc) => {
+    expect(validatePrefabData(doc).warnings).toEqual([expect.stringMatching(/not a prefab document/)]);
+  });
+
+  it('an empty entities array is a prefab with nothing wrong — the accept side', () => {
+    expect(validatePrefabData({ entities: [] }).warnings).toEqual([]);
   });
 
   it('reports schemaApplied:false — it consults no trait schema and must not imply otherwise', () => {

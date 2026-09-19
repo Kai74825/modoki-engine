@@ -22,6 +22,7 @@ import { markUIDirty } from '../../runtime/ui/uiTreeStore';
 import { registerHandleProvider, clampHandleToOwner, type InteractionHandle } from '../../runtime/rendering/interactionHandles';
 import { dragNineSliceGuide } from './sliceDrag';
 import { useDragPointerCapture, pressIsOnScrollbar } from './dragPointerCapture';
+import { ModalShell } from '../components/ModalShell';
 
 export interface NineSliceBorder { l: number; r: number; t: number; b: number; }
 
@@ -34,6 +35,9 @@ const MAX_CANVAS_PX = 8192;
 
 const clamp = (v: number, lo: number, hi: number) => Math.max(lo, Math.min(v, hi));
 
+/** What a save would write, as one comparable string — the border insets plus the edge scale. */
+const borderDigest = (b: NineSliceBorder, scale: number) => `${b.l}|${b.r}|${b.t}|${b.b}|${scale}`;
+
 export function NineSliceEditor({ path, name, onClose }: { path: string; name: string; onClose: () => void }) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const imgRef = useRef<HTMLImageElement | null>(null);
@@ -43,14 +47,22 @@ export function NineSliceEditor({ path, name, onClose }: { path: string; name: s
   // #901: the reason the last Save did not write, shown IN the dialog. Cleared on every
   // Save attempt so a stale reason can never sit under a later, different outcome.
   const [saveRefusal, setSaveRefusal] = useState<SaveRefusal | null>(null);
-  // ⚠️ Clear it when the PATH changes, not only on the next Save. `Inspector.tsx` renders the
-  // asset views with no `key`, and an agent can re-open this modal on another texture
-  // (`TextureAssetView` does exactly that) — so the component survives the swap while
-  // `metaLoadedRef` resets and re-reads. Without this the dialog shows asset B under asset A's
-  // refusal, which is a notice describing work the human is no longer looking at.
-  useEffect(() => { setSaveRefusal(null); }, [path]);
+  // ⚠️ `path` never changes for a mounted instance. `Inspector.tsx` renders the asset view as
+  // `<AssetInspector key={selectedAsset.path}>`, so selecting another texture — including the
+  // `open-sprite-editor` / `open-nine-slice-editor` ops — REMOUNTS this modal with fresh state. Per-path
+  // resets and "did the path change under me" checks guard nothing here (#1328 was filed on the
+  // opposite belief and closed); `editor-texture-modal-swap.spec.ts` pins the remount.
+  // Publish "open, on this texture" for the agent ops (#1213) — the modal's open state is
+  // TextureAssetView-local, so `open-nine-slice-editor` could not otherwise confirm it opened.
+  const setEditorMount = useEditorStore((s) => s.setEditorMount);
   const [border, setBorder] = useState<NineSliceBorder>({ l: 0, r: 0, t: 0, b: 0 });
   const [edgeScale, setEdgeScale] = useState(1);   // edge render scale (CSS px per source px)
+  // Dirtiness, for the move gate (#1362): the border+scale as LOADED vs as shown. `null` until the
+  // read lands, so a modal still loading never reports dirty.
+  const baselineRef = useRef<string | null>(null);
+  const dirty = baselineRef.current !== null && borderDigest(border, edgeScale) !== baselineRef.current;
+  useEffect(() => { setEditorMount('nineslice', { path, dirty }); }, [path, dirty, setEditorMount]);
+  useEffect(() => () => setEditorMount('nineslice', null), [setEditorMount]);
   const [zoom, setZoom] = useState(1);
   const [viewport, setViewport] = useState({ w: DEFAULT_VIEWPORT_W, h: DEFAULT_VIEWPORT_H });
   /** The guide being dragged, with its inset and the pointer's image-space coordinate on that
@@ -104,8 +116,15 @@ export function NineSliceEditor({ path, name, onClose }: { path: string; name: s
         setMeta(m);
         const b = m.border as (Partial<NineSliceBorder> & { scale?: number }) | undefined;
         if (b) { setBorder({ l: b.l || 0, r: b.r || 0, t: b.t || 0, b: b.b || 0 }); setEdgeScale(b.scale && b.scale > 0 ? b.scale : 1); }
+        baselineRef.current = b
+          ? borderDigest({ l: b.l || 0, r: b.r || 0, t: b.t || 0, b: b.b || 0 }, b.scale && b.scale > 0 ? b.scale : 1)
+          : borderDigest({ l: 0, r: 0, t: 0, b: 0 }, 1);
       })
-      .catch(() => { /* fresh — no border yet */ });
+      .catch(() => {
+        // Fresh — no border yet. The zero border IS the baseline, so an untouched modal on a
+        // border-less texture does not read as dirty and block a move (#1362).
+        baselineRef.current = borderDigest({ l: 0, r: 0, t: 0, b: 0 }, 1);
+      });
     return () => ac.abort();
   }, [path]);
 
@@ -353,12 +372,6 @@ export function NineSliceEditor({ path, name, onClose }: { path: string; name: s
 
   // ── Persist ──
   const save = async () => {
-    // ⚠️ Capture the path this attempt is FOR. `writeMetaOrWarn`'s POST now carries a renderer
-    // probe (up to 1500ms, two with discardUnsaved), and the Inspector renders these views with no
-    // `key` — so an agent re-opening this modal on another asset mid-flight would land THIS
-    // asset's refusal on THAT asset's dialog. The `[path]` effect above only clears a refusal left
-    // over from before the swap; this closes the other direction (close-out review 2).
-    const attemptPath = path;
     // ⚠️ Clear FIRST, on every attempt. A refusal left standing under a later outcome is worse than
     // no refusal: press Save again after the dev server recovers and a stale "not saved" would sit
     // there while the write actually landed, which is the same lie in the opposite direction.
@@ -384,13 +397,12 @@ export function NineSliceEditor({ path, name, onClose }: { path: string; name: s
       // the notice carries the consequence + remedy to whoever is editing, in the dialog they are
       // looking at. Reporting to one of them is what made this refusal read as a dead button.
       const refusal: SaveRefusal = { kind: 'meta-never-read' };
-      console.error(saveRefusalConsoleMessage(refusal, 'NineSliceEditor', attemptPath));
-      // The console line is unconditional — it is the record, and it names its own path. Only the
-      // ON-SCREEN notice is dropped when the dialog has moved on, because that one would be read
-      // as describing whatever is showing now.
-      if (attemptPath === path) setSaveRefusal(refusal);
+      console.error(saveRefusalConsoleMessage(refusal, 'NineSliceEditor', path));
+      setSaveRefusal(refusal);
       return;
     }
+    // A swap while this POST is in flight unmounts this modal AND its parent view (see the note at the
+    // top), so what follows still acts on THIS texture, and `onClose` lands on an unmounted parent.
     const persisted = await writeMetaOrWarn(path, nextMeta);
     if (!persisted) {
       // KEEP THE DIALOG OPEN (owner, 2026-08-18). Closing on a failed write throws the edit away
@@ -400,14 +412,14 @@ export function NineSliceEditor({ path, name, onClose }: { path: string; name: s
       // logged the status + body; this line names the dialog, since that one is tagged
       // `[Inspector]` for every caller.
       const refusal: SaveRefusal = { kind: 'write-failed' };
-      console.error(saveRefusalConsoleMessage(refusal, 'NineSliceEditor', attemptPath));
-      // The console line is unconditional — it is the record, and it names its own path. Only the
-      // ON-SCREEN notice is dropped when the dialog has moved on, because that one would be read
-      // as describing whatever is showing now.
-      if (attemptPath === path) setSaveRefusal(refusal);
+      console.error(saveRefusalConsoleMessage(refusal, 'NineSliceEditor', path));
+      setSaveRefusal(refusal);
       return;
     }
     savedRef.current = persisted;
+    // The save IS the new baseline, or the modal stays dirty over work already on disk and the
+    // move gate keeps refusing (#1362).
+    if (persisted) baselineRef.current = borderDigest(border, edgeScale);
     // #845 close-out: this write just committed whatever `readMetaPreferringPark` read at load
     // time — drop that park, unless an Inspector edit parked something NEWER while this modal was
     // open (metaWrittenToDisk tells the two apart by reference; see pendingMeta.ts).
@@ -437,7 +449,7 @@ export function NineSliceEditor({ path, name, onClose }: { path: string; name: s
   // IS the cancel and there is nothing to lose. Guarded by
   // engine/tests/architecture/modalDismissScope.test.ts.
   return (
-    <div style={overlay}>
+    <ModalShell kind="nine-slice-editor" zIndex={10000} scrim="rgba(0,0,0,0.6)">
       <div style={dialog}>
         <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 8 }}>
           <div style={{ color: '#fff', fontSize: 13, fontWeight: 'bold' }}>9-slice Border — {name}</div>
@@ -492,11 +504,10 @@ export function NineSliceEditor({ path, name, onClose }: { path: string; name: s
           <button data-ui-id="nineSlice.save" style={{ ...btn, background: '#2ecc71', border: '1px solid #27ae60', color: '#fff' }} onClick={save}>Save</button>
         </div>
       </div>
-    </div>
+    </ModalShell>
   );
 }
 
-const overlay: React.CSSProperties = { position: 'fixed', inset: 0, zIndex: 10000, background: 'rgba(0,0,0,0.6)', display: 'flex', alignItems: 'center', justifyContent: 'center' };
 const dialog: React.CSSProperties = {
   background: '#1e1e30', border: '1px solid #555', borderRadius: 6, padding: 14, fontFamily: 'monospace',
   display: 'flex', flexDirection: 'column', width: 860, height: 600, minWidth: 520, minHeight: 400,

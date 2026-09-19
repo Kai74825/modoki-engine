@@ -9,13 +9,13 @@
  *  islands, or hand-drawn rects (create / move / resize / pivot / rename / delete).
  *  Dev-only (lives under the editor tree, not shipped). */
 
-import { useEffect, useLayoutEffect, useRef, useState, useCallback } from 'react';
-import { useOverlay } from '../input/useOverlayEscape';
+import { useEffect, useId, useLayoutEffect, useRef, useState, useCallback } from 'react';
 import { isTextEditable } from '../input/focusScope';
 import { register, registerBindings } from '../input/keymap';
 import { useHmrEpoch } from '../input/hmrEpoch';
 import { useEditorStore } from '../store/editorStore';
 import { writeMetaOrWarn } from './assetViews/widgets';
+import { spriteSheetDigest } from './spriteSheetDigest';
 import { SaveRefusedNotice } from './AssetLoadRefusedBanner';
 import { saveRefusalMessage, saveRefusalConsoleMessage, type SaveRefusal } from './saveRefusal';
 import { readMetaPreferringPark, metaWrittenToDisk } from '../scene/pendingMeta';
@@ -32,6 +32,7 @@ import { createCoalescedEdit, type CoalescedEdit } from './coalescedEdit';
 import { BufferedNumberInput } from './fields';
 import { resizeSliceRect, moveSliceRect, type Handle } from './sliceDrag';
 import { useDragPointerCapture, pressIsOnScrollbar } from './dragPointerCapture';
+import { ModalShell } from '../components/ModalShell';
 
 type DragMode =
   | { kind: 'none' }
@@ -69,12 +70,11 @@ export function SpriteEditor({ path, name, onClose }: { path: string; name: stri
   // #901: the reason the last Save did not write, shown IN the dialog. Cleared on every
   // Save attempt so a stale reason can never sit under a later, different outcome.
   const [saveRefusal, setSaveRefusal] = useState<SaveRefusal | null>(null);
-  // ⚠️ Clear it when the PATH changes, not only on the next Save. `Inspector.tsx` renders the
-  // asset views with no `key`, and an agent can re-open this modal on another texture
-  // (`TextureAssetView` does exactly that) — so the component survives the swap while
-  // `metaLoadedRef` resets and re-reads. Without this the dialog shows asset B under asset A's
-  // refusal, which is a notice describing work the human is no longer looking at.
-  useEffect(() => { setSaveRefusal(null); }, [path]);
+  // ⚠️ `path` never changes for a mounted instance. `Inspector.tsx` renders the asset view as
+  // `<AssetInspector key={selectedAsset.path}>`, so selecting another texture — including the
+  // `open-sprite-editor` / `open-nine-slice-editor` ops — REMOUNTS this modal with fresh state. Per-path
+  // resets and "did the path change under me" checks guard nothing here (#1328 was filed on the
+  // opposite belief and closed); `editor-texture-modal-swap.spec.ts` pins the remount.
   const [sprites, setSprites] = useState<SpriteSlice[]>([]);
   // Store-backed, not local `useState`: an agent needs a route to change which slice is
   // selected (`select-sprite-slice`), and `modoki_get_editor_state` needs to be able to report
@@ -87,8 +87,41 @@ export function SpriteEditor({ path, name, onClose }: { path: string; name: stri
     return () => setSelected(null);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+  // Publish "open, on this texture, holding these slices" for the agent ops (#1213). The open state
+  // lived only in TextureAssetView's `useState`, so `select-sprite-slice` stored any string with no
+  // modal on screen and `open-sprite-editor` could not tell whether the modal ever opened. Published
+  // only once THIS path's slices have loaded — before that the slice list is the previous texture's
+  // (or empty), and a caller told "open" would be refused a slice that is about to appear. A texture
+  // swap remounts this modal (see the note above): the old instance's unmount withdraws A's entry and
+  // this one publishes nothing until B's slices load, so `select-sprite-slice` never accepts A's
+  // slices over B.
+  const [loadedPath, setLoadedPath] = useState<string | null>(null);
+  const setEditorMount = useEditorStore((s) => s.setEditorMount);
+  const sliceKey = sprites.filter((s) => s.guid !== '__preview__').map((s) => s.guid).join('\n');
   const [grid, setGrid] = useState<GridOpts>(DEFAULT_GRID);
   const [alphaThreshold, setAlphaThreshold] = useState(8);
+  // ⚠️ Declared AFTER `grid`/`alphaThreshold` on purpose: the digest reads them, and this runs
+  // during render. Above them it is a temporal-dead-zone error.
+  //
+  // ⚠️ The guid list is NOT a dirtiness signal — dragging a slice's edge changes its rect and keeps
+  // its guid, so `sliceKey` is identical for an edited sheet. The digest covers what a save would
+  // write — the slices AND the sticky slicing controls — so "dirty" means the same thing to the
+  // move gate as it does to the Save button (#1362).
+  const sliceDigest = spriteSheetDigest(sprites, { grid, alphaThreshold });
+  // The digest as it was LOADED. `null` until the read lands, so a modal still loading never
+  // reports dirty — its slice list is empty then, which would read as "everything deleted".
+  const baselineDigestRef = useRef<string | null>(null);
+  const gridRef = useRef(grid);
+  gridRef.current = grid;
+  const alphaThresholdRef = useRef(alphaThreshold);
+  alphaThresholdRef.current = alphaThreshold;
+  const dirty = loadedPath === path && baselineDigestRef.current !== null
+    && sliceDigest !== baselineDigestRef.current;
+  useEffect(() => {
+    if (loadedPath !== path) { setEditorMount('sprite', null); return; }
+    setEditorMount('sprite', { path, slices: sliceKey ? sliceKey.split('\n') : [], dirty });
+  }, [loadedPath, path, sliceKey, dirty, setEditorMount]);
+  useEffect(() => () => setEditorMount('sprite', null), [setEditorMount]);
   const initialGuidsRef = useRef<Set<string>>(new Set());
   const dragRef = useRef<DragMode>({ kind: 'none' });
   // The canvas is the FULL zoomed image inside a native scroll viewport — so panning
@@ -144,11 +177,25 @@ export function SpriteEditor({ path, name, onClose }: { path: string; name: stri
     pendingRefAtLoadRef.current = undefined;
     readMetaPreferringPark(path, { signal: ac.signal })
       .then(({ meta: m, pendingRef, ok }) => {
+        // A superseded path's result must not land on the current one: it would set
+        // `metaLoadedRef` and `meta` (with the OLD asset's id) under the new path — the duplicate-GUID
+        // save the reset above exists to prevent (#1213 review).
+        if (ac.signal.aborted) return;
         pendingRefAtLoadRef.current = pendingRef;
         metaLoadedRef.current = ok;
         setMeta(m);
+        setLoadedPath(path);
         const existing = Array.isArray(m.sprites) ? (m.sprites as SpriteSlice[]) : [];
-        setSprites(existing.map((s) => ({ ...s, rect: { ...s.rect }, pivot: { ...s.pivot } })));
+        const loaded = existing.map((s) => ({ ...s, rect: { ...s.rect }, pivot: { ...s.pivot } }));
+        setSprites(loaded);
+        // The baseline uses the values this read is about to APPLY, not the current state — the
+        // setters above have not flushed yet, so reading `grid`/`alphaThreshold` here would capture
+        // the previous texture's (or the defaults) and the modal would open already dirty.
+        const loadedGrid = m.spriteGrid && typeof m.spriteGrid === 'object'
+          ? { ...DEFAULT_GRID, ...(m.spriteGrid as Partial<GridOpts>) }
+          : (existing.length > 0 ? { ...DEFAULT_GRID, ...(inferGridFromRects(existing.map((s) => s.rect)) ?? {}) } : DEFAULT_GRID);
+        const loadedThreshold = typeof m.spriteAlphaThreshold === 'number' ? m.spriteAlphaThreshold : alphaThresholdRef.current;
+        baselineDigestRef.current = spriteSheetDigest(loaded, { grid: loadedGrid, alphaThreshold: loadedThreshold });
         initialGuidsRef.current = new Set(existing.map((s) => s.guid));
         // Restore the last-used slicing controls (saved alongside the slices). When
         // none were saved (older meta, or slices made by auto-alpha / hand-drawing),
@@ -162,7 +209,18 @@ export function SpriteEditor({ path, name, onClose }: { path: string; name: stri
         }
         if (typeof m.spriteAlphaThreshold === 'number') setAlphaThreshold(m.spriteAlphaThreshold);
       })
-      .catch(() => { /* no meta yet — fresh sheet */ });
+      .catch(() => {
+        /* no meta yet — fresh sheet */
+        // A fresh sheet, literally: nothing is shown — or published — under this path.
+        // A save stays refused by `metaLoadedRef` (false here), so this cannot write an empty list
+        // over the real sidecar. Then the modal counts as open on this path for the agent ops (#1213).
+        if (ac.signal.aborted) return;
+        setSprites([]);
+        // A fresh sheet: empty slices with whatever controls are showing IS the baseline.
+        baselineDigestRef.current = spriteSheetDigest([], { grid: gridRef.current, alphaThreshold: alphaThresholdRef.current });
+        initialGuidsRef.current = new Set();
+        setLoadedPath(path);
+      });
     return () => ac.abort();
   }, [path]);
 
@@ -351,8 +409,6 @@ export function SpriteEditor({ path, name, onClose }: { path: string; name: stri
   // `__preview__` is never part of a snapshot.
   const spritesRef = useRef(sprites);
   spritesRef.current = sprites;
-  const gridRef = useRef(grid);
-  gridRef.current = grid;
   const alphaRef = useRef(alphaThreshold);
   alphaRef.current = alphaThreshold;
   // `selected` now comes from the store (see above) rather than local state, so a functional
@@ -453,7 +509,10 @@ export function SpriteEditor({ path, name, onClose }: { path: string; name: stri
   // YIELDS, so resolution fell through to `app.undo` (app-chord, always eligible) and the
   // scene undo ran underneath the modal — the exact failure the original guarded against.
   // Claiming and preventing are separate decisions, so they are separate fields.
-  const overlayId = useOverlay(true, 'sprite-editor');
+  // The modal's overlay id, pushed by the `ModalShell` below. Known here first because these
+  // bindings name it as their owner. The modal kind already blocks the app's undo underneath
+  // (#1270); these claims are what make ⌘Z run the SLICE undo instead of yielding to nothing.
+  const overlayId = `sprite-editor${useId()}`;
   useEffect(() => {
     const notTyping = () => !isTextEditable(document.activeElement);
     // No `when`: these ALWAYS claim, denying the chord to the app scope. `run` no-ops while
@@ -636,12 +695,6 @@ export function SpriteEditor({ path, name, onClose }: { path: string; name: stri
 
   // ── Persist ──
   const save = async () => {
-    // ⚠️ Capture the path this attempt is FOR. `writeMetaOrWarn`'s POST now carries a renderer
-    // probe (up to 1500ms, two with discardUnsaved), and the Inspector renders these views with no
-    // `key` — so an agent re-opening this modal on another asset mid-flight would land THIS
-    // asset's refusal on THAT asset's dialog. The `[path]` effect above only clears a refusal left
-    // over from before the swap; this closes the other direction (close-out review 2).
-    const attemptPath = path;
     // ⚠️ Clear FIRST, on every attempt — see NineSliceEditor.save for why a stale refusal standing
     // under a later successful write is the same lie in the opposite direction.
     setSaveRefusal(null);
@@ -670,23 +723,22 @@ export function SpriteEditor({ path, name, onClose }: { path: string; name: stri
       // BOTH channels (#901) — the console keeps path + mechanism for a debugger, the notice
       // carries consequence + remedy to the person looking at the dialog.
       const refusal: SaveRefusal = { kind: 'meta-never-read' };
-      console.error(saveRefusalConsoleMessage(refusal, 'SpriteEditor', attemptPath));
-      // The console line is unconditional — it is the record, and it names its own path. Only the
-      // ON-SCREEN notice is dropped when the dialog has moved on, because that one would be read
-      // as describing whatever is showing now.
-      if (attemptPath === path) setSaveRefusal(refusal);
+      console.error(saveRefusalConsoleMessage(refusal, 'SpriteEditor', path));
+      setSaveRefusal(refusal);
       return;
     }
+    // A swap while this POST is in flight unmounts this modal AND its parent view (see the note at the
+    // top), so what follows still acts on THIS texture, and `onClose` lands on an unmounted parent.
     const persisted = await writeMetaOrWarn(path, nextMeta);
+    // The save IS the new baseline — otherwise the modal stays dirty after writing and the move
+    // gate keeps refusing over work that is already on disk.
+    if (persisted) baselineDigestRef.current = spriteSheetDigest(sprites, { grid, alphaThreshold });
     if (!persisted) {
       // Keep the dialog open on a failed write — see the note in NineSliceEditor.save. A slice set
       // is far more work to re-author than a border, so losing it to a dev-server blip is worse.
       const refusal: SaveRefusal = { kind: 'write-failed' };
-      console.error(saveRefusalConsoleMessage(refusal, 'SpriteEditor', attemptPath));
-      // The console line is unconditional — it is the record, and it names its own path. Only the
-      // ON-SCREEN notice is dropped when the dialog has moved on, because that one would be read
-      // as describing whatever is showing now.
-      if (attemptPath === path) setSaveRefusal(refusal);
+      console.error(saveRefusalConsoleMessage(refusal, 'SpriteEditor', path));
+      setSaveRefusal(refusal);
       return;
     }
     // #845 close-out: this write just committed whatever `readMetaPreferringPark` read at load
@@ -726,7 +778,7 @@ export function SpriteEditor({ path, name, onClose }: { path: string; name: stri
   // IS the cancel and there is nothing to lose. Guarded by
   // engine/tests/architecture/modalDismissScope.test.ts.
   return (
-    <div style={overlay}>
+    <ModalShell kind="sprite-editor" id={overlayId} zIndex={10000} scrim="rgba(0,0,0,0.6)">
       <div style={dialog}>
         <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 8 }}>
           <div style={{ color: '#fff', fontSize: 13, fontWeight: 'bold' }}>Sprite Editor — {name}</div>
@@ -821,7 +873,7 @@ export function SpriteEditor({ path, name, onClose }: { path: string; name: stri
           <button data-ui-id="spriteEditor.save" style={{ ...btn, background: '#2ecc71', border: '1px solid #27ae60', color: '#fff' }} onClick={save}>Save</button>
         </div>
       </div>
-    </div>
+    </ModalShell>
   );
 }
 
@@ -906,7 +958,6 @@ function detectAlphaIslands(img: HTMLImageElement, w: number, h: number, thresho
 }
 
 // ── small styled bits ──
-const overlay: React.CSSProperties = { position: 'fixed', inset: 0, zIndex: 10000, background: 'rgba(0,0,0,0.6)', display: 'flex', alignItems: 'center', justifyContent: 'center' };
 const dialog: React.CSSProperties = {
   background: '#1e1e30', border: '1px solid #555', borderRadius: 6, padding: 14, fontFamily: 'monospace',
   // Resizable window: drag the bottom-right corner. Flex column so the canvas viewport

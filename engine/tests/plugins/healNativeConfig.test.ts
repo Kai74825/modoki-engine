@@ -1,3 +1,4 @@
+// @vitest-environment jsdom
 /** healNativeConfig — heal-on-open native config (android/local.properties +
  *  iOS DEVELOPMENT_TEAM). Exercised against real temp project dirs. */
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
@@ -6,7 +7,12 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
-import { healNativeConfig, androidSdkDirValue } from '../../plugins/healNativeConfig';
+import { healNativeConfig, androidSdkDirValue, injectedBuildNumbers, writeBuildNumberArgFiles } from '../../plugins/healNativeConfig';
+import {
+  ANDROID_BUILD_NUMBER_ARGS_PATH, IOS_BUILD_NUMBER_ARGS_PATH, ANDROID_VERSION_CODE_INIT_SCRIPT_PATH,
+  renderAndroidVersionCodeInitScript, gradleBuildNumberArg,
+} from '../../plugins/releaseBuild';
+import { loadProjectConfig } from '../../plugins/load-project-config';
 // Read the floors from the schema rather than hardcoding them: this file asserts the WIRING
 // (the default reaches the heal at all). The floor VALUES are pinned, deliberately and with
 // their rationale, in tests/architecture/buildTargetFloor.test.ts — duplicating them here
@@ -2229,13 +2235,31 @@ describe('healNativeConfig — orientation + status bar', () => {
       }
     }
 
-    it('derives the build number from the commit count', () => {
+    /** The whole of #1226. An auto number is the commit count, so writing it rewrote two committed
+     *  files on every build AND every project open. The heal leaves it alone; the marketing version,
+     *  which moves only with the config, is still synced. */
+    it('AUTO: the heal writes no build number, and still syncs the marketing version', () => {
+      writeNative();
+      gitRepoWithCommits(7);
+      writeCfg({ version: '2.4', buildNumber: 1, buildNumberAuto: true });
+      const r = healNativeConfig(root);
+      const g = fs.readFileSync(gradlePath(), 'utf8');
+      const x = fs.readFileSync(pbxPath(), 'utf8');
+      expect(g).toContain('versionCode 1\n');
+      expect(x).toContain('CURRENT_PROJECT_VERSION = 1;');
+      expect(g).toContain('versionName "2.4"');
+      expect(x).toContain('MARKETING_VERSION = 2.4;');
+      expect(r.notes.join(' ')).not.toContain('commit');
+    });
+
+    const inject = () => injectedBuildNumbers(root, loadProjectConfig(root));
+
+    it('derives the injected build number from the commit count, for both platforms', () => {
       writeNative();
       gitRepoWithCommits(7);
       writeCfg({ version: '1.0', buildNumber: 1, buildNumberAuto: true });
-      const r = healNativeConfig(root);
-      expect(fs.readFileSync(gradlePath(), 'utf8')).toContain('versionCode 7');
-      expect(fs.readFileSync(pbxPath(), 'utf8')).toContain('CURRENT_PROJECT_VERSION = 7;');
+      const r = inject();
+      expect([r.android, r.ios]).toEqual([7, 7]);
       expect(r.notes.join(' ')).toContain('derived from git commit count');
     });
 
@@ -2243,27 +2267,68 @@ describe('healNativeConfig — orientation + status bar', () => {
       writeNative();
       gitRepoWithCommits(3);
       writeCfg({ version: '1.0', buildNumber: 10, buildNumberAuto: true });
-      const r = healNativeConfig(root);
-      expect(fs.readFileSync(gradlePath(), 'utf8')).toContain('versionCode 10');
+      const r = inject();
+      expect(r.android).toBe(10);
       expect(r.notes.join(' ')).toContain('floor');
     });
 
-    it('the never-lower guard still wins over a derived number', () => {
-      // The native project already uploaded at 50; the repo only has 3 commits. Writing 3
-      // would be exactly the silent Play rejection this whole heal exists to prevent.
-      writeNative(GRADLE.replace('versionCode 1', 'versionCode 50'), PBX.replace('CURRENT_PROJECT_VERSION = 1;', 'CURRENT_PROJECT_VERSION = 50;'));
+    it('never injects below the committed value, per platform', () => {
+      // The native project was last built at 50 (Android) / 20 (iOS); the repo only has 30 commits.
+      // Handing gradle 30 would be exactly the silent Play rejection the never-lower guard exists for.
+      writeNative(GRADLE.replace('versionCode 1', 'versionCode 50'), PBX.replace('CURRENT_PROJECT_VERSION = 1;', 'CURRENT_PROJECT_VERSION = 20;'));
+      gitRepoWithCommits(30);
+      writeCfg({ version: '1.0', buildNumber: 1, buildNumberAuto: true });
+      const r = inject();
+      expect([r.android, r.ios]).toEqual([50, 30]);
+      // Advice about a platform's file goes to THAT platform's build only.
+      expect(r.platformNotes.android.join(' ')).toContain('building with Android versionCode 50, not 30');
+      expect(r.platformNotes.ios).toEqual([]);
+      expect(r.notes.join(' ')).not.toContain('versionCode');
+    });
+
+    it('passes no number for a platform whose value cannot be ordered', () => {
+      writeNative(GRADLE, PBX.replace('CURRENT_PROJECT_VERSION = 1;', 'CURRENT_PROJECT_VERSION = 1.2;'));
       gitRepoWithCommits(3);
       writeCfg({ version: '1.0', buildNumber: 1, buildNumberAuto: true });
-      const r = healNativeConfig(root);
-      expect(fs.readFileSync(gradlePath(), 'utf8')).toContain('versionCode 50');
-      expect(r.notes.join(' ')).toContain('REFUSED to lower Android versionCode 50');
+      const r = inject();
+      expect(r.android).toBe(3);
+      expect(r.ios).toBeUndefined();
+      expect(r.platformNotes.ios.join(' ')).toContain('building with the committed iOS CURRENT_PROJECT_VERSION');
+    });
+
+    /** #1226 close-out. The route resolves the numbers BEFORE it auto-scaffolds a missing platform folder, so
+     *  a platform with no file yet must still get the number — or a fresh / re-scaffolded folder builds with
+     *  the template's `versionCode 1` while the log reports the derived count. */
+    it('passes the number for a platform whose native folder does not exist yet', () => {
+      gitRepoWithCommits(9);
+      writeCfg({ version: '1.0', buildNumber: 1, buildNumberAuto: true });
+      const r = inject(); // no android/ or ios/ at all
+      expect([r.android, r.ios]).toEqual([9, 9]);
+    });
+
+    it('writes the init script and one arguments file per platform folder present — empty when there is no number', () => {
+      writeNative(GRADLE, PBX.replace('CURRENT_PROJECT_VERSION = 1;', 'CURRENT_PROJECT_VERSION = 1.2;'));
+      gitRepoWithCommits(4);
+      writeCfg({ version: '1.0', buildNumber: 1, buildNumberAuto: true });
+      writeBuildNumberArgFiles(root, inject());
+      const read = (rel: string) => fs.readFileSync(path.join(root, rel), 'utf8');
+      expect(read(ANDROID_BUILD_NUMBER_ARGS_PATH)).toBe(`${gradleBuildNumberArg(4).trim()}\n`);
+      expect(read(ANDROID_VERSION_CODE_INIT_SCRIPT_PATH)).toBe(renderAndroidVersionCodeInitScript());
+      expect(read(IOS_BUILD_NUMBER_ARGS_PATH)).toBe('\n'); // the dotted 1.2 cannot be ordered → build uses the file's own
+    });
+
+    it('writes nothing for a platform folder that is absent', () => {
+      writeCfg({ version: '1.0', buildNumber: 5 });
+      writeBuildNumberArgFiles(root, { android: 5, ios: 5 });
+      expect(fs.existsSync(path.join(root, 'android'))).toBe(false);
+      expect(fs.existsSync(path.join(root, 'ios'))).toBe(false);
     });
 
     it('falls back to app.buildNumber (with a note) outside a git repo', () => {
       writeNative();
       writeCfg({ version: '1.0', buildNumber: 4, buildNumberAuto: true });
-      const r = healNativeConfig(root); // root is a bare tmpdir — no .git anywhere
-      expect(fs.readFileSync(gradlePath(), 'utf8')).toContain('versionCode 4');
+      const r = inject(); // root is a bare tmpdir — no .git anywhere
+      expect(r.android).toBe(4);
       expect(r.notes.join(' ')).toContain('no commit count could be read');
     });
 
@@ -2274,19 +2339,20 @@ describe('healNativeConfig — orientation + status bar', () => {
       writeNative();
       gitRepoWithCommits(7);
       writeCfg({ version: '1.0', buildNumber: 7, buildNumberAuto: true });
-      const r = healNativeConfig(root);
-      expect(fs.readFileSync(gradlePath(), 'utf8')).toContain('versionCode 7');
+      const r = inject();
+      expect(r.android).toBe(7);
       expect(r.notes.join(' ')).toContain('floor');
       expect(r.notes.join(' ')).not.toContain('derived from git commit count');
     });
 
-    it('auto OFF (the default) passes the typed value straight through', () => {
+    it('auto OFF (the default): the heal writes the typed value, and the build is handed the same one', () => {
       writeNative();
       gitRepoWithCommits(30);
       writeCfg({ version: '1.0', buildNumber: 2 }); // no buildNumberAuto field at all
       const r = healNativeConfig(root);
       expect(fs.readFileSync(gradlePath(), 'utf8')).toContain('versionCode 2');
       expect(r.notes.join(' ')).not.toContain('commit');
+      expect([inject().android, inject().ios]).toEqual([2, 2]);
     });
   });
 
@@ -2864,6 +2930,182 @@ describe('healNativeConfig — #370 review findings', () => {
     const aged = readIgnore();
     healNativeConfig(root);
     expect(readIgnore(), 'a #196-cited block is left byte-identical').toBe(aged);
+  });
+});
+
+describe('healNativeConfig — iOS web-view text interaction (#1360)', () => {
+  const MVC_TI = ['ios', 'App', 'App', 'MyViewController.swift'];
+  const readTiMvc = () => fs.readFileSync(path.join(root, ...MVC_TI), 'utf8');
+  function scaffoldTiMvc(body: string) {
+    fs.mkdirSync(path.join(root, 'ios', 'App', 'App'), { recursive: true });
+    fs.writeFileSync(path.join(root, ...MVC_TI), body);
+  }
+
+  /** The pre-#1360 generated file — what every project had before this landed. */
+  const PRE_1360_MVC = `import UIKit
+import Capacitor
+
+/// Custom bridge VC so we can register plugins that SPM won't auto-discover.
+class MyViewController: CAPBridgeViewController {
+    override func viewDidLoad() {
+        super.viewDidLoad()
+        // modoki:game-debug-begin — generated from project.config.json (build.debugBuild)
+        let gameDebugPlugin = GameDebugPlugin()
+        bridge?.registerPluginInstance(gameDebugPlugin)
+        // modoki:game-debug-end
+    }
+}
+`;
+
+  it('inserts the override, and the WebKit import it needs, into an existing project', () => {
+    scaffoldTiMvc(PRE_1360_MVC);
+    writeConfig('');
+    const notes = healNativeConfig(root).notes.join(' ');
+    expect(notes).toContain('disabled iOS web-view text interaction');
+
+    const mvc = readTiMvc();
+    expect(mvc).toContain('modoki:text-interaction-begin');
+    expect(mvc).toContain('modoki:text-interaction-end');
+    expect(mvc).toContain('configuration.preferences.isTextInteractionEnabled = false');
+    // WKWebViewConfiguration is WebKit's — without this the target does not compile.
+    expect(mvc).toContain('import WebKit');
+    // At CLASS-BODY scope, not inside viewDidLoad: `webViewConfiguration(for:)` is a method
+    // override, so landing it in the game-debug fence would not compile.
+    expect(mvc).toMatch(/class MyViewController: CAPBridgeViewController \{\n\s*\/\/ modoki:text-interaction-begin/);
+  });
+
+  it('is idempotent — a second heal reports nothing and changes nothing', () => {
+    scaffoldTiMvc(PRE_1360_MVC);
+    writeConfig('');
+    healNativeConfig(root);
+    const afterFirst = readTiMvc();
+
+    const notes = healNativeConfig(root).notes.join(' ');
+    expect(notes).not.toContain('disabled iOS web-view text interaction');
+    expect(readTiMvc(), 'byte-identical on the second run').toBe(afterFirst);
+    // One copy only. A second insert would be a duplicate override — a compile error.
+    expect(afterFirst.match(/modoki:text-interaction-begin/g)).toHaveLength(1);
+  });
+
+  it('rewrites a STALE fenced block rather than appending beside it', () => {
+    scaffoldTiMvc(PRE_1360_MVC.replace(
+      'class MyViewController: CAPBridgeViewController {',
+      `class MyViewController: CAPBridgeViewController {
+    // modoki:text-interaction-begin — generated; see docs/input.md (#1360)
+    // ...some older, wrong body that must not survive...
+    override func somethingStale() -> Int { return 1 }
+    // modoki:text-interaction-end
+`,
+    ));
+    writeConfig('');
+    healNativeConfig(root);
+
+    const mvc = readTiMvc();
+    expect(mvc, 'the stale body is gone, not merely added to').not.toContain('somethingStale');
+    expect(mvc).toContain('configuration.preferences.isTextInteractionEnabled = false');
+    expect(mvc.match(/modoki:text-interaction-begin/g)).toHaveLength(1);
+  });
+
+  it("preserves a project's hand-added code — the reason the block is fenced (games/ota-test)", () => {
+    // ota-test hand-extends this exact file with an OTA boot hook. Whole-file generation would
+    // silently drop it, and the app would boot the wrong bundle with nothing erroring.
+    scaffoldTiMvc(PRE_1360_MVC.replace(
+      '    override func viewDidLoad() {',
+      `    override func instanceDescriptor() -> InstanceDescriptor {
+        OtaBootHook.run(name: otaShellBundleName)
+        return super.instanceDescriptor()
+    }
+
+    override func viewDidLoad() {`,
+    ));
+    writeConfig('');
+    healNativeConfig(root);
+
+    const mvc = readTiMvc();
+    expect(mvc, 'the hand-added OTA boot hook survives').toContain('OtaBootHook.run(name: otaShellBundleName)');
+    expect(mvc).toContain('override func instanceDescriptor() -> InstanceDescriptor');
+    expect(mvc).toContain('configuration.preferences.isTextInteractionEnabled = false');
+  });
+
+  it('reports a note and changes nothing when the file has neither markers nor the class anchor', () => {
+    const handOwned = 'import UIKit\n\n// someone took this file over entirely\nfinal class Whatever {}\n';
+    scaffoldTiMvc(handOwned);
+    writeConfig('');
+    const notes = healNativeConfig(root).notes.join(' ');
+    expect(notes).toContain('no modoki:text-interaction markers and no class anchor');
+    expect(readTiMvc(), 'a hand-owned file is left byte-identical').toBe(handOwned);
+  });
+
+  it('REFUSES a file that already hand-overrides webViewConfiguration, rather than duplicating it', () => {
+    // Inserting beside an existing override is `invalid redeclaration` — and nothing in `verify`
+    // compiles Swift, so it would ship as a green gate and a dead iOS target. Worse, the fence
+    // would then exist, so the heal could never self-repair it.
+    const handOverride = PRE_1360_MVC.replace(
+      '    override func viewDidLoad() {',
+      `    override func webViewConfiguration(for instanceConfiguration: InstanceConfiguration) -> WKWebViewConfiguration {
+        let c = super.webViewConfiguration(for: instanceConfiguration)
+        c.applicationNameForUserAgent = "Custom"
+        return c
+    }
+
+    override func viewDidLoad() {`,
+    );
+    scaffoldTiMvc(handOverride);
+    writeConfig('');
+    const notes = healNativeConfig(root).notes.join(' ');
+    expect(notes).toContain('already hand-overrides webViewConfiguration(for:)');
+
+    const mvc = readTiMvc();
+    expect(mvc, 'left byte-identical rather than made non-compiling').toBe(handOverride);
+    expect(mvc.match(/override func webViewConfiguration/g), 'still exactly one override').toHaveLength(1);
+  });
+
+  it('imports WebKit even when the file has no `import UIKit` anchor', () => {
+    // The class declaration needs only `import Capacitor`, so the UIKit anchor is not guaranteed.
+    // `String.replace` with a non-matching pattern is a SILENT no-op, which would write the block
+    // with no WebKit import: `cannot find type 'WKWebViewConfiguration' in scope`, under a note
+    // saying the fix landed.
+    scaffoldTiMvc(PRE_1360_MVC.replace('import UIKit\n', ''));
+    writeConfig('');
+    healNativeConfig(root);
+
+    const mvc = readTiMvc();
+    expect(mvc).toContain('import WebKit');
+    expect(mvc).toContain('configuration.preferences.isTextInteractionEnabled = false');
+    expect(mvc.match(/import WebKit/g), 'exactly one').toHaveLength(1);
+  });
+
+  it('collapses TWO fenced blocks back to one — the bad-merge state, which is otherwise terminal', () => {
+    // A non-global replace rewrites only the first block, and against an identical block that is a
+    // byte no-op — so no write, NO NOTE, and the duplicate override stays forever while every
+    // assertion in iosTextInteraction.test.ts still passes.
+    scaffoldTiMvc(PRE_1360_MVC);
+    writeConfig('');
+    healNativeConfig(root);
+    const once = readTiMvc();
+
+    // Simulate the merge: a second copy of the whole fenced block.
+    const block = once.slice(once.indexOf('    // modoki:text-interaction-begin'), once.indexOf('    // modoki:text-interaction-end') + '    // modoki:text-interaction-end'.length);
+    expect(block, 'fixture sanity: the block was located').toContain('isTextInteractionEnabled');
+    scaffoldTiMvc(once.replace(block, `${block}\n${block}`));
+    expect(readTiMvc().match(/modoki:text-interaction-begin/g), 'fixture has two').toHaveLength(2);
+
+    const notes = healNativeConfig(root).notes.join(' ');
+    expect(notes, 'and it SAYS it did something — the silent no-op was the defect').toContain('disabled iOS web-view text interaction');
+
+    const mvc = readTiMvc();
+    expect(mvc.match(/modoki:text-interaction-begin/g), 'collapsed to one').toHaveLength(1);
+    expect(mvc.match(/override func webViewConfiguration/g), 'one override, so it compiles').toHaveLength(1);
+  });
+
+  it('runs OUTSIDE the game-debug gate — a project that does not use the bridge still gets it', () => {
+    // The scope claim, and the reason this heal is not nested in `usesGameDebug`: the magnifier is
+    // equally wrong in a project with no debug bridge, and in a release build. `writeGameDebugDep`
+    // is deliberately NOT called here, so `usesGameDebug` is false.
+    scaffoldTiMvc(PRE_1360_MVC);
+    writeConfig('', false);
+    healNativeConfig(root);
+    expect(readTiMvc()).toContain('configuration.preferences.isTextInteractionEnabled = false');
   });
 });
 

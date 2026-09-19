@@ -18,7 +18,7 @@ import { clearSkeletalSeeks } from '../../runtime/core/skeletalSeek';
 import { getAllTraits } from '../../runtime/core/ecs/traitRegistry';
 import { worldTransforms, deactivatedEntities } from '../../runtime/core/ecs/transformPropagationSystem';
 import { decomposeTrs } from '../../runtime/core/ecs/decomposeTrs';
-import { findEntity, fireDirtyListeners, addDirtyListener, onStructureDirty, getAllEntities, subtreeIds, entityDisplayName } from '../../runtime/core/ecs/entityUtils';
+import { findEntity, fireDirtyListeners, addDirtyListener, onStructureDirty, getAllEntities, subtreeIds, entityDisplayName, guidOfEntityId } from '../../runtime/core/ecs/entityUtils';
 import { markOverrideIfInstance } from '../undo/entityActions';
 import { Transform, EntityAttributes, Collider2D, Collider3D, clampAngle, Bone2D, Billboard3D, CameraFrame, Zone3D } from '../../runtime/traits';
 import { colliderWireframeGeometry, colliderOutlineSig3D, colliderWorldScale3D, type ColliderOutline3DParams } from '../../runtime/rendering/colliderOutline3D';
@@ -56,11 +56,11 @@ import { createViewportBringUp, type BringUpKind } from '../../runtime/rendering
 import type { LivenessCheck } from '../../runtime/core/liveness';
 import { acquireRenderer, releaseRenderer, discardRenderer } from './rendererLease';
 import { disposeSceneViewEntityObjects } from './sceneViewResources';
+import { SceneViewGizmoTable } from '../scene/sceneViewGizmoTable';
 import { drawColliderOutline, drawSkinnedMeshFlat2D, drawSkinnedMeshWireframe2D, drawWeightHeatmap2D, drawDominantBoneMap2D, computePivotOffset, COLLIDER_SPRITE } from '../../runtime/rendering/render2DUtils';
 import { getSkin2DBuffer } from '../../runtime/skinning/skin2DBuffers';
 import { getRig2D, type ParsedRig2D } from '../../runtime/loaders/rig2dCache';
 import { resolveMeshTemplate, onModelInvalidated } from '../../runtime/loaders/meshTemplateCache';
-import { onModelTemplatesLoaded } from '../../runtime/loaders/modelLoadNotify';
 import { boneWeightField, dominantBoneField } from '../../runtime/skinning/rig2dWeightPaint';
 import { overlayPartIndices } from './skinWeightOverlay';
 import { computeCanvasScale, screenToReference2D } from '../../runtime/rendering/canvas2DScaler';
@@ -70,7 +70,7 @@ import {
   type MarqueeCandidate,
 } from '../scene/marqueeSelect';
 import { resolvePickSelection, pickRequestsReveal, type PickModifiers } from '../scene/pickSelection';
-import { computePaintOrder } from '../../runtime/rendering/paintOrder';
+import { getCanvas2DRouting, getPaintOrder } from './sceneView2DGraph';
 import { UIRenderer } from '../../runtime/ui/UIRenderer';
 import { useEditorStore } from '../store/editorStore';
 import { register, registerBindings } from '../input/keymap';
@@ -81,18 +81,20 @@ import { boneRelToProxyLocal, proxyLocalToBoneLocal } from '../scene/billboardBo
 import { setEditorViewportCamera, setFocusEntityHandler, focusEntityInSceneView, canFrameSelected, setViewportController, setEcsObjectsRegistry } from '../scene/sceneViewBus';
 import { withWarnFilter } from '../scene/warnFilter';
 import { mintEditor3DFrameKey, editor2DChromeFrameKey } from '../scene/frameKeys';
-import { computeUIModeNDC, computeFullNDC, computeCamFrustumPositions, computeLetterbox, frameCameraToBox, gameAspectFromRect, createSelectGesture, outlineSourceGeometry, resolveFocusTarget, axisSnapCameraPosition, slerpCameraOffset, perspHalfHeightAtDistance, perspDistanceForHalfHeight, orthoFrustumForHalfHeight, shouldHideMeshesForColliderMode, hiddenContentNotice, colliderModeToast } from '../scene/sceneViewMath';
+import { computeUIModeNDC, computeFullNDC, computeCamFrustumPositions, computeLetterbox, frameCameraToBox, gameAspectFromRect, createSelectGesture, outlineSourceGeometry, syncOutlineFor, disposeEdgeOutline, resolveFocusTarget, axisSnapCameraPosition, slerpCameraOffset, perspHalfHeightAtDistance, perspDistanceForHalfHeight, orthoFrustumForHalfHeight, shouldHideMeshesForColliderMode, hiddenContentNotice, colliderModeToast } from '../scene/sceneViewMath';
 import { sceneManager } from '../../runtime/scene/SceneManager';
 import { PREFAB_EDIT_SCENE_PREFIX, PREFAB_EDIT_ROOT_GUID, exitPrefabEditing } from '../scene/prefabEdit';
+import { confirmDiscardUnsaved } from '../scene/unsavedGate';
 import { pushAction, subscribeUndo } from '../undo/undoManager';
 import { buildTransformUndoAction, buildGroupTransformUndoAction } from '../scene/gizmoUndo';
 import { applyGroupTransform3D, applyGroupTransform2D, filterOutDescendants, resolveGroupPivot2D, virtualDragDelta, groupMemberFields } from '../scene/multiTransform';
-import { entityRef } from '../undo/entityRef';
+import { entityRef, journalRefOf } from '../undo/entityRef';
 import { notifyFieldEdited } from '../animation/recording';
 import {
   parseColliderPoints, serializeColliderPoints, moveVertex, insertVertex, removeVertex,
-  nearestEdgeInsertion, minPointsForShape, type Pt,
+  nearestEdgeInsertion, type Pt,
 } from '../../runtime/core/colliderPoints';
+import { isColliderEditable } from '../scene/colliderEditable';
 import { colliderEditInfo, worldPointToLocal, localToWorld, pickVertex, colliderPickHalfExtents } from './colliderEdit2D';
 import { descendantUnionGizmoBox2D, type GizmoBoundsEntity } from './gizmoBounds';
 import { gizmoWorldScale, rotateRingAim, scaleCenterAim, axisPickAim, ROTATE_RING_RADIUS, SCALE_XYZ_HALF_EXTENT, AXIS_PICKER_CENTER } from './gizmo3dAim';
@@ -276,17 +278,8 @@ function ColliderEditButton() {
   const colliderEditMode = useEditorStore((s) => s.colliderEditMode);
   const setColliderEditMode = useEditorStore((s) => s.setColliderEditMode);
   const selectedId = useEditorStore((s) => s.selectedEntityId);
-  let editable = false;
-  if (selectedId != null) {
-    const colMeta = getAllTraits().find((t) => t.name === 'Collider2D');
-    const ent = colMeta ? findEntity(selectedId) : null;
-    if (ent && colMeta && ent.has(colMeta.trait)) {
-      const shape = (ent.get(colMeta.trait) as { shape: string }).shape;
-      // Any point-list shape is editable (polygon/concave = 3, polyline = 2) — use the
-      // single source of truth so new point-shapes never desync from this gate.
-      editable = minPointsForShape(shape) !== null;
-    }
-  }
+  // Shared with the `set-collider-edit` op, so the op refuses exactly what this effect would undo.
+  const editable = isColliderEditable(selectedId);
   useEffect(() => { if (!editable && colliderEditMode) setColliderEditMode(false); }, [editable, colliderEditMode, setColliderEditMode]);
   if (!editable) return null;
   return (
@@ -578,7 +571,11 @@ export default function SceneView() {
   // (`prefab` → 'edit-exit') and this breadcrumb button take the SAME path — the
   // return-scene reload is what re-expands every instance from the just-saved file,
   // and a second copy of it would be one to drift.
-  const exitPrefabEdit = useCallback(async () => { await exitPrefabEditing(); }, []);
+  // The button asks first (#1419): the return reload discards unsaved prefab-world edits.
+  const exitPrefabEdit = useCallback(async () => {
+    if (!(await confirmDiscardUnsaved('leave prefab edit', 'world-swap'))) return;
+    await exitPrefabEditing();
+  }, []);
   // ── 2D mode viewport zoom/pan ──
   const viewportRef = useRef<HTMLDivElement>(null);
   const viewRef = useRef({ zoom: 1, panX: 0, panY: 0 });
@@ -889,63 +886,6 @@ function useLetterboxBounds() {
   return bounds;
 }
 
-
-/** Build a entityId→parentId map and the set of Canvas2D entity IDs for the
- *  current world. Used to route each Renderable2D to its owning Canvas2D. */
-function buildCanvas2DRouting(): { parentOf: Map<number, number>; sortOrderOf: Map<number, number>; orderInLayerOf: Map<number, number>; canvasIds: Set<number> } {
-  const allTraits = getAllTraits();
-  const eaMeta = allTraits.find(t => t.name === 'EntityAttributes');
-  const c2dMeta = allTraits.find(t => t.name === 'Canvas2D');
-  const r2dMeta = allTraits.find(t => t.name === 'Renderable2D');
-  const parentOf = new Map<number, number>();
-  const sortOrderOf = new Map<number, number>();
-  const orderInLayerOf = new Map<number, number>();
-  const canvasIds = new Set<number>();
-  if (eaMeta) {
-    getCurrentWorld().query(eaMeta.trait).updateEach(([ea]: any[], entity: any) => {
-      parentOf.set(entity.id(), ea.parentId || 0);
-      sortOrderOf.set(entity.id(), ea.sortOrder || 0);
-    });
-  }
-  if (r2dMeta) {
-    getCurrentWorld().query(r2dMeta.trait).updateEach(([r]: any[], entity: any) => {
-      if (r.orderInLayer) orderInLayerOf.set(entity.id(), r.orderInLayer);
-    });
-  }
-  if (c2dMeta) {
-    getCurrentWorld().query(c2dMeta.trait).updateEach((_: any, entity: any) => {
-      canvasIds.add(entity.id());
-    });
-  }
-  return { parentOf, sortOrderOf, orderInLayerOf, canvasIds };
-}
-
-// The routing only depends on the scene graph (parentId/sortOrder/Canvas2D set),
-// which always bumps the 2D dirty version (any ECS write fires addDirtyListener →
-// mark2DDirty; world swap does too). So memoize it by that version: the per-frame
-// draw and — crucially — the per-`pointermove` HOVER hit-test reuse one build
-// instead of allocating fresh maps every event over a static scene. (gizmos F3)
-let _routingCache: { version: number; routing: ReturnType<typeof buildCanvas2DRouting> } | null = null;
-function getCanvas2DRouting(): ReturnType<typeof buildCanvas2DRouting> {
-  const version = get2DDirtyVersion();
-  if (_routingCache && _routingCache.version === version) return _routingCache.routing;
-  const routing = buildCanvas2DRouting();
-  _routingCache = { version, routing };
-  return routing;
-}
-
-// Paint order is a pure function of the routing (sortOrder DFS over the hierarchy), so it's
-// invariant across sim-running redraws of a static scene — cache it by the same 2D dirty
-// version instead of re-running the O(n) DFS every frame per Canvas2D layer (P4).
-let _paintOrderCache: { version: number; order: Map<number, number> } | null = null;
-function getPaintOrder(): Map<number, number> {
-  const version = get2DDirtyVersion();
-  if (_paintOrderCache && _paintOrderCache.version === version) return _paintOrderCache.order;
-  const { sortOrderOf, parentOf, orderInLayerOf } = getCanvas2DRouting();
-  const order = computePaintOrder(sortOrderOf, parentOf, orderInLayerOf.size ? orderInLayerOf : undefined);
-  _paintOrderCache = { version, order };
-  return order;
-}
 
 /** With every 2D pointer surface temporarily click-through, find the UI entity
  *  (if any) directly beneath a screen point. The 2D surfaces have
@@ -1774,7 +1714,7 @@ function installScene2DInteraction(canvasEntityId: number, opts: Scene2DInteract
           return buildTransformUndoAction({
             label: `Transform "${entityDisplayName(m.id)}"`,
             trait: Transform, resolve: () => ref.resolve(), findEntity, before: { ...m.local }, after,
-            entityGuid: ref.guid || String(m.id),
+            entityGuid: journalRefOf(ref.guid, m.id),
           });
         }).filter(Boolean) as ReturnType<typeof buildTransformUndoAction>[];
         if (actions.length) pushAction(buildGroupTransformUndoAction(`Transform ${actions.length} entities`, actions));
@@ -1797,7 +1737,7 @@ function installScene2DInteraction(canvasEntityId: number, opts: Scene2DInteract
         pushAction(buildTransformUndoAction({
           label: `Transform "${entityDisplayName(eid)}"`,
           trait: Transform, resolve: () => ref.resolve(), findEntity, before, after,
-          entityGuid: ref.guid || String(eid),
+          entityGuid: journalRefOf(ref.guid, eid),
         }));
         // Record mode: a gizmo drag writes Transform via direct entity.set (above),
         // which bypasses writeTraitField → the animation record hook never sees it.
@@ -2308,7 +2248,7 @@ function registerScene2DColliderHandles(canvasEntityId: number, getCanvas: () =>
         x: rect.left + (backingX / pw) * rect.width,
         y: rect.top + (backingY / ph) * rect.height,
         label: `vertex ${i}`,
-        meta: { entityId: selId, index: i, local: [p.x, p.y] },
+        meta: { entityId: selId, guid: guidOfEntityId(selId), index: i, local: [p.x, p.y] },
         owner: canvas,
       };
     });
@@ -2886,7 +2826,8 @@ function ThreeJSViewport({ mode, layers, showGrid = true, showColliders = false,
     let projection: 'perspective' | 'orthographic' = 'perspective';
 
     // ── OrbitControls ───────────────────────────────────
-    const controls = new OrbitControls(camera, renderer.domElement);
+    // Typed for BOTH projections: the view toggle re-points `controls.object` at the ortho camera.
+    const controls = new OrbitControls<THREE.PerspectiveCamera | THREE.OrthographicCamera>(camera, renderer.domElement);
     controls.enableDamping = true;
     controls.dampingFactor = 0.1;
     controls.target.set(0, 0, 0);
@@ -2927,13 +2868,17 @@ function ThreeJSViewport({ mode, layers, showGrid = true, showColliders = false,
       // stale, and capture_viewport cannot reveal it either (it screenshots the window, it does
       // not force a render). See runtime/rendering/materialDirty.ts.
       onMaterial3DDirty(markViewportDirty),
-      // Model re-import — BOTH edges, and both are load-bearing. The invalidation evicts the
-      // live meshes (attachInvalidationListener above), which changes the image immediately;
-      // the rebuild lands whenever the GLB finishes re-parsing, which routinely outlasts the
-      // gate's ~1s grace. Without the second one the object stayed missing indefinitely on
-      // this render-on-demand viewport (QA-ASSET-0008).
+      // Model re-import — BOTH edges are load-bearing, and only ONE of them is here now.
+      // The invalidation evicts the live meshes (attachInvalidationListener above), which changes
+      // the image immediately. The REBUILD lands whenever the GLB finishes re-fetching and
+      // re-parsing, which routinely outlasts the gate's ~1s grace — without that second edge the
+      // object stayed missing indefinitely on this render-on-demand viewport (QA-ASSET-0008).
+      // ⚠️ That second edge used to be a dedicated `onModelTemplatesLoaded` subscription here, and
+      // this was its ONLY subscriber in the repo — which is why the stopped GameView never got it
+      // (#1363). Both model caches now call `fireDirtyListeners()` on their load edge like every
+      // other async refill does, so `addDirtyListener` above already carries it for this viewport
+      // AND for every other idle-gated surface. Do not re-add a private channel for it.
       onModelInvalidated(markViewportDirty),
-      onModelTemplatesLoaded(markViewportDirty),
       // ⚠️ UNDO/REDO. It reverts traits with a direct `entity.set`, which does NOT go through
       // writeTraitField and so fires NO dirty broadcast — the 2D gate has said exactly this since
       // it was bitten (see the subscribeUndo effect above), and the 3D gate simply never got the
@@ -3347,7 +3292,7 @@ function ThreeJSViewport({ mode, layers, showGrid = true, showColliders = false,
           return buildTransformUndoAction({
             label: `Transform "${entityDisplayName(m.id)}"`,
             trait: Transform, resolve: () => ref.resolve(), findEntity, before: m.before, after,
-            entityGuid: ref.guid || String(m.id),
+            entityGuid: journalRefOf(ref.guid, m.id),
           });
         }).filter(Boolean) as ReturnType<typeof buildTransformUndoAction>[];
         if (actions.length) {
@@ -3369,7 +3314,7 @@ function ThreeJSViewport({ mode, layers, showGrid = true, showColliders = false,
       pushAction(buildTransformUndoAction({
         label: `Transform "${entityDisplayName(eid)}"`,
         trait: Transform, resolve: () => ref.resolve(), findEntity, before, after,
-        entityGuid: ref.guid || String(eid),
+        entityGuid: journalRefOf(ref.guid, eid),
       }));
       // Record mode: the gizmo writes Transform via direct entity.set, bypassing
       // writeTraitField → the animation record hook never sees it. Notify it for
@@ -3525,7 +3470,7 @@ function ThreeJSViewport({ mode, layers, showGrid = true, showColliders = false,
       if (show3D) for (const [id, obj] of renderState.ecsObjects) if (isLiveOwner(renderState.ecsOwners.get(id))) consider(id, obj);
       for (const [id, e] of renderState.billboards) if (e.group.visible && isLiveOwner(e.owner)) consider(id, e.group);
       if (show3D) for (const [id, e] of renderState.textMeshes) if (e.group.visible && isLiveOwner(e.owner)) consider(id, e.group);
-      for (const [id, obj] of ecsGizmos) if (isLiveOwner(gizmoOwners.get(id))) consider(id, obj);
+      for (const [id, obj, owner] of gizmos.owned()) if (isLiveOwner(owner)) consider(id, obj);
       if (show3D) for (const [id, rec] of flameState.recs) if (isLiveOwner(rec.owner)) consider(id, rec.group as THREE.Object3D);
       if (inside.length === 0) return;
       const cur = useEditorStore.getState().selectedEntityIds;
@@ -3602,7 +3547,7 @@ function ThreeJSViewport({ mode, layers, showGrid = true, showColliders = false,
           .filter(([, rec]) => isLiveOwner(rec.owner))
           .map(([id, rec]) => ({ id, object: rec.group as THREE.Object3D })) : []),
         // 2.5D billboards (SkinnedSprite2D + Billboard3D) render as camera-facing THREE meshes
-        // but live in neither ecsObjects nor ecsGizmos — add their group so the character is
+        // but live in neither ecsObjects nor the gizmo table — add their group so the character is
         // click-selectable in the 3D view. A hit on a part-mesh resolves up to the group's id.
         // Gate on group.visible so picking matches what's actually drawn.
         ...Array.from(renderState.billboards)
@@ -3613,7 +3558,7 @@ function ThreeJSViewport({ mode, layers, showGrid = true, showColliders = false,
         ...(show3D ? Array.from(renderState.textMeshes)
           .filter(([, entry]) => entry.group.visible && isLiveOwner(entry.owner))
           .map(([id, entry]) => ({ id, object: entry.group as THREE.Object3D })) : []),
-        ...Array.from(ecsGizmos).filter(([id]) => isLiveOwner(gizmoOwners.get(id))).map(([id, object]) => ({ id, object })),
+        ...Array.from(gizmos.owned()).filter(([, , owner]) => isLiveOwner(owner)).map(([id, object]) => ({ id, object })),
       ];
       return pick3D(mx, my, activeCam, entries, raycaster);
     }
@@ -3855,7 +3800,7 @@ function ThreeJSViewport({ mode, layers, showGrid = true, showColliders = false,
 
     // ── ECS Entity Meshes (3D only) ─────────────────────
     const renderState = createRenderState();
-    setEcsObjectsRegistry(renderState.ecsObjects); // E2E observation (collider-only mode etc.)
+    setEcsObjectsRegistry(renderState.ecsObjects, renderState.ecsOwners); // E2E observation (collider-only mode etc.)
     scope.add(() => setEcsObjectsRegistry(null)); // drop the dangling ref to the disposed renderState
     const unsubInvalidation = attachInvalidationListener(renderState, scene);
     scope.add(unsubInvalidation);
@@ -3873,16 +3818,16 @@ function ThreeJSViewport({ mode, layers, showGrid = true, showColliders = false,
     // the same id, agentBridge's boundsById Map keeps the last (worldAABB is identical;
     // screen is a valid projection either way).
     // Declared HERE, above the bounds provider, because that provider now reads it (below).
-    // Icon gizmos for Camera/Light/Environment/empty entities — the objects that make an
-    // otherwise-invisible entity clickable in the viewport.
-    const ecsGizmos = new Map<number, THREE.Object3D>();
-    // The packed entity (`entity.valueOf()`) that last KEPT the gizmo at an id — stamped by the loop
-    // below that owns that gizmo, at the point it creates or poses it, and nowhere else. The bounds
-    // provider and the picker refuse an id whose stamp is missing or dead (#1197). ⚠️ Never stamp from
-    // a loop that merely VISITS the id: the Transform (empty) loop visits every entity, and Camera and
-    // Environment gizmos were never reaped, so a top-of-loop stamp let a newcomer on a dead camera's
-    // index vouch for the dead camera's icon — measured, permanently. Those two are reaped now too.
-    const gizmoOwners = new Map<number, number>();
+    // Icon and volume gizmos for Camera/Light/Environment/particle/CameraFrame/Zone3D/empty entities —
+    // the objects that make an otherwise-invisible entity clickable in the viewport. Who owns a slot,
+    // which kind shows when an entity qualifies for two, and what a released gizmo disposes are all
+    // decided in `editor/scene/sceneViewGizmoTable.ts` (#1206). `camGizmoPivot` (declared above) is
+    // shared by every Camera, so the table never removes or disposes it.
+    // ⚠️ This owner SKIPS passes: `gate.shouldDraw` returns before the gizmo loops on an idle
+    // viewport, so the `EntityTable` generation-wrap caveat applies — an index recycled a multiple of
+    // 256 times with no draw in between (a `modoki_eval` loop) aliases the newcomer to the old row,
+    // and the picker and bounds vouch for the old gizmo until the next draw sweeps it.
+    const gizmos = new SceneViewGizmoTable({ scene, shared: new Set([camGizmoPivot]) });
 
     const unregBounds = registerBoundsProvider((ids) => {
       const r = renderer.domElement.getBoundingClientRect();
@@ -3890,7 +3835,7 @@ function ThreeJSViewport({ mode, layers, showGrid = true, showColliders = false,
       // `editor/scene/sceneViewBounds.ts`, where it is unit-tested. Only the live inputs —
       // this renderer's viewport rect and the active editor camera — belong here.
       return computeEntityScreenBounds(
-        boundsSourcesOf(renderState, { objects: ecsGizmos, owners: gizmoOwners }),
+        boundsSourcesOf(renderState, gizmos.owned()),
         activeEditorCam,
         { left: r.left, top: r.top, width: r.width, height: r.height },
         'scene-view',
@@ -3940,7 +3885,7 @@ function ThreeJSViewport({ mode, layers, showGrid = true, showColliders = false,
           || renderState.billboards.get(id)?.group
           || flameState.recs.get(id)?.group;
         if (mesh) meshObjects.push(mesh);
-        const giz = ecsGizmos.get(id);
+        const giz = gizmos.peekId(id);
         if (giz) gizmoObjects.push(giz);
       }
       for (const o of meshObjects) o.updateWorldMatrix(true, true);
@@ -4054,28 +3999,6 @@ function ThreeJSViewport({ mode, layers, showGrid = true, showColliders = false,
     const particleState = createParticleSyncState();
     const flameState = createFlameMeshSyncState();
     const blobShadowState = createBlobShadowSyncState();
-    // F10: persistent "seen this frame" / "seen last frame" Set pairs, swapped
-    // each frame instead of allocating a fresh Set per pass per frame (GC churn
-    // that scaled with frame count). Each pass fills `*ScratchIds`, reaps gizmos
-    // for ids in `*GizmoIds` (last frame) not seen, then swaps so this frame's
-    // seen becomes next frame's previous.
-    let particleGizmoIds = new Set<number>();
-    let particleScratchIds = new Set<number>();
-    // Camera + Environment icon rows, previous frame / scratch — the same swap as the particle pair.
-    // These two kinds were never reaped: a deleted Camera left `camGizmoPivot` in `ecsGizmos` at its
-    // index, so an entity reclaiming that index got no marker of its own, and a Light / Environment
-    // there adopted the shared pivot (#1197 close-out review).
-    let cameraGizmoIds = new Set<number>();
-    let cameraScratchIds = new Set<number>();
-    let envGizmoIds = new Set<number>();
-    let envScratchIds = new Set<number>();
-    let emptyGizmoIds = new Set<number>();
-    let emptyScratchIds = new Set<number>();
-    let frameGizmoIds = new Set<number>();     // CameraFrame boxes shown last frame
-    let frameScratchIds = new Set<number>();
-    let zoneGizmoIds = new Set<number>();      // Zone3D wireframe volumes shown last frame
-    let zoneScratchIds = new Set<number>();
-    const preSyncLightIds = new Set<number>(); // reused; refilled before each syncLights
     let lastPreviewT = 0;
 
     // On world swap (scene change), drop all cached objects so they rebuild from new entities
@@ -4087,33 +4010,14 @@ function ThreeJSViewport({ mode, layers, showGrid = true, showColliders = false,
       // Before the meshes go: release() restores each mesh's previous material slot.
       if (__MODOKI_MODULE_VIDEO__) disposeVideoTextures(renderState);
       disposeRenderState(renderState, scene);
-      // Skip the persistent camGizmoPivot — it's added to scene once at init
-      // and reused across world swaps. Removing it here would orphan it and
-      // make TransformControls warn every frame on next Camera select. This also disposes
-      // descOutlineMeshes on swap (previously left to the next frame's prune) — a strict
-      // improvement, not a behaviour this issue asked for.
-      disposeSceneViewEntityObjects(scene, { outlineMeshes, descOutlineMeshes, colliderWires, colliderWireSigs, ecsGizmos, ecsLights }, camGizmoPivot);
-      gizmoOwners.clear();
-      particleGizmoIds.clear();
-      particleScratchIds.clear();
-      cameraGizmoIds.clear();
-      cameraScratchIds.clear();
-      envGizmoIds.clear();
-      envScratchIds.clear();
-      emptyGizmoIds.clear();
-      emptyScratchIds.clear();
-      frameGizmoIds.clear();
-      frameScratchIds.clear();
-      // koota recycles entity ids across a world swap. If these weren't cleared here, a
-      // stale id (e.g. 5, a Zone3D in the OLD scene) could be reused for a different
-      // entity type in the NEW scene (a Light, even the active Camera) — the zone reap
-      // loop in the frame callback below would then wrongly tear down that other
-      // entity's gizmo for one frame
-      // (scene.remove + material.dispose + ecsGizmos.delete) before self-healing next
-      // frame. Same family as #738/#759: a structure keyed on a recyclable entity id
-      // outliving the world that minted the id.
-      zoneGizmoIds.clear();
-      zoneScratchIds.clear();
+      // This also disposes descOutlineMeshes on swap (previously left to the next frame's prune) — a
+      // strict improvement, not a behaviour this issue asked for.
+      disposeSceneViewEntityObjects(scene, { outlineMeshes, descOutlineMeshes, colliderWires, colliderWireSigs, ecsLights });
+      // A world swap can reuse both the index and the world id, so the gizmo table's generation stamp
+      // cannot tell the outgoing world's rows from the incoming one's: clear them here. The shared
+      // camGizmoPivot stays in the scene — removing it would orphan it and make TransformControls warn
+      // every frame on the next Camera select.
+      gizmos.clear();
       disposeParticleSyncState(particleState, scene);
       disposeFlameMeshSyncState(flameState, scene);
       disposeBlobShadowSyncState(blobShadowState, scene);
@@ -4181,14 +4085,15 @@ function ThreeJSViewport({ mode, layers, showGrid = true, showColliders = false,
       // does (no Camera entity, or all deactivated), gameCam would keep its origin-
       // looking-down-(-Z) construction defaults → UI-mode 3D render + picking break.
       let cameraMatched = false;
+      // One gizmo pass spans every gizmo loop below, through the empty-marker block: each loop claims
+      // or keeps the rows it draws, and `endPass` releases the rest (sceneViewGizmoTable.ts).
+      gizmos.beginPass();
       if (transformMeta && cameraMeta) {
-        const seenCam = cameraScratchIds;
-        seenCam.clear();
         getCurrentWorld().query(transformMeta.trait, cameraMeta.trait).updateEach(([tf, cam], entity) => {
           const id = entity.id();
-          // Seen BEFORE the deactivation return: only a Camera that left the query (deleted, or lost
-          // the trait) has its row reaped below, so a deactivated one stays selectable as before.
-          seenCam.add(id);
+          // Kept BEFORE the deactivation return: only a Camera that left the query (deleted, or lost
+          // the trait) loses its row, so a deactivated one stays selectable as before.
+          gizmos.keep(entity, 'camera');
           if (deactivatedEntities.has(id)) return; // a deactivated camera is not active
           cameraMatched = true;
           // World-space pose (respects parenting), matching runtime
@@ -4236,33 +4141,24 @@ function ThreeJSViewport({ mode, layers, showGrid = true, showColliders = false,
           applyOrthoFrustum(gameOrthoCam, cam.orthoSize, gameCam.aspect);
           gameActiveCam = cam.projection === 'orthographic' ? gameOrthoCam : gameCam;
 
-          // Sync pivot position + rotation from ECS Transform.
-          // Re-parent to scene if a prior teardown (onWorldSwap) detached it —
-          // otherwise the gizmo would attach to a parentless object and
-          // TransformControls would warn every frame.
-          if (camGizmoPivot.parent !== scene) scene.add(camGizmoPivot);
-          camGizmoPivot.position.copy(_svCamPos);
-          const isDraggingCam = gizmoEntityId === id && (gizmo as any).dragging;
-          if (!isDraggingCam) {
-            camGizmoPivot.rotation.set(rx, ry, rz);
+          // The shared pivot is this camera's icon only when the claim succeeds. A camera that
+          // yields (a Zone3D volume or a shown CameraFrame box on the same entity) must not pose
+          // it: the icon would draw where nothing can pick it. `claim` also re-adds the pivot to
+          // the scene if a teardown detached it — otherwise the gizmo would attach to a parentless
+          // object and TransformControls would warn every frame.
+          if (gizmos.claim(entity, 'camera', () => camGizmoPivot)) {
+            // Sync pivot position + rotation from ECS Transform.
+            camGizmoPivot.position.copy(_svCamPos);
+            const isDraggingCam = gizmoEntityId === id && (gizmo as any).dragging;
+            if (!isDraggingCam) {
+              camGizmoPivot.rotation.set(rx, ry, rz);
+            }
+            // Refresh frustum geometry from the current Camera params; clamp far
+            // so the visualization stays a usable size in the editor viewport.
+            // Visibility is owned by the selection block below — hidden by default.
+            updateCamFrustum(cam.fov, getGameAspect(), cam.near, Math.min(cam.far, 20));
           }
-          // Refresh frustum geometry from the current Camera params; clamp far
-          // so the visualization stays a usable size in the editor viewport.
-          // Visibility is owned by the selection block below — hidden by default.
-          updateCamFrustum(cam.fov, getGameAspect(), cam.near, Math.min(cam.far, 20));
-          ecsGizmos.set(id, camGizmoPivot);
-          gizmoOwners.set(id, entity.valueOf());
-
         });
-        // Drop the ROW only — the pivot is shared by every Camera and outlives them all. A row that
-        // another loop has since replaced with its own gizmo is left to that loop.
-        for (const id of cameraGizmoIds) {
-          if (seenCam.has(id) || ecsGizmos.get(id) !== camGizmoPivot) continue;
-          ecsGizmos.delete(id);
-          gizmoOwners.delete(id);
-        }
-        cameraScratchIds = cameraGizmoIds;
-        cameraGizmoIds = seenCam;
       }
 
       // F1 fallback: no active Camera entity → drive gameCam from the editor orbit
@@ -4331,23 +4227,16 @@ function ThreeJSViewport({ mode, layers, showGrid = true, showColliders = false,
       const envMeta = allTraits.find((t) => t.name === 'Environment');
       if (envMeta) {
         let envActive = false;
-        const seenEnv = envScratchIds;
-        seenEnv.clear();
         getCurrentWorld().query(envMeta.trait).updateEach(([env], entity) => {
-          seenEnv.add(entity.id()); // before the deactivation return — see the Camera reap above
+          gizmos.keep(entity, 'environment'); // before the deactivation return — see the Camera loop above
           if (deactivatedEntities.has(entity.id())) return;
           envActive = true;
           const envId = entity.id();
           // Environment gizmo icon
-          if (transformMeta && entity.has(transformMeta.trait) && !ecsGizmos.has(envId)) {
-            const mat = new THREE.MeshBasicMaterial({ color: 0x00cccc, wireframe: true });
-            const g = new THREE.Mesh(GIZMO_SHAPES.environment, mat);
-            scene.add(g);
-            ecsGizmos.set(envId, g);
-          }
-          if (ecsGizmos.has(envId)) {
-            gizmoOwners.set(envId, entity.valueOf());
-            poseIconGizmo(ecsGizmos.get(envId)!, envId, gizmoEntityId === envId && !!(gizmo as { dragging?: boolean }).dragging);
+          if (transformMeta && entity.has(transformMeta.trait)) {
+            const g = gizmos.claim(entity, 'environment',
+              () => new THREE.Mesh(GIZMO_SHAPES.environment, new THREE.MeshBasicMaterial({ color: 0x00cccc, wireframe: true })));
+            if (g) poseIconGizmo(g, envId, gizmoEntityId === envId && !!(gizmo as { dragging?: boolean }).dragging);
           }
           // Editor background: show editor bg color when env doesn't show as background
           if (scene.environment && !env.showAsBackground) {
@@ -4357,25 +4246,9 @@ function ThreeJSViewport({ mode, layers, showGrid = true, showColliders = false,
         if (!envActive) {
           scene.background = _editorBgColor;
         }
-        // Remove the icon of an Environment that left the query. Only an environment icon is
-        // disposed: any other gizmo at that id belongs to the loop that made it.
-        for (const id of envGizmoIds) {
-          if (seenEnv.has(id)) continue;
-          const g = ecsGizmos.get(id) as THREE.Mesh | undefined;
-          if (!g || g.geometry !== GIZMO_SHAPES.environment) continue;
-          scene.remove(g); (g.material as THREE.Material | undefined)?.dispose();
-          ecsGizmos.delete(id);
-          gizmoOwners.delete(id);
-        }
-        envScratchIds = envGizmoIds;
-        envGizmoIds = seenEnv;
       }
 
-      // Sync ECS lights (shared runtime logic handles creation, update, and removal)
-      // Snapshot light IDs before sync to detect removals for gizmo cleanup
-      // (reuses the persistent preSyncLightIds Set — refilled, not reallocated).
-      preSyncLightIds.clear();
-      for (const id of ecsLights.keys()) preSyncLightIds.add(id);
+      // Sync ECS lights (shared runtime logic handles creation, update, and removal).
       // A true look-at exists here (the orbit target) — use it rather than deriving a ground
       // hit, unlike the runtime GameView which has no such concept (see Scene3D.tsx).
       syncLights(getCurrentWorld(), scene, ecsLights, controls.target);
@@ -4385,16 +4258,12 @@ function ThreeJSViewport({ mode, layers, showGrid = true, showColliders = false,
         getCurrentWorld().query(lightMeta.trait).updateEach(([light], entity) => {
           if (deactivatedEntities.has(entity.id())) return;
           const id = entity.id();
-          if (!ecsGizmos.has(id)) {
-            const mat = new THREE.MeshBasicMaterial({ color: light.color, wireframe: true });
-            const g = new THREE.Mesh(GIZMO_SHAPES.light, mat);
-            scene.add(g);
-            ecsGizmos.set(id, g);
+          const g = gizmos.claim(entity, 'light',
+            () => new THREE.Mesh(GIZMO_SHAPES.light, new THREE.MeshBasicMaterial({ color: light.color, wireframe: true }))) as THREE.Mesh | undefined;
+          if (g) {
+            (g.material as THREE.MeshBasicMaterial).color.setHex(light.color);
+            poseIconGizmo(g, id, gizmoEntityId === id && !!(gizmo as { dragging?: boolean }).dragging);
           }
-          const g = ecsGizmos.get(id)!;
-          gizmoOwners.set(id, entity.valueOf());
-          ((g as THREE.Mesh).material as THREE.MeshBasicMaterial).color.setHex(light.color);
-          poseIconGizmo(g, id, gizmoEntityId === id && !!(gizmo as { dragging?: boolean }).dragging);
           // Shadow-frustum viz: outline the shadow-camera coverage for a flagged
           // directional shadow-caster (single reusable box — one key light is typical).
           if (!sfShown && light.lightType === 'directional' && light.castShadow && light.showShadowFrustum) {
@@ -4405,13 +4274,6 @@ function ThreeJSViewport({ mode, layers, showGrid = true, showColliders = false,
             }
           }
         });
-        // Clean up gizmos for lights that syncLights removed
-        for (const id of preSyncLightIds) {
-          if (!ecsLights.has(id)) {
-            const g = ecsGizmos.get(id);
-            if (g) { scene.remove(g); ((g as THREE.Mesh).material as THREE.Material | undefined)?.dispose(); ecsGizmos.delete(id); }
-          }
-        }
       }
       shadowFrustumLines.visible = sfShown;
 
@@ -4419,32 +4281,13 @@ function ThreeJSViewport({ mode, layers, showGrid = true, showColliders = false,
       // in-scene effect preview is driven below, gated on the toolbar toggle).
       const peMeta = allTraits.find((t) => t.name === 'ParticleEmitter');
       if (peMeta && transformMeta) {
-        const seenPe = particleScratchIds;
-        seenPe.clear();
         getCurrentWorld().query(transformMeta.trait, peMeta.trait).updateEach((_vals, entity) => {
           if (deactivatedEntities.has(entity.id())) return;
           const id = entity.id();
-          seenPe.add(id);
-          if (!ecsGizmos.has(id)) {
-            const mat = new THREE.MeshBasicMaterial({ color: 0xffaa33, wireframe: true });
-            const g = new THREE.Mesh(GIZMO_SHAPES.particle, mat);
-            scene.add(g);
-            ecsGizmos.set(id, g);
-          }
-          gizmoOwners.set(id, entity.valueOf());
-          poseIconGizmo(ecsGizmos.get(id)!, id, gizmoEntityId === id && !!(gizmo as { dragging?: boolean }).dragging);
+          const g = gizmos.claim(entity, 'particle',
+            () => new THREE.Mesh(GIZMO_SHAPES.particle, new THREE.MeshBasicMaterial({ color: 0xffaa33, wireframe: true })));
+          if (g) poseIconGizmo(g, id, gizmoEntityId === id && !!(gizmo as { dragging?: boolean }).dragging);
         });
-        // Remove icons for emitters deleted within the current scene.
-        for (const id of particleGizmoIds) {
-          if (!seenPe.has(id)) {
-            const g = ecsGizmos.get(id);
-            if (g) { scene.remove(g); ((g as THREE.Mesh).material as THREE.Material | undefined)?.dispose(); ecsGizmos.delete(id); }
-          }
-        }
-        // Swap: this frame's seen becomes next frame's "previous"; the old
-        // previous becomes the scratch we'll clear+refill next frame.
-        particleScratchIds = particleGizmoIds;
-        particleGizmoIds = seenPe;
       }
 
       // Sync ECS 3D renderables + skeletal rigs (shared runtime core +
@@ -4475,14 +4318,12 @@ function ThreeJSViewport({ mode, layers, showGrid = true, showColliders = false,
 
       // Editor-specific: CameraFrame framing-box gizmo. When `showGizmo` is on we
       // draw the oriented box (wireframe, world position/rotation/scale) and put
-      // it in ecsGizmos so it's pickable + gizmo-editable (resize the framing
-      // volume). When off it's reaped — so the (often large) box never steals
+      // it in the gizmo table so it's pickable + gizmo-editable (resize the framing
+      // volume). When off it is released — so the (often large) box never steals
       // selection clicks; the entity then falls through to the small empty marker
-      // below and stays selectable. Runs BEFORE the empty block so that block sees
-      // it already in ecsGizmos (and skips it) when shown.
+      // below and stays selectable. It outranks that marker (and a camera icon), so
+      // the empty block yields to it while it is shown.
       {
-        const seenFrame = frameScratchIds;
-        seenFrame.clear();
         const gizmoShown = useEditorStore.getState().cameraGizmoShown;
         getCurrentWorld().query(CameraFrame, Transform).updateEach((_t: unknown[], entity) => {
           const id = entity.id();
@@ -4490,20 +4331,9 @@ function ThreeJSViewport({ mode, layers, showGrid = true, showColliders = false,
           // so toggling the box survives reloads/hot-reloads without a Cmd+S and never ships.
           const guid = entity.get(EntityAttributes)?.guid ?? '';
           if (deactivatedEntities.has(id) || !guid || !gizmoShown.has(guid)) return;
-          seenFrame.add(id);
-          let g = ecsGizmos.get(id) as THREE.Mesh | undefined;
-          // Take over a slot that held a different gizmo (e.g. the small empty
-          // marker from the frame before showGizmo was toggled on).
-          if (g && g.geometry !== GIZMO_SHAPES.frameBox) {
-            scene.remove(g); (g.material as THREE.Material | undefined)?.dispose(); ecsGizmos.delete(id); g = undefined;
-          }
-          if (!g) {
-            const mat = new THREE.MeshBasicMaterial({ color: 0x38bdf8, wireframe: true, transparent: true, opacity: 0.6 });
-            g = new THREE.Mesh(GIZMO_SHAPES.frameBox, mat);
-            scene.add(g);
-            ecsGizmos.set(id, g);
-          }
-          gizmoOwners.set(id, entity.valueOf());
+          const g = gizmos.claim(entity, 'frameBox',
+            () => new THREE.Mesh(GIZMO_SHAPES.frameBox, new THREE.MeshBasicMaterial({ color: 0x38bdf8, wireframe: true, transparent: true, opacity: 0.6 })));
+          if (!g) return;
           // Don't fight the transform gizmo while this box is being dragged.
           const isDragging = gizmoEntityId === id && (gizmo as unknown as { dragging?: boolean }).dragging;
           const wt = worldTransforms.get(id);
@@ -4513,30 +4343,18 @@ function ThreeJSViewport({ mode, layers, showGrid = true, showColliders = false,
             g.scale.set(wt.sx || 1, wt.sy || 1, wt.sz || 1);
           }
         });
-        // Reap boxes whose entity no longer shows the gizmo (toggled off, deleted,
-        // deactivated) → they revert to the small empty marker + stop stealing clicks.
-        for (const id of frameGizmoIds) {
-          if (seenFrame.has(id)) continue;
-          const g = ecsGizmos.get(id);
-          if (g) { scene.remove(g); ((g as THREE.Mesh).material as THREE.Material | undefined)?.dispose(); ecsGizmos.delete(id); }
-        }
-        frameScratchIds = frameGizmoIds;
-        frameGizmoIds = seenFrame;
       }
 
       // Editor-specific: Zone3D volume gizmo. A game-logic zone (fish swim area, spawn
       // region, trigger) drawn as a wireframe volume so it's positionable + resizable
       // with the standard transform gizmo, and pickable. Editor-ONLY (never in the built
-      // game). Mirrors the CameraFrame box block: put it in ecsGizmos (pickable + gizmo-
-      // editable), skip while dragging, reap when the trait/entity goes away. Runs BEFORE
-      // the empty block so that block sees it in ecsGizmos and skips it.
+      // game). Mirrors the CameraFrame box block: claimed in the gizmo table (pickable +
+      // gizmo-editable), skip while dragging, released when the trait/entity goes away. It is
+      // the highest-ranked gizmo, so every other loop yields to it on the same entity.
       {
-        const seenZone = zoneScratchIds;
-        seenZone.clear();
         getCurrentWorld().query(Zone3D, Transform).updateEach(([zone], entity) => {
           const id = entity.id();
           if (deactivatedEntities.has(id)) return;
-          seenZone.add(id);
           const wt = worldTransforms.get(id);
           const sx = wt?.sx || 1, sy = wt?.sy || 1, sz = wt?.sz || 1;
           // A capsule needs a PER-ZONE geometry: its radius (sx) and segment length (sy − 2·sx)
@@ -4554,26 +4372,20 @@ function ThreeJSViewport({ mode, layers, showGrid = true, showColliders = false,
             : zone.shape === 'box' ? GIZMO_SHAPES.frameBox
             : isCapsule ? null   // per-zone geometry, built/rebuilt below by size signature
             : GIZMO_SHAPES.zoneSphere;
-          let g = ecsGizmos.get(id) as THREE.Mesh | undefined;
-          // Rebuild if the slot held a different SHARED shape, if a capsule's size signature
-          // changed, or if switching between capsule (per-zone geo) and a shared shape. Dispose
-          // the per-zone capsule geometry (but NEVER a shared GIZMO_SHAPES geometry) on teardown.
-          const hadCapGeo = !!(g?.userData as { zoneCapSig?: string } | undefined)?.zoneCapSig;
-          const stale = g && ((wantGeo && g.geometry !== wantGeo) || (isCapsule && (g.userData as { zoneCapSig?: string }).zoneCapSig !== capSig) || (!isCapsule && hadCapGeo));
-          if (g && stale) {
-            scene.remove(g); (g.material as THREE.Material | undefined)?.dispose();
-            if (hadCapGeo) g.geometry.dispose();
-            ecsGizmos.delete(id); g = undefined;
-          }
-          if (!g) {
+          // Rebuild if the gizmo holds a different SHARED shape, if a capsule's size signature
+          // changed, or if switching between capsule (per-zone geo) and a shared shape. Releasing
+          // the old one disposes the per-zone capsule geometry, never a shared GIZMO_SHAPES one.
+          const fits = (o: THREE.Object3D) => {
+            const capSigOf = (o.userData as { zoneCapSig?: string }).zoneCapSig;
+            return isCapsule ? capSigOf === capSig : !capSigOf && (o as THREE.Mesh).geometry === wantGeo;
+          };
+          const g = gizmos.claim(entity, 'zone', () => {
             const geo = isCapsule ? new THREE.CapsuleGeometry(capR, capLen, 6, 16) : wantGeo!;
-            const mat = new THREE.MeshBasicMaterial({ color: zone.color, wireframe: true, transparent: true, opacity: 0.6 });
-            g = new THREE.Mesh(geo, mat);
-            if (isCapsule) (g.userData as { zoneCapSig?: string }).zoneCapSig = capSig;
-            scene.add(g);
-            ecsGizmos.set(id, g);
-          }
-          gizmoOwners.set(id, entity.valueOf());
+            const m = new THREE.Mesh(geo, new THREE.MeshBasicMaterial({ color: zone.color, wireframe: true, transparent: true, opacity: 0.6 }));
+            if (isCapsule) (m.userData as { zoneCapSig?: string }).zoneCapSig = capSig;
+            return m;
+          }, fits) as THREE.Mesh | undefined;
+          if (!g) return;
           (g.material as THREE.MeshBasicMaterial).color.set(zone.color);
           const isDragging = gizmoEntityId === id && (gizmo as unknown as { dragging?: boolean }).dragging;
           if (wt && !isDragging) {
@@ -4588,17 +4400,6 @@ function ThreeJSViewport({ mode, layers, showGrid = true, showColliders = false,
             else g.scale.set(sx, sx, sx); // sphere / circle
           }
         });
-        for (const id of zoneGizmoIds) {
-          if (seenZone.has(id)) continue;
-          const g = ecsGizmos.get(id) as THREE.Mesh | undefined;
-          if (g) {
-            scene.remove(g); (g.material as THREE.Material | undefined)?.dispose();
-            if ((g.userData as { zoneCapSig?: string }).zoneCapSig) g.geometry.dispose(); // per-zone capsule geo
-            ecsGizmos.delete(id);
-          }
-        }
-        zoneScratchIds = zoneGizmoIds;
-        zoneGizmoIds = seenZone;
       }
 
       // Editor-specific: generic gizmo icons for mesh-less 3D-space entities
@@ -4606,19 +4407,16 @@ function ThreeJSViewport({ mode, layers, showGrid = true, showColliders = false,
       // that has only a Transform has no Three.js object to raycast against or
       // attach the gizmo to, so it can't be selected in the viewport. Runs
       // after syncRenderables + the camera/light/env/particle gizmo blocks so
-      // ecsObjects and ecsGizmos are populated: anything already handled there
-      // (has a mesh, or is a camera/light/env/particle) is skipped.
+      // ecsObjects and the gizmo table are populated: an entity with a mesh is skipped, and one
+      // with a specialized gizmo keeps it — the empty marker is the lowest-ranked kind, so its
+      // claim yields.
       {
-        const seenEmpty = emptyScratchIds;
-        seenEmpty.clear();
         // Fresh selection (the render loop reads it via getState below too) — a mesh-less
         // 3d group only gets an empty gizmo when IT is selected (see the layer check).
         const selForEmpty = useEditorStore.getState().selectedEntityId;
         getCurrentWorld().query(Transform).updateEach((_vals, entity) => {
           const id = entity.id();
           if (deactivatedEntities.has(id)) return;
-          if (frameGizmoIds.has(id)) return; // a shown CameraFrame box owns this id
-          if (zoneGizmoIds.has(id)) return;  // a Zone3D volume gizmo owns this id
           // Only entities with no renderable layer ('' = no Renderable trait).
           // Excludes 3d meshes (own object), 2d/ui entities (not in this view).
           // EXCEPTION: a Billboard3D entity is a SkinnedSprite2D (layer '2d') PROMOTED
@@ -4634,24 +4432,14 @@ function ThreeJSViewport({ mode, layers, showGrid = true, showColliders = false,
           // it's gizmo-editable from the Hierarchy WITHOUT spawning a pickable proxy box
           // for every mesh-less group (there can be hundreds, e.g. generated field tiles).
           if (layer === '3d' && id !== selForEmpty) return;
-          // Skip entities that have a real mesh, or a specialized gizmo
-          // (camera/light/env/particle add to ecsGizmos before this block).
-          // Our own empty gizmos are in ecsGizmos too, but also in emptyGizmoIds,
-          // so they fall through to be re-marked as seen and repositioned —
-          // otherwise they'd be reaped by the cleanup loop and recreated every
-          // frame (flicker).
+          // Skip entities that have a real mesh. One with a specialized gizmo (camera, light,
+          // environment, particle, a shown CameraFrame box, a Zone3D volume) gets `undefined`
+          // back from the claim below.
           if (renderState.ecsObjects.has(id)) return;
           if (renderState.textMeshes.has(id)) return; // has a text mesh → not an "empty"
-          if (ecsGizmos.has(id) && !emptyGizmoIds.has(id)) return;
-          seenEmpty.add(id);
-          gizmoOwners.set(id, entity.valueOf());
-          let g = ecsGizmos.get(id);
-          if (!g) {
-            const mat = new THREE.MeshBasicMaterial({ color: 0x9aa7b4, wireframe: true });
-            g = new THREE.Mesh(GIZMO_SHAPES.empty, mat);
-            scene.add(g);
-            ecsGizmos.set(id, g);
-          }
+          const g = gizmos.claim(entity, 'empty',
+            () => new THREE.Mesh(GIZMO_SHAPES.empty, new THREE.MeshBasicMaterial({ color: 0x9aa7b4, wireframe: true })));
+          if (!g) return;
           const wt = worldTransforms.get(id);
           if (wt) {
             g.position.set(wt.x, wt.y, wt.z);
@@ -4682,21 +4470,10 @@ function ThreeJSViewport({ mode, layers, showGrid = true, showColliders = false,
             }
           }
         });
-        // Remove empty gizmos whose entity no longer qualifies (deleted,
-        // deactivated, or gained a mesh — now in ecsObjects, not in seenEmpty).
-        for (const id of emptyGizmoIds) {
-          if (seenEmpty.has(id)) continue;
-          // On a showGizmo OFF→ON toggle this frame's frame block already took over
-          // this id (created the box + set frameGizmoIds); emptyGizmoIds is still
-          // stale from last frame. Skip so we don't reap the just-created frame box.
-          if (frameGizmoIds.has(id)) continue;
-          if (zoneGizmoIds.has(id)) continue; // a Zone3D volume gizmo owns this id
-          const g = ecsGizmos.get(id);
-          if (g) { scene.remove(g); ((g as THREE.Mesh).material as THREE.Material | undefined)?.dispose(); ecsGizmos.delete(id); }
-        }
-        emptyScratchIds = emptyGizmoIds;
-        emptyGizmoIds = seenEmpty;
       }
+      // Releases every gizmo no loop above claimed or kept this pass: its entity was deleted,
+      // deactivated, lost the trait, gained a mesh, or its index now belongs to someone else.
+      gizmos.endPass();
 
       // Update selection outline (3D meshes, gizmos, and 2D entities)
       const selectedId = useEditorStore.getState().selectedEntityId;
@@ -4725,14 +4502,14 @@ function ThreeJSViewport({ mode, layers, showGrid = true, showColliders = false,
       // whose gizmo *is* camGizmoPivot) is selected. Identifying by pivot
       // pointer avoids re-querying the world for the Camera trait here.
       camFrustumLines.visible = selectedId !== null &&
-        ecsGizmos.get(selectedId) === camGizmoPivot;
+        gizmos.peekId(selectedId) === camGizmoPivot;
 
       // ── 2.5D billboard bone gizmo target ──
       // If a Bone2D of a billboarded rig is selected, park `boneProxy` at the bone inside
       // its billboard `flip` group so the gizmo can pose it. ONLY in 2D (`ui`) view: a 2D
       // rig's bones are posed against the flat, camera-facing sprite there (the 3D view is
       // for placing the whole billboard as a 3D object). Falls through to the normal
-      // ecsObjects/ecsGizmos target below for any other selection.
+      // ecsObjects/gizmo target below for any other selection.
       boneGizmo = null;
       if (selectedId !== null && modeRef.current === 'ui') {
         const selEnt = findEntity(selectedId);
@@ -4780,7 +4557,7 @@ function ThreeJSViewport({ mode, layers, showGrid = true, showColliders = false,
       const selObj = boneGizmo ? boneProxy
         : selBbEntry ? selBbEntry.group
         : (selectedId !== null
-            ? (renderState.ecsObjects.get(selectedId) || renderState.textMeshes.get(selectedId)?.group || ecsGizmos.get(selectedId) || flameState.recs.get(selectedId)?.group)
+            ? (renderState.ecsObjects.get(selectedId) || renderState.textMeshes.get(selectedId)?.group || gizmos.peekId(selectedId) || flameState.recs.get(selectedId)?.group)
             : null);
       // ── Multi-select: attach to the group pivot proxy ──
       // >1 entity selected (and not the bone special-case) → drive the whole cluster. Park the
@@ -4880,8 +4657,7 @@ function ThreeJSViewport({ mode, layers, showGrid = true, showColliders = false,
       const buildOutline = (id: number, obj: THREE.Object3D | null | undefined, color: number) => {
         // A CameraFrame owns its own on-screen representation (teal frameBox / empty marker)
         // and the gizmo attaches to it either way — a yellow EdgesGeometry box on top is
-        // redundant AND buggy (the cached geometry never rebuilds when the slot swaps
-        // marker↔frameBox, so the boxes drift in size). Skip it and drop any stale outline.
+        // redundant. Skip it and drop any stale outline.
         const ent = findEntity(id);
         const isCameraFrame = !!ent && ent.isAlive() && ent.has(CameraFrame);
         const existing = outlineMeshes.get(id);
@@ -4891,19 +4667,15 @@ function ThreeJSViewport({ mode, layers, showGrid = true, showColliders = false,
         // NodeMaterial spam "AttributeNode: Vertex attribute 'position' not found" every frame.
         const geo = isCameraFrame ? undefined : outlineSourceGeometry(obj);
         if (!obj || !geo) {
-          if (existing) { existing.removeFromParent(); existing.geometry.dispose(); (existing.material as THREE.Material).dispose(); outlineMeshes.delete(id); }
+          if (existing) { disposeEdgeOutline(existing); outlineMeshes.delete(id); }
           return;
         }
         wantOutline.add(id);
-        let outline = existing;
-        if (!outline) {
-          const edges = new THREE.EdgesGeometry(geo);
-          outline = new THREE.LineSegments(edges, new THREE.LineBasicMaterial({ color }));
-          scene.add(outline);
-          outlineMeshes.set(id, outline);
-        }
+        // Rebuilt when the source geometry differs from the one the edges were traced from — a
+        // recycled index or a mid-selection mesh swap (#1198); otherwise reused.
+        const outline = syncOutlineFor(outlineMeshes, id, geo, () => new THREE.LineBasicMaterial({ color }), scene);
         // Recolour in place so a primary↔member role swap (active-entity change) updates
-        // without a rebuild — the geometry is cached per id, only the tint changes.
+        // without a rebuild — only the tint changes.
         (outline.material as THREE.LineBasicMaterial).color.setHex(color);
         outline.position.copy(obj.position);
         outline.rotation.copy(obj.rotation);
@@ -4915,17 +4687,12 @@ function ThreeJSViewport({ mode, layers, showGrid = true, showColliders = false,
       for (const id of selIds) {
         if (id === selectedId) continue;
         const obj = renderState.ecsObjects.get(id) || renderState.textMeshes.get(id)?.group
-          || renderState.billboards.get(id)?.group || ecsGizmos.get(id) || flameState.recs.get(id)?.group;
+          || renderState.billboards.get(id)?.group || gizmos.peekId(id) || flameState.recs.get(id)?.group;
         buildOutline(id, obj, OUTLINE_MEMBER);
       }
       // 2D entity selection outline is drawn by the Scene2DChromeOverlay (drawScene2D).
       for (const [id, outline] of outlineMeshes) {
-        if (!wantOutline.has(id)) {
-          outline.removeFromParent();
-          outline.geometry.dispose();
-          (outline.material as THREE.Material).dispose();
-          outlineMeshes.delete(id);
-        }
+        if (!wantOutline.has(id)) { disposeEdgeOutline(outline); outlineMeshes.delete(id); }
       }
 
       // ── Descendants of the selected entity: dimmer secondary outline ──
@@ -4936,8 +4703,7 @@ function ThreeJSViewport({ mode, layers, showGrid = true, showColliders = false,
       // its object's children. Same geometry filter as the primary outline: only real-geometry
       // meshes (ecsObjects / baked LODs) produce edges; mesh-less empties, gizmos, billboard
       // and text groups resolve to geometry-less pivots and are skipped. Edges are cached per
-      // id (not rebuilt on a mid-selection mesh swap) — matches the primary outline's behavior;
-      // a re-select refreshes them.
+      // id and rebuilt when the source geometry changes — same rule as the primary outline.
       const descOutlineIds = new Set<number>();
       if (selectedId !== null) {
         const subtree = subtreeIds(getAllEntities(), selectedId);
@@ -4951,25 +4717,14 @@ function ThreeJSViewport({ mode, layers, showGrid = true, showColliders = false,
           const geo = obj ? outlineSourceGeometry(obj) : undefined;
           if (!obj || !geo) continue;
           descOutlineIds.add(id);
-          let o = descOutlineMeshes.get(id);
-          if (!o) {
-            const edges = new THREE.EdgesGeometry(geo);
-            o = new THREE.LineSegments(edges, new THREE.LineBasicMaterial({ color: 0xf1c40f, transparent: true, opacity: 0.35 }));
-            scene.add(o);
-            descOutlineMeshes.set(id, o);
-          }
+          const o = syncOutlineFor(descOutlineMeshes, id, geo, () => new THREE.LineBasicMaterial({ color: 0xf1c40f, transparent: true, opacity: 0.35 }), scene);
           o.position.copy(obj.position);
           o.rotation.copy(obj.rotation);
           o.scale.copy(obj.scale);
         }
       }
       for (const [id, o] of descOutlineMeshes) {
-        if (!descOutlineIds.has(id)) {
-          o.removeFromParent();
-          o.geometry.dispose();
-          (o.material as THREE.Material).dispose();
-          descOutlineMeshes.delete(id);
-        }
+        if (!descOutlineIds.has(id)) { disposeEdgeOutline(o); descOutlineMeshes.delete(id); }
       }
 
       // ── Collider3D wireframe gizmos (3D mode) ──
@@ -5045,11 +4800,17 @@ function ThreeJSViewport({ mode, layers, showGrid = true, showColliders = false,
       // Editor helpers: visible in 3D mode only
       grid.visible = !isUI && showGridRef.current;
       axes.visible = !isUI;
-      camGizmoPivot.visible = !isUI;
       // CameraFrame framing boxes stay visible in 2D mode too (still gated by showGizmo)
       // so the framing volume can be seen + tuned against the letterboxed device preview;
-      // every other gizmo (empty markers, camera icons) stays 3D-only.
-      for (const [id, g] of ecsGizmos) g.visible = !isUI || frameGizmoIds.has(id);
+      // every other gizmo (empty markers, camera icons) stays 3D-only. The shared camera pivot
+      // is never released, so it is shown only while some camera row holds it — not after the
+      // last Camera is deleted, and not when every camera yields to a higher-ranked gizmo.
+      let pivotHeld = false;
+      for (const [, g, kind] of gizmos) {
+        g.visible = !isUI || kind === 'frameBox';
+        if (g === camGizmoPivot) pivotHeld = true;
+      }
+      camGizmoPivot.visible = !isUI && pivotHeld;
       controls.enabled = !isUI;
 
       // Opt-in: simulate + render emitter effects live in the scene. Uses its own backend
@@ -5181,7 +4942,8 @@ function ThreeJSViewport({ mode, layers, showGrid = true, showColliders = false,
       disposeParticleSyncState(particleState, scene);
       disposeFlameMeshSyncState(flameState, scene);
       disposeBlobShadowSyncState(blobShadowState, scene);
-      disposeSceneViewEntityObjects(scene, { outlineMeshes, descOutlineMeshes, colliderWires, colliderWireSigs, ecsGizmos, ecsLights });
+      disposeSceneViewEntityObjects(scene, { outlineMeshes, descOutlineMeshes, colliderWires, colliderWireSigs, ecsLights });
+      gizmos.clear();
       grid.geometry.dispose(); (grid.material as THREE.Material).dispose();
       axes.geometry.dispose(); (axes.material as THREE.Material).dispose();
       scene.environment = null; // detach shared env — cache owns the texture

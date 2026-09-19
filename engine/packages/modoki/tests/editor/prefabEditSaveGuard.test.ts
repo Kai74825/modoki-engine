@@ -42,8 +42,8 @@ if (typeof globalThis.localStorage === 'undefined') {
   } as Storage;
 }
 
-const saveAssetDialog = vi.fn(async () => null); // null = the human cancelled
-vi.mock('../../src/editor/utils/saveDialog', () => ({ saveAssetDialog }));
+const chooseNewAssetPath = vi.fn(async () => null); // null = the human cancelled
+vi.mock('../../src/editor/utils/saveDialog', () => ({ chooseNewAssetPath }));
 
 const { EntityAttributes } = await import('../../src/runtime/core/traits/EntityAttributes');
 const { Transform } = await import('../../src/runtime/core/traits/Transform');
@@ -51,7 +51,7 @@ const { setCurrentWorld, registerEntity, indexEntityGuid } = await import('../..
 const { registerTrait } = await import('../../src/runtime/core/ecs/traitRegistry');
 const { setRunMode } = await import('../../src/runtime/core/playState');
 const { saveScene, setCurrentScenePath } = await import('../../src/editor/scene/serialize');
-const { PREFAB_EDIT_SCENE_PREFIX, isPrefabEditWorld } = await import('../../src/editor/scene/prefabEditWorld');
+const { PREFAB_EDIT_SCENE_PREFIX, isPrefabEditWorld, prefabEditWorldPath, prefabSessionWorldPath } = await import('../../src/editor/scene/prefabEditWorld');
 
 function registerAll() {
   registerTrait({
@@ -65,7 +65,7 @@ function registerAll() {
 }
 
 beforeEach(() => {
-  saveAssetDialog.mockClear();
+  chooseNewAssetPath.mockClear();
   currentPath = null;
   setRunMode('stopped');
   setCurrentScenePath(null); // what prefab-edit does, and the state the dialog branch keys on
@@ -85,6 +85,26 @@ describe('isPrefabEditWorld', () => {
     currentPath = null;
     expect(isPrefabEditWorld(), 'no scene loaded is not a prefab-edit world').toBe(false);
   });
+
+  it('prefabEditWorldPath names that world — the handle the agent edit routes address it by (#1254)', () => {
+    currentPath = `${PREFAB_EDIT_SCENE_PREFIX}g-ship`;
+    expect(prefabEditWorldPath()).toBe(`${PREFAB_EDIT_SCENE_PREFIX}g-ship`);
+    currentPath = '/assets/scenes/main.scene.json';
+    expect(prefabEditWorldPath()).toBeNull();
+    currentPath = null;
+    expect(prefabEditWorldPath()).toBeNull();
+  });
+
+  it('prefabSessionWorldPath needs the world AND the session for that prefab — an orphaned world is not editable (#1254 review)', () => {
+    const world = `${PREFAB_EDIT_SCENE_PREFIX}g-ship`;
+    currentPath = world;
+    expect(prefabSessionWorldPath({ guid: 'g-ship' })).toBe(world);
+    // An exit whose return-scene reload failed: the world stays, the session is gone — nothing could save an edit.
+    expect(prefabSessionWorldPath(null)).toBeNull();
+    expect(prefabSessionWorldPath({ guid: 'g-other' }), 'a session for a DIFFERENT prefab').toBeNull();
+    currentPath = '/assets/scenes/main.scene.json';
+    expect(prefabSessionWorldPath({ guid: 'g-ship' }), 'a stale flag over a real scene').toBeNull();
+  });
 });
 
 describe('saveScene refuses the prefab-edit world', () => {
@@ -94,7 +114,7 @@ describe('saveScene refuses the prefab-edit world', () => {
     return saveScene().then((r) => {
       expect(r.saved).toBe(false);
       expect(r.reason).toBe('prefab-edit');
-      expect(saveAssetDialog, 'no "Save Scene As" panel — this is the reported bug')
+      expect(chooseNewAssetPath, 'no "Save Scene As" panel — this is the reported bug')
         .not.toHaveBeenCalled();
     });
   });
@@ -119,14 +139,14 @@ describe('saveScene refuses the prefab-edit world', () => {
     setCurrentScenePath('/assets/scenes/brand-new.scene.json');
     const r = await saveScene();
     expect(r.reason, 'not refused — this is a real scene being created').not.toBe('prefab-edit');
-    expect(saveAssetDialog, 'and no dialog: it has a path already').not.toHaveBeenCalled();
+    expect(chooseNewAssetPath, 'and no dialog: it has a path already').not.toHaveBeenCalled();
   });
 
   // ── CONTROL ──────────────────────────────────────────────────────────────────
   it('a REAL scene with no path still reaches the dialog — so the assertions above mean something', async () => {
     currentPath = '/assets/scenes/main.scene.json';
     const r = await saveScene();
-    expect(saveAssetDialog, 'the Save-As branch is genuinely live and reachable').toHaveBeenCalledTimes(1);
+    expect(chooseNewAssetPath, 'the Save-As branch is genuinely live and reachable').toHaveBeenCalledTimes(1);
     expect(r.reason, 'the mock cancels, so nothing is written').toBe('cancelled');
   });
 });
